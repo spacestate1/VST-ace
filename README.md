@@ -19,6 +19,27 @@ set of shims.
 
 `peload/README.md` has the long version, including what the remaining failures
 are and why most of them turned out to be host bugs wearing a plug-in's clothes.
+`PLUGINS.md` lists all 248 plug-ins the hosts are tested against.
+
+![FB-7999 in pestudio](docs/fb-7999.png)
+
+*FB-7999 — a Korg DW-8000 simulation, and the plug-in this whole effort started
+on. A Windows VST2 running as native code on Linux: the Win32 layer draws its
+editor into a buffer, the host blits it, and the zoom bar has scaled it to 91% to
+fit the pane. The preset names on the left were read out of the `.dll`.*
+
+![Cardinal in pestudio](docs/cardinal.png)
+
+*Cardinal — VCV Rack as a Linux VST3. Its editor is not a picture the host draws
+but an OpenGL window the plug-in paints itself, embedded as an X11 child and
+running at 59 fps inside the host. Nothing on this side can scale that, so the
+zoom asks the plug-in to lay itself out again instead — which is what the note
+beside the bar is saying.*
+
+![FB-3300 in pestudio](docs/fb-3300.png)
+
+*FB-3300 — a Korg PS-3300 simulation. Three complete synthesizer blocks and 229
+parameters, the widest editor in the corpus.*
 
 ## What is in here
 
@@ -55,12 +76,26 @@ one live. `c/README.md` covers them.
 ## Building
 
 Needs a C11 and C++20 compiler, CMake ≥ 3.16, GTK4, Qt6, ALSA, PipeWire, X11,
-Cairo and FreeType. On Arch:
+Cairo and FreeType.
+
+**Ubuntu / Debian** — 24.04 or newer, which is where Qt 6 and GTK 4 are recent
+enough to be worth using:
+
+    sudo apt install build-essential cmake pkg-config \
+        libgtk-4-dev qt6-base-dev \
+        libasound2-dev libpipewire-0.3-dev \
+        libx11-dev libcairo2-dev libfreetype-dev
+
+On 22.04 the same packages exist but GTK 4 is old enough that `dwstudio` is worth
+skipping; `pestudio` still builds. If `libfreetype-dev` is not found, it is
+`libfreetype6-dev` on the older releases.
+
+**Arch:**
 
     pacman -S base-devel cmake gtk4 qt6-base alsa-lib pipewire libx11 cairo \
               freetype2
 
-Then:
+Then, on either:
 
     ./dw build          # everything, both windows included
 
