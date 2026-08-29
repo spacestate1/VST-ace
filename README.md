@@ -167,6 +167,15 @@ toolchain, no import libraries — is reported as a skip with the reason rather
 than passing quietly. `--no-build` reuses `peload/build` instead of configuring
 a fresh tree; `--only <check>` runs one.
 
+    python3 tools/triage.py <dir-of-plug-ins>
+
+is the other half, for when plug-ins fail rather than the tree does. One
+plug-in that will not load says little — the backtrace lands in guest code, and
+the cause is usually an import that resolved to the generic stub long before.
+A corpus says a great deal, because the imports only the *failing* plug-ins
+need are a short list. It loads every plug-in in a directory and ranks those
+imports by how many failures need them.
+
 ## Running
 
     dw                       open a window — pestudio or dwstudio, whichever
