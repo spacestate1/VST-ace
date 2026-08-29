@@ -95,3 +95,7 @@ mv "$WORK_DIR"/*.changes "$RELEASE_DIR/" 2>/dev/null || true
 echo
 echo "=== Built ==="
 ls -lh "$RELEASE_DIR"/vst-ace*.deb
+echo
+echo "release/ is not tracked by git. Publish the .deb on the releases page:"
+echo "  gh release create v$VERSION $RELEASE_DIR/vst-ace_$VERSION-1_amd64.deb \\"
+echo "     --title \"vst-ace $VERSION\" --notes \"Ubuntu 24.04 / Debian 13+, amd64.\""
