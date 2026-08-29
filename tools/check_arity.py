@@ -78,11 +78,76 @@ def our_stubs(path):
     pat = re.compile(r'static\s+MS\s+[A-Za-z_][\w \t\*]*?\bst_(\w+)\s*\(([^)]*)\)')
     return [(m.group(1), argbytes(m.group(2))) for m in pat.finditer(src)]
 
+def our_cdecl_stubs(path):
+    """The stubs declared MSCRT -- __cdecl at i386, where MS is stdcall.
+
+    A stub carries no arity to compare, but the choice between the two macros
+    is itself checkable: if the import libraries decorate the name @N, the real
+    export is stdcall and MSCRT is wrong. That is not a cosmetic difference at
+    i386 -- a cdecl stub returns without popping, so the caller is left N bytes
+    low on every call. wvsprintfA and wvsprintfW were declared MSCRT next to
+    wsprintfA/W, which genuinely are __cdecl (WINAPIV) because they are
+    variadic; the va_list forms are not, and are ordinary WINAPI.
+    """
+    src = "\n".join(open(p).read() for p in sources(path))
+    src = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+    pat = re.compile(r'static\s+MSCRT\s+[\w \t\*]*?\bst_(\w+)\s*\(')
+    return [m.group(1) for m in pat.finditer(src)]
+
+
+# Calls that run the other way -- host into guest -- are declared as function
+# pointer typedefs, not as st_ prototypes, so the stub loop below never sees
+# them. There is no import-library arity to check them against either: their
+# shape comes from the Windows API contract rather than from an export. What
+# can be checked is the convention winstubs32.h states for this whole tree --
+# every Windows type that changes width is spelled size_t/intptr_t and never a
+# fixed 64-bit type -- because the cost of getting it wrong is the same as a
+# wrong stub arity, and lands in the same place. An LPARAM declared int64_t
+# pushes 8 bytes into a guest callback that pops 4, so the stack drifts four
+# bytes per call: EnumDisplayMonitors and the EnumResourceNames callbacks both
+# had exactly that.
+FIXED64 = ('int64_t', 'uint64_t', 'long long')
+
+def strip_x64_only(src):
+    """Drop #if defined(__x86_64__) regions, nesting included.
+
+    The width rule only bites at i386, so code that never compiles there is not
+    a finding. mscxxeh.h's MSVC exception funclets are the case that matters:
+    they take a genuine 64-bit frame pointer, in RDX, and the whole file is
+    guarded out of the 32-bit build.
+    """
+    out, depth, skip_at = [], 0, None
+    for line in src.splitlines(True):
+        t = line.lstrip()
+        if re.match(r'#\s*if', t):
+            depth += 1
+            if skip_at is None and re.match(
+                    r'#\s*(ifdef\s+__x86_64__\b'
+                    r'|if\s+defined\s*\(\s*__x86_64__\s*\)\s*$)', t):
+                skip_at = depth
+        if skip_at is None:
+            out.append(line)
+        if re.match(r'#\s*endif', t):
+            if skip_at == depth:
+                skip_at = None
+            depth -= 1
+    return "".join(out)
+
+
+def callback_typedefs(path):
+    src = "\n".join(open(p).read() for p in sources(path))
+    src = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+    src = strip_x64_only(src)
+    pat = re.compile(r'typedef\s+MS\s+[\w \t\*]*?\(\s*\*\s*(\w+)\s*\)\s*\(([^)]*)\)')
+    return [(m.group(1), m.group(2)) for m in pat.finditer(src)]
+
+
 def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else "peload/winstubs.h"
     real = real_arities()
     bad = unknown = ok = cdecl = 0
     undecorated = []
-    for name, mine in our_stubs(sys.argv[1] if len(sys.argv) > 1 else "peload/winstubs.h"):
+    for name, mine in our_stubs(path):
         if name not in real:
             unknown += 1
             continue
@@ -104,8 +169,23 @@ def main():
     if undecorated:
         print("  no @N in the import libs (real __cdecl, or an intrinsic with no"
               " import thunk):\n    " + ", ".join(sorted(undecorated)))
+    miscalled = [n for n in our_cdecl_stubs(path) if real.get(n) is not None]
+    for n in miscalled:
+        print(f"  CONV    {n:34} declared MSCRT (__cdecl), but the import libs"
+              f" decorate it @{real[n]} -- it is stdcall, so it needs MS")
+
+    cbs = callback_typedefs(path)
+    wide = [(n, a) for n, a in cbs if any(t in a for t in FIXED64)]
+    for n, a in wide:
+        print(f"  WIDTH   {n:34} fixed 64-bit parameter in a guest callback"
+              f" -- use intptr_t/uintptr_t: ({' '.join(a.split())})")
+
     print(f"\n{ok} match, {bad} wrong arity, {cdecl} undecorated, "
           f"{unknown} not in the import libs at all")
-    return 1 if bad else 0
+    print(f"{len(cbs) - len(wide)}/{len(cbs)} guest callbacks pointer-width clean")
+    return 1 if bad or wide or miscalled else 0
 
-sys.exit(main())
+# Importable, so tools/regress.py can reuse sources() rather than re-deriving
+# which headers the stub layer is spread across.
+if __name__ == "__main__":
+    sys.exit(main())
