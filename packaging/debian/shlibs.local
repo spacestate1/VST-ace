@@ -1,0 +1,23 @@
+# Qt 6 dependencies as alternatives, because the package name differs between
+# the distributions this package claims to target and dpkg-shlibdeps can only
+# know the one it is building on.
+#
+# Ubuntu 24.04 carried out the 64-bit time_t transition by renaming the
+# affected runtime packages with a "t64" suffix. Debian 13 did the transition
+# too but did not rename every package, and the two do not agree on which:
+#
+#   libQt6Core     libqt6core6t64      exists on both
+#   libQt6Gui      libqt6gui6t64       Ubuntu only -- Debian 13 has libqt6gui6
+#   libQt6Widgets  libqt6widgets6t64   Ubuntu only -- Debian 13 has libqt6widgets6
+#
+# So a .deb built on Ubuntu 24.04 declared two dependencies with no candidate
+# on Debian 13, and apt refused it outright: "libqt6gui6t64 but it is not
+# installable". Verified against a Debian 13 host before and after this file.
+#
+# An alternative satisfies whichever name the target actually has, which is
+# what a package spanning both wants. The versions match what dpkg-shlibdeps
+# derives from Qt's own shlibs on Ubuntu 24.04; the Debian names carry the same
+# minimums because the ABI they refer to is the same.
+libQt6Core 6 libqt6core6t64 (>= 6.4.0) | libqt6core6 (>= 6.4.0)
+libQt6Gui 6 libqt6gui6t64 (>= 6.1.2) | libqt6gui6 (>= 6.1.2)
+libQt6Widgets 6 libqt6widgets6t64 (>= 6.3.0) | libqt6widgets6 (>= 6.3.0)
