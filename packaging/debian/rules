@@ -26,9 +26,10 @@ include /usr/share/dpkg/buildflags.mk
 PKGLIBDIR  := /usr/lib/vst-ace
 PKGDATADIR := /usr/share/vst-ace
 
-DESTDIR      := $(CURDIR)/debian/vst-ace
-BUILD_PELOAD := obj-peload
-BUILD_GUI    := obj-gui
+DESTDIR       := $(CURDIR)/debian/vst-ace
+DESTDIR_I386  := $(CURDIR)/debian/vst-ace-i386
+BUILD_PELOAD  := obj-peload
+BUILD_GUI     := obj-gui
 
 # Every step below is an explicit command rather than dh_auto_build, so the
 # parallelism dpkg was asked for has to be passed on by hand. Serial when
@@ -59,13 +60,15 @@ override_dh_auto_build:
 	    DW_PKGDEFS='-DDW_PKGLIBDIR=\"$(PKGLIBDIR)\" -DDW_PKGDATADIR=\"$(PKGDATADIR)\"'
 	cmake --build $(BUILD_PELOAD) $(PARALLEL)
 	cmake --build $(BUILD_GUI) $(PARALLEL) --target dwstudio
-# pestudio and dwstudio are both skipped rather than failed when their toolkit
-# is missing, so a package built without Qt6 or GTK4 present would otherwise
-# ship quietly incomplete. Insist on all four here, where the missing
-# build-dependency is still the obvious explanation.
+# pestudio, dwstudio and peload32 are all skipped rather than failed when
+# their toolkit is missing, so a package built without Qt6, GTK4 or the i386
+# multilib toolchain present would otherwise ship quietly incomplete. Insist
+# on all five here, where the missing build-dependency is still the obvious
+# explanation.
 	test -x $(BUILD_PELOAD)/peload
 	test -x $(BUILD_PELOAD)/peserve
 	test -x $(BUILD_PELOAD)/pestudio
+	test -x $(BUILD_PELOAD)/peload32
 	test -x $(BUILD_GUI)/dwstudio
 
 override_dh_auto_test:
@@ -77,6 +80,10 @@ override_dh_auto_install:
 	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
 	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
 	install -D -m 0755 c/build/dw               $(DESTDIR)/usr/bin/dw
+# peload32 is i386 code and ships in its own vst-ace-i386 package (see
+# packaging/debian/control), but lands in the same PKGLIBDIR that vst-ace
+# owns -- that is where the bridge looks for it beside the 64-bit binaries.
+	install -D -m 0755 $(BUILD_PELOAD)/peload32 $(DESTDIR_I386)$(PKGLIBDIR)/peload32
 # The three that are worth having on $$PATH, as symlinks rather than copies:
 # the helper lookup above depends on the real programs staying together.
 	for p in peload pestudio dwstudio; do \

@@ -269,9 +269,26 @@ bridge *bridge_open_helper(const char *dll, double samplerate, int blocksize,
 
     if (bridge_op(b, BR_HELLO, 0, 0, 0, 0, 0, &rep) || !rep.ok) {
         /* The server sends a reply with ok == 0 and a reason when the plugin
-         * itself failed to load; a dead socket means it faulted before that. */
-        if (rep.text[0]) snprintf(g_err, sizeof g_err, "%s", rep.text);
-        else snprintf(g_err, sizeof g_err, "the helper died before reporting");
+         * itself failed to load; a dead socket means it faulted before that --
+         * most often a signal, such as SIGABRT out of the "structured
+         * exception dispatch is not implemented" path in winstubs.h when a
+         * plugin's own init throws a C++ exception. Same treatment as
+         * bridge_render_io: say which signal rather than just "died". */
+        if (rep.text[0]) {
+            snprintf(g_err, sizeof g_err, "%s", rep.text);
+        } else {
+            int st = 0, reaped = b->pid > 0 && waitpid(b->pid, &st, WNOHANG) == b->pid;
+            /* Reaped here rather than left for bridge_close: its own pid==0
+             * check would otherwise see an already-collected child as "not
+             * gone yet" and spend half a second waiting for what already
+             * happened. */
+            if (reaped) b->pid = 0;
+            if (reaped && WIFSIGNALED(st))
+                snprintf(g_err, sizeof g_err, "the helper crashed (signal %d, %s)"
+                         " before reporting", WTERMSIG(st), strsignal(WTERMSIG(st)));
+            else
+                snprintf(g_err, sizeof g_err, "the helper died before reporting");
+        }
         bridge_close(b); return NULL;
     }
     snprintf(b->name, sizeof b->name, "%s", rep.text);

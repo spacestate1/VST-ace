@@ -96,19 +96,29 @@ if(HAVE_M32_TOOLCHAIN)
   target_link_libraries(peload32 PRIVATE pthread m)
 
   # The window layer and the DirectWrite shim need 32-bit FreeType. Their .pc
-  # files are under /usr/lib32/pkgconfig, which the default pkg-config path does
-  # not cover, so query them with PKG_CONFIG_LIBDIR pointed there.
+  # files live outside the default pkg-config path -- under /usr/lib32/pkgconfig
+  # on Arch, or under the i386 multiarch triplet's own pkgconfig dir on Debian
+  # and Ubuntu (/usr/lib/i386-linux-gnu/pkgconfig) -- so query both with
+  # PKG_CONFIG_LIBDIR and take whichever answers.
+  set(_pkgconfig32_dirs /usr/lib32/pkgconfig /usr/lib/i386-linux-gnu/pkgconfig)
   set(_pc_saved32 "$ENV{PKG_CONFIG_LIBDIR}")
-  set(ENV{PKG_CONFIG_LIBDIR} /usr/lib32/pkgconfig)
-  execute_process(COMMAND pkg-config --cflags freetype2
-                  OUTPUT_VARIABLE FT32_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE
-                  RESULT_VARIABLE FT32_OK ERROR_QUIET)
-  execute_process(COMMAND pkg-config --libs freetype2
-                  OUTPUT_VARIABLE FT32_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET)
+  set(FT32_OK 1)
+  foreach(_dir ${_pkgconfig32_dirs})
+    set(ENV{PKG_CONFIG_LIBDIR} "${_dir}")
+    execute_process(COMMAND pkg-config --cflags freetype2
+                    OUTPUT_VARIABLE FT32_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE
+                    RESULT_VARIABLE FT32_OK ERROR_QUIET)
+    if(FT32_OK EQUAL 0)
+      execute_process(COMMAND pkg-config --libs freetype2
+                      OUTPUT_VARIABLE FT32_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
+                      ERROR_QUIET)
+      set(PKGCONFIG32_LIBDIR "${_dir}")
+      break()
+    endif()
+  endforeach()
   set(ENV{PKG_CONFIG_LIBDIR} "${_pc_saved32}")
   if(NOT FT32_OK EQUAL 0)
-    message(FATAL_ERROR "peload32 needs 32-bit freetype2 (lib32-freetype2)")
+    message(FATAL_ERROR "peload32 needs 32-bit freetype2 (lib32-freetype2, or libfreetype-dev:i386 on Debian/Ubuntu)")
   endif()
   separate_arguments(FT32_CFLAGS_LIST NATIVE_COMMAND "${FT32_CFLAGS}")
   separate_arguments(FT32_LIBS_LIST   NATIVE_COMMAND "${FT32_LIBS}")
@@ -118,7 +128,8 @@ if(HAVE_M32_TOOLCHAIN)
   # A live editor window needs 32-bit Xlib. There is no x11.pc under
   # /usr/lib32/pkgconfig on Arch, but lib32-libx11 ships the .so, and the X11
   # headers are architecture-independent -- so look for the library directly.
-  find_library(X11_32 NAMES X11 PATHS /usr/lib32 NO_DEFAULT_PATH)
+  # Debian/Ubuntu ship it under the i386 multiarch triplet instead.
+  find_library(X11_32 NAMES X11 PATHS /usr/lib32 /usr/lib/i386-linux-gnu NO_DEFAULT_PATH)
   if(X11_32)
     target_compile_definitions(peload32 PRIVATE PELOAD32_X11=1)
     target_link_libraries(peload32 PRIVATE ${X11_32})
@@ -127,17 +138,22 @@ if(HAVE_M32_TOOLCHAIN)
     message(STATUS "peload32: no editor window (needs lib32-libx11)")
   endif()
 
-  # Live playback needs 32-bit PipeWire and ALSA. Their .pc files live under
-  # /usr/lib32/pkgconfig, which the default pkg-config path does not cover, so
-  # query them explicitly rather than picking up the 64-bit ones.
+  # Live playback needs 32-bit PipeWire and ALSA. Their .pc files live outside
+  # the default pkg-config path -- see the FreeType lookup above for where.
   set(_pc_saved "$ENV{PKG_CONFIG_LIBDIR}")
-  set(ENV{PKG_CONFIG_LIBDIR} /usr/lib32/pkgconfig)
-  execute_process(COMMAND pkg-config --cflags libpipewire-0.3 alsa
-                  OUTPUT_VARIABLE PW32_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE
-                  RESULT_VARIABLE PW32_OK ERROR_QUIET)
-  execute_process(COMMAND pkg-config --libs libpipewire-0.3 alsa
-                  OUTPUT_VARIABLE PW32_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET)
+  set(PW32_OK 1)
+  foreach(_dir ${_pkgconfig32_dirs})
+    set(ENV{PKG_CONFIG_LIBDIR} "${_dir}")
+    execute_process(COMMAND pkg-config --cflags libpipewire-0.3 alsa
+                    OUTPUT_VARIABLE PW32_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE
+                    RESULT_VARIABLE PW32_OK ERROR_QUIET)
+    if(PW32_OK EQUAL 0)
+      execute_process(COMMAND pkg-config --libs libpipewire-0.3 alsa
+                      OUTPUT_VARIABLE PW32_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
+                      ERROR_QUIET)
+      break()
+    endif()
+  endforeach()
   set(ENV{PKG_CONFIG_LIBDIR} "${_pc_saved}")
   if(PW32_OK EQUAL 0)
     separate_arguments(PW32_CFLAGS_LIST NATIVE_COMMAND "${PW32_CFLAGS}")

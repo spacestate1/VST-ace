@@ -42,12 +42,11 @@ peload/thirdparty/
 # under peload/build.
 /peload/peload
 
-# The staging directories a package build configures cmake into. The packages
-# themselves land in release/ and are kept -- that is what gets published.
+# The staging directories a package build configures cmake into.
 obj-*/
 
-# Detached debug symbols, which debhelper produces beside every .deb. 4.5 MB
-# a release and useful only with a core dump in hand, so they belong on the
-# releases page rather than in every clone. build-deb.sh still writes them to
-# release/ next to the .deb it came from.
-release/*.ddeb
+# build-deb.sh writes the .deb, .ddeb, .changes and .buildinfo here. None of it
+# belongs in git -- binaries in source control are how a project gets banned
+# from GitHub for abuse -- so this is where the releases page's assets come
+# from instead, built fresh from a tag rather than committed.
+release/

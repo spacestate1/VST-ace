@@ -1540,6 +1540,14 @@ static MS uint32_t st_GetWindowsDirectoryA(char *buf, uint32_t n)
 static MS uint32_t st_GetPrivateProfileStringA(const char *sec, const char *key,
         const char *def, char *out, uint32_t n, const char *file)
 { (void)sec;(void)key;(void)file; return (uint32_t)snprintf(out, n, "%s", def ? def : ""); }
+/* No ini file is ever really read here, same as the String version above --
+ * so the one contractual thing this can still get right is returning the
+ * caller's own default rather than a bare 0. A plugin gating its own init on
+ * an unexpected "0 back from a config read it thought would return its
+ * default" is a real way for VSTPluginMain to come back with no AEffect. */
+static MS int32_t st_GetPrivateProfileIntA(const char *sec, const char *key,
+        int32_t def, const char *file)
+{ (void)sec;(void)key;(void)file; return def; }
 /* GetFullPathName has a two-call contract, and getting the first call wrong is
  * silent: with no buffer, or one too small, it returns the size *required*
  * including the terminator, and writes nothing; with room it fills the buffer and
@@ -1637,6 +1645,34 @@ static MS void *st_LoadBitmapA(void *inst, const char *name)
 }
 static MS void *st_LoadBitmapW(void *inst, const void *name)
 { (void)inst; return load_bitmap_res(name); }
+
+/* LoadString, for real -- same reasoning as LoadBitmap above: returning 0
+ * unread is a plugin's cue that its own config/resource load failed, and
+ * that is a way for VSTPluginMain to come back with no AEffect at all
+ * (syxg50 calls this right after finding its #110 dialog resource, and gets
+ * no further). An RT_STRING resource packs 16 consecutive string-table
+ * entries per block -- block (id>>4)+1, indexed within it by id&15 -- each a
+ * uint16 length followed by that many UTF-16 code units with no terminator. */
+static MS int32_t st_LoadStringA(void *inst, uint32_t id, char *buf, int32_t max)
+{
+    void *rsrc;
+    const uint16_t *w;
+    int idx = (int)(id & 15), i, len;
+
+    (void)inst;
+    if (!buf || max <= 0) return 0;
+    buf[0] = 0;
+    if (!(rsrc = res_lookup((const void *)6 /* RT_STRING */,
+                            (const void *)(uintptr_t)((id >> 4) + 1), g_rsrc)))
+        return 0;
+    w = (const uint16_t *)(image_base_for_rsrc(rsrc) + ((RES_DATA *)rsrc)->OffsetToData);
+    for (i = 0; i < idx; i++) w += 1 + w[0];
+    len = w[0];
+    if (len >= max) len = max - 1;
+    for (i = 0; i < len; i++) buf[i] = w[1 + i] < 0x100 ? (char)w[1 + i] : '?';
+    buf[len] = 0;
+    return len;
+}
 
 /* ---------------------------------------------------- CRT static init ---
  *
@@ -4675,6 +4711,7 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", GetStartupInfoW), S("kernel32.dll", GetStdHandle),
     S("kernel32.dll", GetStartupInfoA), S("kernel32.dll", GetSystemDirectoryA),
     S("kernel32.dll", GetWindowsDirectoryA), S("kernel32.dll", GetPrivateProfileStringA),
+    S("kernel32.dll", GetPrivateProfileIntA),
     S("kernel32.dll", GetFullPathNameW), S("kernel32.dll", GetCurrentDirectoryW),
     S("kernel32.dll", CreateDirectoryW),
     S("kernel32.dll", SetHandleCount),
@@ -4682,6 +4719,7 @@ static const winstub g_stubs[] = {
     S("user32.dll", SetTimer), S("user32.dll", KillTimer),
 #endif
     S("user32.dll", LoadBitmapA), S("user32.dll", LoadBitmapW),
+    S("user32.dll", LoadStringA),
     S("shell32.dll", SHGetFolderPathA),
     S("kernel32.dll", SetStdHandle), S("kernel32.dll", OutputDebugStringA),
     /* locale */

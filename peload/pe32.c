@@ -649,6 +649,21 @@ static int write_wav(const char *path, const float *inter, int frames, int sr)
     return 1;
 }
 
+/* Every failure between here and serve_run() used to just return, which in
+ * --serve mode meant exiting with the socket never opened. The client reads
+ * that as a dead socket and reports "the helper died before reporting" --
+ * true, but it throws away the specific reason this process already had in
+ * hand. Send it across instead, the same way serve_run's own BR_HELLO would
+ * have. */
+static void serve_report_fail(int fd, const char *msg)
+{
+    bridge_rep r;
+    memset(&r, 0, sizeof r);
+    r.ok = 0;
+    snprintf(r.text, sizeof r.text, "%s", msg);
+    send(fd, &r, sizeof r, MSG_NOSIGNAL);
+}
+
 int main(int argc, char **argv)
 {
     image32 im;
@@ -705,9 +720,19 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    if (teb_install()) { fprintf(stderr, "cannot install fake TEB\n"); return 1; }
-    if (map_image(&im, path)) return 1;
-    if (apply_relocs(&im) < 0) return 1;
+    if (teb_install()) {
+        fprintf(stderr, "cannot install fake TEB\n");
+        if (serve_fd >= 0) serve_report_fail(serve_fd, "cannot install fake TEB");
+        return 1;
+    }
+    if (map_image(&im, path)) {
+        if (serve_fd >= 0) serve_report_fail(serve_fd, "cannot map plug-in image");
+        return 1;
+    }
+    if (apply_relocs(&im) < 0) {
+        if (serve_fd >= 0) serve_report_fail(serve_fd, "relocation failed");
+        return 1;
+    }
     faults_report(&im);
     winstubs_init(im.base, im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
                             ? im.base + im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
@@ -722,11 +747,16 @@ int main(int argc, char **argv)
             (int32_t WINAPI_ (*)(void *, uint32_t, void *))entry;
         int32_t r = dllmain(im.base, 1, NULL);
         PLOG("DllMain returned %d\n", r);
-        if (!r) { fprintf(stderr, "DllMain failed\n"); return 1; }
+        if (!r) {
+            fprintf(stderr, "DllMain failed\n");
+            if (serve_fd >= 0) serve_report_fail(serve_fd, "DllMain failed");
+            return 1;
+        }
     }
 
     if (!(vm = find_export(&im, "VSTPluginMain")) && !(vm = find_export(&im, "main"))) {
         fprintf(stderr, "no VSTPluginMain export\n");
+        if (serve_fd >= 0) serve_report_fail(serve_fd, "no VSTPluginMain export");
         return 1;
     }
     {
@@ -735,6 +765,7 @@ int main(int argc, char **argv)
     }
     if (!fx || fx->magic != 0x56737450) {
         fprintf(stderr, "VSTPluginMain gave no valid AEffect (fx=%p)\n", (void *)fx);
+        if (serve_fd >= 0) serve_report_fail(serve_fd, "VSTPluginMain gave no valid AEffect");
         return 1;
     }
 

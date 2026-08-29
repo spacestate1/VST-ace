@@ -76,11 +76,10 @@ one live. `c/README.md` covers them.
 
 ## Installing
 
-A `.deb` for Ubuntu 24.04 and Debian 13 or newer is in
-[`release/`](release), and on the
+A `.deb` for Ubuntu 24.04 and Debian 13 or newer is on the
 [releases page](https://github.com/spacestate1/VST-ace/releases):
 
-    sudo apt install ./release/vst-ace_0.1.0-1_amd64.deb
+    sudo apt install ./vst-ace_0.1.0-1_amd64.deb
 
 That puts `dw`, `pestudio` and `dwstudio` on `$PATH`, the patch banks in
 `/usr/share/vst-ace/patches`, and both windows in the desktop menu. It hosts
