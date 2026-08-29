@@ -66,6 +66,12 @@ Description: run Windows, macOS and Linux audio plug-ins natively, without Wine
  This package hosts 64-bit plug-ins. For 32-bit Windows VST2 plug-ins, install
  vst-ace-i386 alongside it (packaging/build-deb.sh builds both). No plug-in
  binaries are included -- the plug-ins these hosts load are their authors' own.
+ .
+ A few plug-ins import a Microsoft C or C++ runtime that cannot be stubbed,
+ iostreams and locale objects having vtables and state of their own, and load
+ only with the genuine DLL present. That is not ours to redistribute, so
+ /usr/lib/vst-ace/runtime and .../runtime32 ship empty for it to be dropped
+ into; the README there says what goes in them. Everything else works without.
 
 # vst-ace-i386 is not built from this file: dh only builds the binary packages
 # whose Architecture matches the host a plain `dpkg-buildpackage -b` runs on,

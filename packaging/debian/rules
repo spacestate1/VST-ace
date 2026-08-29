@@ -88,6 +88,18 @@ override_dh_auto_install:
 	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
 	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
 	install -D -m 0755 c/build/dw               $(DESTDIR)/usr/bin/dw
+# The drop-in directories for real Microsoft runtime DLLs, created empty and
+# owned by the package. They cannot be shipped filled -- the redistributable is
+# not ours to hand on -- but the search is relative to the installed binaries,
+# so the directory existing and being documented is the difference between
+# "put the file here" and the user having to read pehost.c to find out where
+# "here" is. A package built without them left no clue at all: three of the
+# four Native Instruments plug-ins in the test corpus load with a runtime
+# present and fail without one.
+	install -d $(DESTDIR)$(PKGLIBDIR)/runtime
+	install -d $(DESTDIR)$(PKGLIBDIR)/runtime32
+	install -D -m 0644 packaging/runtime-README \
+	    $(DESTDIR)$(PKGLIBDIR)/runtime/README
 # peload32 is deliberately not installed here. It is i386 code, and debhelper
 # only builds the binary packages whose Architecture matches this build host,
 # so there is no vst-ace-i386 stanza in debian/control for it to be staged

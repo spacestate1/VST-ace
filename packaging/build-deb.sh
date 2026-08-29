@@ -3,7 +3,11 @@
 # build-deb.sh VERSION -- build the vst-ace .deb for Debian/Ubuntu.
 #
 # Targets Ubuntu 24.04 and Debian 13 (Trixie) and newer, which is where Qt 6
-# and GTK 4 are recent enough for both windows. Run it from anywhere:
+# and GTK 4 are recent enough for both windows. One package serves both: the
+# Qt dependencies are declared as alternatives in debian/shlibs.local, because
+# the two distributions do not agree on which runtime packages carry Ubuntu's
+# "t64" suffix and dpkg-shlibdeps can only see the one it builds on.
+# Run it from anywhere:
 #
 #   bash packaging/build-deb.sh 0.1.0
 #

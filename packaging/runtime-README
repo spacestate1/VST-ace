@@ -1,0 +1,20 @@
+This directory is where vst-ace looks for real Microsoft runtime DLLs, and it
+ships empty because those files are not ours to redistribute.
+
+Some plug-ins import a Microsoft C or C++ runtime whose objects cannot be
+stubbed -- iostreams and locale have vtables and internal state -- so the host
+maps the genuine DLL instead. Without it those plug-ins load with several
+hundred imports bound to a generic stub and fail, usually far from the cause.
+Everything else works with this directory empty, which is how it ships.
+
+  runtime/     x86-64 DLLs, for peload, peserve, pestudio and dwstudio
+  runtime32/   i386 DLLs, for peload32
+
+Both are searched next to the installed binaries, so the files go straight in
+here with no configuration. What is wanted is the Visual C++ 2013
+redistributable -- msvcp120.dll, and msvcr120.dll beside it for the 32-bit
+loader -- in the matching width. Wine's builds of the same DLLs are not a
+substitute: they are compiled against Wine's own ntdll and fault during their
+own startup.
+
+PELOAD_DLL_PATH overrides this search if the files live somewhere else.

@@ -116,7 +116,17 @@ install -D -m 0755 obj-peload/peload   %{buildroot}%{pkglibdir}/peload
 install -D -m 0755 obj-peload/peserve  %{buildroot}%{pkglibdir}/peserve
 install -D -m 0755 obj-peload/pestudio %{buildroot}%{pkglibdir}/pestudio
 install -D -m 0755 obj-gui/dwstudio    %{buildroot}%{pkglibdir}/dwstudio
+%dir %{pkglibdir}/runtime
+%dir %{pkglibdir}/runtime32
+%{pkglibdir}/runtime/README
 install -D -m 0755 c/build/dw          %{buildroot}%{_bindir}/dw
+
+# Where real Microsoft runtime DLLs go. Empty, because the redistributable is
+# not ours to ship; owned by the package, because the host searches next to its
+# own binaries and the user should not have to read the source to learn that.
+install -d %{buildroot}%{pkglibdir}/runtime
+install -d %{buildroot}%{pkglibdir}/runtime32
+install -D -m 0644 packaging/runtime-README %{buildroot}%{pkglibdir}/runtime/README
 
 # -r, so the links are relative: an absolute one records the buildroot's idea
 # of the path and rpm warns about it. /proc/self/exe resolves either kind back
