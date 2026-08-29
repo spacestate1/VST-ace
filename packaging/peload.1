@@ -1,0 +1,81 @@
+.TH PELOAD 1 "August 2026" "vst-ace" "User Commands"
+.SH NAME
+peload \- load and render an audio plug\-in from the command line, without Wine
+.SH SYNOPSIS
+.B peload
+.RI { plugin | bank.json }
+.RI [ options ]
+.SH DESCRIPTION
+.B peload
+loads a plug\-in built for Windows, macOS or Linux and runs it as native code
+on Linux. It reports what the file is, lists its programs and parameters,
+applies a patch, renders audio to a WAV, and can open the plug\-in's own editor
+and capture it.
+.PP
+The loader is chosen from the file itself unless
+.B \-\-as
+overrides it. A bank names the plug\-in it was written for, so
+.B peload
+.I bank.json
+opens that plug\-in with the patch already applied.
+.PP
+Plug\-ins are hosted out of process by default, through the
+.B peserve
+helper beside this program.
+.SH OPTIONS
+.TP
+.B \-\-detect
+Say what platform and loader the file needs, then stop.
+.TP
+.B \-\-params
+List every exposed parameter with its value.
+.TP
+.B \-\-list\-programs
+Name the plug\-in's own programs.
+.TP
+.B \-\-render " \fIout.wav\fR"
+Render to a WAV.
+.B \-\-secs,
+.B \-\-note,
+.B \-\-program
+and
+.B \-\-block
+control what is rendered and in what block size.
+.TP
+.B \-\-patch " \fIbank.json\fR"
+Apply a patch before rendering.
+.B \-\-pick
+selects one when the file holds several, and
+.B \-\-list\-patches
+names them.
+.TP
+.B \-\-save\-patch " \fIout.json\fR"
+Write the current state as a patch.
+.TP
+.B \-\-editor " \fIout.ppm\fR"
+Open the plug\-in's GUI and capture it.
+.TP
+.B \-\-as " \fIkind\fR"
+Force a loader instead of auto\-detecting: \fBauto\fR, \fBwin\-vst2\-64\fR,
+\fBwin\-vst2\-32\fR, \fBwin\-vst3\fR, \fBlinux\-vst3\fR, \fBlinux\-vst2\fR,
+\fBmac\-vst2\fR, \fBmac\-vst3\fR, \fBmac\-au\fR or \fBclassic\-mac\fR.
+.SH ENVIRONMENT
+.TP
+.B PELOAD_DLL_PATH
+Colon\-separated directories to search for a Windows runtime DLL a plug\-in
+needs at load time.
+.TP
+.BR PESERVE ", " PELOAD32
+Override the paths to the helper programs, found in
+.I /usr/lib/vst\-ace
+otherwise.
+.TP
+.B PEHOST_ISOLATE
+Set to 0 to host in process rather than behind the helper.
+.TP
+.B PELOAD_VERBOSE
+Report loading in detail.
+.SH SEE ALSO
+.BR dw (1),
+.BR pestudio (1),
+.BR dwstudio (1).

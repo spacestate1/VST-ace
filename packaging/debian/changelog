@@ -1,0 +1,7 @@
+vst-ace (0.0.0-1) UNRELEASED; urgency=medium
+
+  * Initial release. The version above is a placeholder — packaging/build-deb.sh
+    rewrites it to the version it is given (and the CI release workflow passes
+    the git tag, e.g. v0.1.0 -> 0.1.0-1) before invoking dpkg-buildpackage.
+
+ -- Connor McRann <cmcrann@protonmail.com>  Sat, 29 Aug 2026 12:00:00 +0000

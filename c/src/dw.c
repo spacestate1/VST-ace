@@ -48,15 +48,50 @@
 
 /* ------------------------------------------------------------ the tree ---- */
 
+/* An installed copy has no source tree to find: the package build puts the
+ * helper programs in one directory and the data in another, and defines these
+ * to say where. A source build leaves them empty, and every installed path
+ * below is then unreachable -- `dw` behaves exactly as it always has. */
+#ifndef DW_PKGLIBDIR
+#define DW_PKGLIBDIR ""
+#endif
+#ifndef DW_PKGDATADIR
+#define DW_PKGDATADIR ""
+#endif
+
 /* Where everything lives, worked out once at startup. */
-static char g_re[PATH_MAX];      /* .../vst/re      */
-static char g_vst[PATH_MAX];     /* .../vst         */
+static char g_re[PATH_MAX];      /* .../vst/re, or the installed data dir  */
+static char g_vst[PATH_MAX];     /* .../vst -- the plug-in corpus above it */
+static int  g_installed;         /* found at DW_PKGLIBDIR, not in a tree   */
 
 static int is_dir(const char *p)
 { struct stat st; return !stat(p, &st) && S_ISDIR(st.st_mode); }
 
 static int is_file(const char *p)
 { struct stat st; return !stat(p, &st) && S_ISREG(st.st_mode); }
+
+/* The plug-in corpus, for an installed copy.
+ *
+ * In a source tree it is simply the directory holding `re`, which is where the
+ * windows/, linux/ and macos/ folders sit. A package has no such tree, and the
+ * corpus is not something a package could ship in any case -- the plug-ins are
+ * their authors' own. So it is named by VST_ROOT, or looked for at ~/vst,
+ * which is the same layout one directory further down. Nothing here is fatal:
+ * an unset corpus only means bare plug-in names do not expand and `dw peload`
+ * with no arguments has nothing to list. */
+static void corpus_root(char *out, size_t n)
+{
+    const char *env = getenv("VST_ROOT");
+    const char *home;
+    char        p[PATH_MAX];
+
+    out[0] = 0;
+    if (env && *env && is_dir(env)) { snprintf(out, n, "%s", env); return; }
+    if ((home = getenv("HOME")) && *home) {
+        snprintf(p, sizeof p, "%s/vst", home);
+        if (is_dir(p)) snprintf(out, n, "%s", p);
+    }
+}
 
 /* Find the tree from the executable rather than the working directory -- the
  * point of a single binary is that it runs from anywhere, including a copy on
@@ -90,6 +125,20 @@ static int locate_tree(void)
             return 0;
         }
     }
+    /* No source tree above us. The other possibility is an installed copy,
+     * where the helpers sit together in one directory and there is nothing to
+     * build -- so this is a check for the helpers, not for sources. */
+    if (DW_PKGLIBDIR[0]) {
+        char probe[PATH_MAX];
+        snprintf(probe, sizeof probe, "%s/peload", DW_PKGLIBDIR);
+        if (is_file(probe)) {
+            g_installed = 1;
+            snprintf(g_re, sizeof g_re, "%s", DW_PKGDATADIR);
+            corpus_root(g_vst, sizeof g_vst);
+            return 0;
+        }
+    }
+
     fprintf(stderr, "dw: cannot find the tree from %s -- expected a peload/ "
                     "directory above it\n", exe);
     return -1;
@@ -367,15 +416,28 @@ static int exec_tool(const char *srcdir, const char *target, int argc,
     char **av;
     int    n = 0, i;
 
-    if (cmake_build(srcdir, target)) {
-        fprintf(stderr, "dw: %s failed to build\n", target);
-        return 1;
-    }
-    snprintf(path, sizeof path, "%s/build/%s", srcdir, target);
-    if (!is_file(path)) {
-        fprintf(stderr, "dw: %s was not built -- see the cmake output above "
-                        "for the dependency it is missing\n", target);
-        return 1;
+    if (g_installed) {
+        /* Nothing to build: the package did that. A missing program here is a
+         * broken install rather than a missing dependency, so say so
+         * differently -- the advice below would send someone looking at cmake
+         * output that does not exist. */
+        snprintf(path, sizeof path, "%s/%s", DW_PKGLIBDIR, target);
+        if (!is_file(path)) {
+            fprintf(stderr, "dw: %s is missing from %s -- this is an installed "
+                            "copy and it should be there\n", target, DW_PKGLIBDIR);
+            return 1;
+        }
+    } else {
+        if (cmake_build(srcdir, target)) {
+            fprintf(stderr, "dw: %s failed to build\n", target);
+            return 1;
+        }
+        snprintf(path, sizeof path, "%s/build/%s", srcdir, target);
+        if (!is_file(path)) {
+            fprintf(stderr, "dw: %s was not built -- see the cmake output above "
+                            "for the dependency it is missing\n", target);
+            return 1;
+        }
     }
 
     if (!(av = calloc((size_t)argc + 4, sizeof *av))) return 1;
@@ -454,6 +516,15 @@ static int pkg_exists(const char *module)
 static int have_gui(guikind k)
 {
     char p[PATH_MAX];
+
+    /* Installed, the binary is the whole answer: it was either built into the
+     * package or it was not, and asking pkg-config about a -dev package that a
+     * user's machine has no reason to carry would only ever say no. */
+    if (g_installed) {
+        snprintf(p, sizeof p, "%s/%s", DW_PKGLIBDIR,
+                 k == GUI_QT ? "pestudio" : "dwstudio");
+        return is_file(p);
+    }
 
     if (k == GUI_QT) {
         snprintf(p, sizeof p, "%s/peload/build/pestudio", g_re);
@@ -789,6 +860,13 @@ int main(int argc, char **argv)
         char cdir[PATH_MAX], gdir[PATH_MAX];
         char *mk[] = { "make", "-C", cdir, "--no-print-directory", NULL };
         int   rc, failed = 0;
+
+        if (g_installed) {
+            fprintf(stderr, "dw: this is an installed copy -- there are no "
+                            "sources here to build. Build from a checkout of "
+                            "the tree instead.\n");
+            return 1;
+        }
 
         snprintf(cdir, sizeof cdir, "%s/c", g_re);
         if ((rc = run(mk))) return rc;

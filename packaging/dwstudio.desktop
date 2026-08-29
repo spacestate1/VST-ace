@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=dwstudio
+GenericName=Synthesizer
+Comment=A DW-8000, a 4-op FM synth, a Juno-6 and sample kits
+Exec=dw gui
+Icon=audio-card
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=synthesizer;DW-8000;FM;Juno;drums;
+StartupNotify=true

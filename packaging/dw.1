@@ -1,0 +1,129 @@
+.TH DW 1 "August 2026" "vst-ace" "User Commands"
+.SH NAME
+dw \- the DW\-8000 engine and the native plug\-in hosts, in one program
+.SH SYNOPSIS
+.B dw
+.RI [ command ]
+.RI [ arguments ]
+.SH DESCRIPTION
+.B dw
+is the entry point to
+.BR vst-ace ,
+which loads and runs audio plug\-ins built for Windows, macOS and Linux as
+native code on Linux \(em not under Wine and not emulated.
+.PP
+With no command it opens a window:
+.B pestudio
+if this machine has Qt6,
+.B dwstudio
+if it has GTK4, and the one matching the desktop if it has both.
+.SH COMMANDS
+.TP
+.B \-\-qt ", " \-\-gtk
+Force one window or the other. So does setting
+.B DW_GUI
+to \fBqt\fR or \fBgtk\fR.
+.TP
+.B pe " [\fIdir\fR|\fIbank.json\fR]"
+The Qt6 window: load and play real plug\-ins natively \(em Windows VST2 and
+VST3, native Linux VST3, and each plug\-in's own editor.
+.TP
+.B gui
+The GTK4 window: instruments, patches, drums and a Juno panel.
+.TP
+.B peload " \fIplug\-in\fR [\fIoptions\fR]"
+The same hosts from the command line.
+.B \-\-params
+lists every exposed parameter,
+.B \-\-render \fIout.wav\fR
+renders,
+.B \-\-detect
+reports what the file is, and
+.B \-\-patch
+/
+.B \-\-pick
+apply a patch. Run
+.B dw peload \-\-help
+for the rest.
+.TP
+.B live
+Play live, from a MIDI controller or the computer keyboard.
+.TP
+.B play " \fIpreset\fR"
+Play one preset of the reimplemented DW\-8000 engine, by index or by part of
+its name. No plug\-in is loaded.
+.TP
+.B demo
+A short tour of the factory presets.
+.TP
+.B list
+List the current bank's programs.
+.TP
+.B render " \fIdir\fR"
+Render the whole bank to \fIdir\fR.
+.TP
+.B keys
+The note map, and what this terminal does with a held key.
+.SH ENVIRONMENT
+.TP
+.B VST_ROOT
+The plug\-in corpus: a directory holding
+.IR windows/ ,
+.I linux/
+and
+.I macos/
+subdirectories. An installed copy looks for
+.I ~/vst
+when this is unset. It is what lets a bare plug\-in name be used in place of a
+path; anything given as a path is unaffected.
+.TP
+.B FB7999
+Path to a copy of the FB\-7999 plug\-in binary. The wavetable and all three
+preset banks are read straight out of it, so nothing has to be extracted
+first, and the engine commands need it.
+.TP
+.B BANK
+\fBA\fR (the default), \fBB\fR or \fB6000\fR.
+.TP
+.BR NOTE ", " GATE ", " LEN
+What gets rendered, and for how long.
+.TP
+.BR PELOAD32 ", " PESERVE
+Override the paths to the helper programs. Both are found beside the host
+otherwise, in
+.IR /usr/lib/vst\-ace .
+.TP
+.B PELOAD_DLL_PATH
+Colon\-separated directories to search for a Windows runtime DLL a plug\-in
+needs at load time.
+.SH FILES
+.TP
+.I /usr/lib/vst\-ace/
+The hosts:
+.BR peload ", " peserve ", " pestudio " and " dwstudio .
+.TP
+.I /usr/share/vst\-ace/patches/
+Patch banks, as JSON. Hand one to
+.B dw pe
+to open the plug\-ins it names with their patches loaded.
+.SH NOTES
+Plug\-in editors embed through an X11 window id, so both windows ask for the
+X11 backend under Wayland; XWayland is enough. Override
+.B QT_QPA_PLATFORM
+or
+.B GDK_BACKEND
+for a native Wayland window and no native editors.
+.PP
+Plug\-ins are hosted out of process by default: a browser loads a hundred of
+them in a session, and one that faults should not end it.
+.PP
+This package hosts 64\-bit plug\-ins.
+.B dw peload32
+needs a 32\-bit toolchain that Debian and Ubuntu do not carry the libraries
+for, so it is not built here; build from source for 32\-bit Windows plug\-ins.
+.SH SEE ALSO
+The project documentation in
+.IR /usr/share/doc/vst\-ace/ ,
+and
+.UR https://github.com/spacestate1/VST-ace
+.UE .

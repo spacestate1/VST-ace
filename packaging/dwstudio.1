@@ -1,0 +1,47 @@
+.TH DWSTUDIO 1 "August 2026" "vst-ace" "User Commands"
+.SH NAME
+dwstudio \- a DW\-8000, a 4\-op FM synth, a Juno\-6 and sample kits
+.SH SYNOPSIS
+.B dwstudio
+.RI [ options ]
+.SH DESCRIPTION
+.B dwstudio
+is a GTK4 window over the reimplemented engines: a Korg DW\-8000, a 4\-op FM
+synth, a Juno\-6 and sample kits, voiced from banks read straight out of
+plug\-in binaries rather than extracted to disk first. It hosts real plug\-ins
+through the same
+.B pehost
+API that
+.BR pestudio (1)
+uses, and shares one audio graph, one keyboard and one MIDI input with them.
+.SH OPTIONS
+.TP
+.B \-\-dir " \fIdir\fR"
+Browse this directory instead of the default corpus.
+.TP
+.B \-\-all
+List plug\-ins that have no engine behind them as well.
+.TP
+.B \-\-list
+Print the instruments found and exit.
+.TP
+.B \-\-backend " \fIname\fR"
+Force an audio backend.
+.TP
+.B \-\-cycle " \fIms\fR"
+Step through presets automatically, for demonstration.
+.SH ENVIRONMENT
+.TP
+.B GDK_BACKEND
+A native Linux plug\-in's editor is an X11 window and GTK hands out an X11 id
+only on the X11 backend, so this wants to be \fBx11\fR under Wayland.
+.TP
+.B VST_ROOT
+The plug\-in corpus to browse.
+.TP
+.BR DW_PERIOD ", " DW_LATENCY ", " DW_BACKEND
+Trade latency against underruns, and pick a backend.
+.SH SEE ALSO
+.BR dw (1),
+.BR peload (1),
+.BR pestudio (1).

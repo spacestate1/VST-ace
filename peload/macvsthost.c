@@ -21,6 +21,7 @@
 #define VST2_SYSV 1
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -232,7 +233,10 @@ macvst *macvst_open_native(const char *path, double samplerate, int blocksize)
          * when it asks where it lives. Resolved first, because a plugin joins
          * relative paths onto this and a symlinked .so would send it to the
          * link's folder rather than the release it belongs to. */
-        char        real[1024];
+        /* PATH_MAX because realpath() writes up to that much, and glibc's
+         * fortified form rejects a smaller buffer outright rather than on a
+         * long path -- the same trap plugview.c hit. */
+        char        real[PATH_MAX];
         const char *use = realpath(path, real) ? real : path;
         const char *slash = strrchr(use, '/');
         if (slash && slash != use && (size_t)(slash - use) < sizeof h->dir)

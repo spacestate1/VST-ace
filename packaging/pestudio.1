@@ -1,0 +1,45 @@
+.TH PESTUDIO 1 "August 2026" "vst-ace" "User Commands"
+.SH NAME
+pestudio \- browse and play audio plug\-ins natively, with their own editors
+.SH SYNOPSIS
+.B pestudio
+.RI [ dir | bank.json ]
+.SH DESCRIPTION
+.B pestudio
+is a Qt6 plug\-in browser and player. Pick a folder, pick a plug\-in, and it
+gives you the plug\-in's programs, every exposed parameter, a playable
+keyboard, a pitch wheel, patch banks, a recorder, and the plug\-in's own editor
+\(em drawn into a buffer and blitted for Windows plug\-ins, embedded as an X11
+child window for native Linux ones.
+.PP
+Plug\-ins built for Windows, macOS and Linux all load as native code; there is
+no Wine and no emulation. They are hosted out of process by default, so one
+that faults costs a helper rather than the session.
+.PP
+Given a directory it browses that; given a bank it opens the plug\-ins the bank
+names with their patches loaded. With neither, it starts on the corpus named by
+.BR VST_ROOT ,
+or
+.I ~/vst
+when that is unset.
+.PP
+Launching it as
+.B dw pe
+sets the X11 backend first, which is what a plug\-in's own editor needs; see
+.BR dw (1).
+.SH ENVIRONMENT
+.TP
+.B QT_QPA_PLATFORM
+Editors embed through an X11 window id, so this wants to be \fBxcb\fR under
+Wayland; XWayland is enough. Override it for a native Wayland window and no
+native editors.
+.TP
+.B VST_ROOT
+The plug\-in corpus to start on.
+.TP
+.B PEHOST_ISOLATE
+Set to 0 to host in process rather than behind the helper.
+.SH SEE ALSO
+.BR dw (1),
+.BR peload (1),
+.BR dwstudio (1).

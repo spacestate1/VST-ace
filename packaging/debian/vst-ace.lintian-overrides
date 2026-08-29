@@ -1,0 +1,3 @@
+# This package is published on the project's own releases page rather than
+# uploaded to the Debian archive, so its changelog has no Debian bug to close.
+vst-ace: initial-upload-closes-no-bugs

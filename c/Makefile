@@ -61,22 +61,22 @@ CHECK   := $(BUILD)/check
 all: $(BINS) $(DW_INSTALLED)
 
 $(BIN): $(COMMON_O) $(BUILD)/fbextract.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(RENDER): $(COMMON_O) $(ENGINE_O) $(BUILD)/dwrender.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(FMREND): $(COMMON_O) $(ENGINE_O) $(BUILD)/fb02render.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(JUREND): $(COMMON_O) $(ENGINE_O) $(BUILD)/junorender.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(PLAY): $(COMMON_O) $(ENGINE_O) $(BUILD)/dwplay.o $(BUILD)/dwplay_cli.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS) $(ALSA_LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS) $(ALSA_LIBS)
 
 $(DW): $(COMMON_O) $(ENGINE_O) $(DW_ALSA) $(BUILD)/dw.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS) $(ALSA_LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS) $(ALSA_LIBS)
 
 # A copy rather than a symlink: `dw` locates the tree through /proc/self/exe,
 # and a symlink resolves to the target, which would put it back in build/.
@@ -88,8 +88,16 @@ $(DW_INSTALLED): $(DW)
 # list. A stale list here is not a build annoyance: dw_filter and dw_synth are
 # embedded by value, so a missed header change means two objects disagree about
 # a struct's size and the result is stack corruption, not a link error.
+
+# DW_PKGDEFS is for a package build, which has no source tree for `dw` to find
+# itself in: it names the directories the helper programs and the data were
+# installed to. Empty here, and empty is what a source build wants -- see the
+# top of dw.c. Kept separate from DW_DEFS so passing it on the command line
+# does not take -DDW_HAVE_ALSA=1 with it.
+DW_PKGDEFS ?=
+
 $(BUILD)/dw.o: $(SRCDIR)/dw.c | $(BUILD)
-	$(CC) $(CFLAGS) $(DW_DEFS) -MMD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) $(DW_DEFS) $(DW_PKGDEFS) -MMD -MP -c -o $@ $<
 
 $(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<

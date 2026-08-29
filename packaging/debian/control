@@ -1,0 +1,49 @@
+Source: vst-ace
+Section: sound
+Priority: optional
+Maintainer: Connor McRann <cmcrann@protonmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cmake,
+ pkg-config,
+ libgtk-4-dev,
+ qt6-base-dev,
+ libasound2-dev,
+ libpipewire-0.3-dev,
+ libx11-dev,
+ libcairo2-dev,
+ libfreetype-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/spacestate1/VST-ace
+Vcs-Git: https://github.com/spacestate1/VST-ace.git
+Vcs-Browser: https://github.com/spacestate1/VST-ace
+
+Package: vst-ace
+Architecture: amd64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends}
+Suggests: xwayland
+Description: run Windows, macOS and Linux audio plug-ins natively, without Wine
+ Audio plug-ins built for Windows, macOS and Linux, loaded and run as native
+ code on Linux. Not emulation and not Wine: a PE loader with a Win32 subsystem
+ underneath it, a Mach-O loader with an Objective-C runtime and a software
+ Metal rasteriser, and a CFM/PEF interpreter for Classic Mac OS -- six hosts
+ sharing one set of shims.
+ .
+ Two windows are included. pestudio (Qt6) is a plug-in browser and player: pick
+ a folder, pick a plug-in, and get its programs, every exposed parameter, a
+ playable keyboard, a pitch wheel, patch banks, a recorder, and the plug-in's
+ own editor -- blitted for Windows plug-ins, embedded as an X11 child window
+ for native Linux ones. dwstudio (GTK4) drives the reimplemented engines: a
+ Korg DW-8000, a 4-op FM synth, a Juno-6 and sample kits.
+ .
+ The command line has the same hosts: dw peload inspects and renders a plug-in
+ without a window, and dw play runs the DW-8000 engine with no plug-in loaded
+ at all.
+ .
+ This package hosts 64-bit plug-ins. The i386 loader is not built here, as it
+ needs a 32-bit toolchain and 32-bit FreeType, X11, ALSA and PipeWire that
+ Debian and Ubuntu do not carry for this architecture; build from source for
+ 32-bit Windows plug-ins. No plug-in binaries are included -- the plug-ins
+ these hosts load are their authors' own.

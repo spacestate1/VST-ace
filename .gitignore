@@ -41,3 +41,13 @@ peload/thirdparty/
 # A stale copy of the loader left in the source directory before the build moved
 # under peload/build.
 /peload/peload
+
+# The staging directories a package build configures cmake into. The packages
+# themselves land in release/ and are kept -- that is what gets published.
+obj-*/
+
+# Detached debug symbols, which debhelper produces beside every .deb. 4.5 MB
+# a release and useful only with a core dump in hand, so they belong on the
+# releases page rather than in every clone. build-deb.sh still writes them to
+# release/ next to the .deb it came from.
+release/*.ddeb

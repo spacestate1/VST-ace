@@ -214,7 +214,11 @@ static void roots_discover(void)
  * or the existing one if it is already listed. */
 static int roots_add(const char *path, const char *label)
 {
-    char lbl[64], real[1024];
+    /* PATH_MAX, not a size of our choosing: realpath() is specified to write up
+     * to that much, and glibc's fortified form checks the buffer against it
+     * before resolving anything -- so a smaller one aborts the process on the
+     * first call, whatever the path turns out to be. */
+    char lbl[64], real[PATH_MAX];
     int  i;
 
     if (realpath(path, real)) path = real;
@@ -291,7 +295,7 @@ void plugview_scan(const char *dir)
 {
     char   queue[512][1024];
     int    head = 0, tail = 0, visited = 0;
-    char   real[1024];
+    char   real[PATH_MAX];        /* realpath()'s size, not ours -- see above */
 
     if (!dir || !*dir) return;
 

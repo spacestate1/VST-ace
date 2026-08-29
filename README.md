@@ -49,6 +49,7 @@ parameters, the widest editor in the corpus.*
     patches/    patch banks the hosts and the engines share
     scripts/    the analysis that produced them — Ghidra, Z80, wavetables
     tools/      resource and symbol dumps, arity tables
+    packaging/  the Debian package, and the dependency installer
 
 ### Two windows
 
@@ -73,10 +74,39 @@ worth investigating.
 renders a preset bank to WAV with no plug-in loaded at all, and `dwplay` plays
 one live. `c/README.md` covers them.
 
+## Installing
+
+A `.deb` for Ubuntu 24.04 and Debian 13 or newer is in
+[`release/`](release), and on the
+[releases page](https://github.com/spacestate1/VST-ace/releases):
+
+    sudo apt install ./release/vst-ace_0.1.0-1_amd64.deb
+
+That puts `dw`, `pestudio` and `dwstudio` on `$PATH`, the patch banks in
+`/usr/share/vst-ace/patches`, and both windows in the desktop menu. It hosts
+64-bit plug-ins; the i386 loader needs 32-bit FreeType and X11 that Debian and
+Ubuntu do not carry, so 32-bit Windows plug-ins want a build from source.
+
+An installed copy has no tree to find the plug-in corpus in, so point `VST_ROOT`
+at one — a directory holding `windows/`, `linux/` and `macos/` — or keep it at
+`~/vst`, which is where it looks by default. Paths given on the command line
+work regardless.
+
+`packaging/build-deb.sh <version>` builds the package into `release/`;
+`packaging/debian/` is the recipe. Build it on the distribution it is for —
+a package built against one release's Qt and GTK will not run on another's.
+
 ## Building
 
 Needs a C11 and C++20 compiler, CMake ≥ 3.16, GTK4, Qt6, ALSA, PipeWire, X11,
 Cairo and FreeType.
+
+    bash packaging/install-deps.sh
+
+installs all of them through whichever of apt, dnf, yum, pacman or zypper this
+machine has — `--dry-run` prints the command instead, `--packaging` adds the
+tools that build a `.deb` or an `.rpm`, and `--i386` adds the 32-bit libraries
+the i386 loader wants. By hand instead:
 
 **Ubuntu / Debian** — 24.04 or newer, which is where Qt 6 and GTK 4 are recent
 enough to be worth using:

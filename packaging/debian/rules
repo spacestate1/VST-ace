@@ -1,0 +1,101 @@
+#!/usr/bin/make -f
+#
+# Three build systems in one tree: c/ is a plain Makefile, and peload/ and gui/
+# are separate CMake projects (gui/ pulls peload/ in as a subdirectory for the
+# host library). debhelper's auto-detection expects one project per source
+# tree, so every step here is driven explicitly.
+
+# The distribution's flags as they come, with LTO turned back off. Ubuntu
+# enables it by default, and this tree is not a candidate for it:
+# peload_cxx_throw_c and peload_ms_badjmp are reached only from top-level asm()
+# blocks, so a whole-program pass sees nothing calling them and drops both --
+# which is how this first showed up, as two undefined references while linking
+# peserve. That much a `used` attribute would fix, but it would not fix the
+# rest: the host hands function addresses to guest code, which then calls them
+# from PE, Mach-O and PEF images LTO never sees. Anything it concluded from
+# "nothing calls this" would be wrong in the same way, and the next symptom
+# need not be as loud as a link error.
+export DEB_BUILD_MAINT_OPTIONS = optimize=-lto
+include /usr/share/dpkg/buildflags.mk
+
+# Where the installed copy lives. `dw` is compiled knowing both paths, which is
+# what lets it find its helpers with no source tree above it -- see
+# locate_tree() in c/src/dw.c. Nothing else in the tree needs telling: the
+# bridge looks for peserve and peload32 beside the running executable, and
+# /proc/self/exe resolves the /usr/bin symlinks back to PKGLIBDIR.
+PKGLIBDIR  := /usr/lib/vst-ace
+PKGDATADIR := /usr/share/vst-ace
+
+DESTDIR      := $(CURDIR)/debian/vst-ace
+BUILD_PELOAD := obj-peload
+BUILD_GUI    := obj-gui
+
+# Every step below is an explicit command rather than dh_auto_build, so the
+# parallelism dpkg was asked for has to be passed on by hand. Serial when
+# nothing was asked for, which is what a small builder wants: pestudio's
+# main.cpp alone is 150 KB of Qt.
+NUMJOBS := $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+ifneq ($(NUMJOBS),)
+PARALLEL := --parallel $(NUMJOBS)
+MAKEJOBS := -j$(NUMJOBS)
+endif
+
+CMAKE_FLAGS := \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DCMAKE_INSTALL_PREFIX=/usr \
+	-DCMAKE_C_FLAGS="$(CFLAGS) $(CPPFLAGS)" \
+	-DCMAKE_CXX_FLAGS="$(CXXFLAGS) $(CPPFLAGS)" \
+	-DCMAKE_EXE_LINKER_FLAGS="$(LDFLAGS)"
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	cmake -B $(BUILD_PELOAD) -S peload $(CMAKE_FLAGS)
+	cmake -B $(BUILD_GUI)    -S gui    $(CMAKE_FLAGS)
+
+override_dh_auto_build:
+	$(MAKE) $(MAKEJOBS) -C c \
+	    DW_PKGDEFS='-DDW_PKGLIBDIR=\"$(PKGLIBDIR)\" -DDW_PKGDATADIR=\"$(PKGDATADIR)\"'
+	cmake --build $(BUILD_PELOAD) $(PARALLEL)
+	cmake --build $(BUILD_GUI) $(PARALLEL) --target dwstudio
+# pestudio and dwstudio are both skipped rather than failed when their toolkit
+# is missing, so a package built without Qt6 or GTK4 present would otherwise
+# ship quietly incomplete. Insist on all four here, where the missing
+# build-dependency is still the obvious explanation.
+	test -x $(BUILD_PELOAD)/peload
+	test -x $(BUILD_PELOAD)/peserve
+	test -x $(BUILD_PELOAD)/pestudio
+	test -x $(BUILD_GUI)/dwstudio
+
+override_dh_auto_test:
+# The tests need plug-in binaries, which are not ours to ship and are not here.
+
+override_dh_auto_install:
+	install -D -m 0755 $(BUILD_PELOAD)/peload   $(DESTDIR)$(PKGLIBDIR)/peload
+	install -D -m 0755 $(BUILD_PELOAD)/peserve  $(DESTDIR)$(PKGLIBDIR)/peserve
+	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
+	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
+	install -D -m 0755 c/build/dw               $(DESTDIR)/usr/bin/dw
+# The three that are worth having on $$PATH, as symlinks rather than copies:
+# the helper lookup above depends on the real programs staying together.
+	for p in peload pestudio dwstudio; do \
+	    ln -sf ../lib/vst-ace/$$p $(DESTDIR)/usr/bin/$$p; \
+	done
+# The patch banks. Only the .json banks -- the generators beside them in the
+# tree are for producing more, and need the plug-in corpus to run.
+	install -d $(DESTDIR)$(PKGDATADIR)/patches
+	cd patches && find . -name '*.json' -type f \
+	    -exec install -D -m 0644 '{}' $(DESTDIR)$(PKGDATADIR)/patches/'{}' \;
+	install -D -m 0644 packaging/pestudio.desktop \
+	    $(DESTDIR)/usr/share/applications/pestudio.desktop
+	install -D -m 0644 packaging/dwstudio.desktop \
+	    $(DESTDIR)/usr/share/applications/dwstudio.desktop
+	for m in dw peload pestudio dwstudio; do \
+	    install -D -m 0644 packaging/$$m.1 \
+	        $(DESTDIR)/usr/share/man/man1/$$m.1; \
+	done
+
+override_dh_auto_clean:
+	rm -rf $(BUILD_PELOAD) $(BUILD_GUI)
+	$(MAKE) -C c clean

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=pestudio
+GenericName=Plug-in host
+Comment=Browse and play Windows, macOS and Linux audio plug-ins natively
+Exec=dw pe
+Icon=audio-card
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=VST;VST3;audio;plugin;synthesizer;
+StartupNotify=true
