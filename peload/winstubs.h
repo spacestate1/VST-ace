@@ -716,7 +716,28 @@ static MS char *st_lstrcpyA(char *d, const char *s) { return strcpy(d, s); }
 static MS char *st_lstrcatA(char *d, const char *s) { return strcat(d, s); }
 static MS int32_t st_lstrcmpA(const char *a, const char *b) { return strcmp(a, b); }
 static MS int32_t st_lstrcmpiA(const char *a, const char *b) { return strcasecmp(a, b); }
+/* CharNext/CharPrev, both widths.
+ *
+ * CharNextA was defined here but never registered, so it and its three
+ * relatives all resolved to the generic stub -- which returns 0. That is fatal
+ * rather than merely wrong: these return a pointer the caller immediately
+ * dereferences, so a plugin walking a string with them faults on the first
+ * step. Synth1 does exactly that inside VSTPluginMain, right after DllMain,
+ * and dies at a null read with no AEffect ever returned.
+ *
+ * The pointer arithmetic is the single-byte reading of the contract. Windows
+ * consults the thread's ANSI codepage here and steps two bytes over a DBCS
+ * lead byte; everything this host does is Latin-1 already (see w32_vfmt's own
+ * note), and a plugin formatting paths and preset names never sees the
+ * difference. CharPrev's guard is the important half of its contract: at or
+ * before the start of the string it must return the start, not walk behind it. */
 static MS const char *st_CharNextA(const char *s) { return (s && *s) ? s + 1 : s; }
+static MS const char *st_CharPrevA(const char *start, const char *cur)
+{ return (start && cur && cur > start) ? cur - 1 : start; }
+static MS const uint16_t *st_CharNextW(const uint16_t *s)
+{ return (s && *s) ? s + 1 : s; }
+static MS const uint16_t *st_CharPrevW(const uint16_t *start, const uint16_t *cur)
+{ return (start && cur && cur > start) ? cur - 1 : start; }
 
 /* --------------------------------------------------------------- SEH stubs */
 
@@ -1335,8 +1356,15 @@ static MS int32_t st_FreeResource(void *h) { (void)h; return 1; }
 /* iPlug2 finds its embedded images and fonts by enumerating .rsrc rather than
  * asking for them by name, so this has to genuinely walk the resource tree.
  * Returning 0 here left the plugin with no assets and it faulted. */
-typedef MS int32_t (*enumresnameA)(void *, const char *, char *, int64_t);
-typedef MS int32_t (*enumresnameW)(void *, const uint16_t *, uint16_t *, int64_t);
+/* The trailing LONG_PTR is pointer-sized, so it is spelled intptr_t and not
+ * int64_t -- the same rule winstubs32.h's header states for every Windows type
+ * that changes width. It matters more here than in a stub signature, because
+ * this is a call *into* guest code: at i386 an 8-byte push leaves four bytes
+ * behind after the plugin's own stdcall callback has popped its four
+ * arguments, and iPlug2 enumerates every resource it owns through this. The
+ * entry points below already take intptr_t; this is where it was widened. */
+typedef MS int32_t (*enumresnameA)(void *, const char *, char *, intptr_t);
+typedef MS int32_t (*enumresnameW)(void *, const uint16_t *, uint16_t *, intptr_t);
 
 static RES_DIR *res_type_dir(const void *type, uint8_t *rbase)
 {
@@ -1353,7 +1381,7 @@ static RES_DIR *res_type_dir(const void *type, uint8_t *rbase)
  * receive, which for a wide callback must stay UTF-16 rather than the narrow
  * copy used for the lookup. */
 static int32_t res_enum(void *mod, const void *key, const void *cbtype,
-                        void *cb, int64_t param, int wide)
+                        void *cb, intptr_t param, int wide)
 {
     RES_DIR *d = res_type_dir(key, image_rsrc(mod));
     RES_ENT *e;
@@ -1540,6 +1568,14 @@ static MS uint32_t st_GetWindowsDirectoryA(char *buf, uint32_t n)
 static MS uint32_t st_GetPrivateProfileStringA(const char *sec, const char *key,
         const char *def, char *out, uint32_t n, const char *file)
 { (void)sec;(void)key;(void)file; return (uint32_t)snprintf(out, n, "%s", def ? def : ""); }
+/* No ini file is ever really read here, same as the String version above --
+ * so the one contractual thing this can still get right is returning the
+ * caller's own default rather than a bare 0. A plugin gating its own init on
+ * an unexpected "0 back from a config read it thought would return its
+ * default" is a real way for VSTPluginMain to come back with no AEffect. */
+static MS int32_t st_GetPrivateProfileIntA(const char *sec, const char *key,
+        int32_t def, const char *file)
+{ (void)sec;(void)key;(void)file; return def; }
 /* GetFullPathName has a two-call contract, and getting the first call wrong is
  * silent: with no buffer, or one too small, it returns the size *required*
  * including the terminator, and writes nothing; with room it fills the buffer and
@@ -1637,6 +1673,77 @@ static MS void *st_LoadBitmapA(void *inst, const char *name)
 }
 static MS void *st_LoadBitmapW(void *inst, const void *name)
 { (void)inst; return load_bitmap_res(name); }
+
+/* LoadString, for real -- same reasoning as LoadBitmap above: returning 0
+ * unread is a plugin's cue that its own config/resource load failed, and
+ * that is a way for VSTPluginMain to come back with no AEffect at all
+ * (syxg50 calls this right after finding its #110 dialog resource, and gets
+ * no further). An RT_STRING resource packs 16 consecutive string-table
+ * entries per block -- block (id>>4)+1, indexed within it by id&15 -- each a
+ * uint16 length followed by that many UTF-16 code units with no terminator.
+ *
+ * Every length in that walk is a number out of the plugin's own file, so the
+ * walk is bounded by the resource's declared Size rather than trusted to stay
+ * inside it. These are third-party binaries being read: a block truncated at
+ * the wrong point would otherwise send the walk off the end of the mapped
+ * image, and a length word of 0xffff would do it on the first step. It is the
+ * same reason load_bitmap_res hands w32_bitmap_from_dib a length instead of
+ * letting it find the end itself. */
+static const uint16_t *res_string_entry(uint32_t id, int *len_out)
+{
+    void           *rsrc;
+    const uint16_t *w, *end;
+    int             i, idx = (int)(id & 15);
+
+    *len_out = 0;
+    if (!(rsrc = res_lookup((const void *)6 /* RT_STRING */,
+                            (const void *)(uintptr_t)((id >> 4) + 1), g_rsrc)))
+        return NULL;
+
+    w   = (const uint16_t *)(image_base_for_rsrc(rsrc) + ((RES_DATA *)rsrc)->OffsetToData);
+    end = w + ((RES_DATA *)rsrc)->Size / sizeof *w;
+
+    /* Each step needs the length word itself and the characters it claims. */
+    for (i = 0; i <= idx; i++) {
+        if (w >= end || (size_t)(end - w) < (size_t)w[0] + 1) return NULL;
+        if (i == idx) { *len_out = w[0]; return w + 1; }
+        w += 1 + w[0];
+    }
+    return NULL;
+}
+
+static MS int32_t st_LoadStringA(void *inst, uint32_t id, char *buf, int32_t max)
+{
+    const uint16_t *s;
+    int             len, i;
+
+    (void)inst;
+    if (!buf || max <= 0) return 0;
+    buf[0] = 0;
+    if (!(s = res_string_entry(id, &len))) return 0;
+    if (len > max - 1) len = max - 1;
+    for (i = 0; i < len; i++) buf[i] = s[i] < 0x100 ? (char)s[i] : '?';
+    buf[len] = 0;
+    return len;
+}
+
+/* The wide form, which plugins reach for just as often -- and which a plugin
+ * is stranded by in exactly the same way when it comes back 0. Every other
+ * resource call here is paired A and W for that reason. */
+static MS int32_t st_LoadStringW(void *inst, uint32_t id, uint16_t *buf, int32_t max)
+{
+    const uint16_t *s;
+    int             len, i;
+
+    (void)inst;
+    if (!buf || max <= 0) return 0;
+    buf[0] = 0;
+    if (!(s = res_string_entry(id, &len))) return 0;
+    if (len > max - 1) len = max - 1;
+    for (i = 0; i < len; i++) buf[i] = s[i];
+    buf[len] = 0;
+    return len;
+}
 
 /* ---------------------------------------------------- CRT static init ---
  *
@@ -2819,6 +2926,39 @@ static MSCRT int st__vsnwprintf_l(uint16_t *b, size_t n, const uint16_t *f,
                                   void *loc, MSVA_LIST a)
 { (void)loc; return (int)w32_vfmtw(b, n, f, a); }
 
+/* wsprintf and wvsprintf, user32's own formatters. The two halves do not share
+ * a calling convention, which is the whole reason they are spelled differently
+ * here -- and getting that wrong is silent at x86-64 and fatal at i386.
+ *
+ * wsprintfA/W are WINAPIV: the one cdecl pair in an otherwise stdcall DLL,
+ * because a stdcall callee cannot pop an argument list it has no way to count.
+ * A cdecl export carries no @N, so gen_arity.py finds nothing to record and
+ * win32_arity.h has no entry for either -- which is why the loader says
+ * "unknown stdcall arity, assuming 0" when a plugin imports one. Assuming 0
+ * happens to be right for cdecl, since the caller cleans up, so the stack
+ * survives; what does not survive is the call returning 0 with nothing
+ * written, leaving the caller to use a buffer it believes was filled.
+ *
+ * wvsprintfA/W take the whole argument list as one va_list parameter, so there
+ * is nothing variadic left to count and they are ordinary WINAPI stdcall.
+ * win32_arity.h has them at 12 bytes -- three arguments -- and that is the
+ * authority to follow: a cdecl stub here returns without popping them, so at
+ * i386 the plugin's ESP is left 12 bytes low on every call and its stack is
+ * wrong from that point on. MS, not MSCRT, for these two.
+ *
+ * The 1024 cap is the documented contract, not a shortcut: Windows refuses to
+ * write more than 1024 bytes (or wide characters) here regardless of how big
+ * the caller's buffer is, and callers size their buffers knowing that. */
+#define WSPRINTF_MAX 1024
+static MSCRT int st_wsprintfA(char *b, const char *f, ...)
+{ MSVA_LIST a; size_t r; MSVA_START(a, f); r = w32_vfmt(b, WSPRINTF_MAX, f, 0, a); MSVA_END(a); return (int)r; }
+static MSCRT int st_wsprintfW(uint16_t *b, const uint16_t *f, ...)
+{ MSVA_LIST a; size_t r; MSVA_START(a, f); r = w32_vfmtw(b, WSPRINTF_MAX, f, a); MSVA_END(a); return (int)r; }
+static MS int st_wvsprintfA(char *b, const char *f, MSVA_LIST a)
+{ return (int)w32_vfmt(b, WSPRINTF_MAX, f, 0, a); }
+static MS int st_wvsprintfW(uint16_t *b, const uint16_t *f, MSVA_LIST a)
+{ return (int)w32_vfmtw(b, WSPRINTF_MAX, f, a); }
+
 /* ------------------------------------------------- odds and ends reached ---- */
 
 static MS int32_t st_DuplicateHandle(void *sp, void *sh, void *tp, void **th,
@@ -3774,8 +3914,13 @@ static MS void *st_FindWindowW(const uint16_t *cls, const uint16_t *name)
 static MS void *st_FindWindowExW(void *p, void *c, const uint16_t *cls, const uint16_t *nm)
 { (void)p;(void)c;(void)cls;(void)nm; return NULL; }
 
-typedef MS int32_t (*monitorenumproc)(void *, void *, void *, int64_t);
-static MS int32_t st_EnumDisplayMonitors(void *dc, void *clip, void *cb, int64_t data)
+/* dwData is an LPARAM: pointer-sized, so intptr_t rather than int64_t. As an
+ * int64_t this stub was a five-argument stdcall function at i386 -- it popped
+ * 20 bytes where win32_arity.h says EnumDisplayMonitors takes 16, so a plugin
+ * calling it had its stack unwound four bytes too far, and the callback below
+ * was handed an argument list four bytes wider than it pops. */
+typedef MS int32_t (*monitorenumproc)(void *, void *, void *, intptr_t);
+static MS int32_t st_EnumDisplayMonitors(void *dc, void *clip, void *cb, intptr_t data)
 {
     W32RECT r;
     (void)dc; (void)clip;
@@ -4675,6 +4820,7 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", GetStartupInfoW), S("kernel32.dll", GetStdHandle),
     S("kernel32.dll", GetStartupInfoA), S("kernel32.dll", GetSystemDirectoryA),
     S("kernel32.dll", GetWindowsDirectoryA), S("kernel32.dll", GetPrivateProfileStringA),
+    S("kernel32.dll", GetPrivateProfileIntA),
     S("kernel32.dll", GetFullPathNameW), S("kernel32.dll", GetCurrentDirectoryW),
     S("kernel32.dll", CreateDirectoryW),
     S("kernel32.dll", SetHandleCount),
@@ -4682,6 +4828,14 @@ static const winstub g_stubs[] = {
     S("user32.dll", SetTimer), S("user32.dll", KillTimer),
 #endif
     S("user32.dll", LoadBitmapA), S("user32.dll", LoadBitmapW),
+    S("user32.dll", LoadStringA), S("user32.dll", LoadStringW),
+    /* String walking and user32's own formatter. All six were resolving to the
+     * generic stub, and the four Char* ones hand back a pointer the caller
+     * dereferences straight away -- see their definitions. */
+    S("user32.dll", CharNextA), S("user32.dll", CharPrevA),
+    S("user32.dll", CharNextW), S("user32.dll", CharPrevW),
+    S("user32.dll", wsprintfA), S("user32.dll", wsprintfW),
+    S("user32.dll", wvsprintfA), S("user32.dll", wvsprintfW),
     S("shell32.dll", SHGetFolderPathA),
     S("kernel32.dll", SetStdHandle), S("kernel32.dll", OutputDebugStringA),
     /* locale */

@@ -80,10 +80,105 @@ check_c_source_compiles("#include <pthread.h>\nint main(void){return (int)pthrea
                         HAVE_M32_TOOLCHAIN)
 unset(CMAKE_REQUIRED_FLAGS)
 
-if(HAVE_M32_TOOLCHAIN)
+if(NOT PKG_CONFIG_EXECUTABLE)
+  set(PKG_CONFIG_EXECUTABLE pkg-config)
+endif()
+
+# pkgconfig32(<prefix> <module>...) -- pkg-config, for the 32-bit build.
+#
+# The 32-bit .pc files live outside the default pkg-config path, and where
+# depends on the distribution: /usr/lib32/pkgconfig on Arch, the i386 multiarch
+# triplet's own directory (/usr/lib/i386-linux-gnu/pkgconfig) on Debian and
+# Ubuntu. Ask each in turn with PKG_CONFIG_LIBDIR pointed at it and take the
+# first that answers, so a machine carrying either layout builds -- and so the
+# 64-bit .pc files are never the ones that answer.
+#
+# Sets <prefix>_OK (0 on success, reading the same way as execute_process's own
+# RESULT_VARIABLE), <prefix>_CFLAGS, <prefix>_LIBS, and <prefix>_DIR for the
+# directory that answered.
+#
+# PKG_CONFIG_LIBDIR is process-wide rather than scoped to this function, so it
+# is put back afterwards -- and *unset* rather than set empty when it started
+# unset, because pkg-config reads an empty one as a search path with nothing in
+# it and would fail every later query in this tree.
+function(pkgconfig32 prefix)
+  set(_had_libdir FALSE)
+  if(DEFINED ENV{PKG_CONFIG_LIBDIR})
+    set(_had_libdir TRUE)
+    set(_saved "$ENV{PKG_CONFIG_LIBDIR}")
+  endif()
+
+  set(_ok 1)
+  set(_cflags "")
+  set(_libs "")
+  set(_dir_found "")
+  foreach(_dir /usr/lib32/pkgconfig /usr/lib/i386-linux-gnu/pkgconfig)
+    if(NOT IS_DIRECTORY "${_dir}")
+      continue()
+    endif()
+    set(ENV{PKG_CONFIG_LIBDIR} "${_dir}")
+    execute_process(COMMAND ${PKG_CONFIG_EXECUTABLE} --cflags ${ARGN}
+                    OUTPUT_VARIABLE _cflags OUTPUT_STRIP_TRAILING_WHITESPACE
+                    RESULT_VARIABLE _ok ERROR_QUIET)
+    if(_ok EQUAL 0)
+      execute_process(COMMAND ${PKG_CONFIG_EXECUTABLE} --libs ${ARGN}
+                      OUTPUT_VARIABLE _libs OUTPUT_STRIP_TRAILING_WHITESPACE
+                      RESULT_VARIABLE _ok ERROR_QUIET)
+      set(_dir_found "${_dir}")
+      break()
+    endif()
+  endforeach()
+
+  if(_had_libdir)
+    set(ENV{PKG_CONFIG_LIBDIR} "${_saved}")
+  else()
+    unset(ENV{PKG_CONFIG_LIBDIR})
+  endif()
+
+  set(${prefix}_OK     "${_ok}"        PARENT_SCOPE)
+  set(${prefix}_CFLAGS "${_cflags}"    PARENT_SCOPE)
+  set(${prefix}_LIBS   "${_libs}"      PARENT_SCOPE)
+  set(${prefix}_DIR    "${_dir_found}" PARENT_SCOPE)
+endfunction()
+
+# The window layer and the DirectWrite shim need 32-bit FreeType, and there is
+# no useful peload32 without them -- so it is decided here, before the target
+# exists, rather than left to fail the link.
+#
+# Skipped rather than fatal, for the same reason the -m32 probe above is: a
+# machine can easily have a 32-bit toolchain and no 32-bit FreeType at all --
+# a Fedora box with glibc-devel.i686 pulled in by something else is the usual
+# way to land here -- and a FATAL_ERROR there takes pestudio and the 64-bit
+# loader down with a target neither of them needs. The .deb build insists on
+# peload32 separately, in packaging/debian/rules, where a missing
+# build-dependency is still the obvious explanation.
+set(BUILD_PELOAD32 FALSE)
+if(NOT HAVE_M32_TOOLCHAIN)
+  message(STATUS "peload32 skipped (needs a -m32 toolchain and 32-bit glibc: "
+                 "lib32-glibc, or gcc-multilib on Debian/Ubuntu)")
+else()
+  pkgconfig32(FT32 freetype2)
+  if(FT32_OK EQUAL 0)
+    set(BUILD_PELOAD32 TRUE)
+    message(STATUS "peload32: 32-bit freetype2 from ${FT32_DIR}")
+  else()
+    message(STATUS "peload32 skipped (needs 32-bit freetype2: lib32-freetype2, "
+                   "or libfreetype-dev:i386 on Debian/Ubuntu)")
+  endif()
+endif()
+
+if(BUILD_PELOAD32)
   add_executable(peload32 pe32.c)
   # plain C, and AUTOMOC is on for pestudio's sake
-  set_target_properties(peload32 PROPERTIES AUTOMOC OFF)
+  #
+  # SKIP_BUILD_RPATH: the 32-bit .pc files answer with -L/usr/lib/i386-linux-gnu
+  # on Debian and -L/usr/lib32 on Arch, and CMake writes any link directory it
+  # does not recognise as a system one into the binary as RUNPATH. Both are
+  # already in ld.so's own multiarch search path, so the entry finds nothing
+  # that would not be found anyway -- and lintian rejects the .deb over it
+  # (custom-library-search-path). The 64-bit peload beside it has no RUNPATH
+  # for the same reason: its -L paths are ones CMake already counts as system.
+  set_target_properties(peload32 PROPERTIES AUTOMOC OFF SKIP_BUILD_RPATH TRUE)
   target_include_directories(peload32 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   # -mincoming-stack-boundary=2: the i386 Windows ABI only guarantees a 4-byte
   # aligned stack, while GCC assumes 16 and freely emits movaps against stack
@@ -95,21 +190,8 @@ if(HAVE_M32_TOOLCHAIN)
   target_link_options(peload32 PRIVATE -m32)
   target_link_libraries(peload32 PRIVATE pthread m)
 
-  # The window layer and the DirectWrite shim need 32-bit FreeType. Their .pc
-  # files are under /usr/lib32/pkgconfig, which the default pkg-config path does
-  # not cover, so query them with PKG_CONFIG_LIBDIR pointed there.
-  set(_pc_saved32 "$ENV{PKG_CONFIG_LIBDIR}")
-  set(ENV{PKG_CONFIG_LIBDIR} /usr/lib32/pkgconfig)
-  execute_process(COMMAND pkg-config --cflags freetype2
-                  OUTPUT_VARIABLE FT32_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE
-                  RESULT_VARIABLE FT32_OK ERROR_QUIET)
-  execute_process(COMMAND pkg-config --libs freetype2
-                  OUTPUT_VARIABLE FT32_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET)
-  set(ENV{PKG_CONFIG_LIBDIR} "${_pc_saved32}")
-  if(NOT FT32_OK EQUAL 0)
-    message(FATAL_ERROR "peload32 needs 32-bit freetype2 (lib32-freetype2)")
-  endif()
+  # 32-bit FreeType, already resolved above -- the target only exists because
+  # the query succeeded.
   separate_arguments(FT32_CFLAGS_LIST NATIVE_COMMAND "${FT32_CFLAGS}")
   separate_arguments(FT32_LIBS_LIST   NATIVE_COMMAND "${FT32_LIBS}")
   target_compile_options(peload32 PRIVATE ${FT32_CFLAGS_LIST})
@@ -118,7 +200,8 @@ if(HAVE_M32_TOOLCHAIN)
   # A live editor window needs 32-bit Xlib. There is no x11.pc under
   # /usr/lib32/pkgconfig on Arch, but lib32-libx11 ships the .so, and the X11
   # headers are architecture-independent -- so look for the library directly.
-  find_library(X11_32 NAMES X11 PATHS /usr/lib32 NO_DEFAULT_PATH)
+  # Debian/Ubuntu ship it under the i386 multiarch triplet instead.
+  find_library(X11_32 NAMES X11 PATHS /usr/lib32 /usr/lib/i386-linux-gnu NO_DEFAULT_PATH)
   if(X11_32)
     target_compile_definitions(peload32 PRIVATE PELOAD32_X11=1)
     target_link_libraries(peload32 PRIVATE ${X11_32})
@@ -127,18 +210,11 @@ if(HAVE_M32_TOOLCHAIN)
     message(STATUS "peload32: no editor window (needs lib32-libx11)")
   endif()
 
-  # Live playback needs 32-bit PipeWire and ALSA. Their .pc files live under
-  # /usr/lib32/pkgconfig, which the default pkg-config path does not cover, so
-  # query them explicitly rather than picking up the 64-bit ones.
-  set(_pc_saved "$ENV{PKG_CONFIG_LIBDIR}")
-  set(ENV{PKG_CONFIG_LIBDIR} /usr/lib32/pkgconfig)
-  execute_process(COMMAND pkg-config --cflags libpipewire-0.3 alsa
-                  OUTPUT_VARIABLE PW32_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE
-                  RESULT_VARIABLE PW32_OK ERROR_QUIET)
-  execute_process(COMMAND pkg-config --libs libpipewire-0.3 alsa
-                  OUTPUT_VARIABLE PW32_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET)
-  set(ENV{PKG_CONFIG_LIBDIR} "${_pc_saved}")
+  # Live playback needs 32-bit PipeWire and ALSA. One query for both, so either
+  # one missing costs the same thing: a render-only peload32. That still serves
+  # the bridge, which carries audio over shared memory and lets the 64-bit host
+  # reach the sound server -- what it drops is standalone `peload32 --play`.
+  pkgconfig32(PW32 libpipewire-0.3 alsa)
   if(PW32_OK EQUAL 0)
     separate_arguments(PW32_CFLAGS_LIST NATIVE_COMMAND "${PW32_CFLAGS}")
     separate_arguments(PW32_LIBS_LIST   NATIVE_COMMAND "${PW32_LIBS}")
@@ -149,12 +225,14 @@ if(HAVE_M32_TOOLCHAIN)
   else()
     message(STATUS "peload32: render only (needs lib32-pipewire and lib32-alsa-lib)")
   endif()
-  # win32_arity.h is generated from the mingw-w64 i686 import libraries; it is
-  # checked in, so regenerate only on request.
-  add_custom_target(arity
-    COMMAND ${CMAKE_COMMAND} -E echo "regenerating win32_arity.h"
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_arity.py
-    COMMENT "Regenerate the Win32 stdcall arity table")
-else()
-  message(STATUS "peload32 skipped (needs a -m32 toolchain: lib32-glibc)")
 endif()
+
+# win32_arity.h is generated from the mingw-w64 i686 import libraries; it is
+# checked in, so regenerate only on request. Outside the block above because it
+# needs none of it -- python3 and the mingw import libraries, not a 32-bit
+# toolchain -- and the arity table is what the 64-bit stubs are checked against
+# too, so it should stay reachable on a machine that cannot build peload32.
+add_custom_target(arity
+  COMMAND ${CMAKE_COMMAND} -E echo "regenerating win32_arity.h"
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_arity.py
+  COMMENT "Regenerate the Win32 stdcall arity table")

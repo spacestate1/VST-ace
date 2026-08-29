@@ -74,6 +74,87 @@ fi
 cd "$WORK_DIR/$SRC_TOP"
 dpkg-buildpackage -b -us -uc
 
+# --- the i386 add-on package: peload32, packaged by hand --------------------
+#
+# debhelper only builds the binary packages whose Architecture matches the
+# host a plain `dpkg-buildpackage -b` runs on, so an "Architecture: i386"
+# stanza in debian/control would just be skipped here rather than cross-built.
+# peload32 itself came out fine above regardless: it's an ordinary side-effect
+# target of the same peload/CMakeLists.txt build, using the -m32 toolchain and
+# 32-bit FreeType/X11 this script's Build-Depends already demanded. So the
+# .deb around it is put together directly with dpkg-deb, reusing that binary
+# rather than building anything a second time.
+PELOAD32="$WORK_DIR/$SRC_TOP/obj-peload/peload32"
+if [[ -x "$PELOAD32" ]]; then
+    echo
+    echo "=== Assembling vst-ace-i386 ==="
+    I386_STAGE="$WORK_DIR/i386-stage"
+    mkdir -p "$I386_STAGE/DEBIAN" \
+             "$I386_STAGE/usr/lib/vst-ace" \
+             "$I386_STAGE/usr/share/lintian/overrides" \
+             "$I386_STAGE/usr/share/doc/vst-ace-i386"
+
+    install -m 0755 "$PELOAD32" "$I386_STAGE/usr/lib/vst-ace/peload32"
+    install -m 0644 "$SCRIPT_DIR/debian/copyright" \
+        "$I386_STAGE/usr/share/doc/vst-ace-i386/copyright"
+
+    # Real runtime deps off the binary's own NEEDED list, not a guess.
+    # dpkg-shlibdeps insists on a debian/control to run at all, unrelated to
+    # the one already staged for dpkg-deb under DEBIAN/ -- give it a throwaway
+    # one of its own rather than let it find (and pollute the .deb with) a
+    # "debian/" directory sitting inside the package tree itself.
+    SHLIBS_TMP="$WORK_DIR/i386-shlibdeps-tmp"
+    mkdir -p "$SHLIBS_TMP/debian"
+    cat > "$SHLIBS_TMP/debian/control" <<EOF
+Source: vst-ace
+
+Package: vst-ace-i386
+Architecture: i386
+Description: dummy, read by dpkg-shlibdeps only
+EOF
+    SHLIBS_DEPENDS="$(cd "$SHLIBS_TMP" && dpkg-shlibdeps -O \
+        -e "$I386_STAGE/usr/lib/vst-ace/peload32" \
+        | sed -n 's/^shlibs:Depends=//p')"
+    if [[ -z "$SHLIBS_DEPENDS" ]]; then
+        echo "ERROR: dpkg-shlibdeps could not resolve peload32's runtime libraries" >&2
+        exit 1
+    fi
+
+    cat > "$I386_STAGE/DEBIAN/control" <<EOF
+Package: vst-ace-i386
+Version: ${VERSION}-1
+Section: sound
+Priority: optional
+Architecture: i386
+Maintainer: Connor McRann <cmcrann@protonmail.com>
+Depends: vst-ace (= ${VERSION}-1), ${SHLIBS_DEPENDS}
+Homepage: https://github.com/spacestate1/VST-ace
+Description: 32-bit Windows VST2 loader for vst-ace
+ peload32, the i386 PE loader and VST2 host from vst-ace. A process cannot
+ host both widths at once, so this is a separate program that vst-ace's
+ 64-bit hosts run out of process and bridge to when a plug-in turns out to
+ be 32-bit.
+ .
+ Needs vst-ace itself -- the bridge finds peload32 beside the 64-bit
+ binaries it already has. Installing this on an amd64 system needs the
+ i386 architecture enabled first:
+ .
+   sudo dpkg --add-architecture i386 && sudo apt update
+EOF
+
+    cat > "$I386_STAGE/usr/share/lintian/overrides/vst-ace-i386" <<'EOF'
+# Published on the project's own releases page, not the Debian archive -- no
+# Debian bug for the initial upload to close.
+vst-ace-i386: initial-upload-closes-no-bugs
+EOF
+
+    find "$I386_STAGE" -type d -exec chmod 0755 {} +
+    dpkg-deb --root-owner-group --build "$I386_STAGE" \
+        "$WORK_DIR/vst-ace-i386_${VERSION}-1_i386.deb"
+else
+    echo "vst-ace-i386 skipped: peload32 was not produced by the build above" >&2
+fi
+
 # The .deb, .changes and .buildinfo land in the parent directory.
 shopt -s nullglob
 debs=("$WORK_DIR"/*.deb)
