@@ -48,8 +48,8 @@ parameters, the widest editor in the corpus.*
     c/          the reimplemented engines and the command-line tools
     patches/    patch banks the hosts and the engines share
     scripts/    the analysis that produced them — Ghidra, Z80, wavetables
-    tools/      resource and symbol dumps, arity tables
-    packaging/  the Debian package, and the dependency installer
+    tools/      resource and symbol dumps, arity tables, the checks
+    packaging/  the Debian and Fedora packages, and the dependency installer
 
 ### Two windows
 
@@ -76,24 +76,38 @@ one live. `c/README.md` covers them.
 
 ## Installing
 
-A `.deb` for Ubuntu 24.04 and Debian 13 or newer is on the
-[releases page](https://github.com/spacestate1/VST-ace/releases):
+Packages are on the
+[releases page](https://github.com/spacestate1/VST-ace/releases) — a `.deb` for
+Ubuntu 24.04 and Debian 13 or newer, and an `.rpm` for Fedora 40 or newer:
 
-    sudo apt install ./vst-ace_0.1.0-1_amd64.deb
+    sudo apt install ./vst-ace_0.1.0-1_amd64.deb        # Debian, Ubuntu
+    sudo dnf install ./vst-ace-0.1.0-1.fc43.x86_64.rpm  # Fedora
 
 That puts `dw`, `pestudio` and `dwstudio` on `$PATH`, the patch banks in
-`/usr/share/vst-ace/patches`, and both windows in the desktop menu. It hosts
-64-bit plug-ins; the i386 loader needs 32-bit FreeType and X11 that Debian and
-Ubuntu do not carry, so 32-bit Windows plug-ins want a build from source.
+`/usr/share/vst-ace/patches`, and both windows in the desktop menu.
+
+Either package hosts 64-bit plug-ins. For **32-bit Windows VST2** plug-ins the
+Debian side has a second package carrying `peload32`, the i386 loader the
+64-bit hosts bridge to out of process. It is a foreign-architecture package, so
+i386 has to be enabled before apt will look at it:
+
+    sudo dpkg --add-architecture i386 && sudo apt update
+    sudo apt install ./vst-ace-i386_0.1.0-1_i386.deb
+
+There is no equivalent in the `.rpm` yet; on Fedora, 32-bit plug-ins still want
+a build from source.
 
 An installed copy has no tree to find the plug-in corpus in, so point `VST_ROOT`
 at one — a directory holding `windows/`, `linux/` and `macos/` — or keep it at
 `~/vst`, which is where it looks by default. Paths given on the command line
 work regardless.
 
-`packaging/build-deb.sh <version>` builds the package into `release/`;
-`packaging/debian/` is the recipe. Build it on the distribution it is for —
-a package built against one release's Qt and GTK will not run on another's.
+`packaging/build-deb.sh <version>` and `packaging/build-rpm.sh <version>` build
+them into `release/`, from the recipes in `packaging/debian/` and
+`packaging/rpm/`. Build each on the distribution it is for — a package built
+against one release's Qt and GTK will not run on another's — and publish them
+on the releases page rather than committing them, which is why `release/` is
+not tracked.
 
 ## Building
 
@@ -133,6 +147,25 @@ or by hand:
     make -C c                                   # engines + the dw launcher
     cmake -S peload -B peload/build && cmake --build peload/build   # peload, pestudio
     cmake -S gui    -B gui/build    && cmake --build gui/build      # dwstudio
+
+### Checking
+
+    python3 tools/regress.py
+
+runs everything that can be checked without a plug-in corpus — the tests that
+render need plug-in binaries, which are not ours to ship and are not here. What
+is left is the ground the expensive bugs have actually come from: the i386 ABI
+surface, where a stub declared with the wrong calling convention or a Windows
+type declared at the wrong width corrupts a guest's stack silently and only at
+32-bit, and the packaging recipes, where a list that has drifted out of step
+fails the build on someone else's machine rather than on this one.
+
+Calling conventions and stdcall arities are checked against mingw-w64's i686
+import libraries and again against the compiled code, and `tools/check_arity.py`
+does that half on its own. Anything the machine cannot answer — no `-m32`
+toolchain, no import libraries — is reported as a skip with the reason rather
+than passing quietly. `--no-build` reuses `peload/build` instead of configuring
+a fresh tree; `--only <check>` runs one.
 
 ## Running
 

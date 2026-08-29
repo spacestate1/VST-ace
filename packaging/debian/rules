@@ -26,10 +26,9 @@ include /usr/share/dpkg/buildflags.mk
 PKGLIBDIR  := /usr/lib/vst-ace
 PKGDATADIR := /usr/share/vst-ace
 
-DESTDIR       := $(CURDIR)/debian/vst-ace
-DESTDIR_I386  := $(CURDIR)/debian/vst-ace-i386
-BUILD_PELOAD  := obj-peload
-BUILD_GUI     := obj-gui
+DESTDIR      := $(CURDIR)/debian/vst-ace
+BUILD_PELOAD := obj-peload
+BUILD_GUI    := obj-gui
 
 # Every step below is an explicit command rather than dh_auto_build, so the
 # parallelism dpkg was asked for has to be passed on by hand. Serial when
@@ -70,6 +69,15 @@ override_dh_auto_build:
 	test -x $(BUILD_PELOAD)/pestudio
 	test -x $(BUILD_PELOAD)/peload32
 	test -x $(BUILD_GUI)/dwstudio
+# peload32 has to be the complete one, not merely present. Its editor window
+# and its audio path are both optional in peload/CMakeLists.txt -- without
+# 32-bit X11 or PipeWire it is configured windowless or render-only and still
+# builds -- so `test -x` cannot tell a full loader from a degraded one. The
+# i386 Build-Depends exist to guarantee both; this is what makes them more
+# than a hope. libpipewire covers ALSA with it: one pkg-config query asks for
+# the pair, so neither is linked unless both were found.
+	readelf -d $(BUILD_PELOAD)/peload32 | grep -q 'NEEDED.*libX11'
+	readelf -d $(BUILD_PELOAD)/peload32 | grep -q 'NEEDED.*libpipewire'
 
 override_dh_auto_test:
 # The tests need plug-in binaries, which are not ours to ship and are not here.
@@ -80,10 +88,14 @@ override_dh_auto_install:
 	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
 	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
 	install -D -m 0755 c/build/dw               $(DESTDIR)/usr/bin/dw
-# peload32 is i386 code and ships in its own vst-ace-i386 package (see
-# packaging/debian/control), but lands in the same PKGLIBDIR that vst-ace
-# owns -- that is where the bridge looks for it beside the 64-bit binaries.
-	install -D -m 0755 $(BUILD_PELOAD)/peload32 $(DESTDIR_I386)$(PKGLIBDIR)/peload32
+# peload32 is deliberately not installed here. It is i386 code, and debhelper
+# only builds the binary packages whose Architecture matches this build host,
+# so there is no vst-ace-i386 stanza in debian/control for it to be staged
+# into -- see the note at the foot of that file. packaging/build-deb.sh takes
+# it straight out of $(BUILD_PELOAD) once dpkg-buildpackage has finished and
+# wraps it with dpkg-deb, into the same PKGLIBDIR this package owns, which is
+# where the bridge looks for it beside the 64-bit binaries. The build check
+# above is what guarantees it is there to take.
 # The three that are worth having on $$PATH, as symlinks rather than copies:
 # the helper lookup above depends on the real programs staying together.
 	for p in peload pestudio dwstudio; do \

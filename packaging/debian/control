@@ -2,6 +2,14 @@ Source: vst-ace
 Section: sound
 Priority: optional
 Maintainer: Connor McRann <cmcrann@protonmail.com>
+# The :i386 entries below are what peload32 is built from, and they are not
+# uniform in what their absence costs. FreeType is fatal -- peload/CMakeLists.txt
+# stops the build without it. X11 is optional and costs the editor window.
+# PipeWire and ALSA are queried as a single pkg-config call for both, so the
+# ALSA entry alone would buy nothing: without libpipewire-0.3-dev:i386 beside
+# it the query fails and peload32 is built render-only. That still serves the
+# bridge, which carries audio over shared memory and lets the 64-bit host reach
+# the sound server, but it silently drops standalone `peload32 --play`.
 Build-Depends:
  debhelper-compat (= 13),
  cmake,
@@ -17,7 +25,8 @@ Build-Depends:
  g++-multilib,
  libfreetype-dev:i386,
  libx11-dev:i386,
- libasound2-dev:i386
+ libasound2-dev:i386,
+ libpipewire-0.3-dev:i386
 Standards-Version: 4.6.2
 Homepage: https://github.com/spacestate1/VST-ace
 Vcs-Git: https://github.com/spacestate1/VST-ace.git

@@ -78,9 +78,12 @@ apt)
           libx11-dev libcairo2-dev libfreetype-dev)
     PACKAGING=(debhelper devscripts dpkg-dev fakeroot lintian rsync)
     # Ubuntu and Debian carry only a small i386 set, and it has to be asked
-    # for; without freetype and X11 there the loader builds without its window.
+    # for. This list is also what packaging/debian/control build-depends on to
+    # get peload32 -- keep the two in step, or dpkg-checkbuilddeps stops the
+    # .deb build before it starts. What each one costs when it is absent is
+    # written up there.
     I386=(gcc-multilib g++-multilib libfreetype-dev:i386 libx11-dev:i386
-          libasound2-dev:i386)
+          libasound2-dev:i386 libpipewire-0.3-dev:i386)
     INSTALL=($SUDO apt-get install -y "${PKGS[@]}")
     ;;
 dnf|yum)

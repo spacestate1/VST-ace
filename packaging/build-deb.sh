@@ -94,9 +94,22 @@ if [[ -x "$PELOAD32" ]]; then
              "$I386_STAGE/usr/share/lintian/overrides" \
              "$I386_STAGE/usr/share/doc/vst-ace-i386"
 
-    install -m 0755 "$PELOAD32" "$I386_STAGE/usr/lib/vst-ace/peload32"
+    # -s: stripped on the way in, which is what dh_strip does for the amd64
+    # package above. The unstripped binary stays in obj-peload/ for a backtrace,
+    # the same way that package's symbols stay in its .ddeb rather than in the
+    # .deb people install.
+    install -s -m 0755 "$PELOAD32" "$I386_STAGE/usr/lib/vst-ace/peload32"
     install -m 0644 "$SCRIPT_DIR/debian/copyright" \
         "$I386_STAGE/usr/share/doc/vst-ace-i386/copyright"
+
+    # Debian wants a changelog in every binary package, and this one is
+    # assembled too late to get dh_installchangelogs' copy -- so take the same
+    # source changelog dpkg-buildpackage just used, under the name and the -9n
+    # compression debhelper would have given it. (-n so the gzip header carries
+    # no timestamp, which is what keeps the build reproducible.)
+    gzip -9n < "$WORK_DIR/$SRC_TOP/debian/changelog" \
+        > "$I386_STAGE/usr/share/doc/vst-ace-i386/changelog.Debian.gz"
+    chmod 0644 "$I386_STAGE/usr/share/doc/vst-ace-i386/changelog.Debian.gz"
 
     # Real runtime deps off the binary's own NEEDED list, not a guess.
     # dpkg-shlibdeps insists on a debian/control to run at all, unrelated to
@@ -147,6 +160,10 @@ EOF
 # Debian bug for the initial upload to close.
 vst-ace-i386: initial-upload-closes-no-bugs
 EOF
+    # A heredoc lands under the caller's umask, which on a 002 system is 0664
+    # and draws non-standard-file-perm. The installs above all name a mode;
+    # this is the one file that has to be told after the fact.
+    chmod 0644 "$I386_STAGE/usr/share/lintian/overrides/vst-ace-i386"
 
     find "$I386_STAGE" -type d -exec chmod 0755 {} +
     dpkg-deb --root-owner-group --build "$I386_STAGE" \
@@ -177,6 +194,11 @@ echo
 echo "=== Built ==="
 ls -lh "$RELEASE_DIR"/vst-ace*.deb
 echo
-echo "release/ is not tracked by git. Publish the .deb on the releases page:"
-echo "  gh release create v$VERSION $RELEASE_DIR/vst-ace_$VERSION-1_amd64.deb \\"
-echo "     --title \"vst-ace $VERSION\" --notes \"Ubuntu 24.04 / Debian 13+, amd64.\""
+echo "release/ is not tracked by git. Publish both on the releases page -- the"
+echo "i386 add-on is useless without the amd64 package it depends on, so they"
+echo "belong in the same release rather than one trailing the other:"
+echo "  gh release create v$VERSION \\"
+echo "     $RELEASE_DIR/vst-ace_$VERSION-1_amd64.deb \\"
+echo "     $RELEASE_DIR/vst-ace-i386_$VERSION-1_i386.deb \\"
+echo "     --title \"vst-ace $VERSION\" --notes \"Ubuntu 24.04 / Debian 13+, amd64."
+echo "Install vst-ace-i386 alongside it for 32-bit Windows VST2 plug-ins.\""
