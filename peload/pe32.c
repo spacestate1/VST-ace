@@ -582,11 +582,17 @@ static int try_dir32(const char *dir, size_t dirlen, const char *dll,
  * one fails much later and much less clearly than not finding it at all. */
 static int find_real_dll32(const char *dll, char *out, size_t n)
 {
+    /* Wine's own directories are deliberately not searched.
+     *
+     * They hold Wine's reimplementations, which are real PE files with real
+     * code and load perfectly well -- and then fault inside their own startup,
+     * because they are compiled against Wine's ntdll and expect the PEB, heap
+     * and loader data it provides. Searching them does not produce a working
+     * runtime; it converts "this plug-in loads with some imports stubbed" into
+     * "this plug-in dies", which on a Debian box with wine installed took
+     * peload32 from 36 of 40 plug-ins to none of them. The runtime directories
+     * below, and PELOAD_DLL_PATH, are the supported places. */
     static const char *const fallback[] = {
-        "/usr/lib/wine/i386-windows",
-        "/usr/lib32/wine/i386-windows",
-        "/usr/lib/i386-linux-gnu/wine/i386-windows",
-        "/opt/wine-stable/lib/wine/i386-windows",
         "/usr/lib/vst-ace/runtime32",
         NULL
     };
@@ -628,6 +634,32 @@ static int find_real_dll32(const char *dll, char *out, size_t n)
 }
 
 static int resolve_imports(image32 *im);      /* mutually recursive with below */
+
+/* Is this image a Wine build? Wine compiles its TRACE and ERR macros down to
+ * ntdll's __wine_dbg_* entry points, so a Wine module names them in its import
+ * table -- which can be read before a single instruction of it runs. Worth
+ * checking even though Wine's directories are no longer searched: someone will
+ * copy one into runtime32/ to see if it works, and "declined, and here is why"
+ * is a better answer than a fault inside its DllMain. */
+static int image_is_wine_build(image32 *im)
+{
+    DATA_DIR d = im->opt->DataDirectory[DIR_IMPORT];
+    IMP_DESC *desc;
+
+    if (!d.VirtualAddress) return 0;
+    for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
+        uint32_t *lookup = rva(im, desc->OriginalFirstThunk ? desc->OriginalFirstThunk
+                                                            : desc->FirstThunk);
+        for (; *lookup; lookup++) {
+            const char *sym;
+            if (*lookup & 0x80000000u) continue;          /* by ordinal */
+            sym = (const char *)rva(im, *lookup & 0x7FFFFFFF) + 2;
+            if (!strncmp(sym, "__wine_", 7)) return 1;
+        }
+    }
+    return 0;
+}
+
 static void *find_export(image32 *im, const char *want);
 static int protect_sections(image32 *im);
 
@@ -651,6 +683,17 @@ static realdll *real_dll_get(const char *dll)
     g_nreal++;
 
     if (map_image(&r->im, path) != 0) { g_nreal--; return NULL; }
+    if (image_is_wine_build(&r->im)) {
+        fprintf(stderr, "%s at %s is a Wine build and cannot be used as a "
+                        "runtime here -- it is compiled against Wine's ntdll "
+                        "and faults in its own startup. The Visual C++ "
+                        "redistributable is what goes in runtime32/.\n",
+                dll, path);
+        munmap(r->im.base, r->im.size);
+        r->im.base = NULL;
+        g_nreal--;
+        return NULL;
+    }
     PLOG("real dll: %s from %s\n", dll, path);
     /* apply_relocs returns the number it applied, and negative for failure. */
     if (apply_relocs(&r->im) < 0) { g_nreal--; return NULL; }

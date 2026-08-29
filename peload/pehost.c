@@ -640,6 +640,17 @@ static int try_dir(const char *dir, size_t dirlen, const char *dll,
 
 static int find_real_dll(const char *dll, char *out, size_t n)
 {
+    /* Wine's own directories are deliberately not searched.
+     *
+     * They hold Wine's reimplementations, which are real PE files with real
+     * code and load perfectly well -- and then fault inside their own startup,
+     * because they are compiled against Wine's ntdll and expect the PEB, heap
+     * and loader data it provides. Searching them does not produce a working
+     * runtime; it converts "this plug-in loads with some imports stubbed" into
+     * "this plug-in dies", which on a Debian box with wine installed took
+     * the loader from 36 of 40 plug-ins to none of them. The runtime directories
+     * below, and PELOAD_DLL_PATH, are the supported places. */
+
     /* Width matters here and nothing was checking it. A real runtime DLL is an
      * ordinary PE and the loader will map whichever one it is handed, so the
      * two widths get separate directories rather than sharing `runtime/` and
@@ -653,10 +664,7 @@ static int find_real_dll(const char *dll, char *out, size_t n)
      * x86-64. */
 #ifdef __i386__
     static const char *const fallback[] = {
-        "/usr/lib/wine/i386-windows",
-        "/usr/lib32/wine/i386-windows",
-        "/usr/lib/i386-linux-gnu/wine/i386-windows",
-        "/opt/wine-stable/lib/wine/i386-windows",
+        "/usr/lib/vst-ace/runtime32",
         NULL
     };
     static const char *const runtime_dirs[] = {
@@ -664,10 +672,7 @@ static int find_real_dll(const char *dll, char *out, size_t n)
     };
 #else
     static const char *const fallback[] = {
-        "/usr/lib/wine/x86_64-windows",
-        "/usr/lib64/wine/x86_64-windows",
-        "/usr/lib/x86_64-linux-gnu/wine/x86_64-windows",
-        "/opt/wine-stable/lib/wine/x86_64-windows",
+        "/usr/lib/vst-ace/runtime",
         NULL
     };
     static const char *const runtime_dirs[] = {
