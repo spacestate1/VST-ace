@@ -33,6 +33,9 @@ renders/
 # referenced by any build file; see HANDOFF-2026-08-01-msvcp120.md for how to
 # put msvcp120.dll back on a working copy.
 runtime/
+runtime
+runtime32/
+runtime32
 peload/thirdparty/
 
 # Local Claude Code permissions, per-machine.
@@ -51,3 +54,4 @@ obj-*/
 # https://github.com/spacestate1/VST-ace/releases -- and packaging/build-deb.sh
 # says so when it finishes.
 release/
+runtime32/

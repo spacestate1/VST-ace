@@ -774,16 +774,75 @@ static MS int32_t st_RtlAddFunctionTable(void *t, uint32_t n, uint64_t b)
  * part of a name turns into a directory boundary. Drive letters are left alone:
  * there is no sensible place to point C: at, and failing to find it is the
  * honest outcome. */
-static char *path_norm(char *p)
+static const char *peload_data_root(void);
+
+/* Undo what a guest's own path arithmetic did to a path this host gave it.
+ *
+ * The host hands out real POSIX paths -- SHGetFolderPath answers with
+ * `/home/you/.peload/AppData/Roaming` and so on -- and a plugin that treats
+ * that as an opaque string is fine. Plugins do not treat it as opaque. They
+ * run it through their own Windows path handling, where a leading `/` means
+ * "the root of the current drive" rather than "the root", and it comes back
+ * spelled a way the filesystem cannot use. Two shapes turned up in the corpus,
+ * from the same cause in opposite directions:
+ *
+ *   Kontakt re-anchored it against the current drive and asked for
+ *     C:/home/you/.peload/AppData/Local/Native Instruments/Kontakt 5/...
+ *   FM8 and Absynth dropped the root marker instead and asked for
+ *     home/you/.peload/Documents/Native Instruments/FM8/Sounds
+ *
+ * which is why a settings tree kept appearing in the working directory beside
+ * the real one. Neither is a bug in the plugin: both are what Windows path
+ * rules say those strings mean. Normalising them back here is one memmove and
+ * removes the whole class, where translating at each of the thirty-odd entry
+ * points that take a path would not.
+ *
+ * Backslashes are converted first, so everything below sees one separator. */
+static char *path_norm_n(char *p, size_t n)
 {
     char *q;
-    for (q = p; q && *q; q++) if (*q == '\\') *q = '/';
+    size_t len;
+
+    if (!p) return p;
+    for (q = p; *q; q++) if (*q == '\\') *q = '/';
+
+    /* The extended-length and device prefixes, \\?\ and \\.\ , now spelled
+     * with forward slashes. Dropping them leaves the drive letter below. */
+    if (!strncmp(p, "//?/", 4) || !strncmp(p, "//./", 4))
+        memmove(p, p + 4, strlen(p + 4) + 1);
+
+    /* A drive letter. There are no drives here, and the only way one appears
+     * is a guest having anchored one of our own paths against the current
+     * drive, so what follows it is the path we originally handed out. */
+    if (p[0] && p[1] == ':' &&
+        ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z'))) {
+        memmove(p, p + 2, strlen(p + 2) + 1);
+        if (!p[0]) { p[0] = '/'; p[1] = 0; }
+    }
+
+    /* The opposite slip: our own data root with its leading slash eaten. Only
+     * that prefix is re-anchored -- a genuinely relative path a plugin chose
+     * for itself is left alone, exactly as make_parents_in_root leaves it. */
+    if (p[0] != '/') {
+        const char *root = peload_data_root();
+        if (root && root[0] == '/') {
+            size_t rl = strlen(root) - 1;              /* root without its '/' */
+            if (!strncmp(p, root + 1, rl) &&
+                (p[rl] == '/' || p[rl] == 0)) {
+                len = strlen(p);
+                if (len + 2 <= n) {
+                    memmove(p + 1, p, len + 1);
+                    p[0] = '/';
+                }
+            }
+        }
+    }
     return p;
 }
 static char *w2c_path(const uint16_t *w, char *out, size_t n)
-{ w2c(w, out, n); return path_norm(out); }
+{ w2c(w, out, n); return path_norm_n(out, n); }
 static const char *path_fix(const char *in, char *buf, size_t n)
-{ if (!in) return NULL; snprintf(buf, n, "%s", in); return path_norm(buf); }
+{ if (!in) return NULL; snprintf(buf, n, "%s", in); return path_norm_n(buf, n); }
 
 /* The root of the directory tree this host hands out through SHGetFolderPath.
  * Everything below it is ours to manage; nothing above it is touched. */
@@ -1565,17 +1624,11 @@ static MS uint32_t st_GetSystemDirectoryA(char *buf, uint32_t n)
 { return (uint32_t)snprintf(buf, n, "C:\\Windows\\System32"); }
 static MS uint32_t st_GetWindowsDirectoryA(char *buf, uint32_t n)
 { return (uint32_t)snprintf(buf, n, "C:\\Windows"); }
-static MS uint32_t st_GetPrivateProfileStringA(const char *sec, const char *key,
-        const char *def, char *out, uint32_t n, const char *file)
-{ (void)sec;(void)key;(void)file; return (uint32_t)snprintf(out, n, "%s", def ? def : ""); }
-/* No ini file is ever really read here, same as the String version above --
- * so the one contractual thing this can still get right is returning the
- * caller's own default rather than a bare 0. A plugin gating its own init on
- * an unexpected "0 back from a config read it thought would return its
- * default" is a real way for VSTPluginMain to come back with no AEffect. */
-static MS int32_t st_GetPrivateProfileIntA(const char *sec, const char *key,
-        int32_t def, const char *file)
-{ (void)sec;(void)key;(void)file; return def; }
+/* GetPrivateProfileString and GetPrivateProfileInt were placeholders here that
+ * read no file and handed back the caller's own default -- which was the right
+ * shape for a stub, and is why plugins kept initialising. The real ones, with
+ * the write side beside them so settings survive the session, are further down
+ * with the rest of the profile API. */
 /* GetFullPathName has a two-call contract, and getting the first call wrong is
  * silent: with no buffer, or one too small, it returns the size *required*
  * including the terminator, and writes nothing; with room it fills the buffer and
@@ -4486,6 +4539,586 @@ static MS int32_t st_SystemTimeToTzSpecificLocalTime(const void *tz,
 { (void)tz; if (!in || !out) return 0; *out = *in; return 1; }
 
 #define SM(dll, mangled, fn) { dll, mangled, (void *)fn }
+/* ------------------------------------------------ the C runtime's file API --
+ *
+ * There was no stdio here at all, narrow or wide. Most plugins never notice --
+ * they reach for CreateFileW and get the Win32 path above -- but a plugin that
+ * opens its content through the CRT got the generic stub for every call, and
+ * the generic stub returns 0. For this corner of the CRT that return value is
+ * not merely unhelpful, it is an affirmative lie: `_waccess` returns 0 to mean
+ * "the file is there", and `_wopen` returns 0 to mean "descriptor 0", which is
+ * stdin. Kontakt asks `_waccess` whether its library exists, is told yes, opens
+ * it with `_wopen`, is handed stdin, and reads nothing -- which is what a
+ * sampler rendering silence looks like from outside.
+ *
+ * These are thin wrappers over the host's own libc. The FILE* handed back is
+ * the host's, which is safe precisely because it is opaque: a plugin passes it
+ * to fread and fclose rather than reading its fields. Every path goes through
+ * path_fix, so backslashes arrive normalised as everywhere else, and a create
+ * makes its parents inside this host's tree exactly as file_open does. */
+
+enum {
+    MSO_RDONLY = 0x0000, MSO_WRONLY = 0x0001, MSO_RDWR   = 0x0002,
+    MSO_APPEND = 0x0008, MSO_CREAT  = 0x0100, MSO_TRUNC  = 0x0200,
+    MSO_EXCL   = 0x0400
+};
+
+/* Windows' _O_* bits are not Linux's -- _O_CREAT is 0x100 there and 0100 here,
+ * so passing them through unchanged would ask for something else entirely. */
+static int crt_oflags(int msflags)
+{
+    int fl;
+    if (msflags & MSO_RDWR)        fl = O_RDWR;
+    else if (msflags & MSO_WRONLY) fl = O_WRONLY;
+    else                           fl = O_RDONLY;
+    if (msflags & MSO_APPEND) fl |= O_APPEND;
+    if (msflags & MSO_CREAT)  fl |= O_CREAT;
+    if (msflags & MSO_TRUNC)  fl |= O_TRUNC;
+    if (msflags & MSO_EXCL)   fl |= O_EXCL;
+    return fl;   /* _O_TEXT and _O_BINARY have no effect on this platform */
+}
+
+static int crt_open_path(const char *path, int msflags, int pmode)
+{
+    int fl = crt_oflags(msflags), fd;
+    fd = open(path, fl, pmode ? (mode_t)pmode : 0644);
+    if (fd < 0 && errno == ENOENT && (fl & O_CREAT)) {
+        make_parents_in_root(path);
+        fd = open(path, fl, pmode ? (mode_t)pmode : 0644);
+    }
+    PLOG("  [crt] open(%s) -> %s\n", path, fd < 0 ? strerror(errno) : "ok");
+    return fd;
+}
+
+static MSCRT int st__open(const char *name, int flags, int pmode)
+{ char p[1024]; if (!name) return -1;
+  return crt_open_path(path_fix(name, p, sizeof p), flags, pmode); }
+static MSCRT int st__wopen(const uint16_t *name, int flags, int pmode)
+{ char p[1024]; if (!name) return -1;
+  w2c_path(name, p, sizeof p); return crt_open_path(p, flags, pmode); }
+static MSCRT int st__close(int fd)   { return fd < 0 ? -1 : close(fd); }
+static MSCRT int st__read(int fd, void *b, unsigned n)  { return (int)read(fd, b, n); }
+static MSCRT int st__write(int fd, const void *b, unsigned n) { return (int)write(fd, b, n); }
+static MSCRT long st__lseek(int fd, long off, int whence)
+{ return (long)lseek(fd, off, whence); }
+static MSCRT int64_t st__lseeki64(int fd, int64_t off, int whence)
+{ return (int64_t)lseek(fd, (off_t)off, whence); }
+static MSCRT int st__eof(int fd)
+{ off_t cur = lseek(fd, 0, SEEK_CUR), end = lseek(fd, 0, SEEK_END);
+  if (cur < 0 || end < 0) return -1; lseek(fd, cur, SEEK_SET); return cur >= end; }
+
+/* _access and _waccess return 0 when the file has the mode asked for and -1
+ * when it does not -- the opposite polarity to most of Win32, and the reason
+ * the generic stub was so damaging here. Windows has no X_OK, so an execute
+ * query is answered as existence. */
+static int crt_access(const char *p, int mode)
+{ return access(p, (mode & 2) ? W_OK : (mode & 4) ? R_OK : F_OK); }
+static MSCRT int st__access(const char *n, int mode)
+{ char p[1024]; if (!n) return -1; return crt_access(path_fix(n, p, sizeof p), mode); }
+static MSCRT int st__waccess(const uint16_t *n, int mode)
+{ char p[1024]; if (!n) return -1; w2c_path(n, p, sizeof p); return crt_access(p, mode); }
+
+/* MSVC accepts mode letters this platform does not -- ",ccs=UTF-8", and the
+ * commit and share flags N, S, R, T, D -- so the string is filtered down to
+ * the ones fopen understands rather than passed through and rejected whole. */
+static void crt_mode(const char *in, char *out, size_t n)
+{
+    size_t o = 0;
+    for (; in && *in && o + 1 < n; in++) {
+        if (*in == ',') break;                      /* ",ccs=..." */
+        if (strchr("rwa+b", *in)) out[o++] = *in;
+    }
+    if (!o) out[o++] = 'r';
+    out[o] = 0;
+}
+
+static FILE *crt_fopen_path(const char *path, const char *mode)
+{
+    char m[8];
+    FILE *f;
+    crt_mode(mode, m, sizeof m);
+    f = fopen(path, m);
+    if (!f && errno == ENOENT && !strchr(m, 'r')) {
+        make_parents_in_root(path);
+        f = fopen(path, m);
+    }
+    PLOG("  [crt] fopen(%s,%s) -> %s\n", path, m, f ? "ok" : strerror(errno));
+    return f;
+}
+
+static MSCRT void *st_fopen(const char *name, const char *mode)
+{ char p[1024]; if (!name) return NULL;
+  return crt_fopen_path(path_fix(name, p, sizeof p), mode); }
+static MSCRT void *st__wfopen(const uint16_t *name, const uint16_t *mode)
+{ char p[1024], m[32]; if (!name) return NULL;
+  w2c_path(name, p, sizeof p); w2c(mode, m, sizeof m);
+  return crt_fopen_path(p, m); }
+static MSCRT int st_fopen_s(void **out, const char *name, const char *mode)
+{ if (!out) return 22; *out = st_fopen(name, mode); return *out ? 0 : 2; }
+static MSCRT int st__wfopen_s(void **out, const uint16_t *name, const uint16_t *mode)
+{ if (!out) return 22; *out = st__wfopen(name, mode); return *out ? 0 : 2; }
+static MSCRT void *st__fdopen(int fd, const char *mode)
+{ char m[8]; crt_mode(mode, m, sizeof m); return fdopen(fd, m); }
+static MSCRT int st__fileno(void *f) { return f ? fileno((FILE *)f) : -1; }
+
+static MSCRT int st_fclose(void *f)  { return f ? fclose((FILE *)f) : -1; }
+static MSCRT size_t st_fread(void *b, size_t sz, size_t n, void *f)
+{ return f ? fread(b, sz, n, (FILE *)f) : 0; }
+static MSCRT size_t st_fwrite(const void *b, size_t sz, size_t n, void *f)
+{ return f ? fwrite(b, sz, n, (FILE *)f) : 0; }
+static MSCRT int st_fseek(void *f, long off, int wh)
+{ return f ? fseek((FILE *)f, off, wh) : -1; }
+static MSCRT int st__fseeki64(void *f, int64_t off, int wh)
+{ return f ? fseeko((FILE *)f, (off_t)off, wh) : -1; }
+static MSCRT long st_ftell(void *f) { return f ? ftell((FILE *)f) : -1L; }
+static MSCRT int64_t st__ftelli64(void *f) { return f ? (int64_t)ftello((FILE *)f) : -1; }
+static MSCRT void st_rewind(void *f) { if (f) rewind((FILE *)f); }
+static MSCRT int st_feof(void *f)   { return f ? feof((FILE *)f) : 1; }
+static MSCRT int st_ferror(void *f) { return f ? ferror((FILE *)f) : 1; }
+static MSCRT void st_clearerr(void *f) { if (f) clearerr((FILE *)f); }
+static MSCRT int st_fflush(void *f) { return f ? fflush((FILE *)f) : 0; }
+static MSCRT int st_fgetc(void *f)  { return f ? fgetc((FILE *)f) : -1; }
+static MSCRT int st_fputc(int c, void *f) { return f ? fputc(c, (FILE *)f) : -1; }
+static MSCRT int st_ungetc(int c, void *f) { return f ? ungetc(c, (FILE *)f) : -1; }
+static MSCRT char *st_fgets(char *b, int n, void *f)
+{ return f ? fgets(b, n, (FILE *)f) : NULL; }
+static MSCRT int st_fputs(const char *s, void *f) { return f ? fputs(s, (FILE *)f) : -1; }
+static MSCRT int st_setvbuf(void *f, char *b, int m, size_t sz)
+{ return f ? setvbuf((FILE *)f, b, m, sz) : -1; }
+
+static MSCRT int st_remove(const char *n)
+{ char p[1024]; return n ? remove(path_fix(n, p, sizeof p)) : -1; }
+static MSCRT int st__wremove(const uint16_t *n)
+{ char p[1024]; if (!n) return -1; w2c_path(n, p, sizeof p); return remove(p); }
+static MSCRT int st__unlink(const char *n)
+{ char p[1024]; return n ? unlink(path_fix(n, p, sizeof p)) : -1; }
+static MSCRT int st__wunlink(const uint16_t *n)
+{ char p[1024]; if (!n) return -1; w2c_path(n, p, sizeof p); return unlink(p); }
+static MSCRT int st_rename(const char *a, const char *b)
+{ char p[1024], q[1024]; if (!a || !b) return -1;
+  path_fix(a, p, sizeof p); path_fix(b, q, sizeof q); return rename(p, q); }
+static MSCRT int st__wrename(const uint16_t *a, const uint16_t *b)
+{ char p[1024], q[1024]; if (!a || !b) return -1;
+  w2c_path(a, p, sizeof p); w2c_path(b, q, sizeof q); return rename(p, q); }
+static int crt_mkdir_at(const char *p)
+{ if (mkdir(p, 0755) == 0) return 0;
+  if (errno == EEXIST) return -1;              /* Windows fails this too */
+  if (errno == ENOENT) { make_parents_in_root(p); return mkdir(p, 0755); }
+  return -1; }
+static MSCRT int st__mkdir(const char *n)
+{ char p[1024]; if (!n) return -1; return crt_mkdir_at(path_fix(n, p, sizeof p)); }
+static MSCRT int st__wmkdir(const uint16_t *n)
+{ char p[1024]; if (!n) return -1; w2c_path(n, p, sizeof p); return crt_mkdir_at(p); }
+
+/* The legacy unbounded _vswprintf, which predates the _c suffixed form above
+ * and takes no size. Given a bound anyway: the alternative is trusting the
+ * caller's buffer to fit whatever the format produces. */
+static MSCRT int st__vswprintf(uint16_t *b, const uint16_t *f, MSVA_LIST a)
+{ return (int)w32_vfmtw(b, 4096, f, a); }
+
+/* time_t is 64-bit in this runtime whichever width the guest is, which is the
+ * whole point of the _time64 spelling. */
+static MSCRT int64_t st__time64(int64_t *t)
+{ int64_t v = (int64_t)time(NULL); if (t) *t = v; return v; }
+static MSCRT int32_t st__time32(int32_t *t)
+{ int32_t v = (int32_t)time(NULL); if (t) *t = v; return v; }
+
+
+/* --------------------------------------------------- the private profile API
+
+ * GetPrivateProfileString and its neighbours -- the .ini file API, which is how
+ * a plugin written before the registry became fashionable keeps its settings.
+ * Nothing implemented it, so every read returned the generic stub's 0 and every
+ * write went nowhere: settings did not persist, and the plugins that use it
+ * (stigma64 and sixtraq64 here) silently started from defaults every time.
+ *
+ * Windows resolves a bare filename against the Windows directory. Doing that
+ * literally would scatter .ini files across the working directory, which is
+ * where `\FullBucketMusic\*.ini` came from, so a relative name is anchored
+ * under this host's own tree instead -- the same tree SHGetFolderPath hands
+ * out, which is the place a settings file belongs and survives a reboot. */
+
+static const char *ini_path(const char *name, char *buf, size_t n)
+{
+    char fixed[1024];
+    if (!name || !*name) return NULL;
+    path_fix(name, fixed, sizeof fixed);
+    if (fixed[0] == '/') { snprintf(buf, n, "%s", fixed); return buf; }
+    snprintf(buf, n, "%s/%s", peload_data_root(), fixed);
+    return buf;
+}
+
+/* One pass over the file, calling back per key in the section asked for. The
+ * files are a few hundred bytes; parsing on each call is cheaper than any cache
+ * that would then have to be invalidated by the write side below. */
+typedef void (*ini_cb)(const char *key, const char *val, void *ctx);
+
+static int ini_walk(const char *path, const char *want, ini_cb cb, void *ctx)
+{
+    FILE *f = fopen(path, "r");
+    char line[1024], cur[128];
+    int found = 0;
+    if (!f) return 0;
+    cur[0] = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *s = line, *e, *eq;
+        while (*s == ' ' || *s == '\t') s++;
+        e = s + strlen(s);
+        while (e > s && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t'))
+            *--e = 0;
+        if (!*s || *s == ';' || *s == '#') continue;
+        if (*s == '[') {
+            char *close = strchr(s, ']');
+            if (!close) continue;
+            *close = 0;
+            snprintf(cur, sizeof cur, "%s", s + 1);
+            if (want && !strcasecmp(cur, want)) found = 1;
+            continue;
+        }
+        if (!want || strcasecmp(cur, want) != 0) continue;
+        if (!(eq = strchr(s, '='))) continue;
+        *eq = 0;
+        {   /* trim the key's trailing and the value's leading whitespace */
+            char *ke = eq;
+            while (ke > s && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = 0;
+            eq++;
+            while (*eq == ' ' || *eq == '\t') eq++;
+            if (cb) cb(s, eq, ctx);
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+typedef struct { const char *key; char val[1024]; int hit; } ini_find;
+static void ini_find_cb(const char *k, const char *v, void *ctx)
+{
+    ini_find *fnd = (ini_find *)ctx;
+    if (fnd->hit || strcasecmp(k, fnd->key) != 0) return;
+    snprintf(fnd->val, sizeof fnd->val, "%s", v);
+    fnd->hit = 1;
+}
+
+static MS uint32_t st_GetPrivateProfileStringA(const char *sect, const char *key,
+        const char *def, char *out, uint32_t size, const char *file)
+{
+    char path[1024];
+    ini_find fnd;
+    const char *src;
+    uint32_t n;
+
+    if (!out || !size) return 0;
+    fnd.key = key; fnd.val[0] = 0; fnd.hit = 0;
+    if (key && ini_path(file, path, sizeof path))
+        ini_walk(path, sect, ini_find_cb, &fnd);
+    src = fnd.hit ? fnd.val : (def ? def : "");
+    n = (uint32_t)strlen(src);
+    if (n > size - 1) n = size - 1;
+    memcpy(out, src, n);
+    out[n] = 0;
+    return n;
+}
+static MS uint32_t st_GetPrivateProfileStringW(const uint16_t *sect, const uint16_t *key,
+        const uint16_t *def, uint16_t *out, uint32_t size, const uint16_t *file)
+{
+    char s[256], k[256], d[1024], f[1024], nb[1024];
+    uint32_t n;
+    if (!out || !size) return 0;
+    if (sect) w2c(sect, s, sizeof s);
+    if (key)  w2c(key, k, sizeof k);
+    if (def)  w2c(def, d, sizeof d);
+    if (file) w2c(file, f, sizeof f);
+    n = st_GetPrivateProfileStringA(sect ? s : NULL, key ? k : NULL,
+                                    def ? d : NULL, nb, sizeof nb,
+                                    file ? f : NULL);
+    {   uint32_t i;
+        for (i = 0; i < n && i + 1 < size; i++) out[i] = (uint8_t)nb[i];
+        out[i] = 0;
+        return i;
+    }
+}
+static MS uint32_t st_GetPrivateProfileIntA(const char *sect, const char *key,
+                                            int32_t def, const char *file)
+{
+    char buf[64];
+    if (!st_GetPrivateProfileStringA(sect, key, "", buf, sizeof buf, file))
+        return (uint32_t)def;
+    return (uint32_t)strtol(buf, NULL, 0);
+}
+static MS uint32_t st_GetPrivateProfileIntW(const uint16_t *sect, const uint16_t *key,
+                                            int32_t def, const uint16_t *file)
+{
+    char s[256], k[256], f[1024];
+    if (sect) w2c(sect, s, sizeof s);
+    if (key)  w2c(key, k, sizeof k);
+    if (file) w2c(file, f, sizeof f);
+    return st_GetPrivateProfileIntA(sect ? s : NULL, key ? k : NULL, def,
+                                    file ? f : NULL);
+}
+
+/* GetPrivateProfileSection reports the whole section as "key=value" runs, each
+ * NUL-terminated, the lot terminated by a second NUL. A stub that returned 0
+ * left the caller reading its own uninitialised buffer for that structure. */
+typedef struct { char *out; uint32_t size, used; } ini_sect;
+static void ini_sect_cb(const char *k, const char *v, void *ctx)
+{
+    ini_sect *c = (ini_sect *)ctx;
+    uint32_t need = (uint32_t)(strlen(k) + strlen(v) + 2);
+    if (c->used + need + 1 > c->size) return;         /* leave room for the final NUL */
+    c->used += (uint32_t)snprintf(c->out + c->used, c->size - c->used, "%s=%s", k, v) + 1;
+}
+static MS uint32_t st_GetPrivateProfileSectionA(const char *sect, char *out,
+                                                uint32_t size, const char *file)
+{
+    char path[1024];
+    ini_sect c;
+    if (!out || size < 2) { if (out && size) out[0] = 0; return 0; }
+    c.out = out; c.size = size - 1; c.used = 0;
+    memset(out, 0, size);
+    if (ini_path(file, path, sizeof path))
+        ini_walk(path, sect, ini_sect_cb, &c);
+    out[c.used] = 0;
+    return c.used ? c.used : 0;
+}
+static MS uint32_t st_GetPrivateProfileSectionW(const uint16_t *sect, uint16_t *out,
+                                                uint32_t size, const uint16_t *file)
+{
+    char s[256], f[1024], nb[4096];
+    uint32_t n, i;
+    if (!out || size < 2) { if (out && size) out[0] = 0; return 0; }
+    if (sect) w2c(sect, s, sizeof s);
+    if (file) w2c(file, f, sizeof f);
+    n = st_GetPrivateProfileSectionA(sect ? s : NULL, nb, sizeof nb, file ? f : NULL);
+    for (i = 0; i < n && i + 1 < size; i++) out[i] = (uint8_t)nb[i];
+    out[i] = 0;
+    if (i + 1 < size) out[i + 1] = 0;
+    return i;
+}
+
+/* The write side. An .ini is small enough to rewrite whole, which is also what
+ * makes the semantics easy to get right: a NULL value deletes the key, a NULL
+ * key deletes the section, and a key in a section that does not exist yet
+ * appends both. */
+typedef struct { char *buf; size_t len, cap; } ini_buf;
+static void ib_add(ini_buf *b, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    char tmp[1200];
+    va_start(ap, fmt);
+    n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (b->len + (size_t)n + 1 > b->cap) {
+        size_t want = (b->len + (size_t)n + 1) * 2;
+        char *p = (char *)realloc(b->buf, want);
+        if (!p) return;
+        b->buf = p; b->cap = want;
+    }
+    memcpy(b->buf + b->len, tmp, (size_t)n);
+    b->len += (size_t)n;
+    b->buf[b->len] = 0;
+}
+
+static int ini_write(const char *path, const char *sect, const char *key,
+                     const char *val)
+{
+    FILE *f;
+    char line[1024], cur[128];
+    ini_buf out;
+    int in_target = 0, wrote = 0, seen_section = 0;
+
+    if (!sect) return 0;
+    out.buf = NULL; out.len = 0; out.cap = 0;
+    cur[0] = 0;
+
+    if ((f = fopen(path, "r")) != NULL) {
+        while (fgets(line, sizeof line, f)) {
+            char trimmed[1024], *s = line, *eq;
+            size_t L;
+            snprintf(trimmed, sizeof trimmed, "%s", line);
+            L = strlen(trimmed);
+            while (L && (trimmed[L-1] == '\n' || trimmed[L-1] == '\r')) trimmed[--L] = 0;
+            s = trimmed;
+            while (*s == ' ' || *s == '\t') s++;
+
+            if (*s == '[') {
+                char *close = strchr(s, ']');
+                /* leaving the target section: append a key that was never found */
+                if (in_target && key && val && !wrote) {
+                    ib_add(&out, "%s=%s\n", key, val);
+                    wrote = 1;
+                }
+                in_target = 0;
+                if (close) {
+                    char nm[128];
+                    *close = 0;
+                    snprintf(nm, sizeof nm, "%s", s + 1);
+                    *close = ']';
+                    snprintf(cur, sizeof cur, "%s", nm);
+                    if (!strcasecmp(cur, sect)) { in_target = 1; seen_section = 1; }
+                }
+                /* a NULL key deletes the whole section, header included */
+                if (in_target && !key) continue;
+                ib_add(&out, "%s\n", trimmed);
+                continue;
+            }
+            if (in_target && !key) continue;                  /* dropping section */
+            if (in_target && key && (eq = strchr(s, '=')) != NULL) {
+                char k[256];
+                size_t kl = (size_t)(eq - s);
+                if (kl >= sizeof k) kl = sizeof k - 1;
+                memcpy(k, s, kl); k[kl] = 0;
+                while (kl && (k[kl-1] == ' ' || k[kl-1] == '\t')) k[--kl] = 0;
+                if (!strcasecmp(k, key)) {
+                    if (val) { ib_add(&out, "%s=%s\n", key, val); wrote = 1; }
+                    else wrote = 1;                            /* NULL value deletes */
+                    continue;
+                }
+            }
+            ib_add(&out, "%s\n", trimmed);
+        }
+        fclose(f);
+    }
+    /* the target section was the last in the file, or was not there at all */
+    if (key && val && !wrote) {
+        if (!seen_section) ib_add(&out, "[%s]\n", sect);
+        ib_add(&out, "%s=%s\n", key, val);
+    }
+
+    {
+        FILE *w = fopen(path, "w");
+        if (!w) {
+            make_parents_in_root(path);
+            w = fopen(path, "w");
+        }
+        if (!w) { free(out.buf); return 0; }
+        if (out.buf && out.len) fwrite(out.buf, 1, out.len, w);
+        fclose(w);
+    }
+    free(out.buf);
+    return 1;
+}
+
+static MS int32_t st_WritePrivateProfileStringA(const char *sect, const char *key,
+                                                const char *val, const char *file)
+{
+    char path[1024];
+    if (!ini_path(file, path, sizeof path)) return 0;
+    return ini_write(path, sect, key, val);
+}
+static MS int32_t st_WritePrivateProfileStringW(const uint16_t *sect, const uint16_t *key,
+                                                const uint16_t *val, const uint16_t *file)
+{
+    char s[256], k[256], v[1024], f[1024];
+    if (sect) w2c(sect, s, sizeof s);
+    if (key)  w2c(key, k, sizeof k);
+    if (val)  w2c(val, v, sizeof v);
+    if (file) w2c(file, f, sizeof f);
+    return st_WritePrivateProfileStringA(sect ? s : NULL, key ? k : NULL,
+                                         val ? v : NULL, file ? f : NULL);
+}
+
+/* WritePrivateProfileSection replaces a section outright, taking the same
+ * double-NUL-terminated "key=value" run GetPrivateProfileSection hands back. */
+static MS int32_t st_WritePrivateProfileSectionA(const char *sect, const char *data,
+                                                 const char *file)
+{
+    char path[1024];
+    const char *p;
+    if (!ini_path(file, path, sizeof path) || !sect) return 0;
+    ini_write(path, sect, NULL, NULL);           /* drop what was there */
+    if (!data) return 1;
+    {   /* recreate the header, then every pair in turn */
+        FILE *w = fopen(path, "a");
+        if (!w) return 0;
+        fprintf(w, "[%s]\n", sect);
+        fclose(w);
+    }
+    for (p = data; *p; p += strlen(p) + 1) {
+        char k[256], *eq;
+        snprintf(k, sizeof k, "%s", p);
+        if ((eq = strchr(k, '=')) == NULL) continue;
+        *eq = 0;
+        st_WritePrivateProfileStringA(sect, k, eq + 1, file);
+    }
+    return 1;
+}
+static MS int32_t st_WritePrivateProfileSectionW(const uint16_t *sect,
+                                                 const uint16_t *data,
+                                                 const uint16_t *file)
+{
+    char s[256], f[1024], nb[4096];
+    size_t i = 0, o = 0;
+    if (sect) w2c(sect, s, sizeof s);
+    if (file) w2c(file, f, sizeof f);
+    if (data) {   /* the run is double-NUL terminated, so copy it as one block */
+        while (o + 1 < sizeof nb) {
+            if (!data[i] && !data[i + 1]) break;
+            nb[o++] = data[i] < 256 ? (char)data[i] : '?';
+            i++;
+        }
+    }
+    nb[o] = 0; if (o + 1 < sizeof nb) nb[o + 1] = 0;
+    return st_WritePrivateProfileSectionA(sect ? s : NULL, data ? nb : NULL,
+                                          file ? f : NULL);
+}
+
+
+/* ------------------------------------------------- Wine's debug plumbing ---
+
+ * Only reached when a *Wine* build of a runtime DLL is loaded as a real
+ * dependency, which is the redistributable way to give the i386 loader a C++
+ * standard library: Microsoft's msvcp120 may not be shipped with anything,
+ * Wine's may. Wine compiles its TRACE/WARN/ERR macros down to these four
+ * ntdll entry points, so its msvcp120 imports them even in a build that never
+ * logs anything, and without them every one of those imports took the generic
+ * stub -- which is how four plugins that had got as far as loading the whole
+ * C++ runtime still died, now at a Wine debug call rather than in their own
+ * code.
+ *
+ * All four are __cdecl in Wine, not stdcall, so they are declared MSCRT.
+ * Answering "this channel is switched off" is both the cheapest and the most
+ * faithful thing to do: a plugin is not asking to be traced, and Wine's own
+ * default is every channel off. */
+
+/* struct __wine_debug_channel is { unsigned char flags; char name[15]; } --
+ * only the flags byte is read here, and only to say nothing is enabled. */
+static MSCRT int st___wine_dbg_get_channel_flags(void *channel)
+{ (void)channel; return 0; }
+
+/* Returns nonzero to suppress the message. Wine's TRACE expands to
+ * `if (!__wine_dbg_header(...)) ...`, so 0 here would ask for the body to run
+ * and then hand the text to __wine_dbg_output below. */
+static MSCRT int st___wine_dbg_header(int cls, void *channel, const char *func)
+{ (void)cls; (void)channel; (void)func; return -1; }
+
+/* Reached only if something logs despite the above -- an ERR channel, which
+ * Wine leaves on by default. Worth seeing rather than dropping: it is the
+ * runtime explaining itself. */
+static MSCRT int st___wine_dbg_output(const char *str)
+{
+    if (!str) return 0;
+    if (pe_verbose()) fputs(str, stderr);
+    return (int)strlen(str);
+}
+
+/* Wine hands the result to a printf that runs after the caller returns, so it
+ * has to outlive this call. Wine's own implementation uses a per-thread ring
+ * of buffers for exactly this; the same shape here, one buffer set per thread,
+ * so nothing is freed and nothing is shared between threads. */
+static MSCRT const char *st___wine_dbg_strdup(const char *str)
+{
+    enum { RING = 32, CELL = 256 };
+    static __thread char ring[RING][CELL];
+    static __thread unsigned next;
+    char *slot;
+    if (!str) return NULL;
+    slot = ring[next++ % RING];
+    snprintf(slot, CELL, "%s", str);
+    return slot;
+}
+
 static const winstub g_stubs[] = {
     /* CRT: registered against msvcrt.dll and reached from every versioned
      * runtime name through crt_alias() below */
@@ -4750,6 +5383,41 @@ static const winstub g_stubs[] = {
     S("msvcrt.dll", atoi), S("msvcrt.dll", atof), S("msvcrt.dll", strtol),
     S("msvcrt.dll", strtod), S("msvcrt.dll", rand), S("msvcrt.dll", srand),
     S("msvcrt.dll", getenv), S("msvcrt.dll", strerror), S("msvcrt.dll", clock),
+    /* Wine's debug entry points, imported by any Wine-built runtime DLL the
+     * real-dependency loader maps in. */
+    S("ntdll.dll", __wine_dbg_get_channel_flags),
+    S("ntdll.dll", __wine_dbg_header),
+    S("ntdll.dll", __wine_dbg_output),
+    S("ntdll.dll", __wine_dbg_strdup),
+    /* the .ini settings API, both widths */
+    S("kernel32.dll", GetPrivateProfileStringA), S("kernel32.dll", GetPrivateProfileStringW),
+    S("kernel32.dll", GetPrivateProfileIntA), S("kernel32.dll", GetPrivateProfileIntW),
+    S("kernel32.dll", GetPrivateProfileSectionA), S("kernel32.dll", GetPrivateProfileSectionW),
+    S("kernel32.dll", WritePrivateProfileStringA), S("kernel32.dll", WritePrivateProfileStringW),
+    S("kernel32.dll", WritePrivateProfileSectionA), S("kernel32.dll", WritePrivateProfileSectionW),
+    /* the CRT's file API: stdio, the low-level descriptors under it, and the
+     * wide spellings of both. Kontakt reaches for the wide ones and got the
+     * generic stub for every call before these existed. */
+    S("msvcrt.dll", fopen), S("msvcrt.dll", _wfopen),
+    S("msvcrt.dll", fopen_s), S("msvcrt.dll", _wfopen_s),
+    S("msvcrt.dll", _fdopen), S("msvcrt.dll", _fileno),
+    S("msvcrt.dll", fclose), S("msvcrt.dll", fread), S("msvcrt.dll", fwrite),
+    S("msvcrt.dll", fseek), S("msvcrt.dll", _fseeki64),
+    S("msvcrt.dll", ftell), S("msvcrt.dll", _ftelli64),
+    S("msvcrt.dll", rewind), S("msvcrt.dll", feof), S("msvcrt.dll", ferror),
+    S("msvcrt.dll", clearerr), S("msvcrt.dll", fflush),
+    S("msvcrt.dll", fgetc), S("msvcrt.dll", fputc), S("msvcrt.dll", ungetc),
+    S("msvcrt.dll", fgets), S("msvcrt.dll", fputs), S("msvcrt.dll", setvbuf),
+    S("msvcrt.dll", _open), S("msvcrt.dll", _wopen), S("msvcrt.dll", _close),
+    S("msvcrt.dll", _read), S("msvcrt.dll", _write),
+    S("msvcrt.dll", _lseek), S("msvcrt.dll", _lseeki64), S("msvcrt.dll", _eof),
+    S("msvcrt.dll", _access), S("msvcrt.dll", _waccess),
+    S("msvcrt.dll", remove), S("msvcrt.dll", _wremove),
+    S("msvcrt.dll", _unlink), S("msvcrt.dll", _wunlink),
+    S("msvcrt.dll", rename), S("msvcrt.dll", _wrename),
+    S("msvcrt.dll", _mkdir), S("msvcrt.dll", _wmkdir),
+    S("msvcrt.dll", _vswprintf),
+    S("msvcrt.dll", _time64), S("msvcrt.dll", _time32),
     /* interlocked */
     S("kernel32.dll", InterlockedIncrement), S("kernel32.dll", InterlockedDecrement),
     S("kernel32.dll", InterlockedExchange), S("kernel32.dll", InterlockedExchangeAdd),

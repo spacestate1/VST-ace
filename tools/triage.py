@@ -22,7 +22,19 @@ wrong, but --loader takes the 64-bit peload just as well.
 """
 import argparse, collections, csv, glob, os, re, subprocess, sys
 
-STUB_RE = re.compile(r"\[stub\]\s+(\S+?)!(\S+?):\s+unknown stdcall arity")
+# Two different events, and the difference matters.
+#
+# The i386 loader prints "unknown stdcall arity" at bind time for every import
+# that got the generic stub -- a static fact about the image, available without
+# the code ever running. Both loaders print a bare "[stub] dll!sym" the first
+# time such a stub is actually *called*, which is much stronger evidence: it
+# says this plug-in really did reach for that symbol on this path.
+#
+# Matching only the first line made this tool blind on x86-64, which never
+# prints it: the loader was reporting "no imports fell through to the generic
+# stub" for a corpus in which Kontakt was reaching twenty of them.
+BOUND_RE = re.compile(r"\[stub\]\s+(\S+?)!(\S+?):\s+unknown stdcall arity")
+REACHED_RE = re.compile(r"^\s*\[stub\]\s+(\S+)!(\S+?)\s*$", re.M)
 SIG_RE = re.compile(r"\*\*\* (SIG\w+) in (\w+) code")
 ADDR_RE = re.compile(r"addr\s+(0x[0-9a-fA-F]+)\s*(<[^>]*>)?")
 FRAME_RE = re.compile(r"#0\s+(\S+)")
@@ -87,13 +99,18 @@ def main():
         print("no plug-ins under %s" % a.directory, file=sys.stderr)
         return 2
 
-    results, stubs_of = [], {}
+    results, stubs_of, reached_of = [], {}, {}
     for i, p in enumerate(plugins, 1):
         print("\r  %d/%d %-44s" % (i, len(plugins), os.path.basename(p)[:44]),
               end="", file=sys.stderr, flush=True)
         status, why, out = load_one(a.loader, p, a.timeout)
         results.append((os.path.basename(p), status, why))
-        stubs_of[os.path.basename(p)] = {"%s!%s" % m for m in STUB_RE.findall(out)}
+        b = os.path.basename(p)
+        stubs_of[b] = {"%s!%s" % m for m in BOUND_RE.findall(out)}
+        reached_of[b] = {"%s!%s" % m for m in REACHED_RE.findall(out)}
+        # A reached stub was necessarily bound to one, whether or not this
+        # loader announced the binding.
+        stubs_of[b] |= reached_of[b]
     print("\r" + " " * 60 + "\r", end="", file=sys.stderr)
 
     ok = [r for r in results if r[1] == "OK"]
@@ -117,6 +134,23 @@ def main():
             total[s] += 1
             if name in failing:
                 among_failing[s] += 1
+
+    # Stubs that were actually called, which is the real work queue: a bound
+    # stub nobody calls costs nothing, and a called one returned 0 to code that
+    # asked it a question.
+    reached_total = collections.Counter()
+    for name, syms in reached_of.items():
+        for s in syms:
+            reached_total[s] += 1
+    if reached_total:
+        print("stubs actually reached at run time (returned 0 to the caller)")
+        print("-" * 78)
+        print("  %-5s %-22s %s" % ("plugs", "which", "import"))
+        for s, n in sorted(reached_total.items(), key=lambda kv: (-kv[1], kv[0])):
+            who = sorted(k for k, v in reached_of.items() if s in v)
+            tag = who[0][:22] if n == 1 else "%d plug-ins" % n
+            print("  %-5d %-22s %s" % (n, tag, s))
+        print()
 
     if not total:
         print("no imports fell through to the generic stub -- "
@@ -145,9 +179,12 @@ def main():
     if a.csv:
         with open(a.csv, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["plugin", "status", "detail", "generic_stub_imports"])
+            w.writerow(["plugin", "status", "detail", "stubs_reached",
+                        "generic_stub_imports"])
             for name, status, why in results:
-                w.writerow([name, status, why, " ".join(sorted(stubs_of[name]))])
+                w.writerow([name, status, why,
+                            " ".join(sorted(reached_of[name])),
+                            " ".join(sorted(stubs_of[name]))])
         print("\nper-plug-in detail written to %s" % a.csv)
     return 0
 

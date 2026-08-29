@@ -407,30 +407,63 @@ static int map_image(image32 *im, const char *path)
     close(fd);
     if (f == MAP_FAILED) { perror("mmap file"); return -1; }
 
+    /* Every size below comes out of the file, so every one of them is checked
+     * against it before being used. The x86-64 loader was hardened this way
+     * and this one was not, which left the same overflow live at the width
+     * where the stakes are the same: a truncated download used to memcpy past
+     * the end of the mapping rather than say so. Both ends matter -- the
+     * source has to be inside the file and the destination inside the image. */
+#define BAD32(msg) do { fprintf(stderr, "%s\n", msg); goto bad; } while (0)
+#define FITS32(off, len) \
+    ((uint64_t)(off) + (uint64_t)(len) <= (uint64_t)st.st_size)
+
+    if ((uint64_t)st.st_size < sizeof(DOS_HDR)) BAD32("file too small for a DOS header");
     dos = (DOS_HDR *)f;
-    if (dos->e_magic != 0x5A4D) { fprintf(stderr, "not MZ\n"); return -1; }
+    if (dos->e_magic != 0x5A4D) BAD32("not MZ");
+    if (!FITS32(dos->e_lfanew, sizeof(FILE_HDR))) BAD32("e_lfanew points outside the file");
     im->fh = (FILE_HDR *)(f + dos->e_lfanew);
-    if (im->fh->Signature != 0x4550) { fprintf(stderr, "not PE\n"); return -1; }
+    if (im->fh->Signature != 0x4550) BAD32("not PE");
     if (im->fh->Machine != 0x14c) {
         fprintf(stderr, "machine 0x%x -- this loader is i386 only\n", im->fh->Machine);
-        return -1;
+        goto bad;
     }
+    if (im->fh->SizeOfOptionalHeader < sizeof(OPT_HDR32) ||
+        !FITS32(dos->e_lfanew + sizeof(FILE_HDR), im->fh->SizeOfOptionalHeader))
+        BAD32("optional header does not fit in the file");
     im->opt = (OPT_HDR32 *)((uint8_t *)im->fh + sizeof *im->fh);
-    if (im->opt->Magic != 0x10B) { fprintf(stderr, "not PE32\n"); return -1; }
+    if (im->opt->Magic != 0x10B) BAD32("not PE32");
     im->sec = (SEC_HDR *)((uint8_t *)im->opt + im->fh->SizeOfOptionalHeader);
     im->nsec = im->fh->NumberOfSections;
+    if (im->nsec > 96) BAD32("implausible section count");
+    if (!FITS32((uint8_t *)im->sec - f, (size_t)im->nsec * sizeof(SEC_HDR)))
+        BAD32("section table runs past the end of the file");
+
     im->size = im->opt->SizeOfImage;
+    if (im->size < im->opt->SizeOfHeaders || im->size > (1u << 31))
+        BAD32("implausible SizeOfImage");
 
     im->base = mmap(NULL, im->size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-    if (im->base == MAP_FAILED) { perror("mmap image"); return -1; }
+    if (im->base == MAP_FAILED) { im->base = NULL; perror("mmap image"); goto bad; }
 
+    if (!FITS32(0, im->opt->SizeOfHeaders)) BAD32("SizeOfHeaders exceeds the file");
     memcpy(im->base, f, im->opt->SizeOfHeaders);
     for (i = 0; i < im->nsec; i++) {
         SEC_HDR *s = &im->sec[i];
-        if (s->SizeOfRawData)
-            memcpy(im->base + s->VirtualAddress, f + s->PointerToRawData, s->SizeOfRawData);
+        if (!s->SizeOfRawData) continue;
+        if (!FITS32(s->PointerToRawData, s->SizeOfRawData)) {
+            fprintf(stderr, "section %d raw data runs past the end of the file "
+                            "-- truncated download?\n", i);
+            goto bad;
+        }
+        if ((uint64_t)s->VirtualAddress + s->SizeOfRawData > (uint64_t)im->size) {
+            fprintf(stderr, "section %d maps outside the image\n", i);
+            goto bad;
+        }
+        memcpy(im->base + s->VirtualAddress, f + s->PointerToRawData, s->SizeOfRawData);
     }
+#undef FITS32
+#undef BAD32
     {
         uint32_t lfanew = dos->e_lfanew;
         im->fh  = (FILE_HDR *)(im->base + lfanew);
@@ -441,6 +474,13 @@ static int map_image(image32 *im, const char *path)
     PLOG("image: %u KiB at %p (link base 0x%x)\n",
          im->size / 1024, (void *)im->base, im->opt->ImageBase);
     return 0;
+
+bad:
+    if (im->base) munmap(im->base, im->size);
+    im->base = NULL;
+    im->size = 0;
+    munmap(f, (size_t)st.st_size);
+    return -1;
 }
 
 static int apply_relocs(image32 *im)
@@ -489,11 +529,163 @@ static int protect_sections(image32 *im)
     return 0;
 }
 
+/* ------------------------------------------------- real dependency DLLs ----
+
+ * This loader had no way to load one, and that turned out to be the whole
+ * reason the four Native Instruments plugins died on i386 while the same four
+ * loaded on x86-64. They import MSVCP120.dll -- the C++ standard library, and
+ * for iostreams and locale there is no stubbing it, the objects have vtables
+ * and internal state a stub cannot fake. The 64-bit host maps Microsoft's own
+ * msvcp120.dll out of `runtime/` and binds against it. Here every one of those
+ * several hundred imports fell through to the generic stub instead, which on
+ * i386 returns 0 *and pops nothing*, so the guest stack drifted four bytes per
+ * argument until some later `ret` jumped into hand-waving: SIGSEGV at a null
+ * or near-null address, hundreds of thousands of instructions from the cause.
+ *
+ * So: the same treatment the 64-bit side gets. A dependency image is mapped,
+ * relocated, its own imports resolved -- recursively, since msvcp120 imports
+ * msvcr120 -- and DllMain run, before its exports are used to satisfy the
+ * plugin's imports. Only DLLs actually found on disk are loaded; everything
+ * else keeps the stub path exactly as before, so a host with no runtime/32
+ * directory behaves as it always did. */
+
+#define MAX_REAL_DLLS 8
+
+typedef struct {
+    char    name[64];
+    image32 im;
+    int     inited;
+} realdll;
+
+static realdll g_real[MAX_REAL_DLLS];
+static int     g_nreal;
+
+static int try_dir32(const char *dir, size_t dirlen, const char *dll,
+                     char *out, size_t n)
+{
+    char lower[64];
+    size_t i;
+
+    if (!dirlen || dirlen > n - sizeof lower - 2) return 0;
+    snprintf(out, n, "%.*s/%s", (int)dirlen, dir, dll);
+    if (access(out, R_OK) == 0) return 1;
+    for (i = 0; dll[i] && i < sizeof lower - 1; i++)
+        lower[i] = (char)tolower((unsigned char)dll[i]);
+    lower[i] = 0;
+    if (strcmp(lower, dll) == 0) return 0;
+    snprintf(out, n, "%.*s/%s", (int)dirlen, dir, lower);
+    return access(out, R_OK) == 0;
+}
+
+/* Where a 32-bit runtime DLL may be. Deliberately not the 64-bit `runtime/`:
+ * the two widths are different files with the same name, and mapping the wrong
+ * one fails much later and much less clearly than not finding it at all. */
+static int find_real_dll32(const char *dll, char *out, size_t n)
+{
+    static const char *const fallback[] = {
+        "/usr/lib/wine/i386-windows",
+        "/usr/lib32/wine/i386-windows",
+        "/usr/lib/i386-linux-gnu/wine/i386-windows",
+        "/opt/wine-stable/lib/wine/i386-windows",
+        "/usr/lib/vst-ace/runtime32",
+        NULL
+    };
+    static const char *const rel[] = {
+        "/runtime32", "/../runtime32", "/../../runtime32", NULL
+    };
+    const char *env = getenv("PELOAD_DLL_PATH");
+    int i;
+
+    if (env && *env) {
+        const char *p = env;
+        while (*p) {
+            const char *e = strchr(p, ':');
+            size_t len = e ? (size_t)(e - p) : strlen(p);
+            if (try_dir32(p, len, dll, out, n)) return 1;
+            if (!e) break;
+            p = e + 1;
+        }
+    }
+    {
+        char exe[1024];
+        ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        if (len > 0) {
+            char *slash;
+            exe[len] = 0;
+            if ((slash = strrchr(exe, '/')) != NULL) {
+                *slash = 0;
+                for (i = 0; rel[i]; i++) {
+                    char dir[1200];
+                    snprintf(dir, sizeof dir, "%s%s", exe, rel[i]);
+                    if (try_dir32(dir, strlen(dir), dll, out, n)) return 1;
+                }
+            }
+        }
+    }
+    for (i = 0; fallback[i]; i++)
+        if (try_dir32(fallback[i], strlen(fallback[i]), dll, out, n)) return 1;
+    return 0;
+}
+
+static int resolve_imports(image32 *im);      /* mutually recursive with below */
+static void *find_export(image32 *im, const char *want);
+static int protect_sections(image32 *im);
+
+/* Load one dependency by name, or hand back the one already loaded. NULL means
+ * "not available", which is not an error: the caller falls back to stubs. */
+static realdll *real_dll_get(const char *dll)
+{
+    char path[1200];
+    realdll *r;
+    int i;
+
+    for (i = 0; i < g_nreal; i++)
+        if (!strcasecmp(g_real[i].name, dll)) return &g_real[i];
+    if (g_nreal >= MAX_REAL_DLLS) return NULL;
+    if (!find_real_dll32(dll, path, sizeof path)) return NULL;
+
+    r = &g_real[g_nreal];
+    snprintf(r->name, sizeof r->name, "%s", dll);
+    /* Claim the slot before loading: this recurses through resolve_imports,
+     * and a cycle has to find the half-built entry rather than start again. */
+    g_nreal++;
+
+    if (map_image(&r->im, path) != 0) { g_nreal--; return NULL; }
+    PLOG("real dll: %s from %s\n", dll, path);
+    /* apply_relocs returns the number it applied, and negative for failure. */
+    if (apply_relocs(&r->im) < 0) { g_nreal--; return NULL; }
+    resolve_imports(&r->im);
+    protect_sections(&r->im);
+
+    /* DllMain with DLL_PROCESS_ATTACH. msvcp120's static constructors -- the
+     * locale tables among them -- run here, and skipping it leaves every one
+     * of those objects unconstructed. */
+    if (r->im.opt->AddressOfEntryPoint) {
+        int32_t WINAPI_ (*dllmain)(void *, uint32_t, void *) =
+            (int32_t WINAPI_ (*)(void *, uint32_t, void *))
+            (r->im.base + r->im.opt->AddressOfEntryPoint);
+        dllmain(r->im.base, 1, NULL);
+        r->inited = 1;
+    }
+    return r;
+}
+
+static void *real_dll_export(const char *dll, const char *sym)
+{
+    realdll *r = real_dll_get(dll);
+    if (!r) return NULL;
+    /* An ordinal import against a real DLL is not resolved here: the plugins
+     * that need this import by name, and by-ordinal would mean walking the
+     * export table's ordinal base rather than its name array. */
+    if (!strncmp(sym, "ordinal#", 8)) return NULL;
+    return find_export(&r->im, sym);
+}
+
 static int resolve_imports(image32 *im)
 {
     DATA_DIR d = im->opt->DataDirectory[DIR_IMPORT];
     IMP_DESC *desc;
-    int resolved = 0, stubbed = 0;
+    int resolved = 0, stubbed = 0, fromreal = 0;
 
     if (!d.VirtualAddress) return 0;
     for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
@@ -514,6 +706,11 @@ static int resolve_imports(image32 *im)
             }
             fn = winstub_lookup(dll, sym);
             if (fn) resolved++;
+            /* A real DLL on disk beats a stub every time: it is the actual
+             * implementation, vtables and all. Only reached for symbols this
+             * host does not implement itself, so nothing that worked before
+             * changes hands. */
+            else if ((fn = real_dll_export(dll, sym)) != NULL) fromreal++;
             else {
                 if (g_nimp < MAX_IMPORTS) {
                     snprintf(g_imp[g_nimp].dll, sizeof g_imp[0].dll, "%s", dll);
@@ -527,7 +724,8 @@ static int resolve_imports(image32 *im)
         }
     }
     g_nresolved = resolved;
-    PLOG("imports: %d implemented, %d stubbed\n", resolved, stubbed);
+    PLOG("imports: %d implemented, %d from real DLLs, %d stubbed\n",
+         resolved, fromreal, stubbed);
     return 0;
 }
 

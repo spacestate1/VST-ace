@@ -1079,7 +1079,42 @@ the realistic case:
   VST3 API against a Mach-O image yet -- the two halves exist separately.
 - **SEH.** `__try` regions work only insofar as nothing throws; real unwinding
   means parsing `.pdata`/`.xdata`.
+- **A 32-bit C++ runtime, to go with the 32-bit loader.** `peload32` can load
+  real dependency DLLs now -- it could not before, which is the whole reason
+  the four Native Instruments plugins crashed on i386 while the same four
+  loaded on x86-64. They import several hundred `MSVCP120` iostream and locale
+  symbols, and there is no stubbing those: the objects have vtables and
+  internal state. With a runtime present the loader binds 190 of them and the
+  imports left on the generic stub drop from 313 to 16.
 
-Plugins that write settings do so through the file stubs without path
-translation, which is why `\FullBucketMusic\*.ini` appears in the working
-directory — backslashes and all — rather than under a mapped `%APPDATA%`.
+  What is still needed is the file. `runtime/` holds Microsoft's own x86-64
+  `msvcp120.dll`; `runtime32/` is where the i386 pair goes, from the same
+  place -- the Visual C++ 2013 redistributable, x86. Wine's builds of those
+  DLLs are *not* a substitute: they are compiled against Wine's own `ntdll`
+  and reach for far more of it than the four `__wine_dbg_*` entry points this
+  host now answers. They load, bind, and then fault inside their own startup.
+
+## Settings, and the paths they are written through
+
+Plugins that keep settings in an `.ini` file now get a real
+`GetPrivateProfileString`/`WritePrivateProfileString` and the section calls
+beside them, anchored under this host's own tree rather than resolved against a
+Windows directory that does not exist. Before that the whole family was
+unimplemented, so every read returned the generic stub's 0 and every write went
+nowhere: `stigma64` and `sixtraq64` started from defaults every session and
+nothing said why.
+
+The paths themselves survive a round trip through a guest's own path handling
+now, which they did not. The host hands out real POSIX paths, and a plugin that
+runs one through Windows path rules -- where a leading `/` means "the root of
+the current drive" -- hands back something the filesystem cannot use. Both
+directions turned up in this corpus, from the one cause:
+
+    Kontakt        C:/home/you/.peload/AppData/Local/Native Instruments/...
+    FM8, Absynth     home/you/.peload/Documents/Native Instruments/FM8/Sounds
+
+The first is the path re-anchored against a drive that does not exist; the
+second is the same path with its root marker eaten, which is why a second
+settings tree used to appear in the working directory beside the real one.
+`path_norm_n` undoes both, and only for this host's own data root -- a relative
+path a plugin chose for itself is still its own business.

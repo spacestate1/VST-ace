@@ -208,13 +208,182 @@ static int      g_nresolved;      /* imports satisfied by a real stub */
 static uint8_t *g_tramp;          /* the arena being filled */
 static size_t   g_tramp_left;     /* bytes still free in it */
 
+/* What a stub should hand back when it cannot do the thing.
+ *
+ * Returning 0 is the obvious choice and it is wrong for a large part of this
+ * surface, because 0 is the *success* value across several Windows return
+ * conventions. The generic stub was therefore not saying "this did not
+ * happen"; for those symbols it was affirmatively claiming it had. Measured
+ * cases from the corpus here:
+ *
+ *   _waccess           0 means "the file is there and you may read it"
+ *   _wopen             0 is a valid descriptor -- specifically stdin
+ *   GetIfTable         0 is NO_ERROR, over a table the caller never had filled
+ *   CoGetObject        0 is S_OK, over an interface pointer left uninitialised
+ *
+ * Each of those sends the caller down its success path holding nothing, which
+ * is strictly worse than an error it would have handled: NI Kontakt asked
+ * whether its library existed, was told yes, opened it, got stdin, and read
+ * silence out of it.
+ *
+ * The rule is only ever applied to symbols nobody has implemented -- a real
+ * stub in g_stubs[] never reaches here -- so the worst case is a plugin taking
+ * an error path for a call that was never going to work anyway.
+ *
+ * Two prefix rules cover whole families where the convention is unambiguous,
+ * and the table names the individual symbols worth being sure about. Anything
+ * not matched keeps the old 0, which remains right for the great majority:
+ * handle- and pointer-returning calls, BOOLs, and counts. */
+
+typedef struct { const char *dll, *sym; uint64_t val; } failval;
+
+#define FV_ENOTIMPL   0x80004001ull   /* E_NOTIMPL, for HRESULT */
+#define FV_NOTIMPL    120ull          /* ERROR_CALL_NOT_IMPLEMENTED, Win32 codes */
+#define FV_STATUS     0xC0000002ull   /* STATUS_NOT_IMPLEMENTED, NTSTATUS */
+#define FV_MINUS1     0xFFFFFFFFFFFFFFFFull
+
+static const failval g_failvals[] = {
+    /* CRT: 0 is success, or a descriptor. -1 is the failure both report. */
+    { "msvcrt.dll", "_access",    FV_MINUS1 },
+    { "msvcrt.dll", "_waccess",   FV_MINUS1 },
+    { "msvcrt.dll", "_open",      FV_MINUS1 },
+    { "msvcrt.dll", "_wopen",     FV_MINUS1 },
+    { "msvcrt.dll", "_sopen",     FV_MINUS1 },
+    { "msvcrt.dll", "_wsopen",    FV_MINUS1 },
+    { "msvcrt.dll", "_sopen_s",   FV_MINUS1 },
+    { "msvcrt.dll", "_creat",     FV_MINUS1 },
+    { "msvcrt.dll", "_dup",       FV_MINUS1 },
+    { "msvcrt.dll", "_fileno",    FV_MINUS1 },
+    { "msvcrt.dll", "_chdir",     FV_MINUS1 },
+    { "msvcrt.dll", "_wchdir",    FV_MINUS1 },
+    { "msvcrt.dll", "_rmdir",     FV_MINUS1 },
+    { "msvcrt.dll", "_wrmdir",    FV_MINUS1 },
+    { "msvcrt.dll", "_chmod",     FV_MINUS1 },
+    { "msvcrt.dll", "_wchmod",    FV_MINUS1 },
+    { "msvcrt.dll", "_stat",      FV_MINUS1 },
+    { "msvcrt.dll", "_stat32",    FV_MINUS1 },
+    { "msvcrt.dll", "_stat64",    FV_MINUS1 },
+    { "msvcrt.dll", "_wstat",     FV_MINUS1 },
+    { "msvcrt.dll", "_wstat32",   FV_MINUS1 },
+    { "msvcrt.dll", "_wstat64",   FV_MINUS1 },
+    { "msvcrt.dll", "_fstat",     FV_MINUS1 },
+    { "msvcrt.dll", "_fstat64",   FV_MINUS1 },
+    { "msvcrt.dll", "_setmode",   FV_MINUS1 },
+    { "msvcrt.dll", "_locking",   FV_MINUS1 },
+    { "msvcrt.dll", "_commit",    FV_MINUS1 },
+    { "msvcrt.dll", "_chsize",    FV_MINUS1 },
+    { "msvcrt.dll", "_lseek",     FV_MINUS1 },
+    { "msvcrt.dll", "_lseeki64",  FV_MINUS1 },
+    { "msvcrt.dll", "_telli64",   FV_MINUS1 },
+    { "msvcrt.dll", "_read",      FV_MINUS1 },
+    { "msvcrt.dll", "_write",     FV_MINUS1 },
+    { "msvcrt.dll", "fseek",      FV_MINUS1 },
+    { "msvcrt.dll", "ftell",      FV_MINUS1 },
+    { "msvcrt.dll", "fclose",     FV_MINUS1 },
+    { "msvcrt.dll", "fflush",     FV_MINUS1 },
+    { "msvcrt.dll", "remove",     FV_MINUS1 },
+    { "msvcrt.dll", "rename",     FV_MINUS1 },
+    { "msvcrt.dll", "_unlink",    FV_MINUS1 },
+    { "msvcrt.dll", "_wunlink",   FV_MINUS1 },
+    { "msvcrt.dll", "_mkdir",     FV_MINUS1 },
+    { "msvcrt.dll", "_wmkdir",    FV_MINUS1 },
+    { "msvcrt.dll", "system",     FV_MINUS1 },
+    { "msvcrt.dll", "_wsystem",   FV_MINUS1 },
+    { "msvcrt.dll", "_putenv",    FV_MINUS1 },
+    { "msvcrt.dll", "_wputenv",   FV_MINUS1 },
+
+    /* COM and the shell: HRESULT, where 0 is S_OK and the out-parameter the
+     * caller is about to dereference was never written. */
+    { "ole32.dll",    "CoGetObject",              FV_ENOTIMPL },
+    { "ole32.dll",    "CoCreateInstance",         FV_ENOTIMPL },
+    { "ole32.dll",    "CoCreateInstanceEx",       FV_ENOTIMPL },
+    { "ole32.dll",    "CoGetClassObject",         FV_ENOTIMPL },
+    { "ole32.dll",    "CoGetMalloc",              FV_ENOTIMPL },
+    { "ole32.dll",    "CoCreateGuid",             FV_ENOTIMPL },
+    { "ole32.dll",    "CLSIDFromString",          FV_ENOTIMPL },
+    { "ole32.dll",    "CLSIDFromProgID",          FV_ENOTIMPL },
+    { "ole32.dll",    "IIDFromString",            FV_ENOTIMPL },
+    { "ole32.dll",    "StringFromCLSID",          FV_ENOTIMPL },
+    { "ole32.dll",    "OleInitialize",            FV_ENOTIMPL },
+    { "ole32.dll",    "StgOpenStorage",           FV_ENOTIMPL },
+    { "ole32.dll",    "StgCreateDocfile",         FV_ENOTIMPL },
+    { "oleaut32.dll", "VariantChangeType",        FV_ENOTIMPL },
+    { "shell32.dll",  "SHGetKnownFolderPath",     FV_ENOTIMPL },
+    { "shell32.dll",  "SHCreateItemFromParsingName", FV_ENOTIMPL },
+    { "shlwapi.dll",  "UrlCreateFromPathW",       FV_ENOTIMPL },
+    { "shlwapi.dll",  "UrlCreateFromPathA",       FV_ENOTIMPL },
+    { "shlwapi.dll",  "SHGetValueW",              FV_NOTIMPL  },
+    { "shlwapi.dll",  "SHGetValueA",              FV_NOTIMPL  },
+
+    /* The IP helper: Win32 error codes, 0 being NO_ERROR. GetIfTable is the
+     * one every failing plugin here imports -- it is how a licence binds to a
+     * machine, and answering NO_ERROR over an unwritten table invites the
+     * caller to fingerprint uninitialised stack. */
+    { "iphlpapi.dll", "GetIfTable",           FV_NOTIMPL },
+    { "iphlpapi.dll", "GetIfTable2",          FV_NOTIMPL },
+    { "iphlpapi.dll", "GetIfEntry",           FV_NOTIMPL },
+    { "iphlpapi.dll", "GetAdaptersInfo",      FV_NOTIMPL },
+    { "iphlpapi.dll", "GetAdaptersAddresses", FV_NOTIMPL },
+    { "iphlpapi.dll", "GetIpAddrTable",       FV_NOTIMPL },
+    { "iphlpapi.dll", "GetNetworkParams",     FV_NOTIMPL },
+    { "iphlpapi.dll", "GetIpForwardTable",    FV_NOTIMPL },
+
+    /* Registry and service calls in advapi32 also report Win32 codes. */
+    { "advapi32.dll", "RegCreateKeyExW",  FV_NOTIMPL },
+    { "advapi32.dll", "RegCreateKeyExA",  FV_NOTIMPL },
+    { "advapi32.dll", "RegSetValueExW",   FV_NOTIMPL },
+    { "advapi32.dll", "RegSetValueExA",   FV_NOTIMPL },
+    { "advapi32.dll", "RegDeleteKeyW",    FV_NOTIMPL },
+    { "advapi32.dll", "RegDeleteValueW",  FV_NOTIMPL },
+    { "advapi32.dll", "RegEnumKeyExW",    FV_NOTIMPL },
+    { "advapi32.dll", "RegEnumValueW",    FV_NOTIMPL },
+    { "advapi32.dll", "RegQueryInfoKeyW", FV_NOTIMPL },
+
+    { NULL, NULL, 0 }
+};
+
+/* ntdll's Nt/Zw entry points all return NTSTATUS, where 0 is STATUS_SUCCESS.
+ * The family is large and uniform, so it is matched by prefix rather than
+ * listed. Rtl* is deliberately not: those return every convention there is. */
+static int ntdll_status_call(const char *dll, const char *sym)
+{
+    if (strcasecmp(dll, "ntdll.dll") != 0) return 0;
+    if ((sym[0] == 'N' && sym[1] == 't') || (sym[0] == 'Z' && sym[1] == 'w'))
+        return sym[2] >= 'A' && sym[2] <= 'Z';
+    return 0;
+}
+
+static uint64_t stub_failure_value(const char *dll, const char *sym)
+{
+    int i;
+    for (i = 0; g_failvals[i].sym; i++)
+        if (!strcasecmp(g_failvals[i].dll, dll) && !strcmp(g_failvals[i].sym, sym))
+            return g_failvals[i].val;
+    /* The CRT is reached under several names -- msvcrt, msvcr120, msvcr100 --
+     * and the table spells it once. Match on the family instead of the file. */
+    if (!strncasecmp(dll, "msvcr", 5) || !strncasecmp(dll, "msvcrt", 6))
+        for (i = 0; g_failvals[i].sym; i++)
+            if (!strcasecmp(g_failvals[i].dll, "msvcrt.dll") &&
+                !strcmp(g_failvals[i].sym, sym))
+                return g_failvals[i].val;
+    if (ntdll_status_call(dll, sym)) return FV_STATUS;
+    return 0;
+}
+
 static MS uint64_t missing_import(uint32_t idx)
 {
-    if (idx < (uint32_t)g_nimp) {
-        if (g_imp[idx].calls++ == 0 && pe_verbose())
-            fprintf(stderr, "  [stub] %s!%s\n", g_imp[idx].dll, g_imp[idx].sym);
+    uint64_t v;
+    if (idx >= (uint32_t)g_nimp) return 0;
+    v = stub_failure_value(g_imp[idx].dll, g_imp[idx].sym);
+    if (g_imp[idx].calls++ == 0 && pe_verbose()) {
+        fprintf(stderr, "  [stub] %s!%s", g_imp[idx].dll, g_imp[idx].sym);
+        /* Naming the value matters when it is not zero: it is the difference
+         * between the caller taking its error path and the caller believing
+         * the call worked. */
+        if (v) fprintf(stderr, " -> 0x%llx (failure)", (unsigned long long)v);
+        fputc('\n', stderr);
     }
-    return 0;
+    return v;
 }
 
 /* Emit a tiny MS-ABI stub: reserve shadow space, pass idx as arg1, call the
@@ -471,6 +640,29 @@ static int try_dir(const char *dir, size_t dirlen, const char *dll,
 
 static int find_real_dll(const char *dll, char *out, size_t n)
 {
+    /* Width matters here and nothing was checking it. A real runtime DLL is an
+     * ordinary PE and the loader will map whichever one it is handed, so the
+     * two widths get separate directories rather than sharing `runtime/` and
+     * hoping. peload32 looked only where the 64-bit runtime lives, found no
+     * 32-bit msvcp120.dll -- there is no such thing in an x86_64-windows
+     * directory -- and every one of MSVCP120's iostream and locale imports
+     * fell through to the generic stub. On i386 that stub returns 0 and pops
+     * nothing, so the stack drifted four bytes per argument until a later ret
+     * jumped into nothing: all four Native Instruments plugins died of it with
+     * SIGSEGV on a null or near-null address, while the same four loaded on
+     * x86-64. */
+#ifdef __i386__
+    static const char *const fallback[] = {
+        "/usr/lib/wine/i386-windows",
+        "/usr/lib32/wine/i386-windows",
+        "/usr/lib/i386-linux-gnu/wine/i386-windows",
+        "/opt/wine-stable/lib/wine/i386-windows",
+        NULL
+    };
+    static const char *const runtime_dirs[] = {
+        "/runtime32", "/../runtime32", "/../../runtime32", "", NULL
+    };
+#else
     static const char *const fallback[] = {
         "/usr/lib/wine/x86_64-windows",
         "/usr/lib64/wine/x86_64-windows",
@@ -478,6 +670,10 @@ static int find_real_dll(const char *dll, char *out, size_t n)
         "/opt/wine-stable/lib/wine/x86_64-windows",
         NULL
     };
+    static const char *const runtime_dirs[] = {
+        "/runtime", "/../runtime", "/../../runtime", "", NULL
+    };
+#endif
     const char *env = getenv("PELOAD_DLL_PATH");
     int i;
 
@@ -507,9 +703,7 @@ static int find_real_dll(const char *dll, char *out, size_t n)
         char exe[1024];
         ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
         if (len > 0) {
-            static const char *const rel[] = {
-                "/runtime", "/../runtime", "/../../runtime", "", NULL
-            };
+            const char *const *rel = runtime_dirs;
             char *slash;
             exe[len] = 0;
             if ((slash = strrchr(exe, '/')) != NULL) {
