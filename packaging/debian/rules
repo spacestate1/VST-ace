@@ -87,7 +87,7 @@ override_dh_auto_install:
 	install -D -m 0755 $(BUILD_PELOAD)/peserve  $(DESTDIR)$(PKGLIBDIR)/peserve
 	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
 	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
-	install -D -m 0755 c/build/dw               $(DESTDIR)/usr/bin/dw
+	install -D -m 0755 c/build/va               $(DESTDIR)/usr/bin/va
 # The drop-in directories for real Microsoft runtime DLLs, created empty and
 # owned by the package. They cannot be shipped filled -- the redistributable is
 # not ours to hand on -- but the search is relative to the installed binaries,
@@ -122,7 +122,7 @@ override_dh_auto_install:
 	    $(DESTDIR)/usr/share/applications/pestudio.desktop
 	install -D -m 0644 packaging/dwstudio.desktop \
 	    $(DESTDIR)/usr/share/applications/dwstudio.desktop
-	for m in dw peload pestudio dwstudio; do \
+	for m in va peload pestudio dwstudio; do \
 	    install -D -m 0644 packaging/$$m.1 \
 	        $(DESTDIR)/usr/share/man/man1/$$m.1; \
 	done

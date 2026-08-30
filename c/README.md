@@ -1,36 +1,36 @@
 # The FB-7999 toolchain in C
 
-`make` builds all of it. The one to run is `../dw`:
+`make` builds all of it. The one to run is `../va`:
 
 | | needs | does |
 |---|---|---|
-| `../dw`           | + ALSA     | **the launcher** — the engine, the plugin hosts, everything below |
+| `../va`           | + ALSA     | **the launcher** — the engine, the plugin hosts, everything below |
 | `build/fbextract` | libc, libm | pulls resources, wavetables and preset banks out of the plugin |
 | `build/dwrender`  | libc, libm | renders presets to WAV through a DW-8000 engine |
 | `build/dwplay`    | + ALSA     | plays that engine live from a MIDI or computer keyboard |
 
-`dwplay` is skipped automatically if ALSA is not installed, and `dw` is built
+`dwplay` is skipped automatically if ALSA is not installed, and `va` is built
 without its live and playback commands; the rest still builds.
 
-`dw` is not a wrapper around the three below — it links the same objects, so
+`va` is not a wrapper around the three below — it links the same objects, so
 `list`, `play`, `demo`, `render` and the live keyboard all happen in its own
 process. The single-purpose programs stay because they are useful on their own
 and because their arguments are what the notes in this directory quote.
 
 ## Playing it
 
-`../dw` finds the plugin and the banks itself, from any working directory —
+`../va` finds the plugin and the banks itself, from any working directory —
 the wavetable and all three preset banks are read straight out of the plugin's
 resources, so nothing has to be extracted first:
 
 ```bash
-../dw                    # play the keyboard (the default)
-../dw demo               # a tour of the factory presets
-../dw play "slap bass"   # one preset, by name or index
-../dw list               # the bank's 64 programs
-../dw render out/        # the whole bank to WAVs
-../dw gui                # the GTK window
-../dw pe                 # the Qt plugin host, with each plugin's own editor
+../va                    # play the keyboard (the default)
+../va demo               # a tour of the factory presets
+../va play "slap bass"   # one preset, by name or index
+../va list               # the bank's 64 programs
+../va render out/        # the whole bank to WAVs
+../va gui                # the GTK window
+../va pe                 # the Qt plugin host, with each plugin's own editor
 ```
 
 `dwplay -o capture.wav` records everything played. That exists mainly as a test

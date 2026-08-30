@@ -1,4 +1,4 @@
-/* dw -- one program for the whole tree.
+/* va -- one program for the whole tree.
  *
  * This replaces dw.sh. The shell version had grown into a launcher that
  * located the plugin, extracted its resources if they were missing, ran make,
@@ -51,7 +51,7 @@
 /* An installed copy has no source tree to find: the package build puts the
  * helper programs in one directory and the data in another, and defines these
  * to say where. A source build leaves them empty, and every installed path
- * below is then unreachable -- `dw` behaves exactly as it always has. */
+ * below is then unreachable -- `va` behaves exactly as it always has. */
 #ifndef DW_PKGLIBDIR
 #define DW_PKGLIBDIR ""
 #endif
@@ -77,7 +77,7 @@ static int is_file(const char *p)
  * corpus is not something a package could ship in any case -- the plug-ins are
  * their authors' own. So it is named by VST_ROOT, or looked for at ~/vst,
  * which is the same layout one directory further down. Nothing here is fatal:
- * an unset corpus only means bare plug-in names do not expand and `dw peload`
+ * an unset corpus only means bare plug-in names do not expand and `va peload`
  * with no arguments has nothing to list. */
 static void corpus_root(char *out, size_t n)
 {
@@ -96,7 +96,7 @@ static void corpus_root(char *out, size_t n)
 /* Find the tree from the executable rather than the working directory -- the
  * point of a single binary is that it runs from anywhere, including a copy on
  * $PATH. Walking up looking for peload/pehost.c finds `re` whether this was
- * started as re/dw or as re/c/build/dw, and does not mistake a build directory
+ * started as re/va or as re/c/build/va, and does not mistake a build directory
  * for the top of the tree the way a bare `c/` test would. */
 static int locate_tree(void)
 {
@@ -105,7 +105,7 @@ static int locate_tree(void)
     char *slash;
     int   up;
 
-    if (n <= 0) { fprintf(stderr, "dw: cannot read /proc/self/exe\n"); return -1; }
+    if (n <= 0) { fprintf(stderr, "va: cannot read /proc/self/exe\n"); return -1; }
     exe[n] = 0;
 
     for (up = 0; up < 8; up++) {
@@ -139,7 +139,7 @@ static int locate_tree(void)
         }
     }
 
-    fprintf(stderr, "dw: cannot find the tree from %s -- expected a peload/ "
+    fprintf(stderr, "va: cannot find the tree from %s -- expected a peload/ "
                     "directory above it\n", exe);
     return -1;
 }
@@ -200,7 +200,7 @@ static unsigned char *rom_get(const romsrc *r, const char *type,
 
 static void rom_complain(const romsrc *r, const char *type, const char *name)
 {
-    fprintf(stderr, "dw: cannot find %s/%s.\n", type, name);
+    fprintf(stderr, "va: cannot find %s/%s.\n", type, name);
     if (!r->plugin[0])
         fprintf(stderr, "    No plugin at %s/windows/VST2-64/fb799964.dll "
                         "(set FB7999 to point at one).\n", g_vst);
@@ -218,7 +218,7 @@ static const char *bank_resource_type(void)
     if (!strcasecmp(b, "A")) return "BANK_A";
     if (!strcasecmp(b, "B")) return "BANK_B";
     if (!strcmp(b, "6000") || !strcasecmp(b, "DW6000")) return "PROG6000";
-    fprintf(stderr, "dw: BANK must be A, B or 6000 (got '%s')\n", b);
+    fprintf(stderr, "va: BANK must be A, B or 6000 (got '%s')\n", b);
     exit(2);
 }
 
@@ -268,15 +268,15 @@ static int engine_load(engine *e)
 static int engine_build(engine *e)
 {
     if (wavedst_load(&e->wd, e->wraw, e->wsize, 0)) {
-        fprintf(stderr, "dw: could not determine WAVEDST geometry\n");
+        fprintf(stderr, "va: could not determine WAVEDST geometry\n");
         return -1;
     }
     if (dw_wavetable_build(&e->wt, &e->wd, SR)) {
-        fprintf(stderr, "dw: could not build the mip tables\n");
+        fprintf(stderr, "va: could not build the mip tables\n");
         return -1;
     }
     if (dw_synth_init(&e->syn, &e->wt, SR)) {
-        fprintf(stderr, "dw: synth init failed\n");
+        fprintf(stderr, "va: synth init failed\n");
         return -1;
     }
     e->have_engine = 1;
@@ -352,7 +352,7 @@ static int run(char *const argv[])
     if (pid < 0) { perror("fork"); return -1; }
     if (pid == 0) {
         execvp(argv[0], argv);
-        fprintf(stderr, "dw: cannot run %s: %s\n", argv[0], strerror(errno));
+        fprintf(stderr, "va: cannot run %s: %s\n", argv[0], strerror(errno));
         _exit(127);
     }
     if (waitpid(pid, &status, 0) < 0) return -1;
@@ -423,18 +423,18 @@ static int exec_tool(const char *srcdir, const char *target, int argc,
          * output that does not exist. */
         snprintf(path, sizeof path, "%s/%s", DW_PKGLIBDIR, target);
         if (!is_file(path)) {
-            fprintf(stderr, "dw: %s is missing from %s -- this is an installed "
+            fprintf(stderr, "va: %s is missing from %s -- this is an installed "
                             "copy and it should be there\n", target, DW_PKGLIBDIR);
             return 1;
         }
     } else {
         if (cmake_build(srcdir, target)) {
-            fprintf(stderr, "dw: %s failed to build\n", target);
+            fprintf(stderr, "va: %s failed to build\n", target);
             return 1;
         }
         snprintf(path, sizeof path, "%s/build/%s", srcdir, target);
         if (!is_file(path)) {
-            fprintf(stderr, "dw: %s was not built -- see the cmake output above "
+            fprintf(stderr, "va: %s was not built -- see the cmake output above "
                             "for the dependency it is missing\n", target);
             return 1;
         }
@@ -447,7 +447,7 @@ static int exec_tool(const char *srcdir, const char *target, int argc,
     av[n] = NULL;
 
     execv(path, av);
-    fprintf(stderr, "dw: cannot run %s: %s\n", path, strerror(errno));
+    fprintf(stderr, "va: cannot run %s: %s\n", path, strerror(errno));
     return 1;
 }
 
@@ -511,7 +511,7 @@ static int pkg_exists(const char *module)
 }
 
 /* Built already, or buildable. The binary settles it when it is there;
- * otherwise ask whether the toolkit is installed, since `dw` builds before it
+ * otherwise ask whether the toolkit is installed, since `va` builds before it
  * launches anyway and a missing Qt or GTK is what would stop it. */
 static int have_gui(guikind k)
 {
@@ -567,7 +567,7 @@ static guikind pick_gui(const char **why)
         if (has_ci(want, "gtk") || !strcasecmp(want, "gui") || !strcasecmp(want, "dwstudio")) {
             *why = "DW_GUI"; return GUI_GTK;
         }
-        fprintf(stderr, "dw: DW_GUI should be qt or gtk (got '%s') -- detecting instead\n", want);
+        fprintf(stderr, "va: DW_GUI should be qt or gtk (got '%s') -- detecting instead\n", want);
     }
 
     qt  = have_gui(GUI_QT);
@@ -641,7 +641,7 @@ static int cmd_play(const char *sel)
 
     if (engine_open(&e)) goto done;
     if ((n = bank_find(&e.bk, sel)) < 0) {
-        fprintf(stderr, "dw: no program matching '%s'\n", sel);
+        fprintf(stderr, "va: no program matching '%s'\n", sel);
         goto done;
     }
     printf("program %d: %s\n", n, e.bk.prog[n].name);
@@ -707,7 +707,7 @@ static int cmd_live(const char *sel)
     memset(&o, 0, sizeof o);
     if (sel && *sel) {
         int n = bank_find(&e.bk, sel);
-        if (n < 0) { fprintf(stderr, "dw: no program matching '%s'\n", sel); goto done; }
+        if (n < 0) { fprintf(stderr, "va: no program matching '%s'\n", sel); goto done; }
         o.program = n;
     }
     o.wavedst       = e.wraw;
@@ -725,9 +725,9 @@ done:
 
 static int no_audio(const char *what)
 {
-    fprintf(stderr, "dw: `%s` needs audio, and this build has none -- ALSA was "
+    fprintf(stderr, "va: `%s` needs audio, and this build has none -- ALSA was "
                     "missing when it was compiled.\n"
-                    "    Install alsa-lib and rebuild (`dw build`, or make -C c).\n", what);
+                    "    Install alsa-lib and rebuild (`va build`, or make -C c).\n", what);
     return 1;
 }
 static int cmd_play(const char *sel) { (void)sel; return no_audio("play"); }
@@ -739,30 +739,30 @@ static int cmd_live(const char *sel) { (void)sel; return no_audio("live"); }
 static void usage(void)
 {
     printf(
-"dw -- the DW-8000 engine and the native plug-in hosts, in one program.\n"
+"va -- the DW-8000 engine and the native plug-in hosts, in one program.\n"
 "\n"
-"  dw                      open a window -- pestudio if this box has Qt6,\n"
+"  va                      open a window -- pestudio if this box has Qt6,\n"
 "                          dwstudio if it has GTK4, the one matching the\n"
 "                          desktop if it has both\n"
-"  dw --qt / dw --gtk      force one or the other (so does DW_GUI=qt|gtk)\n"
+"  va --qt / va --gtk      force one or the other (so does DW_GUI=qt|gtk)\n"
 "\n"
-"  dw live                 play live (MIDI controller and/or computer keyboard)\n"
-"  dw play <preset>        play one preset, by index or part of its name\n"
-"  dw demo                 a short tour of the factory presets\n"
-"  dw list                 list the current bank's programs\n"
-"  dw render <dir>         render the whole bank to <dir>\n"
-"  dw keys                 the note map, and what this terminal does with a\n"
+"  va live                 play live (MIDI controller and/or computer keyboard)\n"
+"  va play <preset>        play one preset, by index or part of its name\n"
+"  va demo                 a short tour of the factory presets\n"
+"  va list                 list the current bank's programs\n"
+"  va render <dir>         render the whole bank to <dir>\n"
+"  va keys                 the note map, and what this terminal does with a\n"
 "                          held key\n"
 "\n"
-"  dw gui                  GTK4 window: instruments, patches, drums, Juno panel\n"
-"  dw pe [dir|bank.json]   Qt6 window: load and play real plug-ins natively,\n"
+"  va gui                  GTK4 window: instruments, patches, drums, Juno panel\n"
+"  va pe [dir|bank.json]   Qt6 window: load and play real plug-ins natively,\n"
 "                          no Wine -- Windows VST2 and VST3 at both widths,\n"
 "                          native Linux VST3, and each plug-in's own GUI\n"
-"  dw peload <plug>        the same hosts from the command line: --params,\n"
+"  va peload <plug>        the same hosts from the command line: --params,\n"
 "                          --render out.wav, --patch/--pick, --detect, --as\n"
-"  dw peload32 <plug>      the i386 loader, for 32-bit Windows builds:\n"
+"  va peload32 <plug>      the i386 loader, for 32-bit Windows builds:\n"
 "                          --render, --play, --editor\n"
-"  dw build                rebuild everything, both windows included\n"
+"  va build                rebuild everything, both windows included\n"
 "\n"
 "Bank: BANK=A (default), B, or 6000.  Note and timing: NOTE, GATE, LEN.\n"
 "The wavetable and banks are read out of the plug-in itself; set FB7999 to\n"
@@ -793,12 +793,12 @@ int main(int argc, char **argv)
         case GUI_GTK: cmd = "gui"; break;
         default:
             fprintf(stderr,
-                "dw: no GUI available -- pestudio needs Qt6, dwstudio needs GTK4,\n"
+                "va: no GUI available -- pestudio needs Qt6, dwstudio needs GTK4,\n"
                 "    and neither is installed. The command line still works:\n"
-                "    `dw list`, `dw play <preset>`, `dw render <dir>`, `dw live`.\n");
+                "    `va list`, `va play <preset>`, `va render <dir>`, `va live`.\n");
             return 1;
         }
-        fprintf(stderr, "dw: opening %s (%s; --qt / --gtk to choose, `dw help` "
+        fprintf(stderr, "va: opening %s (%s; --qt / --gtk to choose, `va help` "
                         "for the rest)\n",
                 !strcmp(cmd, "pe") ? "pestudio" : "dwstudio", why);
     }
@@ -848,7 +848,7 @@ int main(int argc, char **argv)
         const char *sub = is32 ? "windows/VST2-32" : "windows/VST2-64";
         snprintf(dir, sizeof dir, "%s/peload", g_re);
         if (argc == 0) {
-            printf("usage: dw %s <plugin> [options] -- run `dw %s --help` for the "
+            printf("usage: dw %s <plugin> [options] -- run `va %s --help` for the "
                    "full list\n", cmd, cmd);
             list_corpus(sub);
             return 0;
@@ -862,7 +862,7 @@ int main(int argc, char **argv)
         int   rc, failed = 0;
 
         if (g_installed) {
-            fprintf(stderr, "dw: this is an installed copy -- there are no "
+            fprintf(stderr, "va: this is an installed copy -- there are no "
                             "sources here to build. Build from a checkout of "
                             "the tree instead.\n");
             return 1;
@@ -876,12 +876,12 @@ int main(int argc, char **argv)
          * which is the point of doing them separately. */
         snprintf(dir,  sizeof dir,  "%s/peload", g_re);
         snprintf(gdir, sizeof gdir, "%s/gui", g_re);
-        if (cmake_build(dir, "all"))       { fprintf(stderr, "dw: peload failed to build\n");   failed = 1; }
-        if (cmake_build(gdir, "dwstudio")) { fprintf(stderr, "dw: dwstudio failed to build\n"); failed = 1; }
+        if (cmake_build(dir, "all"))       { fprintf(stderr, "va: peload failed to build\n");   failed = 1; }
+        if (cmake_build(gdir, "dwstudio")) { fprintf(stderr, "va: dwstudio failed to build\n"); failed = 1; }
         return failed;
     }
 
-    fprintf(stderr, "dw: unknown command '%s'\n\n", cmd);
+    fprintf(stderr, "va: unknown command '%s'\n\n", cmd);
     usage();
     return 2;
 }

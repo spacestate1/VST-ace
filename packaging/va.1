@@ -1,12 +1,12 @@
-.TH DW 1 "August 2026" "vst-ace" "User Commands"
+.TH VA 1 "August 2026" "vst-ace" "User Commands"
 .SH NAME
-dw \- the DW\-8000 engine and the native plug\-in hosts, in one program
+va \- the DW\-8000 engine and the native plug\-in hosts, in one program
 .SH SYNOPSIS
-.B dw
+.B va
 .RI [ command ]
 .RI [ arguments ]
 .SH DESCRIPTION
-.B dw
+.B va
 is the entry point to
 .BR vst-ace ,
 which loads and runs audio plug\-ins built for Windows, macOS and Linux as
@@ -43,7 +43,7 @@ reports what the file is, and
 /
 .B \-\-pick
 apply a patch. Run
-.B dw peload \-\-help
+.B va peload \-\-help
 for the rest.
 .TP
 .B live
@@ -104,7 +104,7 @@ The hosts:
 .TP
 .I /usr/share/vst\-ace/patches/
 Patch banks, as JSON. Hand one to
-.B dw pe
+.B va pe
 to open the plug\-ins it names with their patches loaded.
 .SH NOTES
 Plug\-in editors embed through an X11 window id, so both windows ask for the
@@ -118,7 +118,7 @@ Plug\-ins are hosted out of process by default: a browser loads a hundred of
 them in a session, and one that faults should not end it.
 .PP
 This package hosts 64\-bit plug\-ins.
-.B dw peload32
+.B va peload32
 needs a 32\-bit toolchain that Debian and Ubuntu do not carry the libraries
 for, so it is not built here; build from source for 32\-bit Windows plug\-ins.
 .SH SEE ALSO

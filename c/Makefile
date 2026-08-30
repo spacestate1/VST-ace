@@ -1,11 +1,11 @@
 # The FB-7999 toolchain.
 #
-#   make            build everything, and install `dw` at the top of the tree
+#   make            build everything, and install `va` at the top of the tree
 #   make verify     rebuild the outputs and diff them against out/ from the
 #                   original Python scripts
 #   make clean
 #
-# `dw` is the one to run -- ../dw, from anywhere. The single-purpose tools it
+# `va` is the one to run -- ../va, from anywhere. The single-purpose tools it
 # grew out of are still built and still documented; it links the same objects
 # rather than starting them as subprocesses.
 
@@ -32,12 +32,12 @@ BIN     := $(BUILD)/fbextract
 RENDER  := $(BUILD)/dwrender
 FMREND  := $(BUILD)/fb02render
 JUREND  := $(BUILD)/junorender
-DW      := $(BUILD)/dw
+DW      := $(BUILD)/va
 BINS    := $(BIN) $(RENDER) $(FMREND) $(JUREND) $(DW)
 
-# Where `dw` is meant to be run from. The launcher finds the rest of the tree
+# Where `va` is meant to be run from. The launcher finds the rest of the tree
 # from its own path, so this is ergonomics rather than a requirement.
-DW_INSTALLED := ../dw
+DW_INSTALLED := ../va
 
 # dwplay needs ALSA (sequencer for MIDI in, PCM for audio out). Everything else
 # stays dependency-free, so a machine without ALSA still builds the rest.
@@ -46,7 +46,7 @@ ifeq ($(HAVE_ALSA),yes)
 PLAY      := $(BUILD)/dwplay
 ALSA_LIBS := $(shell pkg-config --libs alsa)
 BINS      += $(PLAY)
-# dw links the live loop directly rather than spawning dwplay, and plays its
+# va links the live loop directly rather than spawning dwplay, and plays its
 # own renders through the same device. Without ALSA it still lists and renders;
 # the commands that need a sound card say so and exit.
 DW_ALSA    := $(BUILD)/dwplay.o
@@ -80,7 +80,7 @@ $(DW): $(COMMON_O) $(ENGINE_O) $(DW_ALSA) $(BUILD)/dw.o
 
 # A copy rather than a symlink: `dw` locates the tree through /proc/self/exe,
 # and a symlink resolves to the target, which would put it back in build/.
-# Copying keeps `../dw` and `c/build/dw` both able to find their way.
+# Copying keeps `../va` and `c/build/va` both able to find their way.
 $(DW_INSTALLED): $(DW)
 	cp -f $< $@
 

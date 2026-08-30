@@ -83,7 +83,7 @@ Ubuntu 24.04 and Debian 13 or newer, and an `.rpm` for Fedora 40 or newer:
     sudo apt install ./vst-ace_0.1.0-1_amd64.deb        # Debian, Ubuntu
     sudo dnf install ./vst-ace-0.1.0-1.fc43.x86_64.rpm  # Fedora
 
-That puts `dw`, `pestudio` and `dwstudio` on `$PATH`, the patch banks in
+That puts `va`, `pestudio` and `dwstudio` on `$PATH`, the patch banks in
 `/usr/share/vst-ace/patches`, and both windows in the desktop menu.
 
 Either package hosts 64-bit plug-ins. For **32-bit Windows VST2** plug-ins the
@@ -140,11 +140,11 @@ skipping; `pestudio` still builds. If `libfreetype-dev` is not found, it is
 
 Then, on either:
 
-    ./dw build          # everything, both windows included
+    ./va build          # everything, both windows included
 
 or by hand:
 
-    make -C c                                   # engines + the dw launcher
+    make -C c                                   # engines + the va launcher
     cmake -S peload -B peload/build && cmake --build peload/build   # peload, pestudio
     cmake -S gui    -B gui/build    && cmake --build gui/build      # dwstudio
 
@@ -180,11 +180,11 @@ imports by how many failures need them.
 
     dw                       open a window — pestudio or dwstudio, whichever
                              matches the desktop (--qt / --gtk to force one)
-    dw pe <dir|bank.json>    the Qt window, on a folder or a patch bank
-    dw gui                   the GTK window
-    dw peload <plug-in>      the same hosts from the command line:
+    va pe <dir|bank.json>    the Qt window, on a folder or a patch bank
+    va gui                   the GTK window
+    va peload <plug-in>      the same hosts from the command line:
                              --params, --render out.wav, --patch/--pick
-    dw play <preset>         the reimplemented engine, no plug-in involved
+    va play <preset>         the reimplemented engine, no plug-in involved
 
 Plug-in editors embed through an X11 window id, so both windows ask for the X11
 backend under Wayland; XWayland is enough. Plug-ins are hosted out of process by

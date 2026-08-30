@@ -119,7 +119,7 @@ install -D -m 0755 obj-gui/dwstudio    %{buildroot}%{pkglibdir}/dwstudio
 %dir %{pkglibdir}/runtime
 %dir %{pkglibdir}/runtime32
 %{pkglibdir}/runtime/README
-install -D -m 0755 c/build/dw          %{buildroot}%{_bindir}/dw
+install -D -m 0755 c/build/va          %{buildroot}%{_bindir}/va
 
 # Where real Microsoft runtime DLLs go. Empty, because the redistributable is
 # not ours to ship; owned by the package, because the host searches next to its
@@ -147,7 +147,7 @@ install -D -m 0644 packaging/pestudio.desktop \
 install -D -m 0644 packaging/dwstudio.desktop \
     %{buildroot}%{_datadir}/applications/dwstudio.desktop
 
-for m in dw peload pestudio dwstudio; do
+for m in va peload pestudio dwstudio; do
     install -D -m 0644 packaging/$m.1 %{buildroot}%{_mandir}/man1/$m.1
 done
 
@@ -158,7 +158,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %files
 %license LICENSE
 %doc README.md PLUGINS.md
-%{_bindir}/dw
+%{_bindir}/va
 %{_bindir}/peload
 %{_bindir}/pestudio
 %{_bindir}/dwstudio
@@ -171,7 +171,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %{pkgdatadir}/patches
 %{_datadir}/applications/pestudio.desktop
 %{_datadir}/applications/dwstudio.desktop
-%{_mandir}/man1/dw.1*
+%{_mandir}/man1/va.1*
 %{_mandir}/man1/peload.1*
 %{_mandir}/man1/pestudio.1*
 %{_mandir}/man1/dwstudio.1*
