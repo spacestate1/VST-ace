@@ -116,9 +116,6 @@ install -D -m 0755 obj-peload/peload   %{buildroot}%{pkglibdir}/peload
 install -D -m 0755 obj-peload/peserve  %{buildroot}%{pkglibdir}/peserve
 install -D -m 0755 obj-peload/pestudio %{buildroot}%{pkglibdir}/pestudio
 install -D -m 0755 obj-gui/dwstudio    %{buildroot}%{pkglibdir}/dwstudio
-%dir %{pkglibdir}/runtime
-%dir %{pkglibdir}/runtime32
-%{pkglibdir}/runtime/README
 install -D -m 0755 c/build/va          %{buildroot}%{_bindir}/va
 
 # Where real Microsoft runtime DLLs go. Empty, because the redistributable is
@@ -167,6 +164,9 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %{pkglibdir}/peserve
 %{pkglibdir}/pestudio
 %{pkglibdir}/dwstudio
+%dir %{pkglibdir}/runtime
+%dir %{pkglibdir}/runtime32
+%{pkglibdir}/runtime/README
 %dir %{pkgdatadir}
 %{pkgdatadir}/patches
 %{_datadir}/applications/pestudio.desktop
