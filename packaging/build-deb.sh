@@ -36,7 +36,11 @@ mkdir -p "$RELEASE_DIR"
 # box in a packaged build could name a version and a date but not the commit,
 # which is the build where knowing it matters most. Empty outside a checkout,
 # which is what a release tarball is.
-VSTACE_GIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+# ${VSTACE_GIT:-...} rather than a plain assignment: a caller that already
+# knows the commit -- a CI job, or anything building from a copy made without
+# .git -- passes it in, and asking git unconditionally would overwrite that
+# with the empty string exactly when it was most needed.
+VSTACE_GIT="${VSTACE_GIT:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)}"
 export VSTACE_GIT
 [ -n "$VSTACE_GIT" ] && echo "building from commit $VSTACE_GIT"
 
