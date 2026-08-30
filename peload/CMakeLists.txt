@@ -1,6 +1,39 @@
 cmake_minimum_required(VERSION 3.16)
 project(peload C CXX ASM)
 
+# ---- what this build is, for the About boxes ------------------------------
+#
+# SOURCE_DATE_EPOCH is honoured because Debian and Fedora set it to keep builds
+# reproducible; taking the clock instead would make two builds of one source
+# differ. Falling back to the clock is right for a developer's own build, which
+# is the case where the date is actually worth reading.
+set(VSTACE_VERSION "0.1.0")
+if(DEFINED ENV{SOURCE_DATE_EPOCH})
+  execute_process(
+    COMMAND date -u -d "@$ENV{SOURCE_DATE_EPOCH}" +%Y-%m-%d
+    OUTPUT_VARIABLE VSTACE_BUILD_DATE OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+endif()
+if(NOT VSTACE_BUILD_DATE)
+  string(TIMESTAMP VSTACE_BUILD_DATE "%Y-%m-%d" UTC)
+endif()
+
+# The commit, when this is a checkout. A release tarball has no .git and simply
+# does not name one, rather than the build failing over it.
+execute_process(
+  COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short HEAD
+  OUTPUT_VARIABLE VSTACE_GIT OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET)
+if(NOT VSTACE_GIT)
+  set(VSTACE_GIT "")
+endif()
+
+add_compile_definitions(
+  VSTACE_VERSION="${VSTACE_VERSION}"
+  VSTACE_BUILD_DATE="${VSTACE_BUILD_DATE}"
+  VSTACE_GIT="${VSTACE_GIT}")
+
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 if(NOT CMAKE_BUILD_TYPE)

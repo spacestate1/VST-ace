@@ -20,6 +20,7 @@
 
 extern "C" {
 #include "pehost.h"
+#include "version.h"
 #include "patch.h"
 #include "win32host.h"
 #include "vst3.h"
@@ -3022,6 +3023,29 @@ private:
         QAction *quit = file->addAction("&Quit");
         quit->setShortcut(QKeySequence::Quit);
         connect(quit, &QAction::triggered, this, &QWidget::close);
+
+        /* Which build this is. Worth having in the window rather than only on
+         * the command line: the usual way this gets asked is somebody
+         * reporting behaviour from a copy neither of us can identify. */
+        QMenu *help = menuBar()->addMenu("&About");
+        QAction *about = help->addAction("&About vst-ace");
+        connect(about, &QAction::triggered, this, [this] {
+            QMessageBox::about(this, "About vst-ace",
+                QString("<b>vst-ace %1</b><br><br>"
+                        "Built %2%3<br><br>"
+                        "Runs Windows, macOS and Linux audio plug-ins as native "
+                        "code on Linux &mdash; a PE loader with a Win32 subsystem "
+                        "under it, a Mach-O loader with an Objective-C runtime, "
+                        "and a CFM/PEF interpreter. Not emulation, and not Wine."
+                        "<br><br>"
+                        "This window is pestudio (Qt %4).")
+                    .arg(VSTACE_VERSION)
+                    .arg(VSTACE_BUILD_DATE)
+                    .arg(QString(VSTACE_GIT).isEmpty()
+                             ? QString()
+                             : QString("<br>Commit %1").arg(VSTACE_GIT))
+                    .arg(QT_VERSION_STR));
+        });
     }
 
     bool loadPluginPath(const QString &path)

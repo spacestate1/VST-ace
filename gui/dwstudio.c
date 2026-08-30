@@ -30,6 +30,7 @@
 
 #include "pehost.h"
 #include "plugview.h"
+#include "../peload/version.h"
 #include <spa/param/audio/format-utils.h>
 #include <gtk/gtk.h>
 #include <pthread.h>
@@ -1530,6 +1531,36 @@ static void act_install_data(GSimpleAction *a, GVariant *p, gpointer ud)
 static void act_quit(GSimpleAction *a, GVariant *p, gpointer ud)
 { (void)a; (void)p; (void)ud; gtk_window_close(GTK_WINDOW(U.win)); }
 
+
+/* Which build this is. The usual way it gets asked is somebody reporting
+ * behaviour from a copy neither of us can identify, so the commit is in here
+ * too when the build came from a checkout. */
+static void act_about(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    GtkAlertDialog *d;
+    char body[512];
+    (void)a; (void)p; (void)u;
+
+    snprintf(body, sizeof body,
+             "Built %s%s%s\n\n"
+             "Runs Windows, macOS and Linux audio plug-ins as native code on "
+             "Linux \xe2\x80\x94 a PE loader with a Win32 subsystem under it, "
+             "a Mach-O loader with an Objective-C runtime, and a CFM/PEF "
+             "interpreter. Not emulation, and not Wine.\n\n"
+             "This window is dwstudio (GTK4).",
+             VSTACE_BUILD_DATE,
+             VSTACE_GIT[0] ? "\nCommit " : "",
+             VSTACE_GIT[0] ? VSTACE_GIT : "");
+
+    /* GtkAlertDialog rather than GtkMessageDialog, which GTK 4.10 deprecated
+     * and which warns on every build here; the file dialogs beside this one
+     * are already on the newer async API. */
+    d = gtk_alert_dialog_new("vst-ace %s", VSTACE_VERSION);
+    gtk_alert_dialog_set_detail(d, body);
+    gtk_alert_dialog_show(d, GTK_WINDOW(U.win));
+    g_object_unref(d);
+}
+
 static GtkWidget *build_menubar(GtkApplication *app)
 {
     static const GActionEntry entries[] = {
@@ -1537,10 +1568,12 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "load-folder", act_load_folder, NULL, NULL, NULL, {0} },
         { "install-data", act_install_data, NULL, NULL, NULL, {0} },
         { "quit",        act_quit,        NULL, NULL, NULL, {0} },
+        { "about",       act_about,       NULL, NULL, NULL, {0} },
     };
-    GMenu *bar  = g_menu_new();
-    GMenu *file = g_menu_new();
-    GMenu *sect = g_menu_new();
+    GMenu *bar   = g_menu_new();
+    GMenu *file  = g_menu_new();
+    GMenu *sect  = g_menu_new();
+    GMenu *about = g_menu_new();
     GtkWidget *w;
 
     g_action_map_add_action_entries(G_ACTION_MAP(U.win), entries,
@@ -1559,9 +1592,14 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append_section(file, NULL, G_MENU_MODEL(sect));
     g_menu_append_submenu(bar, "File", G_MENU_MODEL(file));
 
+    /* Next to File, matching pestudio, so the same question is answered the
+     * same way in whichever window is open. */
+    g_menu_append(about, "About vst-ace", "win.about");
+    g_menu_append_submenu(bar, "About", G_MENU_MODEL(about));
+
     w = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(bar));
     gtk_widget_set_halign(w, GTK_ALIGN_START);
-    g_object_unref(sect); g_object_unref(file); g_object_unref(bar);
+    g_object_unref(about); g_object_unref(sect); g_object_unref(file); g_object_unref(bar);
     return w;
 }
 
