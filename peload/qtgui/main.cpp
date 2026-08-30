@@ -3034,8 +3034,25 @@ private:
          * reporting behaviour from a copy neither of us can identify. */
         QMenu *help = menuBar()->addMenu("&About");
         QAction *about = help->addAction("&About vst-ace");
+        /* A plain QDialog rather than QMessageBox::about().
+         *
+         * The convenience function asks the platform theme for a native
+         * message dialog, and on a desktop whose theme advertises one and then
+         * hands back nothing, Qt calls through the null helper while tearing
+         * the dialog down: QDialogPrivate::setNativeDialogVisible jumps to
+         * address zero and the whole host dies, taking any loaded plug-in with
+         * it. An About box is a label and a button; it is not worth reaching
+         * through a platform helper to draw one, and building it here cannot
+         * take that path at all. */
         connect(about, &QAction::triggered, this, [this] {
-            QMessageBox::about(this, "About vst-ace",
+            QDialog dlg(this);
+            dlg.setWindowTitle("About vst-ace");
+            dlg.setModal(true);
+
+            QString git = QString(VSTACE_GIT).isEmpty()
+                              ? QString()
+                              : QString("<br>Commit %1").arg(VSTACE_GIT);
+            QLabel *body = new QLabel(
                 QString("<b>vst-ace %1</b><br><br>"
                         "Built %2%3<br><br>"
                         "Runs Windows, macOS and Linux audio plug-ins as native "
@@ -3044,12 +3061,25 @@ private:
                         "and a CFM/PEF interpreter. Not emulation, and not Wine."
                         "<br><br>"
                         "This window is pestudio (Qt %4).")
-                    .arg(VSTACE_VERSION)
-                    .arg(VSTACE_BUILD_DATE)
-                    .arg(QString(VSTACE_GIT).isEmpty()
-                             ? QString()
-                             : QString("<br>Commit %1").arg(VSTACE_GIT))
-                    .arg(QT_VERSION_STR));
+                    .arg(VSTACE_VERSION).arg(VSTACE_BUILD_DATE)
+                    .arg(git).arg(QT_VERSION_STR),
+                &dlg);
+            body->setTextFormat(Qt::RichText);
+            body->setWordWrap(true);
+            body->setMinimumWidth(420);
+
+            QPushButton *close = new QPushButton("Close", &dlg);
+            close->setDefault(true);
+            connect(close, &QPushButton::clicked, &dlg, &QDialog::accept);
+
+            QVBoxLayout *lay = new QVBoxLayout(&dlg);
+            lay->addWidget(body);
+            QHBoxLayout *row = new QHBoxLayout;
+            row->addStretch();
+            row->addWidget(close);
+            lay->addLayout(row);
+
+            dlg.exec();
         });
     }
 
