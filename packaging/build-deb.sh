@@ -31,6 +31,16 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 mkdir -p "$RELEASE_DIR"
 
+# The commit, captured here because the staged source below deliberately has no
+# .git in it: dpkg-buildpackage wants an exported tree. Without this the About
+# box in a packaged build could name a version and a date but not the commit,
+# which is the build where knowing it matters most. Empty outside a checkout,
+# which is what a release tarball is.
+VSTACE_GIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+export VSTACE_GIT
+[ -n "$VSTACE_GIT" ] && echo "building from commit $VSTACE_GIT"
+
+
 echo "=== Debian/Ubuntu build: vst-ace $VERSION ==="
 
 # 3.0 (quilt) wants an orig tarball beside a source directory named

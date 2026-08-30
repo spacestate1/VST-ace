@@ -18,12 +18,19 @@ if(NOT VSTACE_BUILD_DATE)
   string(TIMESTAMP VSTACE_BUILD_DATE "%Y-%m-%d" UTC)
 endif()
 
-# The commit, when this is a checkout. A release tarball has no .git and simply
-# does not name one, rather than the build failing over it.
-execute_process(
-  COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short HEAD
-  OUTPUT_VARIABLE VSTACE_GIT OUTPUT_STRIP_TRAILING_WHITESPACE
-  ERROR_QUIET)
+# The commit. Taken from the environment first, because the package builds copy
+# the source without .git -- dpkg-buildpackage works from an exported tree, so
+# a build that asked git here would produce a .deb that could not say which
+# commit it came from, which is the one place the answer matters most.
+# packaging/build-deb.sh and build-rpm.sh export it before they copy.
+if(DEFINED ENV{VSTACE_GIT})
+  set(VSTACE_GIT "$ENV{VSTACE_GIT}")
+else()
+  execute_process(
+    COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short HEAD
+    OUTPUT_VARIABLE VSTACE_GIT OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+endif()
 if(NOT VSTACE_GIT)
   set(VSTACE_GIT "")
 endif()

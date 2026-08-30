@@ -21,6 +21,11 @@ VERSION="${1:-0.0.0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Same as build-deb.sh: rpmbuild works from a tarball with no .git, so the
+# commit has to be carried in from here or the About box cannot name it.
+VSTACE_GIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+export VSTACE_GIT
 RELEASE_DIR="$REPO_ROOT/release"
 WORK_DIR="$(mktemp -d -t vst-ace-rpm-build-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
