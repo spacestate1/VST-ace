@@ -97,6 +97,23 @@ i386 has to be enabled before apt will look at it:
 There is no equivalent in the `.rpm` yet; on Fedora, 32-bit plug-ins still want
 a build from source.
 
+A few plug-ins import a Microsoft C or C++ runtime that cannot be stubbed --
+iostreams and locale objects carry vtables and internal state -- and they load
+only with the genuine DLL present. It is not ours to redistribute, so the main
+package ships the place to put it -- both widths, empty, with a README beside
+them; the i386 add-on carries nothing but peload32:
+
+    /usr/lib/vst-ace/runtime/      x86-64 DLLs, for the 64-bit hosts
+    /usr/lib/vst-ace/runtime32/    i386 DLLs, for peload32
+
+Drop `msvcp120.dll` from the Visual C++ 2013 redistributable into the first,
+and `msvcp120.dll` with `msvcr120.dll` beside it into the second. Both are
+searched next to the installed binaries, so there is nothing to configure;
+`PELOAD_DLL_PATH` overrides the search if they live somewhere else. Everything
+apart from those plug-ins works with both directories empty, which is how they
+ship. Wine's builds of the same DLLs are refused rather than loaded: they are
+compiled against Wine's own `ntdll` and fault inside their own startup.
+
 An installed copy has no tree to find the plug-in corpus in, so point `VST_ROOT`
 at one — a directory holding `windows/`, `linux/` and `macos/` — or keep it at
 `~/vst`, which is where it looks by default. Paths given on the command line
