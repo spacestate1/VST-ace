@@ -351,7 +351,11 @@ static int is_candidate(const char *path, const char *name, int isdir)
 #endif
         return 0;
     }
-    if (l > 4 && !strcasecmp(name + l - 4, ".dll")) return 1;
+    /* The export, not the extension. A .dll is only a Windows binary; an
+     * installer's setup.dll satisfied this test and was listed beside the
+     * synthesisers, then failed when picked. Same reasoning as the .so case
+     * below, which has always checked. */
+    if (l > 4 && !strcasecmp(name + l - 4, ".dll")) return pehost_is_windows_vst(path);
     if (l > 3 && !strcasecmp(name + l - 3, ".so"))
         return !strstr(path, ".lv2/") && pehost_is_native_vst2(path);
 #if PLUGVIEW_MAC

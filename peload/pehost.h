@@ -109,6 +109,13 @@ int pehost_is_bridged(const char *path);
  * scanner needs the same test to know a .so is worth offering. */
 int pehost_is_native_vst2(const char *path);
 
+/* Whether a path is a Windows plug-in: a PE that exports VSTPluginMain, the
+ * pre-2.4 `main`, or VST3's GetPluginFactory. The extension cannot decide it --
+ * an installer is a .dll too -- and both browsers need the same test, having
+ * previously offered every .dll they found. Reads the export table out of the
+ * file; nothing is mapped and nothing runs. */
+int pehost_is_windows_vst(const char *path);
+
 /* ---- data a plugin needs but does not carry ---------------------------
  *
  * Several plugins load, open their editor, and then cannot actually work. A

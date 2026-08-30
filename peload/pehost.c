@@ -2321,6 +2321,118 @@ static void info_set(pehost_info *o, pehost_kind k, const char *os,
     o->loadable = loadable;
 }
 
+/* Does this PE file export a plug-in entry point?
+ *
+ * The machine field says a file is a Windows binary; it does not say the file
+ * is a plug-in. Every .dll was being offered on its extension alone, so a
+ * browser pointed at a directory with an installer in it listed setup.dll
+ * beside the synthesisers, and picking one produced a load failure rather than
+ * an explanation. The ELF side has always answered this properly -- see
+ * pehost_is_native_vst2, which reads .dynsym rather than dlopen'ing every
+ * candidate -- and this is the same test for the other format.
+ *
+ * The export directory is read straight out of the file: headers, the section
+ * table to turn an RVA into a file offset, then the name array. Nothing is
+ * mapped and nothing runs. A plug-in that exports the entry point and still
+ * cannot load reaches the list and fails when picked, with a reason, which is
+ * the trade the scanner already makes elsewhere. */
+static int pe_rva_to_off(FILE *f, long sect_off, int nsec, uint32_t rva, uint32_t *out)
+{
+    int i;
+    for (i = 0; i < nsec; i++) {
+        uint8_t sh[40];
+        uint32_t va, vsz, rsz, praw;
+        if (fseek(f, sect_off + (long)i * 40, SEEK_SET)) return 0;
+        if (fread(sh, 1, sizeof sh, f) != sizeof sh) return 0;
+        memcpy(&vsz,  sh + 8,  4);
+        memcpy(&va,   sh + 12, 4);
+        memcpy(&rsz,  sh + 16, 4);
+        memcpy(&praw, sh + 20, 4);
+        /* VirtualSize can be 0 in old images; the raw size bounds it then. */
+        if (!vsz) vsz = rsz;
+        if (rva >= va && rva < va + vsz) {
+            uint32_t d = rva - va;
+            if (d >= rsz) return 0;              /* inside the zero-fill tail */
+            *out = praw + d;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int pe_exports_plugin_entry(const char *bin)
+{
+    FILE *f;
+    unsigned char mz[2];
+    uint32_t lfanew, expva = 0, expsz = 0, namecnt = 0, namerva = 0, nameoff, diroff;
+    uint16_t nsec = 0, optsz = 0, magic = 0;
+    long sect_off;
+    uint32_t i;
+    int found = 0;
+
+    if (!bin || !(f = fopen(bin, "rb"))) return 0;
+    if (fread(mz, 1, 2, f) != 2 || mz[0] != 'M' || mz[1] != 'Z') goto out;
+    if (fseek(f, 0x3c, SEEK_SET) || fread(&lfanew, 4, 1, f) != 1) goto out;
+    /* COFF header: signature(4) machine(2) nsections(2) ... optsize(2) */
+    if (fseek(f, (long)lfanew + 6, SEEK_SET) || fread(&nsec, 2, 1, f) != 1) goto out;
+    if (fseek(f, (long)lfanew + 20, SEEK_SET) || fread(&optsz, 2, 1, f) != 1) goto out;
+    if (!nsec || nsec > 96 || optsz < 96) goto out;
+    if (fseek(f, (long)lfanew + 24, SEEK_SET) || fread(&magic, 2, 1, f) != 1) goto out;
+
+    /* The data directory sits after the optional header's fixed part, which is
+     * a different length in the two formats: 96 bytes for PE32, 112 for PE32+.
+     * Export is directory 0. */
+    diroff = (magic == 0x20B) ? 112u : (magic == 0x10B) ? 96u : 0u;
+    if (!diroff || optsz < diroff + 8) goto out;
+    if (fseek(f, (long)lfanew + 24 + (long)diroff, SEEK_SET)) goto out;
+    if (fread(&expva, 4, 1, f) != 1 || fread(&expsz, 4, 1, f) != 1) goto out;
+    if (!expva || !expsz) goto out;              /* exports nothing at all */
+
+    sect_off = (long)lfanew + 24 + optsz;
+    if (!pe_rva_to_off(f, sect_off, nsec, expva, &nameoff)) goto out;
+
+    /* IMAGE_EXPORT_DIRECTORY: NumberOfNames at +24, AddressOfNames at +32. */
+    if (fseek(f, (long)nameoff + 24, SEEK_SET) || fread(&namecnt, 4, 1, f) != 1) goto out;
+    if (fseek(f, (long)nameoff + 32, SEEK_SET) || fread(&namerva, 4, 1, f) != 1) goto out;
+    if (!namecnt || namecnt > 65536) goto out;
+    if (!pe_rva_to_off(f, sect_off, nsec, namerva, &nameoff)) goto out;
+
+    for (i = 0; i < namecnt && !found; i++) {
+        uint32_t srva, soff;
+        char nm[64];
+        size_t n;
+        if (fseek(f, (long)nameoff + (long)i * 4, SEEK_SET)) break;
+        if (fread(&srva, 4, 1, f) != 1) break;
+        if (!pe_rva_to_off(f, sect_off, nsec, srva, &soff)) continue;
+        if (fseek(f, (long)soff, SEEK_SET)) continue;
+        n = fread(nm, 1, sizeof nm - 1, f);
+        nm[n] = 0;
+        /* VST2's entry point, its pre-2.4 spelling, and VST3's factory. The
+         * bare "main" is why this cannot simply look for a substring: plenty
+         * of libraries export something containing it. */
+        if (!strcmp(nm, "VSTPluginMain") || !strcmp(nm, "main") ||
+            !strcmp(nm, "GetPluginFactory"))
+            found = 1;
+    }
+out:
+    fclose(f);
+    return found;
+}
+
+/* True when this path is a Windows plug-in worth offering: a PE that exports a
+ * VST entry point. Exposed because both plug-in browsers need the same test --
+ * they were deciding on the file extension, which is why setup.dll appeared in
+ * the list. */
+int pehost_is_windows_vst(const char *path)
+{
+    char bin[1024];
+    if (!path || !*path) return 0;
+    if (pehost_resolve(path, bin, sizeof bin) != 0)
+        snprintf(bin, sizeof bin, "%s", path);
+    if (!pe_machine_of(bin)) return 0;
+    return pe_exports_plugin_entry(bin);
+}
+
 pehost_kind pehost_classify(const char *path, pehost_info *out)
 {
     pehost_info scratch;
@@ -2401,6 +2513,17 @@ pehost_kind pehost_classify(const char *path, pehost_info *out)
         return out->kind;   /* UNKNOWN */
     }
     machine = pe_machine_of(bin);
+    /* A PE that exports no entry point is a Windows binary, not a plug-in --
+     * an installer, a support library, a resource DLL. Saying so here is what
+     * keeps setup.dll out of the browsers, which used to offer every .dll they
+     * found and fail only when one was picked. */
+    if ((machine == 0x8664 || machine == 0x14c) && !pe_exports_plugin_entry(bin)) {
+        snprintf(out->os, sizeof out->os, "windows");
+        snprintf(out->arch, sizeof out->arch, "%s", machine == 0x8664 ? "x86-64" : "i386");
+        snprintf(out->why, sizeof out->why,
+                 "PE binary but no VST entry point (VSTPluginMain or GetPluginFactory)");
+        return out->kind;   /* UNKNOWN */
+    }
     if (machine == 0x8664) {
         info_set(out, PEHOST_KIND_WIN_VST2_64, "windows", "x86-64", "VST2", 1);
     } else if (machine == 0x14c) {

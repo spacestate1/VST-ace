@@ -2056,7 +2056,14 @@ private slots:
                                                        QDir::Name | QDir::IgnoreCase)) {
                 const QString nm = fi.fileName();
                 const bool isV3 = nm.endsWith(".vst3", Qt::CaseInsensitive);
-                const bool isV2 = fi.isFile() && nm.endsWith(".dll", Qt::CaseInsensitive);
+                /* The export decides, not the extension. A .dll is only a
+                 * Windows binary -- an installer's setup.dll ends in .dll too,
+                 * and used to be listed beside the synthesisers and fail when
+                 * picked. Same reasoning already applied to .so below. */
+                const bool isV2 = fi.isFile() &&
+                    nm.endsWith(".dll", Qt::CaseInsensitive) &&
+                    pehost_is_windows_vst(
+                        fi.absoluteFilePath().toLocal8Bit().constData());
                 /* A macOS plugin is a bundle directory, so it is a candidate in
                  * its own right rather than something to walk into. */
                 /* Not offered while PESTUDIO_MAC is off -- see the note at the
