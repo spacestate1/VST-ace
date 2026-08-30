@@ -289,6 +289,19 @@ static void roots_add_standard(void)
     }
 }
 
+
+/* The selector must never be empty: it names the directory being browsed, and
+ * a blank one on a machine with no corpora and no system VST folders left the
+ * window showing plug-ins from a directory it would not admit to. The default
+ * falls back to the home folder, so the selector has to be able to say so. */
+static void roots_add_fallback(void)
+{
+    const char *home;
+    if (P.nroot > 0) return;
+    home = getenv("HOME");
+    if (home && *home && is_dir(home)) roots_add(home, "Home folder");
+}
+
 /* The directory to open on, for a caller that was given none. The checkout's
  * own corpus first so a developer's window opens where it always did, then the
  * system locations, and the home directory only if nothing else exists --
@@ -300,6 +313,7 @@ const char *plugview_default_dir(void)
 
     roots_discover();
     roots_add_standard();
+    roots_add_fallback();
     if (P.nroot > 0) {
         snprintf(out, sizeof out, "%s", P.roots[0].path);
         return out;
@@ -1878,6 +1892,10 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
      * having found no checkout to walk. roots_add appends to rootmodel once it
      * exists, so this has to come before the model is built. */
     roots_add_standard();
+    /* roots_discover() above cleared the list, so the fallback has to be
+     * re-applied here or the dropdown is built empty on a machine that has
+     * neither a checkout nor a system VST directory. */
+    roots_add_fallback();
     P.rootmodel = gtk_string_list_new(NULL);
     for (i = 0; i < P.nroot; i++) gtk_string_list_append(P.rootmodel, P.roots[i].label);
     P.rootdd = gtk_drop_down_new(G_LIST_MODEL(P.rootmodel), NULL);

@@ -2560,6 +2560,11 @@ private:
             for (const auto &o : out) if (o.second == p) dup = true;
             if (!dup) out << qMakePair(QString(p.contains("vst3") ? "VST3" : "VST2"), p);
         }
+        // Never empty: the selector names the directory being browsed, and
+        // defaultDir() falls back to the home folder, so it has to be able to
+        // say so rather than showing a blank.
+        if (out.isEmpty())
+            out << qMakePair(QString("Home folder"), QDir::homePath());
         return out;
     }
 
