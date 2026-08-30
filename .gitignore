@@ -7,7 +7,7 @@ build/
 *.so.*
 compile_commands.json
 # The launcher itself, built from c/src/dw.c.
-/dw
+/va
 
 # Editor and tooling caches.
 .cache/
