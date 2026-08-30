@@ -1413,7 +1413,15 @@ int pehost_can_load(const char *path, char *why, int whyn)
     if (machine == 0x8664) return 1;
     if (machine == 0x14c) {
         if (bridge_available()) return 1;               /* runs in peload32 */
-        if (why) snprintf(why, (size_t)whyn, "32-bit x86 (no peload32 helper)");
+        /* Say which of the two it is. "No helper" and "the helper is here but
+         * its 32-bit libraries are not" want completely different actions from
+         * whoever is reading, and the second is the common one now that
+         * peload32 ships in the same package as everything else. */
+        if (why) {
+            const char *r = bridge_unavailable_reason();
+            snprintf(why, (size_t)whyn, "32-bit x86 -- %s",
+                     r ? r : "no peload32 helper");
+        }
         return 0;
     }
     if (why) snprintf(why, (size_t)whyn, "machine 0x%x", machine);
@@ -2529,7 +2537,14 @@ pehost_kind pehost_classify(const char *path, pehost_info *out)
     } else if (machine == 0x14c) {
         int have = bridge_available();
         info_set(out, PEHOST_KIND_WIN_VST2_32, "windows", "i386", "VST2", have);
-        if (!have) snprintf(out->why, sizeof out->why, "32-bit x86 (no peload32 helper built)");
+        /* Not "no helper built" any more: it may be built, shipped and sitting
+         * right there, with only its 32-bit libraries missing. Those are two
+         * different problems for whoever reads this. */
+        if (!have) {
+            const char *r = bridge_unavailable_reason();
+            snprintf(out->why, sizeof out->why, "%s",
+                     r ? r : "no peload32 helper built");
+        }
     } else if (head_bytes(bin, h5, 5) >= 2 && !memcmp(h5, "\177E", 2)) {
         snprintf(out->os, sizeof out->os, "linux");
         snprintf(out->why, sizeof out->why,

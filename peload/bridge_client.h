@@ -17,6 +17,11 @@ typedef struct bridge bridge;
 
 /* Is a peload32 helper present? False means 32-bit plugins cannot be hosted. */
 int         bridge_available(void);
+
+/* Why the 32-bit helper cannot be used, or NULL when it can. Worth showing a
+ * user verbatim: when the helper is present but its i386 runtime is not, this
+ * is the dynamic linker naming the library that is missing. */
+const char *bridge_unavailable_reason(void);
 const char *bridge_last_error(void);
 
 bridge *bridge_open(const char *dll_path, double samplerate, int blocksize);

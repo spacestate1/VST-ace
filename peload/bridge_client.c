@@ -97,12 +97,98 @@ static int bridge_helper_named(const char *helper, char *out, size_t n)
 static int bridge_helper_path(char *out, size_t n)
 { return bridge_helper_named("peload32", out, n); }
 
-int bridge_available(void)
+/* Can the helper actually run, not merely does the file exist?
+ *
+ * access(X_OK) says a file is executable; it says nothing about whether its
+ * interpreter and libraries are installed. For peload32 that gap is the whole
+ * question. It is an i386 binary on an x86-64 host, so on a machine with no
+ * 32-bit runtime the file is present and executable and exec still fails --
+ * and the host, having been told the bridge was available, reported "the
+ * helper died before reporting" rather than "the 32-bit libraries are not
+ * installed". One of those is actionable.
+ *
+ * Deciding this by running it is the only honest answer: reading PT_INTERP
+ * would catch a missing loader and not a missing libpipewire, and the set of
+ * libraries is not ours to enumerate. `peload32` with no arguments prints its
+ * usage and exits, which is a cheap and side-effect-free probe. Done once and
+ * remembered, because a plug-in browser asks this question per file.
+ *
+ * The stderr of a failed exec is worth keeping: the dynamic linker names the
+ * library it could not find, and that name is the most useful thing anyone can
+ * be told here. */
+
+static int   g_probe_done;
+static int   g_probe_ok;
+static char  g_probe_why[256];
+
+static void bridge_probe(const char *path)
+{
+    int  fd[2];
+    pid_t pid;
+    int  status = 0;
+    char buf[256];
+    ssize_t got = 0;
+
+    g_probe_done = 1;
+    g_probe_ok = 0;
+    g_probe_why[0] = 0;
+
+    if (pipe(fd) != 0) {
+        /* No pipe: fall back to trusting the file, which is where this
+         * started. Better than refusing to bridge over a resource shortage. */
+        g_probe_ok = 1;
+        return;
+    }
+    if ((pid = fork()) < 0) { close(fd[0]); close(fd[1]); g_probe_ok = 1; return; }
+
+    if (pid == 0) {
+        int null = open("/dev/null", O_RDWR);
+        dup2(fd[1], 2);                       /* the linker's complaint */
+        if (null >= 0) { dup2(null, 0); dup2(null, 1); }
+        close(fd[0]); close(fd[1]);
+        execl(path, path, (char *)NULL);
+        _exit(127);
+    }
+
+    close(fd[1]);
+    got = read(fd[0], buf, sizeof buf - 1);
+    close(fd[0]);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+
+    /* Usage output and a non-zero exit are both fine -- it ran. Only a failure
+     * to start at all disqualifies it, which is exec's 127 or a signal. */
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 127) {
+        g_probe_ok = 1;
+        return;
+    }
+
+    if (got > 0) {
+        char *nl;
+        buf[got] = 0;
+        if ((nl = strchr(buf, '\n')) != NULL) *nl = 0;
+        snprintf(g_probe_why, sizeof g_probe_why, "%s", buf);
+    } else {
+        snprintf(g_probe_why, sizeof g_probe_why,
+                 "%s could not be started", path);
+    }
+}
+
+/* Why the 32-bit helper is unusable, or NULL when it is fine. */
+const char *bridge_unavailable_reason(void)
 {
     char p[4096];
-    /* Inside a server, never bridge again: a nested helper would serve itself. */
-    if (getenv("PELOAD_IS_SERVER")) return 0;
-    return bridge_helper_path(p, sizeof p) == 0;
+    if (getenv("PELOAD_IS_SERVER")) return "already inside the helper";
+    if (bridge_helper_path(p, sizeof p) != 0)
+        return "peload32 is not installed beside the other programs";
+    if (!g_probe_done) bridge_probe(p);
+    return g_probe_ok ? NULL : g_probe_why;
+}
+
+int bridge_available(void)
+{
+    /* Present *and* runnable. The file existing was the old test and it was
+     * not enough -- see bridge_probe above. */
+    return bridge_unavailable_reason() == NULL;
 }
 
 int bridge_isolation_available(void)
