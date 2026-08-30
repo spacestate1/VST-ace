@@ -219,7 +219,9 @@ Deliberately, and listed with reasons in `.gitignore`:
   in `FINDINGS.md` and `FINDINGS-FB02.md`.
 - **Rendered audio**, reproducible from `patches/`.
 - **`runtime/msvcp120.dll`**, a Microsoft redistributable some plug-ins need at
-  runtime. `HANDOFF-2026-08-01-msvcp120.md` explains how to put it back.
+  runtime, and its i386 pair under `runtime32/`. See *Installing* above for an
+  installed copy; `HANDOFF-2026-08-01-msvcp120.md` covers a working tree and
+  what the plug-ins that need it do without it.
 - **A vendored libc++**, referenced by no build file here.
 - **Build directories**, which is where every binary lands.
 
