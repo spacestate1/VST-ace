@@ -1,3 +1,11 @@
 # This package is published on the project's own releases page rather than
 # uploaded to the Debian archive, so its changelog has no Debian bug to close.
 vst-ace: initial-upload-closes-no-bugs
+
+# peload32 is an i386 binary inside an amd64 package, deliberately. A 64-bit
+# process cannot map a 32-bit plug-in, so 32-bit Windows VST2s are hosted in
+# this helper out of process; shipping it here rather than as a second package
+# is what makes 32-bit support arrive without the user having to know to ask
+# for it. It is never executed unless a 32-bit plug-in is opened, and the host
+# checks it can actually run before trying.
+vst-ace: binary-from-other-architecture [usr/lib/vst-ace/peload32]

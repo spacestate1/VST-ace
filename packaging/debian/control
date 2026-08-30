@@ -44,7 +44,17 @@ Multi-Arch: foreign
 Depends:
  ${shlibs:Depends},
  ${misc:Depends}
-Suggests: xwayland
+# The i386 runtime peload32 needs, as Suggests rather than Depends.
+#
+# Depends would make this package uninstallable on any host without
+# `dpkg --add-architecture i386`, which is every host that only ever loads
+# 64-bit plug-ins -- a dozen foreign-architecture libraries as the price of a
+# feature they will not use. Suggests costs them nothing, and apt names the set
+# when someone does want it. peload32 itself detects at run time whether these
+# are present and says so plainly when they are not.
+Suggests: xwayland,
+ libc6:i386, libx11-6:i386, libfreetype6:i386,
+ libasound2t64:i386, libpipewire-0.3-0t64:i386
 Description: run Windows, macOS and Linux audio plug-ins natively, without Wine
  Audio plug-ins built for Windows, macOS and Linux, loaded and run as native
  code on Linux. Not emulation and not Wine: a PE loader with a Win32 subsystem

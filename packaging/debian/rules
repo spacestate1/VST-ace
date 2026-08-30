@@ -79,6 +79,16 @@ override_dh_auto_build:
 	readelf -d $(BUILD_PELOAD)/peload32 | grep -q 'NEEDED.*libX11'
 	readelf -d $(BUILD_PELOAD)/peload32 | grep -q 'NEEDED.*libpipewire'
 
+# dh_shlibdeps must not look at peload32.
+#
+# It walks every ELF in the package and turns its NEEDED list into Depends. For
+# an i386 binary that means libc6:i386 and the rest land in an amd64 package's
+# Depends, which is exactly the hard requirement this arrangement exists to
+# avoid -- the package would refuse to install anywhere i386 is not enabled.
+# They are Suggests in debian/control instead, and peload32 checks at run time.
+override_dh_shlibdeps:
+	dh_shlibdeps -Xpeload32
+
 override_dh_auto_test:
 # The tests need plug-in binaries, which are not ours to ship and are not here.
 
@@ -88,6 +98,18 @@ override_dh_auto_install:
 	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
 	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
 	install -D -m 0755 c/build/va               $(DESTDIR)/usr/bin/va
+# peload32 goes in here too, i386 binary in an amd64 package and all.
+#
+# It used to be a package of its own because that is what dpkg's architecture
+# model is for, and the cost was that 32-bit support arrived only if you knew
+# to install a second thing. Shipping it here costs a 64-bit-only user 250 KB
+# and nothing else: it is never executed unless a 32-bit plug-in is opened, and
+# bridge_available() now decides by running it rather than by finding it, so a
+# machine with no i386 runtime reports exactly that instead of pretending the
+# helper worked. The i386 libraries are Suggests in debian/control, not
+# Depends, so this package still installs on a host that has never heard of
+# dpkg --add-architecture.
+	install -D -m 0755 $(BUILD_PELOAD)/peload32 $(DESTDIR)$(PKGLIBDIR)/peload32
 # The drop-in directories for real Microsoft runtime DLLs, created empty and
 # owned by the package. They cannot be shipped filled -- the redistributable is
 # not ours to hand on -- but the search is relative to the installed binaries,
@@ -100,14 +122,6 @@ override_dh_auto_install:
 	install -d $(DESTDIR)$(PKGLIBDIR)/runtime32
 	install -D -m 0644 packaging/runtime-README \
 	    $(DESTDIR)$(PKGLIBDIR)/runtime/README
-# peload32 is deliberately not installed here. It is i386 code, and debhelper
-# only builds the binary packages whose Architecture matches this build host,
-# so there is no vst-ace-i386 stanza in debian/control for it to be staged
-# into -- see the note at the foot of that file. packaging/build-deb.sh takes
-# it straight out of $(BUILD_PELOAD) once dpkg-buildpackage has finished and
-# wraps it with dpkg-deb, into the same PKGLIBDIR this package owns, which is
-# where the bridge looks for it beside the 64-bit binaries. The build check
-# above is what guarantees it is there to take.
 # The three that are worth having on $$PATH, as symlinks rather than copies:
 # the helper lookup above depends on the real programs staying together.
 	for p in peload pestudio dwstudio; do \
