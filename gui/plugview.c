@@ -188,7 +188,7 @@ static void roots_discover(void)
     int     up, i, j;
 
     P.nroot = 0;
-    if (n <= 0) return;
+    if (n <= 0) return;   /* roots_add_standard still applies */
     exe[n] = 0;
 
     for (up = 0; up < 6; up++) {
@@ -229,6 +229,84 @@ static int roots_add(const char *path, const char *label)
     snprintf(P.roots[P.nroot].path,  sizeof P.roots[0].path,  "%s", path);
     if (P.rootmodel) gtk_string_list_append(P.rootmodel, lbl);
     return P.nroot++;
+}
+
+/* Where a Linux system actually keeps plug-ins.
+ *
+ * The corpora above are found by walking up from the executable, which is
+ * exactly right in a checkout and finds nothing at all once this is installed:
+ * from /usr/lib/vst-ace the walk reaches /windows/VST2-64, which no machine
+ * has. Opening the browser from the desktop menu therefore showed an empty
+ * list and, in dwstudio's case, printed "no such directory" at a path the user
+ * had never mentioned. These are the conventional locations, plus whatever
+ * VST_PATH and VST3_PATH name, and only the ones that exist are offered. */
+static void roots_add_standard(void)
+{
+    static const struct { const char *label, *fmt; int home; } cand[] = {
+        { "VST2 (yours)",  "%s/.vst",                        1 },
+        { "VST3 (yours)",  "%s/.vst3",                       1 },
+        { "VST2 (system)", "/usr/lib/vst",                   0 },
+        { "VST3 (system)", "/usr/lib/vst3",                  0 },
+        { "VST2 (local)",  "/usr/local/lib/vst",             0 },
+        { "VST3 (local)",  "/usr/local/lib/vst3",            0 },
+        { "VST2 (system)", "/usr/lib/x86_64-linux-gnu/vst",  0 },
+        { "VST3 (system)", "/usr/lib/x86_64-linux-gnu/vst3", 0 },
+    };
+    const char *home = getenv("HOME");
+    int i;
+
+    for (i = 0; i < (int)(sizeof cand / sizeof cand[0]); i++) {
+        char path[1024];
+        if (cand[i].home) {
+            if (!home || !*home) continue;
+            snprintf(path, sizeof path, cand[i].fmt, home);
+        } else {
+            snprintf(path, sizeof path, "%s", cand[i].fmt);
+        }
+        if (is_dir(path)) roots_add(path, cand[i].label);
+    }
+
+    /* VST_PATH and VST3_PATH are colon-separated, like PATH. */
+    {
+        static const char *const vars[] = { "VST_PATH", "VST3_PATH", NULL };
+        int v;
+        for (v = 0; vars[v]; v++) {
+            const char *e = getenv(vars[v]), *p;
+            if (!e || !*e) continue;
+            for (p = e; *p; ) {
+                const char *sep = strchr(p, ':');
+                size_t len = sep ? (size_t)(sep - p) : strlen(p);
+                char path[1024];
+                if (len && len < sizeof path) {
+                    memcpy(path, p, len);
+                    path[len] = 0;
+                    if (is_dir(path)) roots_add(path, vars[v]);
+                }
+                if (!sep) break;
+                p = sep + 1;
+            }
+        }
+    }
+}
+
+/* The directory to open on, for a caller that was given none. The checkout's
+ * own corpus first so a developer's window opens where it always did, then the
+ * system locations, and the home directory only if nothing else exists --
+ * which at least browses somewhere real. */
+const char *plugview_default_dir(void)
+{
+    static char out[1024];
+    const char *home;
+
+    roots_discover();
+    roots_add_standard();
+    if (P.nroot > 0) {
+        snprintf(out, sizeof out, "%s", P.roots[0].path);
+        return out;
+    }
+    home = getenv("HOME");
+    snprintf(out, sizeof out, "%s", (home && *home) ? home : ".");
+    return out;
 }
 
 /* ------------------------------------------------------------- the browser */
@@ -1791,6 +1869,11 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
      * platform and format, and this is how you get between them -- the same
      * selector pestudio puts at the top of its own list. */
     roots_discover();
+    /* The system's own VST directories go in the same dropdown. Without this
+     * an installed copy offers nothing to switch between, the walk-up above
+     * having found no checkout to walk. roots_add appends to rootmodel once it
+     * exists, so this has to come before the model is built. */
+    roots_add_standard();
     P.rootmodel = gtk_string_list_new(NULL);
     for (i = 0; i < P.nroot; i++) gtk_string_list_append(P.rootmodel, P.roots[i].label);
     P.rootdd = gtk_drop_down_new(G_LIST_MODEL(P.rootmodel), NULL);

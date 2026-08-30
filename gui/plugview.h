@@ -86,4 +86,9 @@ void plugview_shutdown(void);
 }
 #endif
 
+
+/* The directory to open on when the caller named none: the checkout's own
+ * corpus, else a standard system VST location, else $HOME. */
+const char *plugview_default_dir(void);
+
 #endif /* DW_PLUGVIEW_H */

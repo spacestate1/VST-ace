@@ -2545,6 +2545,40 @@ private:
             }
             if (!d.cdUp()) break;
         }
+        // The system's own VST directories, so an installed copy has somewhere
+        // to switch between rather than a selector with nothing in it.
+        for (const QString &p : standardPluginDirs()) {
+            bool dup = false;
+            for (const auto &o : out) if (o.second == p) dup = true;
+            if (!dup) out << qMakePair(QString(p.contains("vst3") ? "VST3" : "VST2"), p);
+        }
+        return out;
+    }
+
+    // Where a Linux system keeps plug-ins, for an installed copy rather than a
+    // checkout. The walk-up below is right in a tree and finds nothing once
+    // this lives in /usr/lib/vst-ace, where it reaches /windows/VST2-64 -- a
+    // path no machine has -- and the window opened on the home directory with
+    // no explanation. Only directories that exist are returned.
+    static QStringList standardPluginDirs()
+    {
+        QStringList out;
+        const QString home = QDir::homePath();
+        const QStringList cand = {
+            home + "/.vst", home + "/.vst3",
+            "/usr/lib/vst", "/usr/lib/vst3",
+            "/usr/local/lib/vst", "/usr/local/lib/vst3",
+            "/usr/lib/x86_64-linux-gnu/vst", "/usr/lib/x86_64-linux-gnu/vst3",
+        };
+        for (const QString &c : cand)
+            if (QDir(c).exists() && !out.contains(c)) out << c;
+        // VST_PATH and VST3_PATH are colon-separated, like PATH.
+        for (const char *var : { "VST_PATH", "VST3_PATH" }) {
+            const QString e = qEnvironmentVariable(var);
+            if (e.isEmpty()) continue;
+            for (const QString &part : e.split(':', Qt::SkipEmptyParts))
+                if (QDir(part).exists() && !out.contains(part)) out << part;
+        }
         return out;
     }
 
@@ -2557,6 +2591,8 @@ private:
             if (QDir(c).exists()) return c;
             if (!d.cdUp()) break;
         }
+        const QStringList std = standardPluginDirs();
+        if (!std.isEmpty()) return std.first();
         return QDir::homePath();
     }
 

@@ -1864,24 +1864,21 @@ int main(int argc, char **argv)
                         "(PEHOST_ISOLATE=0 to disable)\n");
     }
 
-    snprintf(dir, sizeof dir, "../../windows/VST2-64");
+    dir[0] = 0;
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--all")) g_show_all = TRUE;
         else if (!strcmp(argv[i], "--dir") && i + 1 < argc) base = argv[++i];
         else if (!strcmp(argv[i], "--backend") && i + 1 < argc) g_backend_want = argv[++i];
         else if (!strcmp(argv[i], "--cycle") && i + 1 < argc) g_cycle_ms = atoi(argv[++i]);
     }
+    /* Without --dir, ask plugview where to open. It knows the checkout's own
+     * corpora and the system's VST directories, and it only ever names one
+     * that exists -- where this used to build a path out of the executable's
+     * location unconditionally and scan it whether or not it was there. From
+     * an installed copy that path was /windows/VST2-64, so the window opened
+     * on nothing and said so about a directory nobody had asked for. */
     if (base) snprintf(dir, sizeof dir, "%s", base);
-    else {
-        char self[512];
-        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
-        if (n > 0) {
-            char *s;
-            self[n] = '\0';
-            if ((s = strrchr(self, '/'))) *s = '\0';
-            snprintf(dir, sizeof dir, "%s/../../../windows/VST2-64", self);
-        }
-    }
+    else      snprintf(dir, sizeof dir, "%s", plugview_default_dir());
 
     pw_init(&argc, &argv);
     {   /* DW_PERIOD / DW_LATENCY: trade latency against underruns */
