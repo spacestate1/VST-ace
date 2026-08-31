@@ -29,6 +29,19 @@ extern "C" {
 #include <spa/param/audio/format-utils.h>
 }
 
+/* Classic Mac OS hosting is switched ON, separately from macOS, because it
+ * works. A .vstclassic loads, renders audio and draws its own editor -- the
+ * CFM/PEF loader, the PowerPC interpreter and the QuickDraw/PICT path carry it
+ * end to end. The Mach-O side gets as far as audio and no further: its editors
+ * want NSImage, which is a class name here with no methods behind it.
+ *
+ * They were one switch, which meant the working backend was off because the
+ * other one is not finished. Build with -DPESTUDIO_CLASSIC=0 to drop it.
+ */
+#ifndef PESTUDIO_CLASSIC
+#define PESTUDIO_CLASSIC 1
+#endif
+
 /* macOS hosting is switched off in the UI for now.
  *
  * Nothing is removed: machoload.c, the Objective-C runtime, the software Metal
@@ -2137,7 +2150,13 @@ private slots:
                 /* A Classic Mac OS plugin is a plain file -- a PEF, or a resource
                  * fork carrying one -- with no extension convention worth
                  * trusting, so the header decides rather than the name. */
-                const bool isClassic = PESTUDIO_MAC && fi.isFile() && !isV2 &&
+                /* Only files nothing else claimed, and only ones small enough
+                 * to be a plug-in of this era -- the header test opens the file,
+                 * and a Classic plug-in has no extension convention worth
+                 * trusting, so without a bound this would sniff every stray
+                 * file in a scanned tree. Nothing from 2002 is over 32 MB. */
+                const bool isClassic = PESTUDIO_CLASSIC && fi.isFile() && !isV2 &&
+                    !isV3 && fi.size() > 128 && fi.size() < 32u * 1024 * 1024 &&
                     pehost_is_classic_mac(
                         fi.absoluteFilePath().toLocal8Bit().constData());
                 /* A native Linux VST2 is a bare .so, so the export decides -- a
@@ -2694,6 +2713,8 @@ private:
 #if PESTUDIO_MAC
             { "macOS VST2",          "macos/VST2"      },
             { "macOS Audio Units",   "macos/AU"        },
+#endif
+#if PESTUDIO_CLASSIC
             { "Mac OS 9 (Classic)",  "macos/classic"   },
 #endif
         };
@@ -3223,7 +3244,8 @@ private:
         /* Grouped by platform, in the order the browser lists plug-ins, so the
          * Windows folders read together and the native ones together. */
         static const char *groups[] = { VSTDIRS_WINDOWS, VSTDIRS_LINUX,
-                                        VSTDIRS_MACOS,   VSTDIRS_ANY };
+                                        VSTDIRS_MACOS,   VSTDIRS_CLASSIC,
+                                        VSTDIRS_ANY };
         auto fill = [&] {
             list->clear();
             for (const char *g : groups)

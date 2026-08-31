@@ -44,6 +44,14 @@
 #define PLUGVIEW_MAC 0
 #endif
 
+/* Classic Mac OS is on, separately, because it works -- see the longer note in
+ * qtgui/main.cpp. A .vstclassic loads, renders and draws its own editor here
+ * too; the Mach-O side stops at audio. One switch for both meant the finished
+ * backend was off because the unfinished one is. -DPLUGVIEW_CLASSIC=0 drops it. */
+#ifndef PLUGVIEW_CLASSIC
+#define PLUGVIEW_CLASSIC 1
+#endif
+
 /* One entry in the browser. `kind` is what pehost decided the file is, kept so
  * the list can say "VST3" or "32-bit bridge" next to the name -- which is the
  * difference between "this will not load" and "this loads through a helper". */
@@ -204,6 +212,9 @@ static void roots_discover(void)
         { "Windows VST3",        "windows/VST3"    },
         { "Windows VST2 32-bit", "windows/VST2-32" },
         { "Linux native",        "linux/extracted" },
+#if PLUGVIEW_CLASSIC
+        { "Mac OS 9 (Classic)",  "macos/classic"   },
+#endif
 #if PLUGVIEW_MAC
         { "macOS VST2",          "macos/VST2"      },
         { "macOS Audio Units",   "macos/AU"        },
@@ -461,9 +472,15 @@ static int is_candidate(const char *path, const char *name, int isdir)
     if (l > 4 && !strcasecmp(name + l - 4, ".dll")) return pehost_is_windows_vst(path);
     if (l > 3 && !strcasecmp(name + l - 3, ".so"))
         return !strstr(path, ".lv2/") && pehost_is_native_vst2(path);
-#if PLUGVIEW_MAC
-    /* Skipped otherwise, which also spares every unrecognised file in the tree
-     * from being opened and sniffed. */
+#if PLUGVIEW_CLASSIC
+    /* Only files nothing else claimed, and only ones the size a plug-in of this
+     * era can be -- the header test opens the file, and a Classic plug-in has no
+     * extension convention worth trusting, so without a bound this would sniff
+     * every stray file in a scanned tree. Nothing from 2002 is over 32 MB. */
+    {   struct stat st;
+        if (stat(path, &st) || st.st_size <= 128 || st.st_size >= 32 * 1024 * 1024)
+            return 0;
+    }
     return pehost_is_classic_mac(path);
 #else
     return 0;
@@ -1935,7 +1952,7 @@ void plugview_load_folder(GtkWindow *parent)
  * *for*; it does not decide what is in it, because every plug-in is identified
  * from its own binary when it is scanned. */
 static const char *const g_dir_groups[] = {
-    VSTDIRS_WINDOWS, VSTDIRS_LINUX, VSTDIRS_MACOS, VSTDIRS_ANY
+    VSTDIRS_WINDOWS, VSTDIRS_LINUX, VSTDIRS_MACOS, VSTDIRS_CLASSIC, VSTDIRS_ANY
 };
 
 static struct {

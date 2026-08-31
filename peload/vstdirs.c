@@ -42,6 +42,7 @@ const char *vstdirs_os_label(const char *os)
     if (!strcmp(os, VSTDIRS_WINDOWS))    return "Windows";
     if (!strcmp(os, VSTDIRS_LINUX))      return "Linux";
     if (!strcmp(os, VSTDIRS_MACOS))      return "macOS";
+    if (!strcmp(os, VSTDIRS_CLASSIC))    return "Mac OS 9";
     return "Any platform";
 }
 
@@ -54,6 +55,7 @@ static const char *os_norm(const char *os)
     if (!strcmp(os, VSTDIRS_WINDOWS)) return VSTDIRS_WINDOWS;
     if (!strcmp(os, VSTDIRS_LINUX))   return VSTDIRS_LINUX;
     if (!strcmp(os, VSTDIRS_MACOS))   return VSTDIRS_MACOS;
+    if (!strcmp(os, VSTDIRS_CLASSIC)) return VSTDIRS_CLASSIC;
     return VSTDIRS_ANY;
 }
 

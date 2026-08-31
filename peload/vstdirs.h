@@ -48,6 +48,11 @@ extern "C" {
 #define VSTDIRS_WINDOWS  "windows"
 #define VSTDIRS_LINUX    "linux"
 #define VSTDIRS_MACOS    "macos"
+/* Mac OS 9 / Classic, spelled the way pehost_info::os spells it. Its own
+ * group rather than a corner of the macOS one: they share no format, no
+ * binary layout and no loader -- a Classic plug-in is CFM/PEF PowerPC run by
+ * an interpreter, where a macOS one is Mach-O x86-64 run natively. */
+#define VSTDIRS_CLASSIC  "classic"
 #define VSTDIRS_ANY      "any"
 
 typedef struct {

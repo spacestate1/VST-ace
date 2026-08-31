@@ -120,6 +120,13 @@ platform it holds; the list is kept in `~/.config/vst-ace/plugin-folders` and is
 shared, so a folder added in one window is searched by the other. The system VST
 directories and `VST_PATH`/`VST3_PATH` are searched without being asked for.
 
+Mac OS 9 plug-ins are browsed by default and have their own platform group.
+They are the most complete of the three macOS-family backends here: a
+`.vstclassic` loads, renders and draws its own editor through the CFM/PEF
+loader, the PowerPC interpreter and the QuickDraw path. Mach-O macOS hosting is
+still off in the windows (`-DPESTUDIO_MAC=1` / `-DPLUGVIEW_MAC=1` to try it);
+`-DPESTUDIO_CLASSIC=0` / `-DPLUGVIEW_CLASSIC=0` drop the Classic side.
+
 For the command-line tools, point `VST_ROOT` at a directory holding `windows/`,
 `linux/` and `macos/`, or keep it at `~/vst`, which is where they look by
 default. Paths given on the command line work regardless.
