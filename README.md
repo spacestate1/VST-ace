@@ -80,19 +80,28 @@ Packages are on the
 [releases page](https://github.com/spacestate1/VST-ace/releases) — a `.deb` for
 Ubuntu 24.04 and Debian 13 or newer, and an `.rpm` for Fedora 40 or newer:
 
-    sudo apt install ./vst-ace_0.1.0-1_amd64.deb        # Debian, Ubuntu
-    sudo dnf install ./vst-ace-0.1.0-1.fc43.x86_64.rpm  # Fedora
+    sudo apt install ./vst-ace_0.1.1-1_amd64.deb        # Debian, Ubuntu
+    sudo dnf install ./vst-ace-0.1.1-1.fc43.x86_64.rpm  # Fedora
+
+`apt install`, not `dpkg -i`. The leading `./` is what makes apt read the
+argument as a file rather than a package name, and apt is what pulls in GTK 4,
+Qt 6, PipeWire and the rest -- fourteen dependencies, all stock. `dpkg -i`
+unpacks the one file and stops, leaving the package unconfigured and printing
+the libraries it could not find; `sudo apt install -f` finishes that off.
 
 That puts `va`, `pestudio` and `dwstudio` on `$PATH`, the patch banks in
 `/usr/share/vst-ace/patches`, and both windows in the desktop menu.
 
-Either package hosts 64-bit plug-ins. For **32-bit Windows VST2** plug-ins the
-Debian side has a second package carrying `peload32`, the i386 loader the
-64-bit hosts bridge to out of process. It is a foreign-architecture package, so
-i386 has to be enabled before apt will look at it:
+Either package hosts 64-bit plug-ins. **32-bit Windows VST2** plug-ins are
+loaded by `peload32`, the i386 helper the 64-bit hosts bridge to out of
+process; the `.deb` carries it. Its runtime libraries are `Suggests` rather
+than `Depends`, so the package installs on a machine that has never enabled a
+foreign architecture and `peload32` says what is missing rather than failing
+obscurely. To turn it on:
 
     sudo dpkg --add-architecture i386 && sudo apt update
-    sudo apt install ./vst-ace-i386_0.1.0-1_i386.deb
+    sudo apt install libx11-6:i386 libfreetype6:i386 \
+                     libasound2t64:i386 libpipewire-0.3-0t64:i386
 
 There is no equivalent in the `.rpm` yet; on Fedora, 32-bit plug-ins still want
 a build from source.
@@ -101,7 +110,7 @@ A few plug-ins import a Microsoft C or C++ runtime that cannot be stubbed --
 iostreams and locale objects carry vtables and internal state -- and they load
 only with the genuine DLL present. It is not ours to redistribute, so the main
 package ships the place to put it -- both widths, empty, with a README beside
-them; the i386 add-on carries nothing but peload32:
+them:
 
     /usr/lib/vst-ace/runtime/      x86-64 DLLs, for the 64-bit hosts
     /usr/lib/vst-ace/runtime32/    i386 DLLs, for peload32

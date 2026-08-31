@@ -21,7 +21,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 
 Name:           vst-ace
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Run Windows, macOS and Linux audio plug-ins natively, without Wine
 
@@ -61,8 +61,8 @@ own editor -- blitted for Windows plug-ins, embedded as an X11 child window for
 native Linux ones. dwstudio (GTK4) drives the reimplemented engines: a Korg
 DW-8000, a 4-op FM synth, a Juno-6 and sample kits.
 
-The command line has the same hosts: dw peload inspects and renders a plug-in
-without a window, and dw play runs the DW-8000 engine with no plug-in loaded at
+The command line has the same hosts: va peload inspects and renders a plug-in
+without a window, and va play runs the DW-8000 engine with no plug-in loaded at
 all.
 
 This package hosts 64-bit plug-ins. The i386 loader is not built here, as it
@@ -78,7 +78,7 @@ the plug-ins these hosts load are their authors' own.
 # separate CMake projects (gui/ pulls peload/ in for the host library). Each is
 # driven explicitly rather than through %%cmake, which assumes one per tree.
 #
-# `dw` is compiled knowing where it was installed, which is what lets it find
+# `va` is compiled knowing where it was installed, which is what lets it find
 # its helpers with no source tree above it -- see locate_tree() in c/src/dw.c.
 %make_build -C c \
     CFLAGS="%{build_cflags} -Wno-format-truncation" \
@@ -177,5 +177,13 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %{_mandir}/man1/dwstudio.1*
 
 %changelog
+* Mon Aug 31 2026 Connor McRann <cmcrann@protonmail.com> - 0.1.1-1
+- Fix both desktop entries, which named the launcher by its old name and so
+  failed to start either window from the desktop menu.
+- Follow the same rename through the man pages, the package descriptions and
+  va's own usage text.
+- Stamp the About boxes with the version the package is built as, rather than
+  the one written into the CMake files.
+
 * Sat Aug 29 2026 Connor McRann <cmcrann@protonmail.com> - 0.1.0-1
 - Initial release.

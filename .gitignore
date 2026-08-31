@@ -1,5 +1,5 @@
 # Build output. `build/` matches the top-level one and gui/build, peload/build
-# with it -- every one of them is produced by `dw build`.
+# with it -- every one of them is produced by `va build`.
 build/
 *.o
 *.a

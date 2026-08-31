@@ -3,11 +3,21 @@ project(dwstudio LANGUAGES C)
 
 # ---- what this build is, for the About boxes ------------------------------
 #
+# The version, overridable from the environment for the same reason the commit
+# below is: packaging/build-deb.sh and build-rpm.sh take it as an argument and
+# rewrite the package metadata with it, so without this a 0.1.1 package would
+# carry an About box still naming the number written here. The default is what
+# a developer's own build reports, and is the one place to bump it.
+if(DEFINED ENV{VSTACE_VERSION})
+  set(VSTACE_VERSION "$ENV{VSTACE_VERSION}")
+else()
+  set(VSTACE_VERSION "0.1.1")
+endif()
+
 # SOURCE_DATE_EPOCH is honoured because Debian and Fedora set it to keep builds
 # reproducible; taking the clock instead would make two builds of one source
 # differ. Falling back to the clock is right for a developer's own build, which
 # is the case where the date is actually worth reading.
-set(VSTACE_VERSION "0.1.0")
 if(DEFINED ENV{SOURCE_DATE_EPOCH})
   execute_process(
     COMMAND date -u -d "@$ENV{SOURCE_DATE_EPOCH}" +%Y-%m-%d

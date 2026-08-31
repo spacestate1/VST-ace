@@ -146,7 +146,7 @@ esac
 "${INSTALL[@]}"
 
 echo
-echo "=== Done. Build with: ./dw build ==="
+echo "=== Done. Build with: ./va build ==="
 if [[ "$MGR" == "apt" ]]; then
     echo "(On releases before Debian 13 / Ubuntu 24.04, libfreetype-dev is"
     echo " named libfreetype6-dev, and GTK 4 is old enough that dwstudio is"

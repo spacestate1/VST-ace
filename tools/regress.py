@@ -483,6 +483,101 @@ def check_rpm_spec(ctx):
     return PASS, "tags, comment escaping and build macros all present"
 
 
+def installed_programs():
+    """The program names each recipe puts on $PATH.
+
+    debian/rules installs va directly and symlinks the rest in a loop; the spec
+    lists them under %{_bindir} in %files. Both are returned separately because
+    the same .desktop file is installed by both, so it has to name something
+    each of them provides.
+    """
+    rules = open(rel("packaging", "debian", "rules"), encoding="utf-8").read()
+    deb = set(re.findall(r"\$\(DESTDIR\)/usr/bin/(\w[\w.+-]*)", rules))
+    for group in re.findall(r"for p in ([a-z0-9 ]+); do", rules):
+        deb.update(group.split())
+
+    spec_path = rel("packaging", "rpm", "vst-ace.spec")
+    spec = open(spec_path, encoding="utf-8").read() if os.path.exists(spec_path) else ""
+    files = spec[spec.index("%files"):] if "%files" in spec else ""
+    rpm = set(re.findall(r"^%\{_bindir\}/(\S+)", files, re.M))
+    return deb, rpm
+
+
+def check_desktop_exec(ctx):
+    """Every .desktop Exec= must name a program the packages install.
+
+    Would have caught: the launcher renamed from dw to va, leaving Exec=dw pe
+    and Exec=dw gui behind. Both menu entries then failed on a fresh install
+    with "Failed to execute child process dw (No such file or directory)" --
+    and desktop-file-validate passed the files, because it checks their syntax
+    and not whether the program named in them is there.
+    """
+    deb, rpm = installed_programs()
+    if not deb or not rpm:
+        return SKIP, "could not read the program list out of both recipes"
+
+    problems = []
+    for name in sorted(os.listdir(rel("packaging"))):
+        if not name.endswith(".desktop"):
+            continue
+        text = open(rel("packaging", name), encoding="utf-8").read()
+        for key in ("Exec", "TryExec"):
+            m = re.search(r"^%s=(\S+)" % key, text, re.M)
+            if not m:
+                continue
+            # The program is argv[0]; the rest is arguments and field codes.
+            prog = m.group(1)
+            for recipe, have in (("the .deb", deb), ("the .rpm", rpm)):
+                if prog not in have:
+                    problems.append("%s: %s=%s, which %s does not install"
+                                    % (name, key, prog, recipe))
+    if problems:
+        return FAIL, "; ".join(problems)
+    return PASS, "every Exec names a program on $PATH in both packages"
+
+
+def check_version_consistent(ctx):
+    """The two CMake projects must default to the same version.
+
+    Each window compiles VSTACE_VERSION into its own About box, and the default
+    is written out in both peload/CMakeLists.txt and gui/CMakeLists.txt. A bump
+    applied to one and not the other gives pestudio and dwstudio, in the same
+    package, two different answers to what they are -- with nothing to say
+    which is right. The .rpm spec's Version: is checked with them, since
+    build-rpm.sh rewrites that tag rather than reading it.
+    """
+    found = {}
+    for proj in ("peload", "gui"):
+        path = rel(proj, "CMakeLists.txt")
+        # The literal one, not the set() that reads the environment override.
+        lit = [v for v in re.findall(r'^\s*set\(VSTACE_VERSION\s+"([^"]+)"\)',
+                                     open(path, encoding="utf-8").read(), re.M)
+               if "$" not in v]
+        if len(lit) != 1:
+            return FAIL, ("%s/CMakeLists.txt has %d literal VSTACE_VERSION "
+                          "defaults, wanted 1" % (proj, len(lit)))
+        found[proj + "/CMakeLists.txt"] = lit[0]
+
+    spec_path = rel("packaging", "rpm", "vst-ace.spec")
+    if os.path.exists(spec_path):
+        m = re.search(r"^Version:\s*(\S+)", open(spec_path, encoding="utf-8").read(), re.M)
+        if m:
+            found["rpm/vst-ace.spec"] = m.group(1)
+
+    # version.h's fallback, for a compile outside the build system. CMake
+    # always defines the macro, so this one never reaches a package -- but a
+    # stale number here is still a wrong answer waiting for the first person
+    # who builds a file by hand.
+    m = re.search(r'^#define VSTACE_VERSION "([^"]+)"',
+                  open(rel("peload", "version.h"), encoding="utf-8").read(), re.M)
+    if m:
+        found["peload/version.h"] = m.group(1)
+
+    if len(set(found.values())) != 1:
+        return FAIL, "disagree: " + ", ".join("%s=%s" % kv for kv in sorted(found.items()))
+    return PASS, "%s in all %d places" % (next(iter(found.values())), len(found))
+
+
 def check_desktop_files(ctx):
     """The .desktop files both packages install must validate.
 
@@ -524,6 +619,38 @@ def check_man_pages(ctx):
     return PASS, "%d man pages present" % len(names)
 
 
+def check_man_xrefs(ctx):
+    """Man page cross-references must resolve to a page that exists.
+
+    Would have caught: the same rename leaving .BR dw (1) in three of the four
+    pages, so `man pestudio` sent the reader to a page no package ships.
+    """
+    pages = {n[:-2] for n in os.listdir(rel("packaging")) if n.endswith(".1")}
+    if not pages:
+        return SKIP, "no man pages in packaging/"
+
+    have_man = shutil.which("man") is not None
+    dangling, unchecked = [], 0
+    for page in sorted(pages):
+        text = open(rel("packaging", page + ".1"), encoding="utf-8").read()
+        for ref in re.findall(r"^\.BR?\s+(\S+)\s+\(1\)", text, re.M):
+            if ref in pages:
+                continue
+            # Not ours. It may still be a real page on this machine -- a
+            # reference out to something the distribution ships is fine.
+            if not have_man:
+                unchecked += 1
+            elif run(["man", "-w", ref]).returncode != 0:
+                dangling.append("%s.1 -> %s(1)" % (page, ref))
+
+    if dangling:
+        return FAIL, "; ".join(sorted(set(dangling)))
+    if unchecked:
+        return SKIP, ("%d reference(s) out of the tree, and no man here to "
+                      "resolve them" % unchecked)
+    return PASS, "%d pages, every (1) cross-reference resolves" % len(pages)
+
+
 CHECKS = [
     ("stub-wiring",        check_stub_wiring),
     ("arity-source",       check_arity_source),
@@ -537,8 +664,11 @@ CHECKS = [
     ("i386-deps-match",    check_i386_deps_match),
     ("rules-staging-dirs", check_rules_staging_dirs),
     ("rpm-spec",           check_rpm_spec),
+    ("version-consistent", check_version_consistent),
     ("desktop-files",      check_desktop_files),
+    ("desktop-exec",       check_desktop_exec),
     ("man-pages",          check_man_pages),
+    ("man-xrefs",          check_man_xrefs),
 ]
 
 

@@ -30,6 +30,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # with the empty string exactly when it was most needed.
 VSTACE_GIT="${VSTACE_GIT:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)}"
 export VSTACE_GIT
+
+# The About boxes are compiled with this, so the number the package is named
+# after and the number it reports are the same one. The spec's Version: tag is
+# rewritten below; this is the other half of that.
+export VSTACE_VERSION="$VERSION"
+
 RELEASE_DIR="$REPO_ROOT/release"
 WORK_DIR="$(mktemp -d -t vst-ace-rpm-build-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -88,3 +94,8 @@ ls -lh "$RELEASE_DIR"/vst-ace*.rpm
 echo
 echo "release/ is not tracked by git. Publish the .rpm on the releases page:"
 echo "  gh release upload v$VERSION $RELEASE_DIR/vst-ace-$VERSION-1*.rpm"
+echo
+# Same reason as build-deb.sh: say how to install it where it is downloaded.
+# rpm -i has dnf's dependency problem too, and the same one-line answer.
+echo "Note for the release text -- install with dnf, not rpm -i:"
+echo "  sudo dnf install ./vst-ace-$VERSION-1.fc*.x86_64.rpm"

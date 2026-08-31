@@ -812,7 +812,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "demo"))   return cmd_demo();
     if (!strcmp(cmd, "list"))   return cmd_list();
     if (!strcmp(cmd, "render")) {
-        if (argc < 1) { fprintf(stderr, "usage: dw render <dir>\n"); return 2; }
+        if (argc < 1) { fprintf(stderr, "usage: va render <dir>\n"); return 2; }
         return cmd_render(argv[0]);
     }
     if (!strcmp(cmd, "keys")) {
@@ -848,7 +848,7 @@ int main(int argc, char **argv)
         const char *sub = is32 ? "windows/VST2-32" : "windows/VST2-64";
         snprintf(dir, sizeof dir, "%s/peload", g_re);
         if (argc == 0) {
-            printf("usage: dw %s <plugin> [options] -- run `va %s --help` for the "
+            printf("usage: va %s <plugin> [options] -- run `va %s --help` for the "
                    "full list\n", cmd, cmd);
             list_corpus(sub);
             return 0;

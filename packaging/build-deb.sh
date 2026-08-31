@@ -42,6 +42,10 @@ mkdir -p "$RELEASE_DIR"
 # with the empty string exactly when it was most needed.
 VSTACE_GIT="${VSTACE_GIT:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)}"
 export VSTACE_GIT
+
+# The About boxes are compiled with this, so the number the package is named
+# after and the number it reports are the same one.
+export VSTACE_VERSION="$VERSION"
 [ -n "$VSTACE_GIT" ] && echo "building from commit $VSTACE_GIT"
 
 
@@ -60,7 +64,7 @@ rsync -a \
     --exclude='__pycache__/' \
     --exclude='*.o' \
     --exclude='*.d' \
-    --exclude='/dw' \
+    --exclude='/va' \
     --exclude='/out/' \
     --exclude='/project/' \
     --exclude='/renders/' \
@@ -131,6 +135,15 @@ echo "release/ is not tracked by git. Publish it on the releases page:"
 echo "  gh release create v$VERSION \\"
 echo "     $RELEASE_DIR/vst-ace_$VERSION-1_amd64.deb \\"
 echo "     --title \"vst-ace $VERSION\" --notes \"Ubuntu 24.04 / Debian 13+, amd64."
+echo ""
+# The install line goes first, and says which tool. Someone landing on the
+# releases page reaches for dpkg -i, which unpacks the file and stops --
+# fourteen dependencies unmet and a package left unconfigured. apt is what
+# resolves them, and the ./ is what makes it read a path rather than a name.
+echo "Install with apt, not dpkg -i -- apt pulls in GTK 4, Qt 6 and the rest:"
+echo "  sudo apt install ./vst-ace_$VERSION-1_amd64.deb"
+echo "If dpkg -i was already run, sudo apt install -f finishes it."
+echo ""
 echo "32-bit Windows VST2 plug-ins work once the i386 runtime is present:"
 echo "  sudo dpkg --add-architecture i386 && sudo apt update"
 echo "  sudo apt install libx11-6:i386 libfreetype6:i386 libasound2t64:i386 \\"

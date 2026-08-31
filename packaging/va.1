@@ -117,10 +117,20 @@ for a native Wayland window and no native editors.
 Plug\-ins are hosted out of process by default: a browser loads a hundred of
 them in a session, and one that faults should not end it.
 .PP
-This package hosts 64\-bit plug\-ins.
+Both packages host 64\-bit plug\-ins. The Debian and Ubuntu package carries
+.B peload32
+beside them as well \(em the i386 loader the 64\-bit hosts bridge to for 32\-bit
+Windows VST2 plug\-ins. The i386 runtime libraries it needs are
+.B Suggests
+rather than
+.BR Depends ,
+so the package installs on a host that has never enabled a foreign
+architecture and
 .B va peload32
-needs a 32\-bit toolchain that Debian and Ubuntu do not carry the libraries
-for, so it is not built here; build from source for 32\-bit Windows plug\-ins.
+reports what is missing rather than assuming it is there; installing them with
+.B dpkg \-\-add\-architecture i386
+is what turns it on. The Fedora package does not build it \(em build from
+source there for 32\-bit Windows plug\-ins.
 .SH SEE ALSO
 The project documentation in
 .IR /usr/share/doc/vst\-ace/ ,

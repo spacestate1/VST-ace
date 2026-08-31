@@ -18,7 +18,7 @@
 export DEB_BUILD_MAINT_OPTIONS = optimize=-lto
 include /usr/share/dpkg/buildflags.mk
 
-# Where the installed copy lives. `dw` is compiled knowing both paths, which is
+# Where the installed copy lives. `va` is compiled knowing both paths, which is
 # what lets it find its helpers with no source tree above it -- see
 # locate_tree() in c/src/dw.c. Nothing else in the tree needs telling: the
 # bridge looks for peserve and peload32 beside the running executable, and

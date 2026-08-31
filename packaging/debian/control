@@ -34,12 +34,12 @@ Vcs-Browser: https://github.com/spacestate1/VST-ace
 
 Package: vst-ace
 Architecture: amd64
-# vst-ace-i386's Depends: vst-ace needs this: without it, dpkg reads an
-# unqualified dependency as "the same architecture as the depending package"
-# -- i386 -- and refuses to let an amd64 vst-ace satisfy it. Foreign is the
-# correct read here, not a workaround: peload32 finds the rest of vst-ace by
-# walking /proc/self/exe to a path, not by linking against it, so nothing
-# about the dependency actually needs the architectures to match.
+# Foreign because nothing about this package's interface is
+# architecture-specific: the programs are found by path, not linked against.
+# It was added for a separate vst-ace-i386 package to be able to depend on
+# this one; that package is gone -- peload32 ships here now -- but the
+# statement is still the true one, and it is what lets an i386 package on some
+# other host satisfy a dependency on vst-ace.
 Multi-Arch: foreign
 Depends:
  ${shlibs:Depends},
@@ -69,12 +69,14 @@ Description: run Windows, macOS and Linux audio plug-ins natively, without Wine
  for native Linux ones. dwstudio (GTK4) drives the reimplemented engines: a
  Korg DW-8000, a 4-op FM synth, a Juno-6 and sample kits.
  .
- The command line has the same hosts: dw peload inspects and renders a plug-in
- without a window, and dw play runs the DW-8000 engine with no plug-in loaded
+ The command line has the same hosts: va peload inspects and renders a plug-in
+ without a window, and va play runs the DW-8000 engine with no plug-in loaded
  at all.
  .
- This package hosts 64-bit plug-ins. For 32-bit Windows VST2 plug-ins, install
- vst-ace-i386 alongside it (packaging/build-deb.sh builds both). No plug-in
+ This package hosts 64-bit plug-ins, and carries peload32 for 32-bit Windows
+ VST2 ones: the i386 loader the 64-bit hosts bridge to out of process. It needs
+ the i386 runtime libraries in Suggests, which want dpkg --add-architecture
+ i386 first; without them it says so rather than failing obscurely. No plug-in
  binaries are included -- the plug-ins these hosts load are their authors' own.
  .
  A few plug-ins import a Microsoft C or C++ runtime that cannot be stubbed,
@@ -83,11 +85,12 @@ Description: run Windows, macOS and Linux audio plug-ins natively, without Wine
  /usr/lib/vst-ace/runtime and .../runtime32 ship empty for it to be dropped
  into; the README there says what goes in them. Everything else works without.
 
-# vst-ace-i386 is not built from this file: dh only builds the binary packages
-# whose Architecture matches the host a plain `dpkg-buildpackage -b` runs on,
-# so a hardcoded "Architecture: i386" stanza here would simply be skipped on
-# an amd64 build rather than cross-built. packaging/build-deb.sh assembles it
-# by hand instead, straight from peload32 -- the one binary this Build-Depends
-# list's i386 toolchain exists to produce -- once dpkg-buildpackage above has
-# finished; see the control template it generates for that package's own
-# metadata.
+# There is no second, i386 stanza here, and there is no vst-ace-i386 package
+# any more. dh only builds the binary packages whose Architecture matches the
+# host that `dpkg-buildpackage -b` runs on, so a hardcoded "Architecture: i386"
+# stanza would be skipped on an amd64 build rather than cross-built, and
+# build-deb.sh used to assemble that package by hand instead. The cost was that
+# 32-bit support arrived only for users who knew to install a second thing.
+# debian/rules installs peload32 into this package instead -- an i386 binary in
+# an amd64 package, which dpkg is content with as long as dh_shlibdeps is kept
+# away from it. See the override there.
