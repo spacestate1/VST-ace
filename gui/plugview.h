@@ -43,6 +43,11 @@ void plugview_scan(const char *dir);
 void plugview_open_vst(GtkWindow *parent);
 void plugview_load_folder(GtkWindow *parent);
 
+/* Settings > Plug-in Folders: the folders searched for plug-ins, each under
+ * the platform it holds. Persisted, and shared with pestudio -- one answer per
+ * machine to "where are my plug-ins", not one per window. See vstdirs.h. */
+void plugview_edit_folders(GtkWindow *parent);
+
 /* True when a plug-in is loaded, i.e. when it -- and not an engine -- is what
  * should be heard. Cheap enough for the audio callback. */
 int  plugview_active(void);

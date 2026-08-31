@@ -1517,6 +1517,16 @@ static void act_load_folder(GSimpleAction *a, GVariant *p, gpointer ud)
     plugview_load_folder(GTK_WINDOW(U.win));
 }
 
+/* Settings > Plug-in Folders. Where the plug-ins are, set once and kept --
+ * and kept where pestudio reads it too, so the two windows search the same
+ * places. Load Folder above adds one in passing; this is the list itself. */
+static void act_plugin_folders(GSimpleAction *a, GVariant *p, gpointer ud)
+{
+    (void)a; (void)p; (void)ud;
+    gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
+    plugview_edit_folders(GTK_WINDOW(U.win));
+}
+
 /* Plug-ins that need data they have not got are marked in the list and spelled
  * out in the status line; this is what does something about the ones that can
  * be. Under File because it acts on the whole scanned folder rather than on
@@ -1567,13 +1577,15 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "open-vst",    act_open_vst,    NULL, NULL, NULL, {0} },
         { "load-folder", act_load_folder, NULL, NULL, NULL, {0} },
         { "install-data", act_install_data, NULL, NULL, NULL, {0} },
+        { "plugin-folders", act_plugin_folders, NULL, NULL, NULL, {0} },
         { "quit",        act_quit,        NULL, NULL, NULL, {0} },
         { "about",       act_about,       NULL, NULL, NULL, {0} },
     };
-    GMenu *bar   = g_menu_new();
-    GMenu *file  = g_menu_new();
-    GMenu *sect  = g_menu_new();
-    GMenu *about = g_menu_new();
+    GMenu *bar      = g_menu_new();
+    GMenu *file     = g_menu_new();
+    GMenu *sect     = g_menu_new();
+    GMenu *settings = g_menu_new();
+    GMenu *about    = g_menu_new();
     GtkWidget *w;
 
     g_action_map_add_action_entries(G_ACTION_MAP(U.win), entries,
@@ -1592,6 +1604,10 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append_section(file, NULL, G_MENU_MODEL(sect));
     g_menu_append_submenu(bar, "File", G_MENU_MODEL(file));
 
+    /* Between File and About, matching pestudio. */
+    g_menu_append(settings, "Plug-in Folders…", "win.plugin-folders");
+    g_menu_append_submenu(bar, "Settings", G_MENU_MODEL(settings));
+
     /* Next to File, matching pestudio, so the same question is answered the
      * same way in whichever window is open. */
     g_menu_append(about, "About vst-ace", "win.about");
@@ -1599,7 +1615,8 @@ static GtkWidget *build_menubar(GtkApplication *app)
 
     w = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(bar));
     gtk_widget_set_halign(w, GTK_ALIGN_START);
-    g_object_unref(about); g_object_unref(sect); g_object_unref(file); g_object_unref(bar);
+    g_object_unref(about); g_object_unref(settings);
+    g_object_unref(sect); g_object_unref(file); g_object_unref(bar);
     return w;
 }
 

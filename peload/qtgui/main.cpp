@@ -20,6 +20,7 @@
 
 extern "C" {
 #include "pehost.h"
+#include "vstdirs.h"
 #include "version.h"
 #include "patch.h"
 #include "win32host.h"
@@ -1574,24 +1575,48 @@ public:
         auto *lv = new QVBoxLayout(left);
         lv->setContentsMargins(6, 6, 6, 6);
 
-        rootBox_ = new QComboBox;
-        for (const auto &r : discoverRoots()) rootBox_->addItem(r.first, r.second);
         loadUserRoots();   /* the folders the user added in past sessions */
+        /* A plug-in named on the command line, or a --dir, is somewhere to
+         * scan rather than somewhere to browse: it joins the roots so what it
+         * holds turns up in the list, and the selection below finds it there. */
+        if (!startPlugin.isEmpty()) sessionRoots_ << QFileInfo(startPlugin).absolutePath();
+        else if (!startDir.isEmpty()) sessionRoots_ << startDir;
+
+        /* What to browse, in the two terms a plug-in actually has: the format
+         * it is and the platform it was built for.
+         *
+         * This pair replaces a selector that named directories -- "Windows VST2
+         * 64-bit", "Linux native", every folder the user had ever added. That
+         * made the corpus layout the user's problem, and it listed one format
+         * once per directory holding it, so "VST2" appeared three times over
+         * and picking the wrong one showed an empty list. Every root is scanned
+         * once now and these two narrow the result, so each format is offered
+         * exactly once however many folders it is spread across. */
+        typeBox_ = new QComboBox;
+        osBox_   = new QComboBox;
+        auto *typeRow = new QHBoxLayout;
+        typeRow->addWidget(new QLabel("Type:"));
+        typeRow->addWidget(typeBox_, 1);
+        auto *osRow = new QHBoxLayout;
+        osRow->addWidget(new QLabel("OS:"));
+        osRow->addWidget(osBox_, 1);
+
         auto *dirRow = new QHBoxLayout;
-        /* A named plugin sets the browsing root to the directory holding it, so
-         * the list it lands in is the one it came from and its neighbours are
-         * there to switch to. */
-        dirEdit_ = new QLineEdit(
-            !startPlugin.isEmpty() ? QFileInfo(startPlugin).absolutePath()
-            : !startDir.isEmpty()  ? startDir
-            : rootBox_->count()    ? rootBox_->itemData(0).toString()
-                                   : defaultDir());
+        /* Where the plug-in under the cursor came from. A display now, not the
+         * thing being browsed: with every root scanned at once there is no one
+         * directory to type into, and the useful one is the selection's. */
+        dirEdit_ = new QLineEdit(defaultDir());
+        dirEdit_->setReadOnly(true);
+        dirEdit_->setFrame(false);
+        dirEdit_->setCursorPosition(0);
         auto *browse = new QPushButton("...");
         browse->setFixedWidth(30);
+        browse->setToolTip("Add a folder to the scan");
         dirRow->addWidget(new QLabel("Dir:"));
         dirRow->addWidget(dirEdit_);
         dirRow->addWidget(browse);
-        lv->addWidget(rootBox_);
+        lv->addLayout(typeRow);
+        lv->addLayout(osRow);
         lv->addLayout(dirRow);
 
         /* Opening a plug-in and adding a folder used to be a pair of buttons
@@ -1599,27 +1624,13 @@ public:
          * that is where a program's file commands belong, and because the same
          * two commands then sit in the same place in both windows. */
 
-        /* Force a loader when auto-detect guesses wrong -- a Windows VST3 shipped
-         * as a bare .dll, a plugin whose bytes and name disagree. "Auto-detect"
-         * (the default) sniffs, exactly as before; any other choice hands the
-         * file straight to that backend so the user can try it. */
-        auto *forceRow = new QHBoxLayout;
-        forceBox_ = new QComboBox;
-        forceBox_->addItem("Auto-detect", (int)PEHOST_KIND_AUTO);
-        {
-            static const pehost_kind kinds[] = {
-                PEHOST_KIND_WIN_VST2_64, PEHOST_KIND_WIN_VST2_32, PEHOST_KIND_WIN_VST3,
-                PEHOST_KIND_LINUX_VST3,  PEHOST_KIND_LINUX_VST2,
-                PEHOST_KIND_MAC_VST2,    PEHOST_KIND_MAC_VST3,   PEHOST_KIND_MAC_AU,
-                PEHOST_KIND_CLASSIC_MAC,
-            };
-            for (pehost_kind k : kinds)
-                forceBox_->addItem(QString::fromUtf8(pehost_kind_label(k)), (int)k);
-        }
-        forceRow->addWidget(new QLabel("Load as:"));
-        forceRow->addWidget(forceBox_, 1);
-        lv->addLayout(forceRow);
-
+        /* There is no "Load as" row any more. It offered the same nine loaders
+         * the OS selector above now sorts by, and asked the user to pick one --
+         * a choice they had no way to make better than the sniffer, which reads
+         * the binary. Detection is what decides how a plug-in is hosted, always;
+         * the selector above says which platform's plug-ins to show, which is
+         * the question people were really answering with it. pehost_open_as is
+         * untouched and still forces a backend for `va peload --as`. */
         pluginList_ = new QListWidget;
         lv->addWidget(new QLabel("Plugins"));
         lv->addWidget(pluginList_, 3);
@@ -1824,29 +1835,21 @@ public:
         statusBar()->showMessage("starting audio...");
 
         /* wiring */
+        /* Adding a folder is a rescan, not a change of view: the list is every
+         * root at once, so a new one joins it rather than replacing it. */
         connect(browse, &QPushButton::clicked, this, [this] {
-            QString d = QFileDialog::getExistingDirectory(this, "Plugin directory", dirEdit_->text());
-            if (!d.isEmpty()) { dirEdit_->setText(d); rescan(); }
+            QString d = QFileDialog::getExistingDirectory(this, "Add plugin folder",
+                                                          dirEdit_->text());
+            if (!d.isEmpty()) addUserRoot(VSTDIRS_ANY, d, /*select=*/true);
         });
-        connect(dirEdit_, &QLineEdit::returnPressed, this, &Window::rescan);
-        if (!startDir.isEmpty())
-            for (int i = 0; i < rootBox_->count(); i++)
-                if (rootBox_->itemData(i).toString() == QDir(startDir).absolutePath()) {
-                    QSignalBlocker b(rootBox_);
-                    rootBox_->setCurrentIndex(i);
-                    break;
-                }
-        connect(rootBox_, &QComboBox::currentIndexChanged, this, [this](int i) {
-            if (i >= 0) { dirEdit_->setText(rootBox_->itemData(i).toString()); rescan(); }
-        });
+        /* Filtering is not scanning. Both selectors sift the list already in
+         * hand, so switching format or platform is instant however long the
+         * corpus took to walk. */
+        connect(typeBox_, &QComboBox::currentIndexChanged, this,
+                [this](int) { applyFilter(); });
+        connect(osBox_, &QComboBox::currentIndexChanged, this,
+                [this](int) { applyFilter(); });
         connect(pluginList_, &QListWidget::currentRowChanged, this, &Window::loadRow);
-        /* Changing "Load as" re-opens the current selection under the new loader,
-         * so trying a different backend is one click, not a reload dance. Guarded
-         * so populating the combo at startup (no selection yet) does nothing. */
-        connect(forceBox_, &QComboBox::currentIndexChanged, this, [this] {
-            int row = pluginList_->currentRow();
-            if (row >= 0) loadRow(row);
-        });
         connect(patchList_, &QListWidget::currentRowChanged, this, &Window::applyPatchRow);
         connect(programList_, &QListWidget::currentRowChanged, this, [this](int r) {
             /* A program change dispatches straight into the plugin, so it has
@@ -2035,20 +2038,75 @@ protected:
         QMainWindow::closeEvent(e);
     }
 
-private slots:
-    void rescan()
-    {
-        pluginList_->clear();
-        paths_ = QStringList();
-        unloadable_.clear();
+private:
+    /* One scanned plug-in. Held whole so the selectors can sift without
+     * walking the disk again -- see rescan(). Out here rather than down with
+     * the other members because scanRoot() names it in its parameter list, and
+     * a nested type has to exist by then -- and out of the slots section
+     * below, where moc will only have declarations it can make slots of. */
+    struct Entry {
+        QString name, path, label, os, fmt;
+        int     kind = 0;                /* pehost_kind, for the sort within a platform */
+        bool    loadable = false;
+    };
 
+private slots:
+    /* Sort order for the browser: platform first, then format within it, then
+     * name. Grouping by platform is what makes one list of every root readable
+     * -- the Windows builds together, the native ones together -- and it is the
+     * order the OS selector narrows to when a platform is picked out of it.
+     *
+     * pehost_info::os is the authority rather than the file's extension: a
+     * .vst3 is a Windows plug-in or a Linux one depending on the binary inside
+     * it, which is exactly the distinction a directory-shaped selector could
+     * not make. */
+    static int osRank(const char *os)
+    {
+        if (!qstrcmp(os, "windows")) return 0;
+        if (!qstrcmp(os, "linux"))   return 1;
+        if (!qstrcmp(os, "macos"))   return 2;
+        if (!qstrcmp(os, "classic")) return 3;
+        return 4;   /* nothing placed it -- listed last, with its reason */
+    }
+
+    /* "windows" -> "Windows". The label a person reads, from the tag pehost
+     * writes; kept here so both selectors and both windows spell it the same. */
+    static QString osLabel(const QString &os)
+    {
+        if (os == "windows") return "Windows";
+        if (os == "linux")   return "Linux";
+        if (os == "macos")   return "macOS";
+        if (os == "classic") return "Mac OS 9";
+        return "Unrecognised";
+    }
+
+    /* Every directory the browser walks: the corpora found by walking up from
+     * the binary, the system VST locations, whatever the user has added, and
+     * anything named on the command line. Deduped -- a system location can also
+     * be a corpus, and a folder can be added twice. */
+    QStringList scanRoots() const
+    {
+        QStringList out;
+        auto add = [&out](const QString &p) {
+            if (p.isEmpty()) return;
+            const QString abs = QDir(p).absolutePath();
+            if (QDir(abs).exists() && !out.contains(abs)) out << abs;
+        };
+        for (const auto &r : discoverRoots()) add(r.second);
+        for (const auto &d : userDirs_)       add(d.second);
+        for (const QString &d : sessionRoots_) add(d);
+        return out;
+    }
+
+    /* Walk one root, appending what it holds to `out`. Split out of rescan()
+     * because there are several roots now and each is walked the same way. */
+    void scanRoot(const QString &rootPath, QList<Entry> &out)
+    {
         /* Walk the tree rather than one flat directory: VST2 plugins are loose
          * .dll files while VST3 arrives either as a single file or as a bundle
          * directory, and the Linux builds sit several levels down. A .vst3
          * directory is a leaf -- its innards are not separate plugins. */
-        QDir root(dirEdit_->text());
-        QList<QPair<QString, QString>> found;   /* label, absolute path */
-        QStringList queue{ root.absolutePath() };
+        QStringList queue{ QDir(rootPath).absolutePath() };
         int guard = 0;
         while (!queue.isEmpty() && guard++ < 4000) {
             QDir d(queue.takeFirst());
@@ -2093,43 +2151,137 @@ private slots:
                     pehost_is_native_vst2(
                         fi.absoluteFilePath().toLocal8Bit().constData());
                 if (isV3 || isV2 || isMac || isClassic || isLinuxV2) {
-                    /* Check the header now rather than discovering at load time
-                     * that it is, say, a 32-bit build this loader cannot run. */
+                    const QString abs = fi.absoluteFilePath();
+                    /* Roots overlap -- a system VST directory can sit inside a
+                     * corpus, and a user can add one that is already scanned.
+                     * The same file must not be listed twice. */
+                    bool dup = false;
+                    for (const Entry &e : out) if (e.path == abs) { dup = true; break; }
+                    if (dup) continue;
+
+                    /* One verdict, not three. pehost_classify says what the
+                     * file is, whether this build can run it and why not, in a
+                     * single pass -- where can_load and is_bridged each sniffed
+                     * it again and between them still could not tell a Windows
+                     * VST3 from a Linux one, which is the very thing the OS
+                     * selector sorts on. It is also what dwstudio already
+                     * asks, so the two windows now label a corpus identically. */
+                    pehost_info info;
+                    pehost_classify(abs.toLocal8Bit().constData(), &info);
+
+                    Entry e;
+                    e.path     = abs;
+                    e.name     = nm;
+                    e.kind     = int(info.kind);
+                    e.os       = QString::fromLatin1(info.os);
+                    e.fmt      = QString::fromLatin1(info.format);
+                    e.loadable = info.loadable != 0;
                     /* Room for a real explanation: "Classic Mac OS / Carbon
                      * (CFM/PEF, PowerPC)" is worth showing in full. */
-                    char why[128] = { 0 };
-                    const bool ok = pehost_can_load(
-                        fi.absoluteFilePath().toLocal8Bit().constData(), why, sizeof why);
-                    /* Say when a plugin will be hosted out of process: it
-                     * behaves the same, but a crash there is survivable and
-                     * worth distinguishing when one happens. */
-                    const bool bridged = ok && pehost_is_bridged(
-                        fi.absoluteFilePath().toLocal8Bit().constData());
-                    QString label = nm + (isV3 ? "   [VST3]"
-                                              : isClassic ? "   [Mac OS 9 VST]"
-                                              : isMac ? (nm.endsWith(".component", Qt::CaseInsensitive)
-                                                         ? "   [macOS AU]" : "   [macOS VST2]")
-                                              : isLinuxV2 ? "   [Linux VST2]"
-                                              : bridged ? "   [VST2 32-bit]" : "   [VST2]");
-                    if (!ok) label += QString("  -- %1").arg(why[0] ? why : "unsupported");
-                    found << qMakePair(label, fi.absoluteFilePath());
-                    if (!ok) unloadable_.insert(fi.absoluteFilePath());
+                    e.label = nm + "   [" +
+                              (info.kind != PEHOST_KIND_UNKNOWN
+                                   ? QString::fromUtf8(pehost_kind_label(info.kind))
+                                   : QString("Unrecognised")) + "]";
+                    if (!e.loadable)
+                        e.label += QString("  -- %1").arg(info.why[0] ? info.why
+                                                                     : "unsupported");
+                    out << e;
                 } else if (fi.isDir()) {
                     queue << fi.absoluteFilePath();
                 }
             }
         }
-        std::sort(found.begin(), found.end(),
-                  [](const QPair<QString, QString> &a, const QPair<QString, QString> &b) {
-                      return a.first.compare(b.first, Qt::CaseInsensitive) < 0;
-                  });
-        for (const auto &f : found) {
-            paths_ << f.second;
-            pluginList_->addItem(f.first);
+    }
+
+    /* Walk every root. The result is kept whole in all_ and sifted by
+     * applyFilter(), so changing format or platform costs nothing: the
+     * expensive part is sniffing files, and it happens once. */
+    void rescan()
+    {
+        all_.clear();
+        const QStringList roots = scanRoots();
+        for (const QString &r : roots) scanRoot(r, all_);
+
+        std::sort(all_.begin(), all_.end(), [](const Entry &a, const Entry &b) {
+            const int ra = osRank(a.os.toLatin1().constData());
+            const int rb = osRank(b.os.toLatin1().constData());
+            if (ra != rb) return ra < rb;
+            if (a.kind != b.kind) return a.kind < b.kind;
+            return a.label.compare(b.label, Qt::CaseInsensitive) < 0;
+        });
+        fprintf(stderr, "pestudio: scanned %d root(s) -> %d plugin(s)\n",
+                int(roots.size()), int(all_.size())); fflush(stderr);
+        rootCount_ = int(roots.size());
+        rebuildFilters();
+        applyFilter();
+    }
+
+    /* Offer only what was actually found, once each. The selectors are built
+     * from the scan rather than from a fixed list, so a machine with no Linux
+     * plug-ins is not asked to choose between platforms it has none of, and a
+     * format spread over three directories is still one entry. Both keep their
+     * current choice across a rescan when it still applies. */
+    void rebuildFilters()
+    {
+        const QString wantType = typeBox_->count() ? typeBox_->currentData().toString()
+                                                   : QString();
+        const QString wantOs   = osBox_->count()   ? osBox_->currentData().toString()
+                                                   : QString();
+        QStringList types, oses;
+        for (const Entry &e : all_) {
+            const QString f = e.fmt.isEmpty() ? QString("Unrecognised") : e.fmt;
+            if (!types.contains(f)) types << f;
+            if (!oses.contains(e.os)) oses << e.os;
         }
-        fprintf(stderr, "pestudio: scanned %s -> %d plugin(s)\n",
-                qPrintable(root.absolutePath()), int(paths_.size())); fflush(stderr);
-        statusBar()->showMessage(QString("%1 plugin(s) under %2").arg(paths_.size()).arg(root.absolutePath()));
+        std::sort(types.begin(), types.end());
+        std::sort(oses.begin(), oses.end(), [](const QString &a, const QString &b) {
+            return osRank(a.toLatin1().constData()) < osRank(b.toLatin1().constData());
+        });
+
+        QSignalBlocker bt(typeBox_), bo(osBox_);
+        typeBox_->clear();
+        typeBox_->addItem(QString("All types (%1)").arg(all_.size()), QString());
+        for (const QString &t : types) typeBox_->addItem(t, t);
+        osBox_->clear();
+        osBox_->addItem("All platforms", QString());
+        for (const QString &o : oses) osBox_->addItem(osLabel(o), o);
+
+        const int ti = wantType.isEmpty() ? 0 : typeBox_->findData(wantType);
+        const int oi = wantOs.isEmpty()   ? 0 : osBox_->findData(wantOs);
+        typeBox_->setCurrentIndex(ti < 0 ? 0 : ti);
+        osBox_->setCurrentIndex(oi < 0 ? 0 : oi);
+    }
+
+    /* Fill the visible list from all_, honouring both selectors. all_ is
+     * already in platform order, so the filtered list keeps that grouping. */
+    void applyFilter()
+    {
+        const QString wantType = typeBox_->currentData().toString();
+        const QString wantOs   = osBox_->currentData().toString();
+
+        pluginList_->clear();
+        paths_ = QStringList();
+        unloadable_.clear();
+
+        for (const Entry &e : all_) {
+            const QString f = e.fmt.isEmpty() ? QString("Unrecognised") : e.fmt;
+            if (!wantType.isEmpty() && f != wantType) continue;
+            if (!wantOs.isEmpty() && e.os != wantOs) continue;
+            paths_ << e.path;
+            pluginList_->addItem(e.label);
+            if (!e.loadable) unloadable_.insert(e.path);
+        }
+
+        const QString what =
+            wantType.isEmpty() && wantOs.isEmpty()
+                ? QString("%1 plugin(s) in %2 location(s)")
+                      .arg(paths_.size()).arg(rootCount_)
+                : QString("%1 of %2 plugin(s) -- %3%4")
+                      .arg(paths_.size()).arg(all_.size())
+                      .arg(wantOs.isEmpty() ? QString("every platform") : osLabel(wantOs))
+                      .arg(wantType.isEmpty() ? QString() : ", " + wantType);
+        statusBar()->showMessage(what);
+
         /* Load something straight away: an empty host makes an attached
          * keyboard look broken when it is only unassigned. */
         if (!paths_.isEmpty() && pluginList_->currentRow() < 0) {
@@ -2152,7 +2304,7 @@ private slots:
                     bankApplied_ = true;
                     statusBar()->showMessage(
                         base + " is not a plugin this host can load, or is not "
-                               "under " + root.absolutePath(), 0);
+                               "in any scanned folder", 0);
                     info_->setText("<b>" + base.toHtmlEscaped() + "</b> was named on "
                                    "the command line but is not in the list.<br>"
                                    "<span style='color:#888'>Nothing was loaded.</span>");
@@ -2176,6 +2328,11 @@ private slots:
     void loadRow(int row)
     {
         if (row < 0 || row >= paths_.size()) return;
+        /* The list spans every folder now, so which one this plug-in came out
+         * of is worth saying -- two builds of the same plug-in under different
+         * roots are otherwise one name twice. */
+        dirEdit_->setText(QFileInfo(paths_[row]).absolutePath());
+        dirEdit_->setCursorPosition(0);
         if (g_inPlugin) {
             /* Reached from inside a plugin call, by way of the input pump.
              * Closing the plugin now would free the interpreter that is running. */
@@ -2248,9 +2405,9 @@ private slots:
         fflush(stderr);
         QApplication::setOverrideCursor(Qt::WaitCursor);
         QElapsedTimer tOpen; tOpen.start();
-        pehost_kind kind = forceBox_ ? (pehost_kind)forceBox_->currentData().toInt()
-                                     : PEHOST_KIND_AUTO;
-        bool ok = eng_.load(paths_[row], &err, kind);
+        /* Always sniffed. What a plug-in is is a property of the file, not a
+         * setting -- see the note where the "Load as" row used to be. */
+        bool ok = eng_.load(paths_[row], &err, PEHOST_KIND_AUTO);
         qint64 msOpen = tOpen.elapsed();
         QApplication::restoreOverrideCursor();
         if (!ok) {
@@ -2962,35 +3119,75 @@ private:
         return s;
     }
 
-    /* The user's own scan folders, persisted so a Downloads or system-VST
-     * directory added once is still there next launch. The search set becomes
-     * the user's, not only the built-in list in discoverRoots(). */
-    void saveUserRoots()
+    /* The user's own plug-in folders, kept in the shared file rather than in
+     * this window's QSettings.
+     *
+     * They were per-application: a folder added here was invisible to dwstudio
+     * and vice versa, so the same machine had two answers to "where are my
+     * plug-ins" depending on which window asked. One file, both windows -- see
+     * vstdirs.h. An existing QSettings list is migrated on first read so a
+     * folder set before this change is not silently dropped. */
+    bool haveUserDir(const QString &abs) const
     {
-        QSettings s("pestudio", "pestudio");
-        s.setValue("userRoots", userRoots_);
+        for (const auto &d : userDirs_) if (d.second == abs) return true;
+        return false;
     }
+
     void loadUserRoots()
     {
+        userDirs_.clear();
+        vstdir dirs[VSTDIRS_MAX];
+        const int n = vstdirs_load(dirs, VSTDIRS_MAX);
+        for (int i = 0; i < n; i++)
+            userDirs_ << qMakePair(QString::fromLatin1(dirs[i].os),
+                                   QString::fromLocal8Bit(dirs[i].path));
+
+        /* Folders set before the shared file existed lived in this window's
+         * QSettings, where dwstudio could not see them. Moved across once,
+         * untagged, and the old key dropped so there is not a second place to
+         * look. */
         QSettings s("pestudio", "pestudio");
-        const QStringList saved = s.value("userRoots").toStringList();
-        for (const QString &d : saved) addUserRoot(d, /*select=*/false);
+        const QStringList old = s.value("userRoots").toStringList();
+        if (old.isEmpty()) return;
+        for (const QString &d : old) {
+            const QString abs = QDir(d).absolutePath();
+            if (abs.isEmpty() || haveUserDir(abs)) continue;
+            if (vstdirs_add(VSTDIRS_ANY, abs.toLocal8Bit().constData()) >= 0)
+                userDirs_ << qMakePair(QString(VSTDIRS_ANY), abs);
+        }
+        s.remove("userRoots");
     }
     /* Add a folder as a browsing root. Deduped against what is already listed;
      * a genuinely new one is remembered. `select` switches the browser to it,
      * which triggers a rescan so the folder's plugins appear at once. */
-    void addUserRoot(const QString &dir, bool select)
+    /* `os` is the platform group the folder goes in -- VSTDIRS_WINDOWS,
+     * _LINUX, _MACOS, or _ANY for a folder holding a mix. */
+    void addUserRoot(const QString &os, const QString &dir, bool select)
     {
         const QString abs = QDir(dir).absolutePath();
-        for (int i = 0; i < rootBox_->count(); i++)
-            if (rootBox_->itemData(i).toString() == abs) {
-                if (select) rootBox_->setCurrentIndex(i);
-                return;
-            }
-        QString name = QFileInfo(abs).fileName();
-        rootBox_->addItem((name.isEmpty() ? abs : name) + "  [added]", abs);
-        if (!userRoots_.contains(abs)) { userRoots_ << abs; saveUserRoots(); }
-        if (select) rootBox_->setCurrentIndex(rootBox_->count() - 1);
+        if (abs.isEmpty() || !QDir(abs).exists()) return;
+        if (!haveUserDir(abs) && scanRoots().contains(abs)) {
+            /* Already scanned, as one of the corpora found by walking up from
+             * the binary. Saying so beats silently doing nothing, which reads
+             * as the button being broken. */
+            if (select) statusBar()->showMessage(abs + " is already being scanned", 4000);
+            return;
+        }
+        if (vstdirs_add(os.toLatin1().constData(), abs.toLocal8Bit().constData()) < 0) {
+            statusBar()->showMessage(QString("could not save the folder list to %1")
+                                         .arg(QString::fromLocal8Bit(vstdirs_file())), 6000);
+            return;
+        }
+        loadUserRoots();          /* re-read, so an added or re-tagged folder is
+                                   * exactly what the file now says */
+        if (select) rescan();
+    }
+
+    void removeUserRoot(const QString &dir)
+    {
+        vstdirs_remove(QDir(dir).absolutePath().toLocal8Bit().constData());
+        loadUserRoots();
+        rescan();
     }
 
     /* File: open one plug-in, or add a folder of them.
@@ -2999,6 +3196,127 @@ private:
      * looks for "open", it keeps the keyboard shortcut somewhere discoverable,
      * and dwstudio carries the same two commands under the same name -- so
      * whichever window is open, the way in is the same. */
+    /* The plug-in folders dialog: the persisted scan list, with the
+     * discovered corpora shown greyed beneath it so the window can answer
+     * "where is it looking" in one place rather than none. Every change
+     * rescans, because a folder that is in the list and not in the browser
+     * would be the same puzzle one level further in. */
+    void editPluginFolders()
+    {
+        QDialog dlg(this);
+        dlg.setWindowTitle("Plug-in folders");
+        dlg.resize(660, 440);
+        auto *v = new QVBoxLayout(&dlg);
+
+        v->addWidget(new QLabel(
+            "Folders searched for plug-ins. Kept between sessions and shared "
+            "with the GTK window."));
+
+        auto *list = new QTreeWidget;
+        list->setColumnCount(2);
+        list->setHeaderLabels({ "Platform", "Folder" });
+        list->setRootIsDecorated(false);
+        list->setUniformRowHeights(true);
+        list->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        v->addWidget(list, 1);
+
+        /* Grouped by platform, in the order the browser lists plug-ins, so the
+         * Windows folders read together and the native ones together. */
+        static const char *groups[] = { VSTDIRS_WINDOWS, VSTDIRS_LINUX,
+                                        VSTDIRS_MACOS,   VSTDIRS_ANY };
+        auto fill = [&] {
+            list->clear();
+            for (const char *g : groups)
+                for (const auto &d : userDirs_) {
+                    if (d.first != QLatin1String(g)) continue;
+                    auto *it = new QTreeWidgetItem(list);
+                    it->setText(0, QString::fromUtf8(vstdirs_os_label(g)));
+                    it->setText(1, d.second);
+                    it->setData(0, Qt::UserRole, d.second);
+                    if (!QDir(d.second).exists()) {
+                        it->setText(1, d.second + "   -- missing");
+                        it->setForeground(1, Qt::red);
+                    }
+                }
+        };
+        fill();
+
+        /* Which group a folder is being added to. A Windows corpus, a Linux one
+         * and a macOS one are separate entries, which is how they are kept on
+         * disk; "Any platform" is for a folder holding a mix. */
+        auto *btns = new QHBoxLayout;
+        btns->addWidget(new QLabel("Add as:"));
+        auto *asBox = new QComboBox;
+        for (const char *g : groups)
+            asBox->addItem(QString::fromUtf8(vstdirs_os_label(g)), QString::fromLatin1(g));
+        btns->addWidget(asBox);
+        auto *add = new QPushButton("Add Folder...");
+        auto *rm  = new QPushButton("Remove");
+        rm->setEnabled(false);
+        btns->addWidget(add);
+        btns->addWidget(rm);
+        btns->addStretch(1);
+        v->addLayout(btns);
+
+        /* The tag says what the folder is for, not what is in it. Worth saying
+         * out loud here, because a settings page that groups things by platform
+         * looks like it decides the platform, and this one does not. */
+        auto *note = new QLabel(
+            "The platform says what a folder is for. Every plug-in is still "
+            "identified by its own binary when it is scanned, so a Windows "
+            "plug-in in the Linux folder is listed as Windows.");
+        note->setWordWrap(true);
+        note->setStyleSheet("color:#888");
+        v->addWidget(note);
+
+        /* What is scanned without being asked for. Read-only on purpose: these
+         * come from where the binary sits and from the system VST directories,
+         * so removing one here would only be undone by the next launch. */
+        QStringList builtin;
+        for (const auto &r : discoverRoots())
+            if (!haveUserDir(r.second)) builtin << r.second + "   (" + r.first + ")";
+        if (!builtin.isEmpty()) {
+            auto *lbl = new QLabel("Also searched, found automatically:");
+            lbl->setStyleSheet("color:#888");
+            v->addWidget(lbl);
+            auto *bl = new QListWidget;
+            bl->addItems(builtin);
+            bl->setSelectionMode(QAbstractItemView::NoSelection);
+            bl->setStyleSheet("color:#888");
+            bl->setMaximumHeight(96);
+            v->addWidget(bl);
+        }
+
+        auto *where = new QLabel("Stored in " +
+                                 QString::fromLocal8Bit(vstdirs_file()).toHtmlEscaped());
+        where->setStyleSheet("color:#888");
+        where->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        v->addWidget(where);
+
+        auto *box = new QDialogButtonBox(QDialogButtonBox::Close);
+        v->addWidget(box);
+
+        connect(list, &QTreeWidget::itemSelectionChanged, &dlg,
+                [&] { rm->setEnabled(!list->selectedItems().isEmpty()); });
+        connect(add, &QPushButton::clicked, &dlg, [&] {
+            const QString os = asBox->currentData().toString();
+            const QString d = QFileDialog::getExistingDirectory(
+                &dlg, QString("Add %1 plug-in folder")
+                          .arg(QString::fromUtf8(vstdirs_os_label(os.toLatin1().constData()))));
+            if (d.isEmpty()) return;
+            addUserRoot(os, d, /*select=*/true);
+            fill();
+        });
+        connect(rm, &QPushButton::clicked, &dlg, [&] {
+            const auto sel = list->selectedItems();
+            if (sel.isEmpty()) return;
+            removeUserRoot(sel.first()->data(0, Qt::UserRole).toString());
+            fill();
+        });
+        connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::accept);
+        dlg.exec();
+    }
+
     void buildMenus()
     {
         QMenu *file = menuBar()->addMenu("&File");
@@ -3021,13 +3339,23 @@ private:
         connect(loadFolder, &QAction::triggered, this, [this] {
             QString dir = QFileDialog::getExistingDirectory(this, "Load plug-in folder",
                                                             dirEdit_->text());
-            if (!dir.isEmpty()) addUserRoot(dir, /*select=*/true);
+            if (!dir.isEmpty()) addUserRoot(VSTDIRS_ANY, dir, /*select=*/true);
         });
 
         file->addSeparator();
         QAction *quit = file->addAction("&Quit");
         quit->setShortcut(QKeySequence::Quit);
         connect(quit, &QAction::triggered, this, &QWidget::close);
+
+        /* Where the plug-ins are. File > Load Folder adds one in passing; this
+         * is the list itself, so a folder can be taken off the scan as well as
+         * put on it, and so there is somewhere to look to find out why a
+         * plug-in is or is not being found. Saved with QSettings, which is why
+         * it survives the session -- the corpora found by walking up from the
+         * binary are not listed here because they are not a setting. */
+        QMenu *settings = menuBar()->addMenu("&Settings");
+        QAction *folders = settings->addAction("Plug-in &Folders...");
+        connect(folders, &QAction::triggered, this, &Window::editPluginFolders);
 
         /* Which build this is. Worth having in the window rather than only on
          * the command line: the usual way this gets asked is somebody
@@ -3225,10 +3553,16 @@ private:
     bool          switching_ = false;   /* inside a patch-driven plugin change */
     QString       loadedPath_;          /* what is open, for cross-machine banks */
     Engine        eng_;
-    QLineEdit    *dirEdit_;
-    QComboBox    *rootBox_;
-    QComboBox    *forceBox_ = nullptr;   /* "Load as": force a loader, or auto-detect */
-    QStringList   userRoots_;            /* extra scan folders the user added, persisted */
+    QLineEdit    *dirEdit_;              /* where the selection came from -- display only */
+    QComboBox    *typeBox_ = nullptr;    /* VST2 / VST3 / AU, each offered once */
+    QComboBox    *osBox_   = nullptr;    /* Windows / Linux / macOS, the sort and the filter */
+    /* The plug-in folders the user set, each with the platform it holds --
+     * see vstdirs.h. The tag groups the settings list and nothing more: what a
+     * plug-in is comes from its own binary, every scan. */
+    QList<QPair<QString, QString>> userDirs_;   /* {platform, path} */
+    QStringList   sessionRoots_;         /* --dir or a named plug-in: this run only */
+    QList<Entry>  all_;
+    int           rootCount_ = 0;        /* how many folders the last scan walked */
     QComboBox    *srcBox_;
     QListWidget  *pluginList_, *programList_, *patchList_;
     QPushButton  *recBtn_ = nullptr;

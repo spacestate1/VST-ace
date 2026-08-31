@@ -7,6 +7,7 @@
 #include "plugview.h"
 
 #include "pehost.h"
+#include "vstdirs.h"
 #include "vst3.h"
 
 /* gdk_x11_display_get_xdisplay and gdk_x11_surface_get_xid are marked
@@ -57,6 +58,13 @@ typedef struct {
      * sound. See pehost_data_check. */
     char warn[160];
     int  repairable;          /* the missing data exists and can be linked in */
+    /* What pehost_classify made of it, kept so the two selectors can sift the
+     * list without sniffing anything again. `os` is the authority the OS
+     * selector sorts and filters on -- a .vst3 is a Windows plug-in or a Linux
+     * one depending on the binary inside it, which no extension reveals. */
+    char os[16];              /* "windows" | "linux" | "macos" | "classic" */
+    char fmt[8];              /* "VST2" | "VST3" | "AU" */
+    int  kindv;               /* pehost_kind, ordering formats within a platform */
 } entry;
 
 /* One entry in the platform dropdown: a corpus directory and what to call it. */
@@ -64,8 +72,22 @@ typedef struct { char label[64]; char path[1024]; } proot;
 
 static struct {
     GtkWidget *root;
-    GtkWidget *rootdd;        /* which platform's plug-ins to browse */
-    GtkStringList *rootmodel;
+    /* What to browse, in the two terms a plug-in actually has: the format it
+     * is and the platform it was built for. These replace a dropdown that
+     * named directories -- one entry per corpus, plus every folder the user
+     * had ever added -- which made the tree layout the user's problem and
+     * offered "VST2" once per directory holding one. Every root is scanned
+     * now, once, and these two sift the result. pestudio has the same pair,
+     * in the same order, for the same reason. */
+    GtkWidget *filterrows[2]; /* the Type: and OS: rows, packed into the pane */
+    GtkWidget *typedd;        /* All types | VST2 | VST3 | AU */
+    GtkWidget *osdd;          /* All platforms | Windows | Linux | macOS */
+    GtkStringList *typemodel;
+    GtkStringList *osmodel;
+    char   types[8][8];       /* the formats this scan actually found */
+    int    ntypes;
+    char   oses[8][16];       /* and the platforms, in display order */
+    int    noses;
     proot  roots[MAX_ROOTS];
     int    nroot;
     GtkWidget *dirlabel;
@@ -82,7 +104,13 @@ static struct {
 
     entry  plug[MAX_PLUGINS];
     int    nplug;
-    char   dir[1024];
+    /* Which of them the two selectors let through, as indices into plug[].
+     * The list box shows these and nothing else, so a row index is not a
+     * plug[] index any more -- everything that starts from a clicked row goes
+     * through here. */
+    int    vis[MAX_PLUGINS];
+    int    nvis;
+    char   dir[1024];         /* where the selection came from -- a display */
 
     /* The loaded plug-in. Written only from the GTK thread, and only while the
      * audio callback is parked -- see load(). The audio callback reads it
@@ -227,7 +255,6 @@ static int roots_add(const char *path, const char *label)
     snprintf(lbl, sizeof lbl, "%s", label);
     snprintf(P.roots[P.nroot].label, sizeof P.roots[0].label, "%s", lbl);
     snprintf(P.roots[P.nroot].path,  sizeof P.roots[0].path,  "%s", path);
-    if (P.rootmodel) gtk_string_list_append(P.rootmodel, lbl);
     return P.nroot++;
 }
 
@@ -302,6 +329,30 @@ static void roots_add_fallback(void)
     if (home && *home && is_dir(home)) roots_add(home, "Home folder");
 }
 
+/* The folders the user set, from the file pestudio writes too -- one list per
+ * machine, not one per window. See vstdirs.h. Added after the discovered
+ * corpora so a folder that is already one of them is deduped away by
+ * roots_add rather than scanned twice. */
+static void roots_add_user(void)
+{
+    vstdir dirs[VSTDIRS_MAX];
+    int    n = vstdirs_load(dirs, VSTDIRS_MAX), i;
+
+    /* Labelled with the platform the user filed it under, which is what the
+     * settings list shows. It does not decide what is in it: every plug-in is
+     * sniffed on the way into the list. */
+    for (i = 0; i < n; i++)
+        if (is_dir(dirs[i].path))
+            roots_add(dirs[i].path, vstdirs_os_label(dirs[i].os));
+}
+
+/* A --dir, or the folder a plug-in was opened out of. Remembered across the
+ * roots_discover() calls that reset the list, which happen after this is set:
+ * plugview_scan runs before the pane exists and roots_discover runs when it is
+ * built, so without this the folder the user actually asked for was the one
+ * folder dropped from the scan. */
+static char g_session_dir[1024];
+
 /* The directory to open on, for a caller that was given none. The checkout's
  * own corpus first so a developer's window opens where it always did, then the
  * system locations, and the home directory only if nothing else exists --
@@ -341,8 +392,46 @@ static void plug_status(const char *fmt, ...)
     if (P.status) gtk_label_set_text(GTK_LABEL(P.status), P.loaded_msg);
 }
 
+/* Platform first, then format within it, then name.
+ *
+ * Grouping by platform is what makes one list of every folder readable -- the
+ * Windows builds together, the native ones together -- and it is the order the
+ * OS selector narrows to when one platform is picked out of it. Identical to
+ * pestudio's, so the two windows list a corpus the same way round. */
+static int os_rank(const char *os)
+{
+    if (!strcmp(os, "windows")) return 0;
+    if (!strcmp(os, "linux"))   return 1;
+    if (!strcmp(os, "macos"))   return 2;
+    if (!strcmp(os, "classic")) return 3;
+    return 4;                 /* nothing placed it -- last, with its reason */
+}
+
+/* "windows" -> "Windows". The label a person reads, from the tag pehost
+ * writes. */
+static const char *os_label(const char *os)
+{
+    if (!strcmp(os, "windows")) return "Windows";
+    if (!strcmp(os, "linux"))   return "Linux";
+    if (!strcmp(os, "macos"))   return "macOS";
+    if (!strcmp(os, "classic")) return "Mac OS 9";
+    return "Unrecognised";
+}
+
+/* A format for the type selector. Empty when pehost could not place the file,
+ * which still has to be selectable -- it is in the list with its reason. */
+static const char *fmt_of(const entry *e)
+{ return e->fmt[0] ? e->fmt : "Unrecognised"; }
+
 static int entry_cmp(const void *a, const void *b)
-{ return g_ascii_strcasecmp(((const entry *)a)->name, ((const entry *)b)->name); }
+{
+    const entry *x = a, *y = b;
+    int rx = os_rank(x->os), ry = os_rank(y->os);
+
+    if (rx != ry) return rx - ry;
+    if (x->kindv != y->kindv) return x->kindv - y->kindv;
+    return g_ascii_strcasecmp(x->name, y->name);
+}
 
 /* Is this entry a plug-in worth listing, and if so what shape?
  *
@@ -387,7 +476,11 @@ static int is_candidate(const char *path, const char *name, int isdir)
  * one directory, and found nothing at all under linux/extracted, where each
  * one arrives as its own unpacked release with the plug-in several levels
  * down. */
-void plugview_scan(const char *dir)
+/* Walk one folder, appending what it holds to plug[]. Split out of
+ * plugview_scan because there are several folders now and each is walked the
+ * same way -- and because the caller, not this, decides when the list starts
+ * over. */
+static void scan_tree(const char *dir)
 {
     char   queue[512][1024];
     int    head = 0, tail = 0, visited = 0;
@@ -399,11 +492,8 @@ void plugview_scan(const char *dir)
      * path and hands over something like ".../gui/build/../../../windows/
      * VST2-64" -- the same directory the dropdown discovered, but not the same
      * string, so it was listed twice and neither entry matched the other. */
-    if (realpath(dir, real)) snprintf(P.dir, sizeof P.dir, "%s", real);
-    else                     snprintf(P.dir, sizeof P.dir, "%s", dir);
-    P.nplug = 0;
-
-    snprintf(queue[tail++], sizeof queue[0], "%s", P.dir);
+    if (realpath(dir, real)) snprintf(queue[tail++], sizeof queue[0], "%s", real);
+    else                     snprintf(queue[tail++], sizeof queue[0], "%s", dir);
 
     while (head < tail && P.nplug < MAX_PLUGINS && visited < 512) {
         char        base[1024];
@@ -437,6 +527,14 @@ void plugview_scan(const char *dir)
              * simply absent from the list looks like one the scan failed to
              * find, and "why is it not there" is a worse question than "why
              * will it not load". pestudio does the same. */
+            {   /* Folders overlap -- a system VST directory can sit inside a
+                 * corpus, and the user can add one that is already scanned.
+                 * The same file must not be listed twice. */
+                int k, seen = 0;
+                for (k = 0; k < P.nplug; k++)
+                    if (!strcmp(P.plug[k].path, path)) { seen = 1; break; }
+                if (seen) continue;
+            }
             e = &P.plug[P.nplug++];
             snprintf(e->path, sizeof e->path, "%s", path);
             snprintf(e->name, sizeof e->name, "%s", nm);
@@ -448,6 +546,12 @@ void plugview_scan(const char *dir)
              * showed the less informed of the two answers. */
             pehost_classify(path, &info);
             e->loadable = info.loadable;
+            /* The platform and format the two selectors sort and sift on. From
+             * the binary, every time -- which is why a .vst3 can come out
+             * Windows here and Linux three rows down. */
+            snprintf(e->os,  sizeof e->os,  "%s", info.os);
+            snprintf(e->fmt, sizeof e->fmt, "%s", info.format);
+            e->kindv = (int)info.kind;
             {   /* Directory reads only -- nothing is loaded to find this out. */
                 pehost_data_need dn;
                 if (pehost_data_check(path, &dn)) {
@@ -462,10 +566,85 @@ void plugview_scan(const char *dir)
         }
         g_dir_close(d);
     }
+}
+
+/* Rebuild the two selectors from what the scan actually found.
+ *
+ * Offered once each and only when present, so a machine with no Linux plug-ins
+ * is not asked to choose between platforms it has none of, and a format spread
+ * over three folders is still one entry -- which is the whole complaint about
+ * the dropdown this replaced. */
+static void rebuild_filters(void)
+{
+    int i, j;
+
+    P.ntypes = P.noses = 0;
+    for (i = 0; i < P.nplug; i++) {
+        const char *f = fmt_of(&P.plug[i]);
+        for (j = 0; j < P.ntypes; j++) if (!strcmp(P.types[j], f)) break;
+        if (j == P.ntypes && P.ntypes < (int)(sizeof P.types / sizeof P.types[0]))
+            snprintf(P.types[P.ntypes++], sizeof P.types[0], "%s", f);
+        for (j = 0; j < P.noses; j++) if (!strcmp(P.oses[j], P.plug[i].os)) break;
+        if (j == P.noses && P.noses < (int)(sizeof P.oses / sizeof P.oses[0]))
+            snprintf(P.oses[P.noses++], sizeof P.oses[0], "%s", P.plug[i].os);
+    }
+    /* plug[] is already in platform order, so the platforms come out in it
+     * too; the formats are sorted by name, there being no better order. */
+    for (i = 0; i < P.ntypes; i++)
+        for (j = i + 1; j < P.ntypes; j++)
+            if (g_ascii_strcasecmp(P.types[i], P.types[j]) > 0) {
+                char t[sizeof P.types[0]];
+                memcpy(t, P.types[i], sizeof t);
+                memcpy(P.types[i], P.types[j], sizeof t);
+                memcpy(P.types[j], t, sizeof t);
+            }
+
+    if (!P.typedd) return;
+    /* Rebuilding a model the dropdown is watching moves its selection; both go
+     * back to "All", which is the honest answer after a rescan anyway -- what
+     * was selected may no longer be among the choices. */
+    P.loading = 1;
+    while (g_list_model_get_n_items(G_LIST_MODEL(P.typemodel)) > 1)
+        gtk_string_list_remove(P.typemodel, 1);
+    for (i = 0; i < P.ntypes; i++) gtk_string_list_append(P.typemodel, P.types[i]);
+    while (g_list_model_get_n_items(G_LIST_MODEL(P.osmodel)) > 1)
+        gtk_string_list_remove(P.osmodel, 1);
+    for (i = 0; i < P.noses; i++) gtk_string_list_append(P.osmodel, os_label(P.oses[i]));
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(P.typedd), 0);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(P.osdd), 0);
+    P.loading = 0;
+}
+
+/* Every folder the browser walks: the corpora found by walking up from the
+ * binary, the system VST directories, the folders the user set in Settings,
+ * and anything named on the command line. The list is held whole and sifted by
+ * fill_browser, so changing format or platform costs nothing -- the expensive
+ * part is sniffing files, and it happens once. */
+void plugview_scan(const char *dir)
+{
+    int i;
+
+    /* A folder handed in is somewhere to scan rather than somewhere to browse:
+     * it joins the roots, and what it holds turns up in the one list. */
+    if (dir && *dir) {
+        snprintf(g_session_dir, sizeof g_session_dir, "%s", dir);
+        roots_add(dir, "given folder");
+    }
+    if (P.nroot == 0) { roots_discover(); roots_add_standard(); roots_add_user(); }
+    /* Called before the pane exists -- dwstudio hands over its --dir or its
+     * default from main(). Remembering the folder is all that is wanted here:
+     * plugview_new rebuilds the root list and scans, so walking every folder
+     * now would only be to throw the result away and walk them again. */
+    if (!P.list) return;
+
+    P.nplug = 0;
+    for (i = 0; i < P.nroot; i++) scan_tree(P.roots[i].path);
     qsort(P.plug, (size_t)P.nplug, sizeof P.plug[0], entry_cmp);
+    rebuild_filters();
     /* Said out loud, the way pestudio says it, so the two windows can be
-     * compared on the same folder without reading either one's status bar. */
-    fprintf(stderr, "plugview: scanned %s -> %d plug-in(s)\n", P.dir, P.nplug);
+     * compared on the same corpus without reading either one's status bar. */
+    fprintf(stderr, "plugview: scanned %d folder(s) -> %d plug-in(s)\n",
+            P.nroot, P.nplug);
 }
 
 static void append_row(const entry *e);
@@ -477,22 +656,63 @@ static void clear_list(GtkWidget *lb)
         gtk_list_box_remove(GTK_LIST_BOX(lb), row);
 }
 
+/* What the selectors are set to, or NULL for "all of them". Index 0 is the
+ * "All ..." row in both, so anything else indexes the arrays the scan built. */
+static const char *want_type(void)
+{
+    guint i;
+    if (!P.typedd) return NULL;
+    i = gtk_drop_down_get_selected(GTK_DROP_DOWN(P.typedd));
+    if (i == GTK_INVALID_LIST_POSITION || i == 0 || (int)i > P.ntypes) return NULL;
+    return P.types[i - 1];
+}
+
+static const char *want_os(void)
+{
+    guint i;
+    if (!P.osdd) return NULL;
+    i = gtk_drop_down_get_selected(GTK_DROP_DOWN(P.osdd));
+    if (i == GTK_INVALID_LIST_POSITION || i == 0 || (int)i > P.noses) return NULL;
+    return P.oses[i - 1];
+}
+
 static void fill_browser(void)
 {
+    const char *wt = want_type(), *wo = want_os();
     int i;
 
     if (!P.list) return;
     clear_list(P.list);
-    for (i = 0; i < P.nplug; i++) append_row(&P.plug[i]);
-    plug_status("%d plug-in(s) under %s", P.nplug, P.dir);
+    P.nvis = 0;
+    for (i = 0; i < P.nplug; i++) {
+        const entry *e = &P.plug[i];
+        if (wt && strcmp(fmt_of(e), wt)) continue;
+        if (wo && strcmp(e->os, wo)) continue;
+        P.vis[P.nvis++] = i;
+        append_row(e);
+    }
+
+    if (!wt && !wo) plug_status("%d plug-in(s) in %d folder(s)", P.nplug, P.nroot);
+    else            plug_status("%d of %d plug-in(s) -- %s%s%s", P.nvis, P.nplug,
+                                wo ? os_label(wo) : "every platform",
+                                wt ? ", " : "", wt ? wt : "");
 
     /* Load the first one, the way pestudio does. Not for the convenience: a
      * GtkListBox picks a row for itself when it first takes focus, so without
      * saying which, the window came up having loaded whichever row that
      * happened to be -- different one each run. */
-    if (P.nplug > 0)
+    if (P.nvis > 0)
         gtk_list_box_select_row(GTK_LIST_BOX(P.list),
             gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), 0));
+}
+
+/* Both selectors sift the list already in hand -- no folder is walked again,
+ * so switching format or platform is instant however long the scan took. */
+static void on_filter_changed(GObject *dd, GParamSpec *ps, gpointer ud)
+{
+    (void)dd; (void)ps; (void)ud;
+    if (P.loading) return;
+    fill_browser();
 }
 
 /* --------------------------------------------------- native (X11) editor */
@@ -1506,35 +1726,12 @@ static void load(const entry *e)
     }
 }
 
-/* Switching platform rescans and shows what that corpus holds. Loading the
- * first of them is fill_browser's doing, and is the same thing that happens at
- * startup -- picking "Linux native" should show a Linux plug-in, not an empty
- * pane waiting to be clicked. */
-static void on_root_changed(GObject *dd, GParamSpec *ps, gpointer ud)
+/* Rescan every folder and show the result. What File > Load Folder and the
+ * settings dialog call once they have changed the set of folders. */
+static void rescan_all(void)
 {
-    guint i;
-
-    (void)ps; (void)ud;
-    if (P.loading) return;
-    i = gtk_drop_down_get_selected(GTK_DROP_DOWN(dd));
-    if (i == GTK_INVALID_LIST_POSITION || (int)i >= P.nroot) return;
-    plugview_scan(P.roots[i].path);
-    gtk_label_set_text(GTK_LABEL(P.dirlabel), P.roots[i].path);
+    plugview_scan(NULL);
     fill_browser();
-}
-
-/* Point the dropdown at `dir`, listing it as its own entry when it is not one
- * of the corpora. */
-static void root_select_path(const char *dir, const char *label)
-{
-    int i;
-
-    if (!dir || !dir[0] || !P.rootdd) return;
-    i = roots_add(dir, label);
-    if (i < 0) return;
-    P.loading = 1;                       /* not a user choice: do not rescan */
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(P.rootdd), (guint)i);
-    P.loading = 0;
 }
 
 /* Looking at the Editor page is what opens a native editor. Leaving the page
@@ -1564,8 +1761,23 @@ static void on_plug_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer ud)
     int i;
     (void)lb; (void)ud;
     if (!row) return;
+    /* A row index is an index into the *visible* rows, which the selectors
+     * decide -- not into plug[]. Reading plug[] with it directly loaded a
+     * different plug-in from the one clicked as soon as anything was
+     * filtered. */
     i = gtk_list_box_row_get_index(row);
-    if (i < 0 || i >= P.nplug) return;
+    if (i < 0 || i >= P.nvis) return;
+    i = P.vis[i];
+    /* Which folder it came out of, now that the list spans all of them: two
+     * builds of one plug-in under different roots are otherwise one name
+     * twice. */
+    if (P.dirlabel) {
+        char dir[1024], *slash;
+        snprintf(dir, sizeof dir, "%s", P.plug[i].path);
+        if ((slash = strrchr(dir, '/'))) *slash = 0;
+        snprintf(P.dir, sizeof P.dir, "%s", dir);
+        gtk_label_set_text(GTK_LABEL(P.dirlabel), dir);
+    }
     if (!P.plug[i].loadable) {
         plug_status("%s: %s", P.plug[i].name, P.plug[i].kind);
         return;
@@ -1615,8 +1827,19 @@ static void open_path(const char *path)
                     why[0] ? why : "not a plug-in this host can load");
         return;
     }
-    for (i = 0; i < P.nplug; i++)
-        if (!strcmp(P.plug[i].path, path)) {
+    /* Anything opened by hand has to end up visible, so the selectors go back
+     * to "All" first: opening a Linux plug-in while the list is filtered to
+     * Windows would otherwise add it and select nothing. */
+    if (P.typedd && (gtk_drop_down_get_selected(GTK_DROP_DOWN(P.typedd)) ||
+                     gtk_drop_down_get_selected(GTK_DROP_DOWN(P.osdd)))) {
+        P.loading = 1;
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(P.typedd), 0);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(P.osdd), 0);
+        P.loading = 0;
+        fill_browser();
+    }
+    for (i = 0; i < P.nvis; i++)
+        if (!strcmp(P.plug[P.vis[i]].path, path)) {
             gtk_list_box_select_row(GTK_LIST_BOX(P.list),
                 gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), i));
             return;
@@ -1629,13 +1852,17 @@ static void open_path(const char *path)
     snprintf(e->name, sizeof e->name, "%s", base ? base + 1 : path);
     pehost_classify(path, &info);
     snprintf(e->kind, sizeof e->kind, "%s", pehost_kind_label(info.kind));
+    snprintf(e->os,   sizeof e->os,   "%s", info.os);
+    snprintf(e->fmt,  sizeof e->fmt,  "%s", info.format);
+    e->kindv = (int)info.kind;
     e->loadable = 1;                          /* pehost_can_load said so above */
     append_row(e);
+    P.vis[P.nvis++] = P.nplug;
     P.nplug++;
 
     /* Selecting it is what loads it -- one path in, not two. */
     gtk_list_box_select_row(GTK_LIST_BOX(P.list),
-        gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), P.nplug - 1));
+        gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), P.nvis - 1));
 }
 
 static void on_vst_chosen(GObject *src, GAsyncResult *res, gpointer ud)
@@ -1668,13 +1895,14 @@ static void on_dir_chosen(GObject *src, GAsyncResult *res, gpointer ud)
     {
         char *path = g_file_get_path(f);
         if (path) {
-            const char *base = strrchr(path, '/');
-            char lbl[64];
-            snprintf(lbl, sizeof lbl, "%s  [added]", base && base[1] ? base + 1 : path);
-            plugview_scan(path);
-            gtk_label_set_text(GTK_LABEL(P.dirlabel), path);
-            root_select_path(path, lbl);
-            fill_browser();
+            /* Remembered, not just browsed: a folder chosen here is one the
+             * user means to keep, and it is the same list Settings edits and
+             * pestudio reads. Untagged -- File > Load Folder does not ask
+             * which platform, and Settings is where that is chosen. */
+            if (vstdirs_add(VSTDIRS_ANY, path) < 0)
+                plug_status("could not save the folder list to %s", vstdirs_file());
+            roots_add(path, "user folder");
+            rescan_all();
             g_free(path);
         }
     }
@@ -1688,6 +1916,256 @@ void plugview_load_folder(GtkWindow *parent)
     gtk_file_dialog_set_title(d, "Load plug-in folder");
     gtk_file_dialog_select_folder(d, parent, NULL, on_dir_chosen, NULL);
     g_object_unref(d);
+}
+
+
+/* ------------------------------------------------- settings: plug-in folders */
+
+/* Where the plug-ins are, as a list the user owns rather than a folder they
+ * happen to be browsing.
+ *
+ * File > Load Folder adds one in passing; this is the list itself, so a folder
+ * can be taken off the scan as well as put on it, and so there is somewhere to
+ * look to find out why a plug-in is or is not being found. It is the same file
+ * pestudio reads and writes -- one answer per machine to "where are my
+ * plug-ins", not one per window. See vstdirs.h.
+ *
+ * Folders are grouped by the platform they hold, so a Windows corpus, a macOS
+ * one and a Linux one are separate entries. That tag is what the folder is
+ * *for*; it does not decide what is in it, because every plug-in is identified
+ * from its own binary when it is scanned. */
+static const char *const g_dir_groups[] = {
+    VSTDIRS_WINDOWS, VSTDIRS_LINUX, VSTDIRS_MACOS, VSTDIRS_ANY
+};
+
+static struct {
+    GtkWidget *win;
+    GtkWidget *list;          /* the folders, grouped */
+    GtkWidget *rm;
+    GtkWidget *asdd;          /* which group Add puts the next one in */
+    char       sel[1024];     /* the selected folder, or "" */
+} F;
+
+static void folders_refill(void);
+
+static void on_folder_row(GtkListBox *lb, GtkListBoxRow *row, gpointer ud)
+{
+    const char *p;
+    (void)lb; (void)ud;
+    F.sel[0] = 0;
+    if (row && (p = g_object_get_data(G_OBJECT(row), "path")))
+        snprintf(F.sel, sizeof F.sel, "%s", p);
+    if (F.rm) gtk_widget_set_sensitive(F.rm, F.sel[0] != 0);
+}
+
+static void folders_refill(void)
+{
+    vstdir dirs[VSTDIRS_MAX];
+    int    n, i, added = 0;
+    size_t g;
+
+    if (!F.list) return;
+    clear_list(F.list);
+    F.sel[0] = 0;
+    if (F.rm) gtk_widget_set_sensitive(F.rm, FALSE);
+
+    n = vstdirs_load(dirs, VSTDIRS_MAX);
+    /* In the order the browser lists plug-ins, so the Windows folders read
+     * together and the native ones together. */
+    for (g = 0; g < sizeof g_dir_groups / sizeof g_dir_groups[0]; g++)
+        for (i = 0; i < n; i++) {
+            char       text[1200];
+            GtkWidget *l;
+            GtkListBoxRow *row;
+
+            if (strcmp(dirs[i].os, g_dir_groups[g])) continue;
+            snprintf(text, sizeof text, "%-12s  %s%s",
+                     vstdirs_os_label(dirs[i].os), dirs[i].path,
+                     is_dir(dirs[i].path) ? "" : "   -- missing");
+            l = gtk_label_new(text);
+            gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
+            gtk_widget_set_margin_start(l, 4);
+            gtk_widget_set_margin_end(l, 4);
+            gtk_list_box_append(GTK_LIST_BOX(F.list), l);
+            /* The path lives on the row, not in a parallel array: rows are
+             * built group by group, so a row's position is not an index into
+             * anything the caller still has. */
+            row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(F.list), added++);
+            if (row) g_object_set_data_full(G_OBJECT(row), "path",
+                                            g_strdup(dirs[i].path), g_free);
+        }
+}
+
+static void on_folder_chosen(GObject *src, GAsyncResult *res, gpointer ud)
+{
+    GFile *f = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char  *os = ud, *path;
+
+    g_object_unref(src);
+    if (f) {
+        if ((path = g_file_get_path(f))) {
+            if (vstdirs_add(os, path) < 0)
+                plug_status("could not save the folder list to %s", vstdirs_file());
+            folders_refill();
+            /* The scan set changed, so the browser behind the dialog is out of
+             * date the moment this returns. */
+            roots_discover(); roots_add_standard(); roots_add_user();
+            roots_add_fallback();
+            if (g_session_dir[0]) roots_add(g_session_dir, "given folder");
+            rescan_all();
+            g_free(path);
+        }
+        g_object_unref(f);
+    }
+    g_free(os);
+}
+
+static void on_folder_add(GtkButton *b, gpointer ud)
+{
+    GtkFileDialog *d = gtk_file_dialog_new();
+    guint          i = gtk_drop_down_get_selected(GTK_DROP_DOWN(F.asdd));
+    const char    *os = i < sizeof g_dir_groups / sizeof g_dir_groups[0]
+                            ? g_dir_groups[i] : VSTDIRS_ANY;
+    char           title[64];
+
+    (void)b; (void)ud;
+    snprintf(title, sizeof title, "Add %s plug-in folder", vstdirs_os_label(os));
+    gtk_file_dialog_set_title(d, title);
+    gtk_file_dialog_select_folder(d, GTK_WINDOW(F.win), NULL,
+                                  on_folder_chosen, g_strdup(os));
+}
+
+static void on_folder_remove(GtkButton *b, gpointer ud)
+{
+    (void)b; (void)ud;
+    if (!F.sel[0]) return;
+    vstdirs_remove(F.sel);
+    folders_refill();
+    roots_discover(); roots_add_standard(); roots_add_user(); roots_add_fallback();
+    if (g_session_dir[0]) roots_add(g_session_dir, "given folder");
+    rescan_all();
+}
+
+static void on_folder_close(GtkButton *b, gpointer ud)
+{
+    (void)b; (void)ud;
+    if (F.win) gtk_window_destroy(GTK_WINDOW(F.win));
+}
+
+static void on_folders_gone(GtkWidget *w, gpointer ud)
+{
+    (void)w; (void)ud;
+    F.win = NULL; F.list = NULL; F.rm = NULL; F.asdd = NULL;
+}
+
+void plugview_edit_folders(GtkWindow *parent)
+{
+    GtkWidget     *box, *sw, *btns, *lbl, *close;
+    GtkStringList *asmodel;
+    size_t         g;
+    int            i;
+
+    if (F.win) { gtk_window_present(GTK_WINDOW(F.win)); return; }
+
+    F.win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(F.win), "Plug-in folders");
+    gtk_window_set_default_size(GTK_WINDOW(F.win), 660, 440);
+    gtk_window_set_transient_for(GTK_WINDOW(F.win), parent);
+    gtk_window_set_modal(GTK_WINDOW(F.win), TRUE);
+    g_signal_connect(F.win, "destroy", G_CALLBACK(on_folders_gone), NULL);
+
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_margin_top(box, 10);    gtk_widget_set_margin_bottom(box, 10);
+    gtk_widget_set_margin_start(box, 10);  gtk_widget_set_margin_end(box, 10);
+
+    lbl = gtk_label_new("Folders searched for plug-ins. Kept between sessions "
+                        "and shared with the Qt window.");
+    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+    gtk_box_append(GTK_BOX(box), lbl);
+
+    F.list = gtk_list_box_new();
+    g_signal_connect(F.list, "row-selected", G_CALLBACK(on_folder_row), NULL);
+    sw = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), F.list);
+    gtk_widget_set_vexpand(sw, TRUE);
+    gtk_box_append(GTK_BOX(box), sw);
+
+    btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_append(GTK_BOX(btns), gtk_label_new("Add as:"));
+    asmodel = gtk_string_list_new(NULL);
+    for (g = 0; g < sizeof g_dir_groups / sizeof g_dir_groups[0]; g++)
+        gtk_string_list_append(asmodel, vstdirs_os_label(g_dir_groups[g]));
+    F.asdd = gtk_drop_down_new(G_LIST_MODEL(asmodel), NULL);
+    gtk_box_append(GTK_BOX(btns), F.asdd);
+    {
+        GtkWidget *add = gtk_button_new_with_label("Add Folder…");
+        g_signal_connect(add, "clicked", G_CALLBACK(on_folder_add), NULL);
+        gtk_box_append(GTK_BOX(btns), add);
+    }
+    F.rm = gtk_button_new_with_label("Remove");
+    gtk_widget_set_sensitive(F.rm, FALSE);
+    g_signal_connect(F.rm, "clicked", G_CALLBACK(on_folder_remove), NULL);
+    gtk_box_append(GTK_BOX(btns), F.rm);
+    gtk_box_append(GTK_BOX(box), btns);
+
+    /* Said out loud, because a settings page that groups things by platform
+     * looks like it decides the platform, and this one does not. */
+    lbl = gtk_label_new("The platform says what a folder is for. Every plug-in is "
+                        "still identified by its own binary when it is scanned, so "
+                        "a Windows plug-in in the Linux folder is listed as Windows.");
+    gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+    gtk_widget_add_css_class(lbl, "dim-label");
+    gtk_box_append(GTK_BOX(box), lbl);
+
+    /* What is scanned without being asked for. Read-only on purpose: these
+     * come from where the binary sits and from the system VST directories, so
+     * removing one here would only be undone by the next launch. */
+    {
+        GtkWidget *bl = gtk_list_box_new();
+        GtkWidget *bsw = gtk_scrolled_window_new();
+        vstdir     ud[VSTDIRS_MAX];
+        int        un = vstdirs_load(ud, VSTDIRS_MAX), k, shown = 0;
+
+        for (i = 0; i < P.nroot; i++) {
+            char line[1200];
+            int  mine = 0;
+            for (k = 0; k < un; k++)
+                if (!strcmp(ud[k].path, P.roots[i].path)) { mine = 1; break; }
+            if (mine) continue;
+            snprintf(line, sizeof line, "%s   (%s)", P.roots[i].path, P.roots[i].label);
+            gtk_list_box_append(GTK_LIST_BOX(bl), gtk_label_new(line));
+            shown++;
+        }
+        if (shown) {
+            lbl = gtk_label_new("Also searched, found automatically:");
+            gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+            gtk_widget_add_css_class(lbl, "dim-label");
+            gtk_box_append(GTK_BOX(box), lbl);
+            gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(bsw), bl);
+            gtk_widget_set_size_request(bsw, -1, 96);
+            gtk_box_append(GTK_BOX(box), bsw);
+        }
+    }
+
+    {
+        char where[1200];
+        snprintf(where, sizeof where, "Stored in %s", vstdirs_file());
+        lbl = gtk_label_new(where);
+        gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+        gtk_label_set_selectable(GTK_LABEL(lbl), TRUE);
+        gtk_widget_add_css_class(lbl, "dim-label");
+        gtk_box_append(GTK_BOX(box), lbl);
+    }
+
+    close = gtk_button_new_with_label("Close");
+    gtk_widget_set_halign(close, GTK_ALIGN_END);
+    g_signal_connect(close, "clicked", G_CALLBACK(on_folder_close), NULL);
+    gtk_box_append(GTK_BOX(box), close);
+
+    gtk_window_set_child(GTK_WINDOW(F.win), box);
+    folders_refill();
+    gtk_window_present(GTK_WINDOW(F.win));
 }
 
 /* ---------------------------------------------------- installing plug-in data */
@@ -1741,8 +2219,7 @@ void plugview_install_missing_data(void)
      * is already open went looking before the folders existed. */
     plug_status("linked %d folder(s) for %d plug-in(s)%s -- reload one to see it",
                 files, plugins, failed ? ", some failed" : "");
-    plugview_scan(P.dir);
-    fill_browser();
+    rescan_all();
 }
 
 /* ------------------------------------------------------------ the audio API */
@@ -1874,7 +2351,6 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
     GtkWidget *sidebar;
     GtkEventController *ctl;
     GtkGesture *click;
-    int i;
 
     P.park   = park;
     P.unpark = unpark;
@@ -1882,27 +2358,51 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
     P.rate   = samplerate > 0 ? samplerate : 48000.0;
     P.block  = blocksize > 0 ? blocksize : 512;
 
-    /* ---- left: directory, plug-ins, programs ---- */
-    /* Which platform's plug-ins to browse. The tree carries a corpus per
-     * platform and format, and this is how you get between them -- the same
-     * selector pestudio puts at the top of its own list. */
+    /* ---- left: what to browse, plug-ins, programs ---- */
+    /* Every folder is walked, once, and the two selectors below sift the
+     * result. The dropdown here used to name folders -- one per corpus, plus
+     * every one the user had added -- which made the tree layout the user's
+     * problem and offered the same format once per folder holding it. */
     roots_discover();
-    /* The system's own VST directories go in the same dropdown. Without this
-     * an installed copy offers nothing to switch between, the walk-up above
-     * having found no checkout to walk. roots_add appends to rootmodel once it
-     * exists, so this has to come before the model is built. */
+    /* The system's own VST directories, and the folders the user set in
+     * Settings. Without the first an installed copy has nothing to scan, the
+     * walk-up above having found no checkout to walk. */
     roots_add_standard();
+    roots_add_user();
     /* roots_discover() above cleared the list, so the fallback has to be
-     * re-applied here or the dropdown is built empty on a machine that has
+     * re-applied here or nothing is scanned at all on a machine that has
      * neither a checkout nor a system VST directory. */
     roots_add_fallback();
-    P.rootmodel = gtk_string_list_new(NULL);
-    for (i = 0; i < P.nroot; i++) gtk_string_list_append(P.rootmodel, P.roots[i].label);
-    P.rootdd = gtk_drop_down_new(G_LIST_MODEL(P.rootmodel), NULL);
-    gtk_widget_set_hexpand(P.rootdd, TRUE);
+    /* Whatever plugview_scan was told to look at before the pane existed --
+     * dwstudio's --dir, or its default -- survives that reset here. */
+    if (g_session_dir[0]) roots_add(g_session_dir, "given folder");
 
-    /* The folder being shown. Choosing a different one is File > Load Folder,
-     * not a button here. */
+    /* Format, then platform: the two terms a plug-in actually has, and the
+     * same pair in the same order as pestudio's. Filled by rebuild_filters()
+     * from what the scan found, so neither offers a choice with nothing
+     * behind it. */
+    P.typemodel = gtk_string_list_new(NULL);
+    gtk_string_list_append(P.typemodel, "All types");
+    P.typedd = gtk_drop_down_new(G_LIST_MODEL(P.typemodel), NULL);
+    gtk_widget_set_hexpand(P.typedd, TRUE);
+    P.osmodel = gtk_string_list_new(NULL);
+    gtk_string_list_append(P.osmodel, "All platforms");
+    P.osdd = gtk_drop_down_new(G_LIST_MODEL(P.osmodel), NULL);
+    gtk_widget_set_hexpand(P.osdd, TRUE);
+    {
+        GtkWidget *tr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        GtkWidget *orow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_box_append(GTK_BOX(tr), gtk_label_new("Type:"));
+        gtk_box_append(GTK_BOX(tr), P.typedd);
+        gtk_box_append(GTK_BOX(orow), gtk_label_new("OS:"));
+        gtk_box_append(GTK_BOX(orow), P.osdd);
+        P.filterrows[0] = tr;
+        P.filterrows[1] = orow;
+    }
+
+    /* Where the plug-in under the cursor came from. A display now, not the
+     * thing being browsed: with every folder scanned at once there is no one
+     * directory to point at, and the useful one is the selection's. */
     top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     P.dirlabel = gtk_label_new(P.dir[0] ? P.dir : "(no folder)");
     gtk_label_set_ellipsize(GTK_LABEL(P.dirlabel), PANGO_ELLIPSIZE_START);
@@ -1923,7 +2423,8 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
     gtk_widget_set_size_request(progsw, -1, 170);
 
     left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_box_append(GTK_BOX(left), P.rootdd);
+    gtk_box_append(GTK_BOX(left), P.filterrows[0]);
+    gtk_box_append(GTK_BOX(left), P.filterrows[1]);
     gtk_box_append(GTK_BOX(left), top);
     gtk_box_append(GTK_BOX(left), gtk_label_new("Plug-ins"));
     gtk_box_append(GTK_BOX(left), sw);
@@ -2057,10 +2558,11 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
     gtk_box_append(GTK_BOX(sidebar), P.status);
 
     P.root = sidebar;
-    /* Whatever plugview_scan was told to look at before the pane existed --
-     * dwstudio's --dir, or its default -- becomes the selected entry. */
-    root_select_path(P.dir, "given folder");
-    g_signal_connect(P.rootdd, "notify::selected", G_CALLBACK(on_root_changed), NULL);
+    /* The roots were rebuilt above, so what was scanned before the pane
+     * existed is out of date -- scan again over the full set, then show it. */
+    plugview_scan(NULL);
+    g_signal_connect(P.typedd, "notify::selected", G_CALLBACK(on_filter_changed), NULL);
+    g_signal_connect(P.osdd,   "notify::selected", G_CALLBACK(on_filter_changed), NULL);
     fill_browser();
     {   /* Where a native editor's descriptors and timers end up. Installed
          * once: only one editor is open at a time. */

@@ -54,10 +54,10 @@ parameters, the widest editor in the corpus.*
 ### Two windows
 
 **pestudio** (`peload/qtgui`, Qt6) is a plug-in browser and player: pick a
-folder, pick a plug-in, and get its programs, every exposed parameter, a
-playable keyboard, a pitch wheel, patch banks, a recorder, and the plug-in's own
-editor — blitted for Windows plug-ins, embedded as an X11 child window for
-native Linux ones.
+format and a platform, pick a plug-in, and get its programs, every exposed
+parameter, a playable keyboard, a pitch wheel, patch banks, a recorder, and the
+plug-in's own editor — blitted for Windows plug-ins, embedded as an X11 child
+window for native Linux ones.
 
 **dwstudio** (`gui/`, GTK4) is the same host beside the engines in `c/src`: a
 DW-8000, a 4-op FM synth, a Juno-6 and sample kits, voiced from banks read
@@ -114,10 +114,15 @@ apart from those plug-ins works with both directories empty, which is how they
 ship. Wine's builds of the same DLLs are refused rather than loaded: they are
 compiled against Wine's own `ntdll` and fault inside their own startup.
 
-An installed copy has no tree to find the plug-in corpus in, so point `VST_ROOT`
-at one — a directory holding `windows/`, `linux/` and `macos/` — or keep it at
-`~/vst`, which is where it looks by default. Paths given on the command line
-work regardless.
+An installed copy has no tree to find the plug-in corpus in. Both windows take
+the folders to search under **Settings > Plug-in Folders**, each filed under the
+platform it holds; the list is kept in `~/.config/vst-ace/plugin-folders` and is
+shared, so a folder added in one window is searched by the other. The system VST
+directories and `VST_PATH`/`VST3_PATH` are searched without being asked for.
+
+For the command-line tools, point `VST_ROOT` at a directory holding `windows/`,
+`linux/` and `macos/`, or keep it at `~/vst`, which is where they look by
+default. Paths given on the command line work regardless.
 
 `packaging/build-deb.sh <version>` and `packaging/build-rpm.sh <version>` build
 them into `release/`, from the recipes in `packaging/debian/` and
