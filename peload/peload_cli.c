@@ -26,7 +26,9 @@
 #define WM_MOUSEMOVE   0x0200
 #define WM_LBUTTONDOWN 0x0201
 #define WM_LBUTTONUP   0x0202
-#define MAX_CLICKS     8
+#define MAX_CLICKS     400   /* a grid probe of one editor is a few hundred */
+/* Parameters watched across a click, to report what one actually did. */
+#define MAX_WATCH_PARAMS 512
 
 typedef struct {
     const char *path;             /* the plugin, or a bank that names one */
@@ -47,7 +49,62 @@ typedef struct {
     /* --click X,Y, repeatable. See the click loop in the editor capture. */
     struct { int x, y; } click[MAX_CLICKS];
     int         nclick;
+    /* --drag x1,y1,x2,y2: press, sweep, release. See drag_pump. */
+    int         drag[4];
+    int         has_drag;
 } opts;
+
+/* A scripted drag, driven from inside the plug-in's own tracking loop.
+ *
+ * A Classic control does not get told the pointer moved -- on mouse-down it
+ * spins, polling GetMouse until the button comes up, redrawing itself as it
+ * goes. That is what makes a dial follow the pointer, and it means the host
+ * cannot simply send it a stream of move events: nothing of the host's runs
+ * until the loop ends. What runs instead is the input pump, which the shim
+ * calls from inside that poll -- see cfm_set_input_pump.
+ *
+ * So the sweep lives here, in the pump: each time the plug-in asks where the
+ * pointer is, it has moved a little further along. Which is exactly what a
+ * window system would have been doing, and it makes a drag reproducible
+ * without a display or a hand on a mouse. */
+static struct {
+    pehost *h;
+    int     x0, y0, x1, y1;
+    int     step, steps, released;
+    float   seen[512];        /* the value at each step, to prove it tracked */
+    int     nseen, watch, nparam;
+    float   base[MAX_WATCH_PARAMS];   /* values before the press, to spot the one moving */
+} g_drag;
+
+static void drag_pump(void *ud)
+{
+    int x, y;
+
+    (void)ud;
+    if (!g_drag.h) return;
+    if (g_drag.step >= g_drag.steps) {
+        /* The gesture ends here, inside the plug-in's own loop, because that is
+         * the only place it can: the loop spins until the button comes up, so a
+         * release sent from outside it would never arrive. This is the hand
+         * letting go of the mouse. */
+        if (!g_drag.released) {
+            g_drag.released = 1;
+            pehost_editor_mouse(g_drag.h, g_drag.x1, g_drag.y1, WM_LBUTTONUP, 0, 0);
+        }
+        return;
+    }
+    g_drag.step++;
+    x = g_drag.x0 + (g_drag.x1 - g_drag.x0) * g_drag.step / g_drag.steps;
+    y = g_drag.y0 + (g_drag.y1 - g_drag.y0) * g_drag.step / g_drag.steps;
+    pehost_editor_mouse(g_drag.h, x, y, WM_MOUSEMOVE, 1, 0);
+    /* Nothing is read from the plug-in here. This runs inside the plug-in's own
+     * tracking loop, so asking it for a parameter would be a second entry into
+     * code that is already running -- the same re-entrancy the parameter list
+     * guards against in the windows. Whether the control tracked is settled
+     * after the gesture, by where it ended up: a press alone puts it under the
+     * pointer's start, so a value matching the *end* is proof it followed. */
+    g_drag.nseen++;
+}
 
 /* ------------------------------------------------------------- file output */
 
@@ -121,6 +178,8 @@ static void usage(void)
         "              [--save-patch out.json]  write the current state\n"
         "              [--editor out.ppm]   open the GUI and capture it\n"
        "              [--click X,Y]        click there first (repeatable)\n"
+       "              [--drag X1,Y1,X2,Y2] press, sweep, release -- and report\n"
+       "                                   whether a control tracked the sweep\n"
         "              [--block N]          frames per block (default 512)\n"
         "\n"
         "A bank names the plugin it was written for, so `peload bank.json`\n"
@@ -144,6 +203,13 @@ static int parse_args(int argc, char **argv, opts *o)
         else if (!strcmp(argv[i], "--program") && i + 1 < argc)  o->prog  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--params"))                   o->dump  = 1;
         else if (!strcmp(argv[i], "--editor") && i + 1 < argc)   o->shot  = argv[++i];
+        else if (!strcmp(argv[i], "--drag") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%d,%d,%d,%d", &o->drag[0], &o->drag[1],
+                       &o->drag[2], &o->drag[3]) != 4) {
+                fprintf(stderr, "--drag wants X1,Y1,X2,Y2\n"); return 2;
+            }
+            o->has_drag = 1;
+        }
         else if (!strcmp(argv[i], "--click") && i + 1 < argc) {
             int cx, cy;
             if (sscanf(argv[++i], "%d,%d", &cx, &cy) != 2) {
@@ -413,6 +479,7 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
     {
         const unsigned int *px = NULL;
         int pw = 0, ph = 0, frame, ci;
+        float before[MAX_WATCH_PARAMS];
 
         /* Let it settle: editors commonly need a few idle cycles before the
          * first full repaint lands. */
@@ -426,6 +493,12 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
          * checked without a display or a person. Each click is a press, a
          * short hold and a release, with idles throughout, because that is
          * what a plug-in watching for a drag expects to see. */
+        /* The state to compare against, taken once the editor has settled. */
+        {
+            int np = pehost_num_params(h), pi;
+            for (pi = 0; pi < np && pi < MAX_WATCH_PARAMS; pi++)
+                before[pi] = pehost_get_param(h, pi);
+        }
         for (ci = 0; ci < o->nclick; ci++) {
             pehost_editor_mouse(h, o->click[ci].x, o->click[ci].y, WM_MOUSEMOVE, 0, 0);
             pehost_editor_pump(h); usleep(16000);
@@ -433,7 +506,86 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
             for (frame = 0; frame < 4; frame++) { pehost_editor_pump(h); usleep(16000); }
             pehost_editor_mouse(h, o->click[ci].x, o->click[ci].y, WM_LBUTTONUP, 0, 0);
             for (frame = 0; frame < 30; frame++) { pehost_editor_pump(h); usleep(16000); }
-            printf("  clicked %d,%d\n", o->click[ci].x, o->click[ci].y);
+            /* Say what the click did to the plug-in, not just that it happened.
+             * A control that draws but does not move is the failure this is
+             * looking for, and it is invisible in a screenshot. */
+            {
+                int np = pehost_num_params(h), pi, moved = 0;
+                printf("  clicked %d,%d", o->click[ci].x, o->click[ci].y);
+                for (pi = 0; pi < np && pi < MAX_WATCH_PARAMS; pi++) {
+                    float now = pehost_get_param(h, pi);
+                    if (fabs(now - before[pi]) > 1e-6) {
+                        char nm[64] = "";
+                        pehost_param_name(h, pi, nm, sizeof nm);
+                        printf("%s %s %.3f -> %.3f", moved++ ? "," : " --",
+                               nm[0] ? nm : "param", before[pi], now);
+                        before[pi] = now;
+                    }
+                }
+                printf("%s\n", moved ? "" : " -- nothing moved");
+            }
+        }
+
+        /* The drag. Which parameter to watch is whichever the press moves --
+         * the control under the pointer names itself by changing. */
+        if (o->has_drag) {
+            int np = pehost_num_params(h), pi;
+            for (pi = 0; pi < np && pi < MAX_WATCH_PARAMS; pi++)
+                before[pi] = pehost_get_param(h, pi);
+
+            g_drag.h = h;
+            g_drag.x0 = o->drag[0]; g_drag.y0 = o->drag[1];
+            g_drag.x1 = o->drag[2]; g_drag.y1 = o->drag[3];
+            g_drag.step = 0; g_drag.steps = 60; g_drag.nseen = 0; g_drag.watch = -1;
+            g_drag.released = 0;
+            g_drag.nparam = np < MAX_WATCH_PARAMS ? np : MAX_WATCH_PARAMS;
+            for (pi = 0; pi < g_drag.nparam; pi++) g_drag.base[pi] = before[pi];
+
+            pehost_editor_mouse(h, o->drag[0], o->drag[1], WM_MOUSEMOVE, 0, 0);
+            pehost_editor_pump(h);
+            /* Find the control by pressing: whatever moves is what is under it. */
+            /* Watch every parameter, because which one the press moves cannot
+             * be known before the press -- and the press does not return until
+             * the plug-in's loop has run the whole gesture. */
+            g_drag.watch = -1;
+            pehost_editor_mouse(h, o->drag[0], o->drag[1], WM_LBUTTONDOWN, 1, 0);
+            for (pi = 0; pi < np && pi < MAX_WATCH_PARAMS; pi++)
+                if (fabs(pehost_get_param(h, pi) - before[pi]) > 1e-6) {
+                    g_drag.watch = pi; break;
+                }
+            /* Then let it sweep. The plug-in may already be spinning inside its
+             * own loop here, in which case the pump above has been driving the
+             * pointer all along and these idles simply let it finish. */
+            for (frame = 0; frame < 120 && g_drag.step < g_drag.steps; frame++) {
+                pehost_editor_pump(h);
+                usleep(4000);
+            }
+            if (!g_drag.released) {   /* never entered a tracking loop */
+                g_drag.released = 1;
+                pehost_editor_mouse(h, o->drag[2], o->drag[3], WM_LBUTTONUP, 0, 0);
+            }
+            for (frame = 0; frame < 20; frame++) { pehost_editor_pump(h); usleep(16000); }
+            g_drag.h = NULL;          /* the pump is a no-op from here */
+
+            {
+                int moved = 0;
+                printf("  dragged %d,%d -> %d,%d, %d pointer step(s) delivered",
+                       o->drag[0], o->drag[1], o->drag[2], o->drag[3], g_drag.nseen);
+                for (pi = 0; pi < np && pi < MAX_WATCH_PARAMS; pi++) {
+                    float now = pehost_get_param(h, pi);
+                    if (fabs(now - before[pi]) > 1e-6) {
+                        char nm[64] = "";
+                        pehost_param_name(h, pi, nm, sizeof nm);
+                        printf("%s %s %.3f -> %.3f", moved++ ? "," : " --",
+                               nm[0] ? nm : "param", before[pi], now);
+                    }
+                }
+                if (!moved) printf(" -- nothing moved");
+                printf("\n");
+                if (g_drag.nseen == 0)
+                    printf("    (no steps delivered: the plug-in never entered a "
+                           "tracking loop, so this was a click, not a drag)\n");
+            }
         }
         if (pehost_editor_pixels(h, &px, &pw, &ph) && px && pw > 0 && ph > 0) {
             long nonzero = 0;
@@ -469,6 +621,11 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+
+    /* Before the plug-in opens, not after: the Classic shim is handed the pump
+     * when it is built, so one installed later is never seen. pestudio's own
+     * main() says the same thing above its call for the same reason. */
+    if (o.has_drag) pehost_set_input_pump(drag_pump, NULL);
 
     if (!(h = pehost_open_as(o.path, force, (double)RATE, o.block))) {
         fprintf(stderr, "load failed: %s\n", pehost_last_error());

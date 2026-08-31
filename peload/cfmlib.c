@@ -747,6 +747,11 @@ static int spec_path(cfm *c, uint32_t spec, char *out, size_t n)
 static void f_FSFindFolder(cfm *c)
 {
     uint32_t out = arg(c, 3);
+    if (getenv("CFMFILE")) {
+        uint32_t t = arg(c, 1);
+        fprintf(stderr, "  [file] FSFindFolder type='%c%c%c%c'\n",
+                (char)(t >> 24), (char)(t >> 16), (char)(t >> 8), (char)t);
+    }
     if (!out || c->ndirs == 0) { reterr(c, fnfErr); return; }
     /* An FSRef is opaque, so its contents are ours to choose. Tag it so
      * FSGetCatalogInfo can recognise one we made. */
@@ -794,6 +799,9 @@ static void f_FSMakeFSSpec(cfm *c)
     /* Report whether the file exists, which is what the caller checks. */
     g_pstr(c, spec + 6, leaf, sizeof leaf);
     if (!spec_path(c, spec, path, sizeof path)) { reterr(c, paramErr); return; }
+    if (getenv("CFMFILE"))
+        fprintf(stderr, "  [file] FSMakeFSSpec \"%s\" -> %s (%s)\n",
+                leaf, path, access(path, F_OK) == 0 ? "exists" : "MISSING");
     reterr(c, access(path, F_OK) == 0 ? noErr : fnfErr);
 }
 
@@ -861,6 +869,8 @@ static void f_FSRead(cfm *c)
         if (n < chunk) break;
     }
     if (pcount) s32(c, pcount, got);
+    if (getenv("CFMFILE"))
+        fprintf(stderr, "  [file] FSRead wanted %u byte(s), got %u\n", want, got);
     /* Short reads report end-of-file, which is how the caller finds the length. */
     reterr(c, got < want ? -39 /* eofErr */ : noErr);
 }

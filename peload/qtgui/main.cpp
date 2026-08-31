@@ -1449,9 +1449,22 @@ private:
 
     void tick()
     {
-        if (!host_ || g_inPlugin) return;   /* already inside the plugin */
+        if (!host_) return;
+        /* Being inside the plugin is not a reason to skip the frame, only to
+         * skip the pump.
+         *
+         * A Classic control tracks a drag in a loop of its own and paints
+         * itself as it goes, polling for input from inside that loop -- which
+         * is where this gets its chance to run. Returning here, as this used to,
+         * meant the widget never re-read the plug-in's offscreen for as long as
+         * the button was down: the picture froze on mouse-down and jumped to its
+         * final state on mouse-up. Reading the pixels is a locked copy of the
+         * buffer the plug-in is painting into, not a call into it, so the dial
+         * follows the pointer. The pump is what must not happen -- that would
+         * dispatch into code already running. */
+        const bool inside = g_inPlugin;
         PluginCall guard;
-        pehost_editor_pump(host_);
+        if (!inside) pehost_editor_pump(host_);
         const unsigned int *px = nullptr;
         int w = 0, h = 0;
         if (!pehost_editor_pixels(host_, &px, &w, &h) || !px || w <= 0 || h <= 0) {

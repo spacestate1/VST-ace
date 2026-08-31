@@ -85,6 +85,7 @@ struct pefvst {
      * arrive while the guest is mid-call -- and dispatching again from there
      * would both re-enter the plugin and deadlock on the lock below. */
     int       in_guest;
+    int       ed_w, ed_h;     /* editor size, asked for once -- see pefvst_editor_draw */
     pthread_t guest_thread;
     char      err[256];
 
@@ -603,10 +604,28 @@ int pefvst_editor_open(pefvst *v)
  * real screen with overlapping windows, and there is neither here. */
 void pefvst_editor_draw(pefvst *v)
 {
-    int w = 0, h = 0;
+    int w = v->ed_w, h = v->ed_h;
 
     if (!v || !v->ae || !v->editor_open) return;
-    pefvst_editor_size(v, &w, &h);
+    /* Not while the plug-in is already running on this thread.
+     *
+     * A Classic control tracks a drag in a loop of its own, redrawing itself as
+     * it goes, and it polls for input from inside that loop -- which is where
+     * the host gets its chance to run. Taking that chance to dispatch a full
+     * repaint is a second entry into code that is already drawing, and what it
+     * looks like is a dial that stutters instead of following the pointer.
+     * pefvst_editor_mouse declines for the same reason, a few lines down. The
+     * plug-in is painting itself here; it does not need telling. */
+    if (v->in_guest && pthread_equal(v->guest_thread, pthread_self())) return;
+
+    /* The size is asked for once, at open. effEditGetRect is a dispatch into
+     * the plug-in like any other, and an editor does not change size between
+     * frames -- asking every time cost one round trip per repaint for an
+     * answer that was already known. */
+    if (w <= 0 || h <= 0) {
+        pefvst_editor_size(v, &w, &h);
+        v->ed_w = w; v->ed_h = h;
+    }
     if (w <= 0 || h <= 0) return;
     /* An ERect is four int16 in top, left, bottom, right order -- the same
      * layout as the Rect effEditGetRect hands back. */
@@ -663,14 +682,39 @@ int pefvst_editor_key(pefvst *v, int ch)
 const uint32_t *pefvst_editor_pixels(pefvst *v, int *w, int *h)
 {
     const uint32_t *px;
+    int mine;
 
     if (!v) return NULL;
+    /* Whether this thread is already inside the guest -- which is the case for
+     * the whole of a drag, because a Classic control tracks the pointer in a
+     * loop of its own and polls for input from inside it. Worked out before the
+     * idle below, which clears the flag on its way out. */
+    mine = v->in_guest && pthread_equal(v->guest_thread, pthread_self());
     /* The idle call locks for itself; the copy that follows reads the guest's
      * memory directly and so needs the lock too, or it can capture a frame the
-     * audio thread is halfway through changing. */
-    if (v->editor_open) pefvst_dispatch(v, PV_EDIT_IDLE, 0, 0, 0, 0.0f);
-    pthread_mutex_lock(&v->lock);
-    px = cfm_gworld_pixels(v->c, w, h);
-    pthread_mutex_unlock(&v->lock);
+     * audio thread is halfway through changing.
+     *
+     * The idle is skipped when the guest is already running on this thread --
+     * which is the case all through a drag, because a Classic control tracks
+     * the pointer in a loop of its own. Reading is still fine there and is the
+     * whole point: the plug-in is painting into that offscreen as it tracks, so
+     * a host that reads it gets the dial moving under the pointer rather than a
+     * picture frozen until the button comes up. Dispatching into it would be a
+     * second entry into code that is already running. */
+    if (v->editor_open && !mine)
+        pefvst_dispatch(v, PV_EDIT_IDLE, 0, 0, 0, 0.0f);
+    if (mine) {
+        /* The lock is already held by this thread: pefvst_dispatch takes it
+         * before running the guest and does not let go until the guest returns.
+         * Taking it again would deadlock -- it is not a recursive mutex -- and
+         * there is nothing left to guard against, because holding it is what
+         * makes this exclusive in the first place. Getting this wrong froze the
+         * whole window the moment a Classic editor was opened. */
+        px = cfm_gworld_pixels(v->c, w, h);
+    } else {
+        pthread_mutex_lock(&v->lock);
+        px = cfm_gworld_pixels(v->c, w, h);
+        pthread_mutex_unlock(&v->lock);
+    }
     return px;
 }
