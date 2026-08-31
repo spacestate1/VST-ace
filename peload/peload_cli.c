@@ -21,6 +21,13 @@
 #define RATE 48000
 
 /* Everything the command line can say. */
+/* Win32 mouse messages, the form pehost_editor_mouse takes. Only the three a
+ * click is made of are needed here. */
+#define WM_MOUSEMOVE   0x0200
+#define WM_LBUTTONDOWN 0x0201
+#define WM_LBUTTONUP   0x0202
+#define MAX_CLICKS     8
+
 typedef struct {
     const char *path;             /* the plugin, or a bank that names one */
     const char *wav;              /* --render */
@@ -37,6 +44,9 @@ typedef struct {
     /* The host runs at 256; matching it here is what reproduces a plugin that
      * only misbehaves under the block size it will actually be given. */
     int         block;
+    /* --click X,Y, repeatable. See the click loop in the editor capture. */
+    struct { int x, y; } click[MAX_CLICKS];
+    int         nclick;
 } opts;
 
 /* ------------------------------------------------------------- file output */
@@ -110,6 +120,7 @@ static void usage(void)
         "                                    mac-au, classic-mac)\n"
         "              [--save-patch out.json]  write the current state\n"
         "              [--editor out.ppm]   open the GUI and capture it\n"
+       "              [--click X,Y]        click there first (repeatable)\n"
         "              [--block N]          frames per block (default 512)\n"
         "\n"
         "A bank names the plugin it was written for, so `peload bank.json`\n"
@@ -133,6 +144,15 @@ static int parse_args(int argc, char **argv, opts *o)
         else if (!strcmp(argv[i], "--program") && i + 1 < argc)  o->prog  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--params"))                   o->dump  = 1;
         else if (!strcmp(argv[i], "--editor") && i + 1 < argc)   o->shot  = argv[++i];
+        else if (!strcmp(argv[i], "--click") && i + 1 < argc) {
+            int cx, cy;
+            if (sscanf(argv[++i], "%d,%d", &cx, &cy) != 2) {
+                fprintf(stderr, "--click wants X,Y\n"); return 2;
+            }
+            if (o->nclick < MAX_CLICKS) {
+                o->click[o->nclick].x = cx; o->click[o->nclick].y = cy; o->nclick++;
+            }
+        }
         else if (!strcmp(argv[i], "--block") && i + 1 < argc)    o->block = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--patch") && i + 1 < argc)    o->patch_in  = argv[++i];
         else if (!strcmp(argv[i], "--save-patch") && i + 1 < argc)
@@ -371,7 +391,7 @@ static int render_to_wav(pehost *h, const opts *o)
     return 0;
 }
 
-static void capture_editor(pehost *h, const char *shot)
+static void capture_editor(pehost *h, const char *shot, const opts *o)
 {
     int kind = pehost_editor_kind(h);
     int w = 0, ht = 0;
@@ -392,13 +412,28 @@ static void capture_editor(pehost *h, const char *shot)
 
     {
         const unsigned int *px = NULL;
-        int pw = 0, ph = 0, frame;
+        int pw = 0, ph = 0, frame, ci;
 
         /* Let it settle: editors commonly need a few idle cycles before the
          * first full repaint lands. */
         for (frame = 0; frame < 40; frame++) {
             pehost_editor_pump(h);
             usleep(16000);
+        }
+        /* Then any clicks asked for. An editor whose controls only appear once
+         * a tab is selected, or a page turned, cannot be photographed without
+         * being touched first -- and doing it here means the picture can be
+         * checked without a display or a person. Each click is a press, a
+         * short hold and a release, with idles throughout, because that is
+         * what a plug-in watching for a drag expects to see. */
+        for (ci = 0; ci < o->nclick; ci++) {
+            pehost_editor_mouse(h, o->click[ci].x, o->click[ci].y, WM_MOUSEMOVE, 0, 0);
+            pehost_editor_pump(h); usleep(16000);
+            pehost_editor_mouse(h, o->click[ci].x, o->click[ci].y, WM_LBUTTONDOWN, 1, 0);
+            for (frame = 0; frame < 4; frame++) { pehost_editor_pump(h); usleep(16000); }
+            pehost_editor_mouse(h, o->click[ci].x, o->click[ci].y, WM_LBUTTONUP, 0, 0);
+            for (frame = 0; frame < 30; frame++) { pehost_editor_pump(h); usleep(16000); }
+            printf("  clicked %d,%d\n", o->click[ci].x, o->click[ci].y);
         }
         if (pehost_editor_pixels(h, &px, &pw, &ph) && px && pw > 0 && ph > 0) {
             long nonzero = 0;
@@ -455,7 +490,7 @@ int main(int argc, char **argv)
     }
 
     if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
-    if (o.shot) capture_editor(h, o.shot);
+    if (o.shot) capture_editor(h, o.shot, &o);
 
     {
         int impl, stub, called;

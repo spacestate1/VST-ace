@@ -99,6 +99,12 @@ void  pefvst_note(pefvst *v, int on, int key, int velocity);
  * pefvst_editor_pixels() returns what it has drawn, as 32-bit BGRA. */
 int   pefvst_editor_open(pefvst *v);
 
+/* Ask the plug-in to paint the whole editor -- effEditDraw. On Mac the host
+ * owns the editor's window, so a plug-in paints when it is told to and not
+ * before; without this a Classic editor draws its background at open and never
+ * its controls. Sent on open and on every idle. */
+void  pefvst_editor_draw(pefvst *v);
+
 /* Report the mouse to the editor and give it a chance to react. `down` is 1
  * while a button is held. Returns 1 if the editor said it handled the click. */
 int   pefvst_editor_mouse(pefvst *v, int x, int y, int down);

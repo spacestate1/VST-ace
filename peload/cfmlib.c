@@ -1057,6 +1057,16 @@ static int bits_of(cfm *c, uint32_t bits, uint32_t *base, uint32_t *rb,
 
 /* CopyBits(srcBits, dstBits, srcRect, dstRect, mode, maskRgn). Nearest-neighbour
  * scaling, which is what QuickDraw did for a non-integer ratio. */
+/* CFMBLIT=1 traces every CopyBits. Read once: this sits in the inner loop of
+ * everything a Classic editor draws, and a getenv per blit is a syscall per
+ * blit. */
+static int blit_trace(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("CFMBLIT"); v = e && *e != '0'; }
+    return v;
+}
+
 static void f_CopyBits(cfm *c)
 {
     uint32_t sb, db, srb, drb;
@@ -1070,6 +1080,21 @@ static void f_CopyBits(cfm *c)
     dr = g_rect(c, arg(c, 3));
 
     touch_base(c, db);
+    if (blit_trace()) {
+        /* Where the bits went, and whether the source had anything in it. The
+         * question an empty panel raises is which of those two it is, and the
+         * answer is not reachable from outside: this is the only place that
+         * sees both ends of the copy. */
+        long nz = 0; int yy, xx;
+        for (yy = sr.t; yy < sr.b && yy < sh; yy++)
+            for (xx = sr.l; xx < sr.r && xx < sw; xx++)
+                if (yy >= 0 && xx >= 0 &&
+                    (g32(c, sb + (uint32_t)yy * srb + (uint32_t)xx * 4) & 0xFFFFFF)) nz++;
+        fprintf(stderr, "  [blit] src %dx%d (%d,%d %d,%d) -> dst %dx%d (%d,%d %d,%d)"
+                        " mode %d  src non-black %ld\n",
+                sw, sh, sr.l, sr.t, sr.r, sr.b, dw, dh, dr.l, dr.t, dr.r, dr.b,
+                (int)arg(c, 4), nz);
+    }
     for (y = dr.t; y < dr.b; y++) {
         int syy;
         if (y < 0 || y >= dh) continue;

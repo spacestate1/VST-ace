@@ -3396,7 +3396,14 @@ int pehost_editor_open(pehost *h)
 
 void pehost_editor_pump(pehost *h)
 {
-    if (h && h->cl) { pefvst_dispatch(h->cl, PV_EDIT_IDLE, 0, 0, 0, 0.0f); return; }
+    if (h && h->cl) {
+        /* Idle, then draw. A Classic editor repaints when the host asks it to
+         * -- see pefvst_editor_draw -- so a pump that only idles leaves every
+         * control the plug-in has just made dirty still unpainted. */
+        pefvst_dispatch(h->cl, PV_EDIT_IDLE, 0, 0, 0, 0.0f);
+        pefvst_editor_draw(h->cl);
+        return;
+    }
     if (h && h->mv) { macvst_editor_pump(h->mv); return; }
     if (h && h->br) return;   /* the helper pumps its own editor */
     w32_pump();

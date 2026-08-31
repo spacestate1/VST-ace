@@ -580,7 +580,41 @@ int pefvst_editor_open(pefvst *v)
     if (v->err[0]) return 0;
     v->editor_open = 1;
     pefvst_dispatch(v, PV_EDIT_IDLE, 0, 0, 0, 0.0f);
+    pefvst_editor_draw(v);
     return 1;
+}
+
+/* effEditDraw: tell the plug-in to paint, and where.
+ *
+ * On Mac the host owns the editor's window, so the plug-in does not paint when
+ * it feels like it -- it paints when the host says the window needs it, which
+ * on a real Mac is the update event the Window Manager delivers. There is no
+ * window and no Window Manager here, so nothing was ever telling it to paint,
+ * and the whole opcode went unused: defined in pefvst.h since the beginning and
+ * dispatched from nowhere.
+ *
+ * What that looked like was an editor that drew its background at effEditOpen
+ * and nothing after. A Destroy FX editor decodes its artwork into small
+ * offscreens on open -- a 17x112 slider track, a 17x17 knob -- and composites
+ * them when it is asked to draw. It was building every control and never being
+ * asked, so the panel stayed as the background left it.
+ *
+ * The rect is the whole editor: partial-area drawing is an optimisation for a
+ * real screen with overlapping windows, and there is neither here. */
+void pefvst_editor_draw(pefvst *v)
+{
+    int w = 0, h = 0;
+
+    if (!v || !v->ae || !v->editor_open) return;
+    pefvst_editor_size(v, &w, &h);
+    if (w <= 0 || h <= 0) return;
+    /* An ERect is four int16 in top, left, bottom, right order -- the same
+     * layout as the Rect effEditGetRect hands back. */
+    ppc_write16(v->m, v->scratch,      0);
+    ppc_write16(v->m, v->scratch + 2,  0);
+    ppc_write16(v->m, v->scratch + 4,  (uint16_t)h);
+    ppc_write16(v->m, v->scratch + 6,  (uint16_t)w);
+    pefvst_dispatch(v, PV_EDIT_DRAW, 0, 0, v->scratch, 0.0f);
 }
 
 int pefvst_editor_mouse(pefvst *v, int x, int y, int down)
