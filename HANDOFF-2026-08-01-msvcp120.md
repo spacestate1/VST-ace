@@ -340,7 +340,7 @@ its types are `FM`, `FNT`, `FRM`, `PICTURE`, `PM`, `TTFD`, `#3`, `#14`, `#16`,
 ## Reproducing
 
 ```sh
-cd /storage01/synth_stuff/vst/re
+cd /storage01/code/c_things/vst-ace
 cmake --build peload/build -j"$(nproc)"
 
 cd peload/build
