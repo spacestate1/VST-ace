@@ -66,7 +66,7 @@ target_link_libraries(vst3_msabi PRIVATE PkgConfig::FREETYPE)
 
 # The macOS side: a Mach-O loader plus the framework shims. In-process, because
 # macOS x86-64 is System V -- the same ABI this host already uses.
-add_library(pehost STATIC pehost.c vst3_dispatch.c bridge_client.c patch.c
+add_library(pehost STATIC pehost.c vst3_dispatch.c bridge_client.c patch.c vstdirs.c
             machoload.c macshim.c macvdsp.c macfound.c macobjc.c macns.c
             macquartz.c macmetal.c macobjc_msgsend.S macvsthost.c macau.c
             # Classic Mac OS: a PowerPC interpreter, the PEF loader, the system
