@@ -3804,6 +3804,208 @@ private:
         }
         s.remove("userRoots");
     }
+    /* ------------------------------------------------- installing a plug-in ---
+     *
+     * A plug-in opened through File > Open is usually somewhere it was
+     * unpacked -- a download, a Documents folder -- rather than anywhere a
+     * host would look. That works once, and then the next session has to go
+     * and find it again; worse, a plug-in that loads its own data from beside
+     * itself only works from wherever it was unpacked to.
+     *
+     * So the first time one is opened from outside the folders being scanned,
+     * offer to install it: copy it where plug-ins belong on this system, add
+     * that folder to the scan, and load the installed copy rather than the
+     * original. Declining is remembered per plug-in, and "don't ask again"
+     * silences it for good.
+     */
+
+    static bool looksLikePlugin(const QString &name)
+    {
+        static const char *ext[] = { ".dll", ".so", ".vst3", ".vst", ".component" };
+        for (const char *e : ext)
+            if (name.endsWith(QLatin1String(e), Qt::CaseInsensitive)) return true;
+        return false;
+    }
+
+    /* Is this path already somewhere the browser looks? Both the roots being
+     * scanned and the system directories count: a plug-in in /usr/lib/vst3 is
+     * installed whether or not this window happens to list that folder. */
+    bool pathAlreadyInstalled(const QString &abs) const
+    {
+        QStringList known = scanRoots();
+        known += standardPluginDirs();
+        for (const QString &k : known) {
+            if (k.isEmpty()) continue;
+            const QString root = QDir(k).absolutePath();
+            if (abs == root || abs.startsWith(root + "/")) return true;
+        }
+        return false;
+    }
+
+    /* Copy a directory and everything under it. Qt has no recursive copy, and
+     * a bundle or a plug-in's data folder is exactly the case that needs one. */
+    static bool copyTree(const QString &src, const QString &dst, QString *err)
+    {
+        QDir().mkpath(dst);
+        QDirIterator it(src, QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            it.next();
+            const QString rel = QDir(src).relativeFilePath(it.filePath());
+            const QString to  = dst + "/" + rel;
+            if (it.fileInfo().isDir()) {
+                if (!QDir().mkpath(to)) { *err = "could not create " + to; return false; }
+            } else {
+                QDir().mkpath(QFileInfo(to).absolutePath());
+                QFile::remove(to);                    /* overwrite an earlier install */
+                if (!QFile::copy(it.filePath(), to)) {
+                    *err = "could not copy " + rel; return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /* What installing this plug-in has to move.
+     *
+     * A bundle is a directory and travels whole. A bare file usually travels
+     * alone -- but not always: a SynthEdit plug-in is a .dll beside the modules
+     * and skin bitmaps it loads at run time, and copying only the .dll produces
+     * a plug-in that loads and then fails with nothing to show for it. So when
+     * the containing folder holds exactly one plug-in and other files besides,
+     * the folder is treated as the plug-in's own and goes across intact.
+     *
+     * More than one plug-in in the folder means it is a collection rather than
+     * one plug-in's install, and only the file named is taken. */
+    static QString installSource(const QString &abs, bool *wholeFolder)
+    {
+        *wholeFolder = false;
+        const QFileInfo fi(abs);
+        if (fi.isDir()) return abs;                   /* a bundle */
+
+        const QDir parent = fi.dir();
+        int plugins = 0, others = 0;
+        for (const QFileInfo &e :
+             parent.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot)) {
+            if (looksLikePlugin(e.fileName())) plugins++;
+            else                               others++;
+        }
+        if (plugins == 1 && others > 0) { *wholeFolder = true; return parent.absolutePath(); }
+        return abs;
+    }
+
+    /* Offer, once, to install a plug-in that was opened from outside the scan.
+     * Returns the path to load -- the installed copy if one was made, and the
+     * original otherwise, so declining still opens what was asked for. */
+    QString offerInstall(const QString &abs)
+    {
+        if (pathAlreadyInstalled(abs)) return abs;
+
+        QSettings st("pestudio", "pestudio");
+        if (st.value("installOfferOff", false).toBool()) return abs;
+        /* Asked about this one before and declined: opening it again is not a
+         * change of mind, and re-asking every time is what makes a prompt a
+         * nuisance. */
+        QStringList declined = st.value("installDeclined").toStringList();
+        if (declined.contains(abs)) return abs;
+
+        const QStringList targets = standardPluginDirs();
+        if (targets.isEmpty()) return abs;            /* nowhere to put it */
+
+        bool wholeFolder = false;
+        const QString src = installSource(abs, &wholeFolder);
+
+        QDialog dlg(this);
+        dlg.setWindowTitle("Install plug-in");
+        auto *v = new QVBoxLayout(&dlg);
+        auto *head = new QLabel(QString("<b>%1</b> is not in any of your plug-in folders.")
+                                    .arg(QFileInfo(abs).fileName()), &dlg);
+        head->setTextFormat(Qt::RichText);
+        v->addWidget(head);
+        auto *why = new QLabel(
+            wholeFolder
+                ? QString("Installing copies the whole <b>%1</b> folder, since the plug-in "
+                          "loads its own data from beside itself.")
+                      .arg(QFileInfo(src).fileName())
+                : QString("Installing copies it where this system keeps plug-ins, so it is "
+                          "found every session."),
+            &dlg);
+        why->setTextFormat(Qt::RichText);
+        why->setWordWrap(true);
+        v->addWidget(why);
+
+        auto *row = new QHBoxLayout;
+        row->addWidget(new QLabel("Install into:", &dlg));
+        auto *where = new QComboBox(&dlg);
+        for (const QString &t : targets) where->addItem(t);
+        where->setEditable(false);
+        row->addWidget(where, 1);
+        auto *browse = new QPushButton("Other...", &dlg);
+        row->addWidget(browse);
+        v->addLayout(row);
+
+        auto *never = new QCheckBox("Don't offer this again", &dlg);
+        v->addWidget(never);
+
+        auto *box = new QDialogButtonBox(&dlg);
+        QPushButton *inst = box->addButton("Install", QDialogButtonBox::AcceptRole);
+        box->addButton("Just open it", QDialogButtonBox::RejectRole);
+        v->addWidget(box);
+        inst->setDefault(true);
+
+        connect(browse, &QPushButton::clicked, &dlg, [&] {
+            const QString d = QFileDialog::getExistingDirectory(&dlg, "Install into",
+                                                                where->currentText());
+            if (d.isEmpty()) return;
+            where->insertItem(0, d);
+            where->setCurrentIndex(0);
+        });
+        connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+        const bool go = dlg.exec() == QDialog::Accepted;
+        if (never->isChecked()) st.setValue("installOfferOff", true);
+        if (!go) {
+            if (!never->isChecked()) {
+                declined << abs;
+                st.setValue("installDeclined", declined);
+            }
+            return abs;
+        }
+
+        const QString target = where->currentText();
+        const QString dest   = target + "/" + QFileInfo(src).fileName();
+        QString err;
+        bool ok;
+        if (QFileInfo(src).isDir()) {
+            ok = copyTree(src, dest, &err);
+        } else {
+            QDir().mkpath(target);
+            QFile::remove(dest);
+            ok = QFile::copy(src, dest);
+            if (!ok) err = "could not copy " + QFileInfo(src).fileName();
+        }
+        if (!ok) {
+            QMessageBox::warning(this, "Install failed",
+                                 err.isEmpty() ? QString("could not install into " + target)
+                                               : err);
+            return abs;
+        }
+
+        /* The folder it went into becomes a browsing root, or the plug-in is
+         * installed and still not listed -- which would read as the install
+         * having done nothing. */
+        addUserRoot(VSTDIRS_ANY, target, /*select=*/false);
+
+        /* Load the installed copy, not the original: that is the one that will
+         * still be there next session, and for a whole-folder install it is the
+         * one sitting next to its data. */
+        const QString loaded = wholeFolder ? dest + "/" + QFileInfo(abs).fileName() : dest;
+        statusBar()->showMessage("installed into " + target, 6000);
+        rescan();
+        return QFileInfo::exists(loaded) ? loaded : abs;
+    }
+
     /* Add a folder as a browsing root. Deduped against what is already listed;
      * a genuinely new one is remembered. `select` switches the browser to it,
      * which triggers a rescan so the folder's plugins appear at once. */
@@ -3976,6 +4178,9 @@ private:
                 this, "Open VST", dirEdit_->text(),
                 "Plug-ins (*.dll *.so *.vst3 *.vst *.component);;All files (*)");
             if (f.isEmpty()) return;
+            /* Offer to install it before loading, so what gets loaded is the
+             * copy that will still be here next session. */
+            f = offerInstall(QFileInfo(f).absoluteFilePath());
             statusBar()->showMessage(describeFile(f));
             if (!loadPluginPath(f))
                 statusBar()->showMessage("load failed: " +

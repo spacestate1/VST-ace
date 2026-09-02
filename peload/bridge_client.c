@@ -267,6 +267,31 @@ void bridge_close(bridge *b)
 bridge *bridge_open(const char *dll, double samplerate, int blocksize)
 { return bridge_open_helper(dll, samplerate, blocksize, "peload32"); }
 
+/* Wait a moment for a helper that is already on its way out.
+ *
+ * Every caller of this has just watched the socket close, so the helper is
+ * exiting -- but exiting is not the same as reaped, and a single WNOHANG loses
+ * that race often enough that "the helper died before reporting" was the usual
+ * message for a plug-in whose init threw. Ten milliseconds at a time up to half
+ * a second, the same shape as the wait in bridge_close, turns that into the
+ * signal that actually killed it.
+ *
+ * Only for paths where the load has already failed. The render path has its own
+ * WNOHANG checks and must keep them: half a second inside an audio callback is
+ * a dropout, and there the question is being asked while the stream is live.
+ *
+ * Returns 1 and fills *st when the child was collected. */
+static int reap_briefly(bridge *b, int *st)
+{
+    int i;
+    if (!b || b->pid <= 0) return 0;
+    for (i = 0; i < 50; i++) {
+        if (waitpid(b->pid, st, WNOHANG) == b->pid) { b->pid = 0; return 1; }
+        { struct timespec ts = { 0, 10000000 }; nanosleep(&ts, NULL); }
+    }
+    return 0;
+}
+
 bridge *bridge_open_helper(const char *dll, double samplerate, int blocksize,
                            const char *helper_name)
 {
@@ -374,12 +399,11 @@ bridge *bridge_open_helper(const char *dll, double samplerate, int blocksize,
         if (rep.text[0]) {
             snprintf(g_err, sizeof g_err, "%s", rep.text);
         } else {
-            int st = 0, reaped = b->pid > 0 && waitpid(b->pid, &st, WNOHANG) == b->pid;
             /* Reaped here rather than left for bridge_close: its own pid==0
              * check would otherwise see an already-collected child as "not
              * gone yet" and spend half a second waiting for what already
-             * happened. */
-            if (reaped) b->pid = 0;
+             * happened. reap_briefly clears b->pid itself. */
+            int st = 0, reaped = reap_briefly(b, &st);
             if (reaped && WIFSIGNALED(st))
                 snprintf(g_err, sizeof g_err, "the helper crashed (signal %d, %s)"
                          " before reporting", WTERMSIG(st), strsignal(WTERMSIG(st)));
