@@ -1,7 +1,7 @@
 # Plug-ins tested
 
 Every plug-in the two windows and the command-line hosts are exercised against:
-**248** across six platform/format combinations.
+**270** across seven platform/format combinations.
 
 None of them are in this repository. They live outside the tree, under
 `../windows`, `../linux` and `../macos`, and they are their authors' own — nothing
@@ -104,20 +104,34 @@ file's headers and reports the loader it needs, without loading it.
 
 Not loadable by any backend here: `Cardinal.vst`.
 
-## macOS VST2 — 27
+## macOS VST2 — 31
 `macos/VST2` — `.vst` bundles, loaded by the Mach-O loader with an Objective-C runtime
 
 | | | |
 |---|---|---|
-| `Automaton.vst` | `FB7999.vst` | `Qyooo.vst` |
-| `Axon.vst` | `FreqShifter.vst` | `Ragnarok.vst` |
-| `Basic.vst` | `Fury800.vst` | `RatshackReverb2.vst` |
-| `Blooo.vst` | `Kern.vst` | `Replicant.vst` |
-| `Deputy.vst` | `ModulAir.vst` | `Scrooo.vst` |
-| `DrDevice.vst` | `MonoFury.vst` | `Stigma.vst` |
-| `FB3100.vst` | `MPS.vst` | `Tattoo.vst` |
-| `FB3200.vst` | `Nabla.vst` | `Tricent.vst` |
-| `FB3300.vst` | `Phosphor.vst` | `WhispAir.vst` |
+| `Automaton.vst` | `Fury800.vst` | `Ragnarok.vst` |
+| `Axon.vst` | `karlette.vst` | `RatshackReverb2.vst` |
+| `Basic.vst` | `Kern.vst` | `Replicant.vst` |
+| `Blooo.vst` | `model-e.vst` | `Scrooo.vst` |
+| `Deputy.vst` | `ModulAir.vst` | `Stigma.vst` |
+| `DrDevice.vst` | `MonoFury.vst` | `Tattoo.vst` |
+| `FB3100.vst` | `MPS.vst` | `Tricent.vst` |
+| `FB3200.vst` | `Nabla.vst` | `vb1.vst` |
+| `FB3300.vst` | `neon.vst` | `WhispAir.vst` |
+| `FB7999.vst` | `Phosphor.vst` |  |
+| `FreqShifter.vst` | `Qyooo.vst` |  |
+
+## macOS VST3 — 18
+`macos/VST3` — `.vst3` bundles, the same Mach-O loader under the VST3 host
+
+| | | |
+|---|---|---|
+| `Blooo.vst3` | `FreqShifter.vst3` | `Nabla.vst3` |
+| `Deputy.vst3` | `Fury800.vst3` | `Qyooo.vst3` |
+| `FB3100.vst3` | `Kern.vst3` | `Scrooo.vst3` |
+| `FB3200.vst3` | `ModulAir.vst3` | `Stigma.vst3` |
+| `FB3300.vst3` | `MonoFury.vst3` | `Tricent.vst3` |
+| `FB7999.vst3` | `MPS.vst3` | `WhispAir.vst3` |
 
 ## macOS Audio Units — 50
 `macos/AU` — `.component` bundles, same loader
@@ -158,3 +172,18 @@ documented at length in `peload/README.md`:
 - `NI Massive` calls `ExitProcess(1)` while loading. It is reported as a failed
   load rather than taking the window down with it, which is why plug-ins are
   hosted out of process by default.
+
+On the macOS side, and unlike the above, these are ours rather than the
+plug-ins' -- they are counted against the host in `peload/README.md`:
+
+- `model-e` is the one macOS VST2 whose editor still draws nothing: it is
+  VSTGUI 4 driving a `.uidesc` layout through the Resource Manager, which is not
+  implemented. Its audio works.
+- One of the fifty Audio Units, `Ragnarok.component`, exports the
+  pre-AudioComponent Component Manager entry point and nothing else, which the
+  AU host does not speak; it declines rather than crashing. Its VST2 and VST3
+  builds load. Eight others used to fail the same way -- every Audio Damage
+  Audio Unit -- and they turned out to be Symbiosis wrappers holding a complete
+  VST2, which is what the host loads now: all eight render, show their editors,
+  and produce a byte-identical WAV to their own `.vst` build.
+

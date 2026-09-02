@@ -35,19 +35,26 @@
 #define MAX_PLUGINS 1024
 #define MAX_ROOTS   24
 
-/* macOS hosting is switched off in the UI, exactly as it is in pestudio -- see
- * the note at the top of qtgui/main.cpp. Nothing is removed: pehost still
- * loads a .vst, .component or Classic plug-in, and `dw peload` still opens one
- * from the command line. This only stops the window offering them, so the two
- * windows browse the same set. Build with -DPLUGVIEW_MAC=1 to put it back. */
+/* macOS hosting, on in both windows so they browse the same set -- see the
+ * longer note at the top of qtgui/main.cpp for what "on" is worth measured
+ * against the corpus. -DPLUGVIEW_MAC=0 takes .vst and .component bundles back
+ * out of the browser; the loaders stay compiled in either way, and `va peload`
+ * on the command line has always reached them. */
 #ifndef PLUGVIEW_MAC
-#define PLUGVIEW_MAC 0
+#define PLUGVIEW_MAC 1
 #endif
 
-/* Classic Mac OS is on, separately, because it works -- see the longer note in
- * qtgui/main.cpp. A .vstclassic loads, renders and draws its own editor here
- * too; the Mach-O side stops at audio. One switch for both meant the finished
- * backend was off because the unfinished one is. -DPLUGVIEW_CLASSIC=0 drops it. */
+/* Audio Units, separately from the rest of the macOS support and off -- every
+ * .component here is the same plug-in as the .vst beside it. The loader stays
+ * compiled in: naming one on the command line still works, and
+ * -DPLUGVIEW_AU=1 puts them back in the scan. */
+#ifndef PLUGVIEW_AU
+#define PLUGVIEW_AU 0
+#endif
+
+/* Classic Mac OS, separately: a .vstclassic loads, renders and draws its own
+ * editor through the CFM/PEF loader and the PowerPC interpreter.
+ * -DPLUGVIEW_CLASSIC=0 drops it. */
 #ifndef PLUGVIEW_CLASSIC
 #define PLUGVIEW_CLASSIC 1
 #endif
@@ -170,6 +177,11 @@ static struct {
      * twice does not compound. */
     int        ed_base_w, ed_base_h;
     double     ed_zoom;
+    /* An automatic fit that has not managed to measure the pane yet, and
+     * whether the fit is still in charge. See zoom_fit_idle. */
+    int        ed_fit_pending;
+    int        ed_fit_auto;
+    int        ed_fit_vw, ed_fit_vh;   /* pane size the last fit measured */
     GtkWidget *zoom_out, *zoom_in, *zoom_fit, *zoom_one, *zoom_lbl, *zoom_note;
 
     int        ed_native;     /* the loaded plug-in wants an X11 window */
@@ -217,8 +229,8 @@ static void roots_discover(void)
 #endif
 #if PLUGVIEW_MAC
         { "macOS VST2",          "macos/VST2"      },
+        { "macOS VST3",          "macos/VST3"      },
         { "macOS Audio Units",   "macos/AU"        },
-        { "Mac OS 9 (Classic)",  "macos/classic"   },
 #endif
     };
     char    exe[1024];
@@ -461,6 +473,8 @@ static int is_candidate(const char *path, const char *name, int isdir)
     if (isdir) {
 #if PLUGVIEW_MAC
         if (l > 4  && !strcasecmp(name + l - 4,  ".vst"))       return 1;
+#endif
+#if PLUGVIEW_AU
         if (l > 10 && !strcasecmp(name + l - 10, ".component")) return 1;
 #endif
         return 0;
@@ -864,6 +878,8 @@ static Display *ed_display(void)
 static void     zoom_apply(void);
 static void     zoom_update_ui(void);
 static gboolean zoom_fit_idle(gpointer u);
+static void     zoom_fit(int only_shrink);
+static void     zoom_fit_poll(void);
 
 static void hook_resize(void *ud, int w, int h)
 {
@@ -1243,7 +1259,11 @@ static gboolean editor_tick(gpointer ud)
      * as that scrolls, resizes, and comes and goes with the page. Scrolling in
      * particular emits no signal that reports the new geometry after layout,
      * so this is where it is noticed. */
-    if (P.ed_attached) { native_editor_place(); return G_SOURCE_CONTINUE; }
+    if (P.ed_attached) {
+        native_editor_place();
+        zoom_fit_poll();
+        return G_SOURCE_CONTINUE;
+    }
     if (!P.host || !P.ed_open) return G_SOURCE_CONTINUE;
     if (!GTK_IS_WIDGET(P.editor) || !gtk_widget_get_mapped(P.editor))
         return G_SOURCE_CONTINUE;
@@ -1251,6 +1271,7 @@ static gboolean editor_tick(gpointer ud)
     pehost_editor_pump(P.host);
     in_plugin--;
     gtk_widget_queue_draw(P.editor);
+    zoom_fit_poll();
     return G_SOURCE_CONTINUE;
 }
 
@@ -1378,7 +1399,9 @@ static void zoom_set(double z)
  * where a constant ratio feels the same at every size. */
 static void zoom_step(int dir)
 {
-    if (dir) zoom_set(P.ed_zoom * (dir > 0 ? 1.25 : 1.0 / 1.25));
+    if (!dir) return;
+    P.ed_fit_auto = 0;
+    zoom_set(P.ed_zoom * (dir > 0 ? 1.25 : 1.0 / 1.25));
 }
 
 /* Scale the editor to the space there is.
@@ -1398,24 +1421,52 @@ static void zoom_fit(int only_shrink)
     if (!P.editor || !(port = gtk_widget_get_parent(P.editor))) return;
     vw = gtk_widget_get_width(port);
     vh = gtk_widget_get_height(port);
-    if (vw < 16 || vh < 16) return;        /* not laid out yet */
+    if (vw < 16 || vh < 16) return;        /* not laid out yet -- try again */
     z  = (double)vw / P.ed_base_w;
     zy = (double)vh / P.ed_base_h;
     if (zy < z) z = zy;
     if (only_shrink && z >= 1.0) z = 1.0;
     zoom_set(z);
+    P.ed_fit_pending = 0;                  /* measured something real */
+    P.ed_fit_vw = vw; P.ed_fit_vh = vh;
+}
+
+/* Keep the editor fitted while nobody has asked for a particular zoom: re-fit
+ * when the pane changes size, and keep trying while it has not been laid out
+ * yet. Touching the zoom controls ends it -- a chosen zoom is a decision. */
+static void zoom_fit_poll(void)
+{
+    GtkWidget *port;
+    if (!P.ed_fit_auto && !P.ed_fit_pending) return;
+    if (!P.editor || !(port = gtk_widget_get_parent(P.editor))) return;
+    if (!P.ed_fit_pending &&
+        gtk_widget_get_width(port)  == P.ed_fit_vw &&
+        gtk_widget_get_height(port) == P.ed_fit_vh) return;
+    zoom_fit(1);
 }
 
 /* The automatic fit runs one main-loop turn after the editor opens: the pane
  * has not been laid out at this editor's size yet, and measuring it now returns
- * the last plug-in's. */
+ * the last plug-in's.
+ *
+ * One turn is not always enough, and when it was not the fit simply did not
+ * happen -- zoom_fit returns without a word if the pane has no size, and
+ * nothing asked again. An editor larger than the pane then stayed at 100% and
+ * you got the top-left corner of it and a pair of scrollbars, which is what
+ * WhispAir and Tricent did: the two largest editors here are the two most
+ * likely to be opened before the pane has been laid out at their size. The
+ * flag keeps the request alive and editor_tick retries it until the pane can
+ * actually be measured. */
 static gboolean zoom_fit_idle(gpointer u)
-{ (void)u; zoom_fit(1); return G_SOURCE_REMOVE; }
+{ (void)u; P.ed_fit_pending = 1; P.ed_fit_auto = 1;
+  P.ed_fit_vw = P.ed_fit_vh = -1; zoom_fit(1); return G_SOURCE_REMOVE; }
 
 static void on_zoom_out(GtkButton *b, gpointer u) { (void)b; (void)u; zoom_step(-1); }
 static void on_zoom_in (GtkButton *b, gpointer u) { (void)b; (void)u; zoom_step(+1); }
-static void on_zoom_fit(GtkButton *b, gpointer u) { (void)b; (void)u; zoom_fit(0); }
-static void on_zoom_one(GtkButton *b, gpointer u) { (void)b; (void)u; zoom_set(1.0); }
+static void on_zoom_fit(GtkButton *b, gpointer u)
+{ (void)b; (void)u; P.ed_fit_auto = 1; zoom_fit(0); }
+static void on_zoom_one(GtkButton *b, gpointer u)
+{ (void)b; (void)u; P.ed_fit_auto = 0; zoom_set(1.0); }
 
 static void on_ed_pressed(GtkGestureClick *g, int n, double x, double y, gpointer ud)
 {
@@ -1644,6 +1695,8 @@ static void unload_locked(void)
     P.ed_nat_w = P.ed_nat_h = 0;
     P.ed_base_w = P.ed_base_h = 0;
     P.ed_zoom = 1.0;
+    P.ed_fit_pending = 0;          /* whatever was still to be fitted is gone */
+    P.ed_fit_auto = 0;
     zoom_update_ui();
     atomic_store_explicit(&P.live, 0, memory_order_release);
     P.ed_open = 0;

@@ -29,33 +29,40 @@ extern "C" {
 #include <spa/param/audio/format-utils.h>
 }
 
-/* Classic Mac OS hosting is switched ON, separately from macOS, because it
- * works. A .vstclassic loads, renders audio and draws its own editor -- the
- * CFM/PEF loader, the PowerPC interpreter and the QuickDraw/PICT path carry it
- * end to end. The Mach-O side gets as far as audio and no further: its editors
- * want NSImage, which is a class name here with no methods behind it.
- *
- * They were one switch, which meant the working backend was off because the
- * other one is not finished. Build with -DPESTUDIO_CLASSIC=0 to drop it.
- */
+/* Classic Mac OS hosting. A .vstclassic loads, renders audio and draws its own
+ * editor -- the CFM/PEF loader, the PowerPC interpreter and the QuickDraw/PICT
+ * path carry it end to end. Build with -DPESTUDIO_CLASSIC=0 to drop it. */
 #ifndef PESTUDIO_CLASSIC
 #define PESTUDIO_CLASSIC 1
 #endif
 
-/* macOS hosting is switched off in the UI for now.
+/* macOS hosting: Mach-O VST2, VST3 and Audio Units, all three offered.
  *
- * Nothing is removed: machoload.c, the Objective-C runtime, the software Metal
- * rasteriser, macvst and macau are all still compiled into pehost and still
- * work. peload will still load a .vst or .component from the command line, and
- * a patch bank naming one still opens it. This only stops the window offering
- * them -- the macOS roots are left out of the directory list and macOS bundles
- * are skipped when a directory is scanned, so there is no route to one by
- * clicking.
+ * This was off, on the grounds that the Mach-O side "gets as far as audio and
+ * no further". That had stopped being true of the backends and was still true
+ * of the window, which is the wrong way round -- so it is on, and measured:
+ * 30 of 31 VST2 bundles render and 19 draw their own editors, 41 of 50 Audio
+ * Units render and every one of the 18 that names a Cocoa view draws it, and
+ * all 18 VST3 bundles render and draw. What is left is named in
+ * peload/README.md rather than hidden behind this switch.
  *
- * Build with -DPESTUDIO_MAC=1 to put it back.
- */
+ * Build with -DPESTUDIO_MAC=0 to take them back out of the browser; nothing
+ * else changes, since the loaders are compiled in either way and `peload` on
+ * the command line has always reached them. */
 #ifndef PESTUDIO_MAC
-#define PESTUDIO_MAC 0
+#define PESTUDIO_MAC 1
+#endif
+
+/* Audio Units, separately from the rest of the macOS support and off.
+ *
+ * Every `.component` in this corpus is the same plug-in as the `.vst` beside
+ * it -- the same editor, the same audio, sample for sample -- so listing both
+ * doubles the browser for nothing and invites picking the one that is harder
+ * to reason about. The loader is compiled in either way: naming a `.component`
+ * on the command line, or opening one through File > Open, still works, and
+ * -DPESTUDIO_AU=1 puts them back in the scan. */
+#ifndef PESTUDIO_AU
+#define PESTUDIO_AU 0
 #endif
 
 static const int    kSampleRate = 48000;
@@ -218,6 +225,154 @@ private:
     int                   rate_ = 48000;
 };
 
+/* ------------------------------------------------------ input devices
+ *
+ * What the machine has to listen with: microphones, USB interfaces, and the
+ * monitor of anything that is playing. PipeWire calls them Audio/Source nodes,
+ * and the registry is the only place that knows about them, so this opens a
+ * short-lived connection of its own rather than reaching into the one the audio
+ * thread is using. It runs for as long as the enumeration takes -- one core
+ * round trip -- and only when the window asks. */
+struct InputDevice { QString node, label; };
+
+struct DevScan {
+    QList<InputDevice> found;
+    pw_main_loop      *loop = nullptr;
+    int                sync = 0;
+};
+
+static void dev_global(void *data, uint32_t, uint32_t,
+                       const char *type, uint32_t, const struct spa_dict *props)
+{
+    DevScan *s = static_cast<DevScan *>(data);
+    if (!type || strcmp(type, PW_TYPE_INTERFACE_Node) != 0 || !props) return;
+    const char *cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    if (!cls || strcmp(cls, "Audio/Source") != 0) return;
+    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (!name) return;
+    const char *desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+    InputDevice d;
+    d.node  = QString::fromUtf8(name);
+    d.label = QString::fromUtf8(desc && *desc ? desc : name);
+    s->found.push_back(d);
+}
+
+static void dev_core_done(void *data, uint32_t id, int seq)
+{
+    DevScan *s = static_cast<DevScan *>(data);
+    if (id == PW_ID_CORE && seq == s->sync) pw_main_loop_quit(s->loop);
+}
+
+static QList<InputDevice> listInputDevices()
+{
+    DevScan scan;
+    pw_context  *ctx  = nullptr;
+    pw_core     *core = nullptr;
+    pw_registry *reg  = nullptr;
+    spa_hook     rl{}, cl{};
+
+    static const pw_registry_events rev = {
+        .version = PW_VERSION_REGISTRY_EVENTS,
+        .global  = dev_global,
+        .global_remove = nullptr,
+    };
+    static const pw_core_events cev = {
+        .version = PW_VERSION_CORE_EVENTS,
+        .info = nullptr, .done = dev_core_done, .ping = nullptr,
+        .error = nullptr, .remove_id = nullptr,
+        .bound_id = nullptr, .add_mem = nullptr, .remove_mem = nullptr,
+    };
+
+    scan.loop = pw_main_loop_new(nullptr);
+    if (!scan.loop) return scan.found;
+    ctx = pw_context_new(pw_main_loop_get_loop(scan.loop), nullptr, 0);
+    if (ctx) core = pw_context_connect(ctx, nullptr, 0);
+    if (core) {
+        reg = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+        if (reg) {
+            pw_registry_add_listener(reg, &rl, &rev, &scan);
+            pw_core_add_listener(core, &cl, &cev, &scan);
+            /* Ask the server to say when it has finished replaying the globals
+             * it already has; without it the loop waits forever for a device
+             * that is not going to appear. */
+            scan.sync = pw_core_sync(core, PW_ID_CORE, 0);
+            pw_main_loop_run(scan.loop);
+        }
+    }
+    if (reg)  pw_proxy_destroy(reinterpret_cast<pw_proxy *>(reg));
+    if (core) pw_core_disconnect(core);
+    if (ctx)  pw_context_destroy(ctx);
+    pw_main_loop_destroy(scan.loop);
+    return scan.found;
+}
+
+/* ---------------------------------------------------------- capture ring
+ *
+ * The capture stream and the playback stream are separate PipeWire streams and
+ * are not called in lockstep, so what one writes the other reads through a ring
+ * rather than a shared block. Single producer, single consumer, no locks: both
+ * ends are realtime and neither may wait on the other.
+ *
+ * Running dry is normal for the first few blocks and after an xrun, and it is
+ * silence rather than a stall -- an effect fed nothing produces nothing, which
+ * is the honest answer while the input catches up. */
+class CaptureRing {
+public:
+    void reset(int frames)
+    {
+        cap_ = size_t(frames) * 2 * 8;          /* eight blocks of headroom */
+        buf_.assign(cap_, 0.0f);
+        head_.store(0, std::memory_order_relaxed);
+        tail_.store(0, std::memory_order_relaxed);
+    }
+    /* Capture thread. Drops the oldest when the reader has fallen behind: a
+     * vocoder wants the newest voice, not a growing delay. */
+    void write(const float *src, int frames)
+    {
+        if (buf_.empty()) return;
+        const size_t n = size_t(frames) * 2;
+        uint64_t h = head_.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < n; i++) buf_[(h + i) % cap_] = src[i];
+        head_.store(h + n, std::memory_order_release);
+        uint64_t t = tail_.load(std::memory_order_acquire);
+        if (h + n - t > cap_) tail_.store(h + n - cap_, std::memory_order_release);
+    }
+    /* Audio thread. Returns how many frames it could actually supply. */
+    int read(float *dst, int frames)
+    {
+        const size_t want = size_t(frames) * 2;
+        if (buf_.empty()) { memset(dst, 0, want * sizeof *dst); return 0; }
+        uint64_t h = head_.load(std::memory_order_acquire);
+        uint64_t t = tail_.load(std::memory_order_relaxed);
+        size_t have = size_t(h - t);
+        /* Keep the latency small.
+         *
+         * The two streams are not started together and the capture side fills
+         * this while the plug-in is being fed something else, so by the time
+         * the input is chosen there is a large standing backlog -- getting on
+         * for half a second was measured. Taking one block a read and leaving
+         * the rest, that backlog never drains: the plug-in hears the microphone
+         * that far behind the keys, which on a live vocoder smears the voice
+         * across the carrier and is heard as a wash rather than as words.
+         *
+         * The two streams share PipeWire's graph clock, so once the backlog is
+         * dropped to a small cushion it stays there -- this heals the startup
+         * lag once and then does nothing. Three blocks is enough to ride out
+         * the jitter between the two callbacks without adding audible delay. */
+        const size_t maxLatency = want * 3;
+        if (have > maxLatency) { t = h - maxLatency; have = maxLatency; }
+        if (have > want) have = want;
+        for (size_t i = 0; i < have; i++) dst[i] = buf_[(t + i) % cap_];
+        if (have < want) memset(dst + have, 0, (want - have) * sizeof *dst);
+        tail_.store(t + have, std::memory_order_release);
+        return int(have / 2);
+    }
+private:
+    std::vector<float>    buf_;
+    size_t                cap_ = 0;
+    std::atomic<uint64_t> head_{0}, tail_{0};
+};
+
 /* ----------------------------------------------------------------- engine */
 
 /* Owns the plugin and the PipeWire stream. The park handshake exists because
@@ -271,12 +426,79 @@ public:
         }
         if (pw_thread_loop_start(loop_) < 0) { *err = "pw_thread_loop_start failed"; return false; }
         running_ = true;
+        ring_.reset(kMaxFrames);
+        openCapture(QString());          /* the system default, until one is picked */
         return true;
     }
+
+    /* ---- audio input -------------------------------------------------------
+     *
+     * A second stream, connected the other way. Everything here used to be
+     * synthesised -- silence, a sawtooth, or noise -- which is enough to tell
+     * whether a compressor is working and no use at all for a vocoder, which
+     * needs a real voice on its modulator input.
+     *
+     * `target` is a PipeWire node name; empty means whatever the system has as
+     * its default source. Reconnecting is a destroy and a fresh connect, which
+     * is what changing a device amounts to, and it happens with the thread loop
+     * locked because the callback may be running. */
+    bool openCapture(const QString &target)
+    {
+        if (!loop_) return false;
+        pw_thread_loop_lock(loop_);
+        if (capture_) { pw_stream_destroy(capture_); capture_ = nullptr; }
+
+        char lat[64];
+        snprintf(lat, sizeof lat, "%d/%d", kQuantum, kSampleRate);
+        pw_properties *props =
+            pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio",
+                              PW_KEY_MEDIA_CATEGORY, "Capture",
+                              PW_KEY_MEDIA_ROLE, "Production",
+                              PW_KEY_NODE_LATENCY, lat, nullptr);
+        if (!target.isEmpty())
+            pw_properties_set(props, PW_KEY_TARGET_OBJECT,
+                              target.toUtf8().constData());
+
+        static const pw_stream_events cev = {
+            .version = PW_VERSION_STREAM_EVENTS,
+            .process = &Engine::onCapture,
+        };
+        capture_ = pw_stream_new_simple(pw_thread_loop_get_loop(loop_),
+                                        "pestudio input", props, &cev, this);
+        if (!capture_) { pw_thread_loop_unlock(loop_); return false; }
+
+        uint8_t pod[1024];
+        spa_pod_builder bb = SPA_POD_BUILDER_INIT(pod, sizeof pod);
+        spa_audio_info_raw info{};
+        info.format = SPA_AUDIO_FORMAT_F32;
+        info.rate = kSampleRate;
+        info.channels = 2;
+        info.position[0] = SPA_AUDIO_CHANNEL_FL;
+        info.position[1] = SPA_AUDIO_CHANNEL_FR;
+        const spa_pod *params[1] = {
+            spa_format_audio_raw_build(&bb, SPA_PARAM_EnumFormat, &info) };
+        int rc = pw_stream_connect(capture_, PW_DIRECTION_INPUT, PW_ID_ANY,
+                                   pw_stream_flags(PW_STREAM_FLAG_AUTOCONNECT |
+                                                   PW_STREAM_FLAG_MAP_BUFFERS |
+                                                   PW_STREAM_FLAG_RT_PROCESS),
+                                   params, 1);
+        if (rc < 0) { pw_stream_destroy(capture_); capture_ = nullptr; }
+        pw_thread_loop_unlock(loop_);
+        captureTarget_ = target;
+        return capture_ != nullptr;
+    }
+
+    QString captureTarget() const { return captureTarget_; }
+    bool captureOpen() const { return capture_ != nullptr; }
+    void resetCaptureCount() { capFrames_.store(0, std::memory_order_relaxed); }
+    /* Frames actually taken from the input in the last block: zero for a whole
+     * second means the device is connected and silent, or not connected. */
+    uint64_t captureFrames() const { return capFrames_.load(std::memory_order_relaxed); }
 
     void stopAudio()
     {
         if (loop_)   pw_thread_loop_stop(loop_);
+        if (capture_) { pw_stream_destroy(capture_); capture_ = nullptr; }
         if (stream_) { pw_stream_destroy(stream_); stream_ = nullptr; }
         if (loop_)   { pw_thread_loop_destroy(loop_); loop_ = nullptr; }
         free(buf_); buf_ = nullptr;
@@ -363,6 +585,12 @@ public:
     bool    audioRunning() const { return running_; }
     unsigned long callbacks() const { return calls_.load(std::memory_order_relaxed); }
     float   peak() { return peak_.exchange(0.0f, std::memory_order_relaxed); }
+    /* The same, for what arrives on the input. Separate from the output peak
+     * because they answer different questions: whether the plug-in is making a
+     * sound, and whether the microphone is. */
+    float   inPeak() { return inPeak_.exchange(0.0f, std::memory_order_relaxed); }
+    void    setInputGain(float g) { inGain_.store(g, std::memory_order_relaxed); }
+    float   inputGain() const { return inGain_.load(std::memory_order_relaxed); }
 
 private:
     static const int kMaxFrames = 8192;
@@ -398,7 +626,16 @@ private:
              * request and the graph quantum may be larger. pehost_render_io
              * splits the block so the plugin never sees more frames than it was
              * promised, so there is nothing to do about it here. */
-            if (host_ && !pehost_is_synth(host_) && source() != SrcSilence) {
+            /* Whether it has an input, not whether it calls itself a synth.
+             *
+             * Full Bucket's vocoder is the case that settles it: the VST2 build
+             * reports "effect, 4 in" and the VST3 build reports "synth, 2 in",
+             * and both use those inputs for the modulator. Gated on the synth
+             * flag, the VST3 one was handed nothing and could only ever be
+             * silent -- the same plug-in, working one way and not the other. A
+             * plug-in with no input bus is unaffected: there is nothing to feed
+             * it either way. */
+            if (host_ && pehost_num_inputs(host_) > 0 && source() != SrcSilence) {
                 fillInput(n);
                 pehost_render_io(host_, in_, buf_, n);
             } else {
@@ -427,6 +664,32 @@ private:
         pw_stream_queue_buffer(stream_, b);
     }
 
+    static void onCapture(void *ud) { static_cast<Engine *>(ud)->capture(); }
+
+    void capture()
+    {
+        pw_buffer *b = pw_stream_dequeue_buffer(capture_);
+        if (!b) return;
+        spa_buffer *sb = b->buffer;
+        const float *src = static_cast<const float *>(sb->datas[0].data);
+        if (src && sb->datas[0].chunk) {
+            int n = int(sb->datas[0].chunk->size / (sizeof(float) * 2));
+            if (n > 0) {
+                if (n > kMaxFrames) n = kMaxFrames;
+                ring_.write(src, n);
+                capFrames_.fetch_add(uint64_t(n), std::memory_order_relaxed);
+                { float pk = 0.0f;
+                  for (int i = 0; i < n * 2; i++) {
+                      float a = src[i] < 0 ? -src[i] : src[i];
+                      if (a > pk) pk = a;
+                  }
+                  float cur = inPeak_.load(std::memory_order_relaxed);
+                  if (pk > cur) inPeak_.store(pk, std::memory_order_relaxed); }
+            }
+        }
+        pw_stream_queue_buffer(capture_, b);
+    }
+
 public:
     Recorder rec_;
     float gain_ = 0.8f;
@@ -434,7 +697,7 @@ public:
     /* What to feed a plugin that processes rather than generates. An effect given
      * silence correctly produces silence, so with no source at all a compressor
      * or a gate looks broken when it is working perfectly. */
-    enum Source { SrcSilence = 0, SrcNotes = 1, SrcNoise = 2 };
+    enum Source { SrcSilence = 0, SrcNotes = 1, SrcNoise = 2, SrcInput = 3 };
     void setSource(Source s) { src_.store(int(s), std::memory_order_relaxed); }
     Source source() const { return Source(src_.load(std::memory_order_relaxed)); }
 
@@ -460,6 +723,12 @@ private:
 
     /* The input signal, for effects. */
     float               *in_ = nullptr;
+    pw_stream           *capture_ = nullptr;
+    CaptureRing          ring_;
+    QString              captureTarget_;
+    std::atomic<uint64_t> capFrames_{0};
+    std::atomic<float>    inPeak_{0.0f};
+    std::atomic<float>    inGain_{4.0f};          /* +12 dB: a headset's speech to line level */
     std::atomic<int>     src_{SrcSilence};
     std::atomic<uint8_t> gate_[128] = {};
     float                env_[128] = {};        /* audio thread only */
@@ -475,6 +744,25 @@ private:
         int i, note;
 
         memset(in_, 0, size_t(n) * 2 * sizeof(float));
+        if (source() == SrcInput) {
+            /* From the device, through the input gain. Short of a full block
+             * the rest is silence rather than the previous block repeated -- a
+             * vocoder stuttering the last 5 ms of a word is worse than a gap.
+             *
+             * The gain is what makes a microphone usable here at all. A USB
+             * headset delivers speech at a few hundredths of full scale, and a
+             * plug-in written for line level -- Full Bucket's vocoder puts out
+             * fifty decibels under with that on its modulator, Mic Level or no
+             * -- expects a preamp in front of it. This is the preamp. */
+            const float g = inGain_.load(std::memory_order_relaxed);
+            ring_.read(in_, n);
+            if (g != 1.0f)
+                for (int i = 0; i < n * 2; i++) {
+                    float v = in_[i] * g;
+                    in_[i] = v > 1.0f ? 1.0f : v < -1.0f ? -1.0f : v;
+                }
+            return;
+        }
         if (source() == SrcNoise) {
             for (i = 0; i < n; i++) {
                 rng_ = rng_ * 1664525u + 1013904223u;
@@ -1826,13 +2114,53 @@ public:
         level_->setRange(0, 100);
         level_->setTextVisible(false);
         level_->setFixedWidth(160);
+        /* What the microphone is doing, next to what the plug-in is doing.
+         * Two meters because they fail separately: a vocoder with a working mic
+         * and no notes held is silent, and so is one with notes and no mic, and
+         * the output meter alone cannot tell you which. Hidden unless the input
+         * is actually the source -- an idle meter is furniture. */
+        inLabel_ = new QLabel("Mic");
+        inLevel_ = new QProgressBar;
+        inLevel_->setRange(0, 100);
+        inLevel_->setTextVisible(false);
+        inLevel_->setFixedWidth(120);
+        inLevel_->setToolTip("the audio input, after the mic gain -- what the plug-in receives");
+        inGain_ = new QSlider(Qt::Horizontal);
+        inGain_->setRange(0, 36);                  /* decibels */
+        inGain_->setValue(12);
+        inGain_->setFixedWidth(90);
+        inGain_->setToolTip("microphone gain, 0 to +36 dB");
+        inLabel_->setVisible(false);
+        inLevel_->setVisible(false);
+        inGain_->setVisible(false);
+        /* A vocoder is two inputs -- a modulator and a carrier -- and feeding a
+         * microphone to both puts the raw voice in the output beside the
+         * vocoded sound. Checked, the input goes only to the first pair, which
+         * on the plug-ins that do this is the modulator: clean vocoding, no
+         * bleed. It changes nothing for an ordinary two-in effect, where both
+         * channels are the first pair anyway. */
+        micVocoder_ = new QCheckBox("Mute raw");
+        micVocoder_->setChecked(true);
+        micVocoder_->setToolTip("feed the input only to the plug-in's first two "
+                                "channels -- the modulator on a vocoder -- so the "
+                                "raw voice does not pass through to the output");
+        micVocoder_->setVisible(false);
         /* What an effect is fed. Silence is right for a synth and useless for an
          * effect, so the choice is exposed rather than assumed. */
         srcBox_ = new QComboBox;
         srcBox_->addItem("silence", int(Engine::SrcSilence));
         srcBox_->addItem("keys",    int(Engine::SrcNotes));
         srcBox_->addItem("noise",   int(Engine::SrcNoise));
-        srcBox_->setToolTip("what to feed an effect's input -- a synth ignores it");
+        srcBox_->addItem("input",   int(Engine::SrcInput));
+        srcBox_->setToolTip("what to feed an effect's input -- a synth ignores it.\n"
+                            "\"input\" is the device chosen under Audio input.");
+        /* Wide enough for the longest entry rather than for whatever the style
+         * felt like: left at the default it came up narrow enough to clip the
+         * text, and a dropdown you cannot read the current value of is worse
+         * than no dropdown. AdjustToContents measures every item, so adding one
+         * later cannot make it too small again. */
+        srcBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+        srcBox_->setMinimumContentsLength(7);      /* "silence" */
         bar->addWidget(panic);
         bar->addWidget(recBtn_);
         bar->addWidget(recLabel_);
@@ -1840,6 +2168,11 @@ public:
         bar->addWidget(new QLabel("Effect in"));
         bar->addWidget(srcBox_);
         bar->addSpacing(12);
+        bar->addWidget(inLabel_);
+        bar->addWidget(inLevel_);
+        bar->addWidget(inGain_);
+        bar->addWidget(micVocoder_);
+        bar->addSpacing(8);
         bar->addWidget(new QLabel("Level"));
         bar->addWidget(level_);
         bar->addWidget(new QLabel("Gain"));
@@ -1902,8 +2235,11 @@ public:
         });
         connect(zoomOut_,  &QToolButton::clicked,  this, [this] { zoomStep(-1); });
         connect(zoomIn_,   &QToolButton::clicked,  this, [this] { zoomStep(+1); });
-        connect(zoomFit_,  &QPushButton::clicked,  this, [this] { zoomFit(); });
-        connect(zoom1to1_, &QPushButton::clicked,  this, [this] { setZoom(1.0); });
+        connect(zoomFit_,  &QPushButton::clicked,  this, [this] {
+            fitAuto_ = true; lastViewport_ = editorScroll_->viewport()->size();
+            zoomFit();
+        });
+        connect(zoom1to1_, &QPushButton::clicked,  this, [this] { fitAuto_ = false; setZoom(1.0); });
         connect(pixelEditor_, &PixelEditor::zoomStep, this, &Window::zoomStep);
         connect(recBtn_, &QPushButton::clicked, this, &Window::toggleRecord);
         connect(panic, &QPushButton::clicked, this, [this] {
@@ -1917,8 +2253,18 @@ public:
             if (wheel_) wheel_->recentre();
         });
         connect(gain_, &QSlider::valueChanged, this, [this](int v) { eng_.gain_ = v / 100.0f; });
+        connect(inGain_, &QSlider::valueChanged, this, [this](int db) {
+            eng_.setInputGain(powf(10.0f, float(db) / 20.0f));
+            inGain_->setToolTip(QString("microphone gain: +%1 dB").arg(db));
+        });
+        connect(micVocoder_, &QCheckBox::toggled, this, [this] { applyInputMask(); });
         connect(srcBox_, &QComboBox::currentIndexChanged, this, [this](int i) {
-            eng_.setSource(Engine::Source(srcBox_->itemData(i).toInt()));
+            const int src = srcBox_->itemData(i).toInt();
+            eng_.setSource(Engine::Source(src));
+            /* The mic meter appears with the source it measures. */
+            micMeterOn_ = src == int(Engine::SrcInput);
+            if (micMeterOn_) { eng_.inPeak(); refreshAudioInputs(); }
+            updateAudioInState();          /* one place decides what is shown */
         });
         /* Watch keys for the whole application, so a note key pressed with the
          * piano focused is still released when the key comes up over the editor.
@@ -2023,6 +2369,9 @@ public:
                                      "-frame quantum (" +
                                      QString::number(1000.0 * kQuantum / kSampleRate, 'f', 1) +
                                      " ms), realtime");
+        /* After the audio is up, so the capture stream exists to be pointed at
+         * whatever is chosen. */
+        refreshAudioInputs();
         /* If a previous run died mid-render, that plugin is suspect. */
         {
             QFile f(markerPath());
@@ -2151,15 +2500,13 @@ private slots:
                         fi.absoluteFilePath().toLocal8Bit().constData());
                 /* A macOS plugin is a bundle directory, so it is a candidate in
                  * its own right rather than something to walk into. */
-                /* Not offered while PESTUDIO_MAC is off -- see the note at the
-                 * top. A .vst bundle left in a scanned directory is passed over
-                 * as if it were any other folder, so browsing cannot reach one.
-                 * The header test for a Classic plug-in is skipped too, which
-                 * also spares every unrecognised file in the tree from being
-                 * opened and sniffed. */
-                const bool isMac = PESTUDIO_MAC && fi.isDir() &&
-                                   (nm.endsWith(".vst", Qt::CaseInsensitive) ||
-                                    nm.endsWith(".component", Qt::CaseInsensitive));
+                /* A macOS .vst3 is caught by isV3 above -- it is a bundle
+                 * directory like every other .vst3 -- so only these two need
+                 * naming. With PESTUDIO_MAC off both are passed over as if they
+                 * were any other folder, and browsing cannot reach one. */
+                const bool isMac = fi.isDir() &&
+                    ((PESTUDIO_MAC && nm.endsWith(".vst", Qt::CaseInsensitive)) ||
+                     (PESTUDIO_AU  && nm.endsWith(".component", Qt::CaseInsensitive)));
                 /* A Classic Mac OS plugin is a plain file -- a PEF, or a resource
                  * fork carrying one -- with no extension convention worth
                  * trusting, so the header decides rather than the name. */
@@ -2359,6 +2706,9 @@ private slots:
 
     void loadRow(int row)
     {
+        /* Noted before anything is torn down: which tab the user was on decides
+         * whether the new plug-in's editor should be opened. */
+        const bool wasOnEditor = tabs_ && tabs_->currentIndex() == 1;
         if (row < 0 || row >= paths_.size()) return;
         /* The list spans every folder now, so which one this plug-in came out
          * of is worth saying -- two builds of the same plug-in under different
@@ -2449,15 +2799,27 @@ private slots:
         }
         pehost *h = eng_.host();
         loadedPath_ = paths_[row];
-        /* An effect with nothing fed to it can only be silent, which reads as a
-         * broken plugin. Start it on the keys; a synth is left on silence because
-         * anything fed to it would only be added to what it generates. */
-        if (srcBox_) {
-            int want = pehost_is_synth(h) ? int(Engine::SrcSilence) : int(Engine::SrcNotes);
+        /* A plug-in with an input and nothing fed to it can only be silent,
+         * which reads as a broken plug-in. Start it on the keys; one with no
+         * input bus is left on silence, because anything fed to it would only
+         * be added to what it generates.
+         *
+         * Two things this must not do. It must not ask whether the plug-in is a
+         * synth -- Full Bucket's vocoder is a synth with two inputs, and asking
+         * the wrong question left it on silence and unable to vocode anything.
+         * And it must not override the microphone: choosing an input device and
+         * then loading the plug-in you meant to use it with is the normal order
+         * to do things in, and having the source quietly revert to the keys on
+         * every load is indistinguishable from the microphone not working. */
+        if (srcBox_ && eng_.source() != Engine::SrcInput) {
+            int want = pehost_num_inputs(h) > 0 ? int(Engine::SrcNotes)
+                                                : int(Engine::SrcSilence);
             int ix = srcBox_->findData(want);
             if (ix >= 0 && ix != srcBox_->currentIndex()) srcBox_->setCurrentIndex(ix);
             else eng_.setSource(Engine::Source(want));
         }
+        /* The mask lives on the plug-in handle; a fresh plug-in needs it sent. */
+        applyInputMask();
         int impl = 0, stub = 0, called = 0;
         pehost_import_stats(&impl, &stub, &called);
         info_->setText(QString(
@@ -2486,8 +2848,11 @@ private slots:
          * folder should not instantiate a GUI per plugin -- each one costs a
          * window, a GL context and whatever state the plugin keeps -- and a
          * misbehaving editor then only misbehaves when actually asked for. */
+        deadReported_ = false;
         editorKind_ = pehost_editor_kind(h);
         editorOpened_ = false;
+        fitPending_ = false;      /* whatever was still to be fitted is gone */
+        fitAuto_ = false;
         tabs_->setTabEnabled(1, editorKind_ != PEHOST_EDITOR_NONE);
         tabs_->setTabText(1, editorKind_ == PEHOST_EDITOR_NONE ? "Editor (n/a)" : "Editor");
         if (editorKind_ != PEHOST_EDITOR_NONE) {
@@ -2496,7 +2861,24 @@ private slots:
             tabs_->setTabToolTip(1, QString("%1x%2%3").arg(w).arg(ht)
                                     .arg(pehost_editor_can_resize(h) ? ", resizable" : ""));
         }
-        tabs_->setCurrentIndex(0);
+        /* Stay where the user was.
+         *
+         * Selecting another plug-in while looking at an editor used to drop you
+         * back on the parameter list, and -- because the editor is only ever
+         * instantiated by the tab-change signal -- the new plug-in's editor was
+         * not opened either. Coming back to the tab fixed it, which is why this
+         * reads as "the editor stopped working" rather than as a tab that
+         * moved: the pane you left is empty and nothing says why. Browsing with
+         * the parameter list in front of you still costs no editors, because
+         * this only reopens the one you were already looking at. */
+        if (wasOnEditor && editorKind_ != PEHOST_EDITOR_NONE) {
+            tabs_->setCurrentIndex(1);
+            /* setCurrentIndex only emits when the index changes, and it has not
+             * if the editor tab was already current. */
+            if (tabs_->currentIndex() == 1) openEditor();
+        } else {
+            tabs_->setCurrentIndex(0);
+        }
 
         if (programList_->count()) programList_->setCurrentRow(0);
         /* The patches that belong to *this* plugin, and then one of them.
@@ -2560,6 +2942,26 @@ private slots:
             gui = pixelEditor_->attach(h);
             if (gui) editorStack_->setCurrentIndex(1);
         }
+        /* Ask again now the editor exists.
+         *
+         * An Audio Unit does not have a size until its view has been built --
+         * `WhispAir.component` answers 0x0 before the editor is opened and
+         * 1127x776 after, where the same plug-in's `.vst` answers 1127x776 to
+         * both. Taking the first answer meant everything below was skipped for
+         * every AU: the pane kept the previous plug-in's size while the editor
+         * grew to its own, so it appeared cropped with scrollbars, and the Fit
+         * button was disabled because the window believed there was no editor
+         * to fit. Failing that, the framebuffer's own dimensions -- whatever
+         * the plug-in is actually drawing into is the truth. */
+        if (gui && (w <= 0 || ht <= 0)) {
+            pehost_editor_size(h, &w, &ht);
+            if (w <= 0 || ht <= 0) {
+                const unsigned int *px = nullptr; int pw = 0, ph = 0;
+                if (pehost_editor_pixels(h, &px, &pw, &ph) && pw > 0 && ph > 0) {
+                    w = pw; ht = ph;
+                }
+            }
+        }
         if (gui && w > 0 && ht > 0) {
             editorW_ = w; editorH_ = ht;
             zoom_ = 1.0;
@@ -2571,6 +2973,18 @@ private slots:
              * Zooming out only: an editor smaller than the space is left at
              * the size the plug-in drew rather than blown up to fill the
              * window, which no plug-in's artwork survives. */
+            /* One turn of the event loop is not always enough for the pane to
+             * have been laid out at this editor's size, and when it was not,
+             * the fit simply did not happen: zoomFit returns without a word if
+             * the viewport has no size, and nothing asked again. An editor
+             * larger than the pane then stayed at 100% and you got its top-left
+             * corner and a pair of scrollbars -- which is what WhispAir and
+             * Tricent did, the two largest editors here being the two most
+             * likely to be opened before the pane has caught up. The flag keeps
+             * the request alive and pollUi retries it. */
+            fitPending_ = true;
+            fitAuto_ = true;
+            lastViewport_ = QSize();
             QTimer::singleShot(0, this, [this] { zoomFit(true); });
         }
         updateZoomUi();
@@ -2612,7 +3026,9 @@ private slots:
      * where a constant ratio feels the same at every size. */
     void zoomStep(int dir)
     {
-        if (dir) setZoom(zoom_ * (dir > 0 ? 1.25 : 1.0 / 1.25));
+        if (!dir) return;
+        fitAuto_ = false;
+        setZoom(zoom_ * (dir > 0 ? 1.25 : 1.0 / 1.25));
     }
 
     /* Scale the editor to the space there is.
@@ -2626,9 +3042,10 @@ private slots:
     {
         if (!editorCanZoom() || editorW_ <= 0 || editorH_ <= 0) return;
         const QSize v = editorScroll_->viewport()->size();
-        if (v.width() < 16 || v.height() < 16) return;   /* not laid out yet */
+        if (v.width() < 16 || v.height() < 16) return;   /* not laid out -- retry */
         const double z = qMin(double(v.width())  / editorW_,
                               double(v.height()) / editorH_);
+        fitPending_ = false;                             /* measured something real */
         if (onlyShrink && z >= 1.0) { setZoom(1.0); return; }
         setZoom(z);
     }
@@ -2670,6 +3087,139 @@ private slots:
             zoomNote_->setText(QString());
     }
 
+    /* The menus under Inputs, rebuilt each time the menu is opened: devices
+     * come and go while the window is up and a list built once is wrong by the
+     * time anybody looks at it. */
+    void rebuildInputMenus()
+    {
+        if (audioInMenu_) {
+            audioInMenu_->clear();
+            const QString cur = eng_.captureTarget();
+            auto *grp = new QActionGroup(audioInMenu_);
+            grp->setExclusive(true);
+            for (int i = 0; i <= audioDevices_.size(); i++) {
+                const QString node = i ? audioDevices_[i - 1].node : QString();
+                QAction *a = audioInMenu_->addAction(
+                    i ? audioDevices_[i - 1].label : QString("system default"));
+                a->setCheckable(true);
+                a->setChecked(node == cur);
+                grp->addAction(a);
+                connect(a, &QAction::triggered, this,
+                        [this, i] { chooseAudioInput(i); });
+            }
+            audioInMenu_->addSeparator();
+            /* Whether anything is arriving, where the device is chosen: a
+             * device that is connected and silent and one that is not connected
+             * look identical until something counts frames. */
+            audioInMenu_->addAction(audioInText_)->setEnabled(false);
+        }
+        if (midiInMenu_) {
+            midiInMenu_->clear();
+            QStringList in = (midi_ && midi_->isOpen()) ? midi_->sources()
+                                                        : QStringList();
+            if (in.isEmpty())
+                midiInMenu_->addAction("nothing connected")->setEnabled(false);
+            else
+                for (const QString &n : in)
+                    midiInMenu_->addAction(n)->setEnabled(false);
+            midiInMenu_->addSeparator();
+            QMenu *ch = midiInMenu_->addMenu("Channel");
+            auto *cg = new QActionGroup(ch);
+            cg->setExclusive(true);
+            for (int i = 0; i < midiChan_->count(); i++) {
+                QAction *a = ch->addAction(midiChan_->itemText(i));
+                a->setCheckable(true);
+                a->setChecked(i == midiChan_->currentIndex());
+                cg->addAction(a);
+                connect(a, &QAction::triggered, this,
+                        [this, i] { midiChan_->setCurrentIndex(i); });
+            }
+        }
+    }
+
+    /* Point the capture stream at one of the devices in audioDevices_, or at
+     * the system default for index 0. */
+    void chooseAudioInput(int index)
+    {
+        const QString node = (index > 0 && index <= audioDevices_.size())
+                             ? audioDevices_[index - 1].node : QString();
+        if (!eng_.openCapture(node)) {
+            statusBar()->showMessage("could not open that input device", 4000);
+            return;
+        }
+        eng_.resetCaptureCount();
+        /* Choosing an input is the whole of what "turn the microphone on"
+         * means to anyone doing it. Leaving the effect source on the keys
+         * afterwards makes the choice do nothing audible, and the only sign is
+         * a meter that never appears -- so route it here and say so, rather
+         * than making it two steps that look like one. */
+        if (srcBox_) {
+            int ix = srcBox_->findData(int(Engine::SrcInput));
+            if (ix >= 0 && ix != srcBox_->currentIndex()) {
+                srcBox_->setCurrentIndex(ix);
+                statusBar()->showMessage("effect input switched to the "
+                                         "microphone", 4000);
+            }
+        }
+        updateAudioInState();
+    }
+
+    /* The devices the machine has, as PipeWire reports them now. Called at
+     * startup and from Rescan: plugging a USB interface in is exactly when the
+     * list is wrong, and asking on a timer would rescan the graph forever. */
+    void refreshAudioInputs()
+    {
+        const QString keep = eng_.captureTarget();
+        audioDevices_ = listInputDevices();
+        if (keep.isEmpty()) { updateAudioInState(); return; }
+        for (const InputDevice &d : audioDevices_)
+            if (d.node == keep) { updateAudioInState(); return; }
+        /* The device that was chosen has gone. Say so rather than silently
+         * listening to something else. */
+        eng_.openCapture(QString());
+        statusBar()->showMessage("that input device is gone -- back to the "
+                                 "system default", 5000);
+        updateAudioInState();
+    }
+
+    /* Whether anything is actually arriving. A device that is connected and
+     * silent and one that is not connected look identical until you count
+     * frames, and "the vocoder does nothing" is the same complaint either way. */
+    /* Send the plug-in the input-channel mask the checkbox asks for: the first
+     * two channels only when muting the raw voice, all of them otherwise.
+     * Re-sent on every load, because the mask lives on the plug-in handle and
+     * a fresh plug-in starts with none. */
+    void applyInputMask()
+    {
+        if (!eng_.host()) return;
+        pehost_set_input_mask(eng_.host(),
+                              micVocoder_ && micVocoder_->isChecked() ? 0x3u : 0u);
+    }
+
+    void updateAudioInState()
+    {
+        const uint64_t now = eng_.captureFrames();
+        const bool live = now != audioInSeen_;
+        audioInSeen_ = now;
+        audioInText_ = !eng_.captureOpen() ? QString("no input stream")
+                     : now == 0            ? QString("open, nothing received yet")
+                     : live                ? QString("receiving audio")
+                                           : QString("open, idle");
+        /* Shown whenever something is actually arriving, not only when it is
+         * routed to the plug-in. "Is the microphone working" and "is the
+         * microphone reaching this plug-in" are different questions, and the
+         * first one is the one asked when nothing seems to be happening. */
+        const bool show = micMeterOn_ || (eng_.captureOpen() && now > 0);
+        if (inLabel_ && show != micShown_) {
+            micShown_ = show;
+            inLabel_->setVisible(show);
+            inLevel_->setVisible(show);
+            inGain_->setVisible(show);
+            micVocoder_->setVisible(show);
+            if (!show) inLevel_->setValue(0);
+        }
+    }
+
     void updateMidiSources()
     {
         if (!midi_ || !midi_->isOpen()) return;
@@ -2684,6 +3234,54 @@ private slots:
     void pollUi()
     {
         level_->setValue(int(eng_.peak() * 100.0f));
+        /* Self-heal a missing editor.
+         *
+         * If the editor tab is the one showing, the plug-in has an editor, and
+         * none is open, open it. This is a safety net under every path that
+         * switches plug-ins: whatever sequence of tab changes and reloads left
+         * the editor closed while its tab is in front -- and switching between
+         * many plug-ins has been reported to do exactly that -- the next poll
+         * puts it right, rather than leaving a blank pane until the user thinks
+         * to click away and back. A genuinely refused editor sets editorOpened_
+         * and disables its tab, so this does not spin on one that cannot open.
+         * Skipped inside a plug-in call, where opening an editor would re-enter
+         * code already running -- the same guard openEditor makes itself. */
+        if (!g_inPlugin && tabs_ && tabs_->currentIndex() == 1 &&
+            editorKind_ != PEHOST_EDITOR_NONE && !editorOpened_)
+            openEditor();
+        /* A plug-in whose helper has died stops repainting and goes silent, and
+         * both of those look exactly like a plug-in that is working and idle.
+         * Said once, where the user is looking, with what to do about it. */
+        if (eng_.host() && !pehost_alive(eng_.host()) && !deadReported_) {
+            deadReported_ = true;
+            pixelEditor_->detach();
+            editor_->detach();
+            statusBar()->showMessage("this plug-in stopped responding -- its "
+                                     "editor and audio are gone until it is "
+                                     "loaded again", 0);
+            tabs_->setTabText(1, "Editor (stopped)");
+        }
+        /* Gated on the source rather than on the widget being visible: a
+         * child of a window that has not been shown yet reports invisible, and
+         * the meter would sit dead until something else repainted it. */
+        if (micShown_) {
+            float v = eng_.inPeak() * eng_.inputGain();
+            inLevel_->setValue(int((v > 1.0f ? 1.0f : v) * 100.0f));
+        }
+        if (++audioInTick_ >= 10) { audioInTick_ = 0; updateAudioInState(); }
+        /* Before the g_inPlugin guard and before anything expensive: an editor
+         * that has not been fitted yet is showing the wrong part of itself. */
+        /* Keep the editor fitted while nobody has asked for a particular zoom:
+         * re-fit when the pane changes size, and keep trying while it has not
+         * been laid out yet. Touching any of the zoom controls ends this -- a
+         * chosen zoom is a decision and the window should not argue with it. */
+        if (fitAuto_ || fitPending_) {
+            const QSize v = editorScroll_->viewport()->size();
+            if (fitPending_ || v != lastViewport_) {
+                lastViewport_ = v;
+                zoomFit(true);
+            }
+        }
         /* Alongside the meter and before the g_inPlugin guard: a take running
          * while a plugin's editor is being dragged still has to show its clock. */
         tickRecord();
@@ -2725,6 +3323,7 @@ private:
             { "Windows VST2 32-bit", "windows/VST2-32" },
 #if PESTUDIO_MAC
             { "macOS VST2",          "macos/VST2"      },
+            { "macOS VST3",          "macos/VST3"      },
             { "macOS Audio Units",   "macos/AU"        },
 #endif
 #if PESTUDIO_CLASSIC
@@ -2885,7 +3484,21 @@ private:
                                         (editorStack_ && editorStack_->isAncestorOf(f)));
             if (down) {
                 if (qobject_cast<QLineEdit *>(f)) break;
-                if (inEditor) break;
+                /* Not `if (inEditor) break;`.
+                 *
+                 * Turning a knob in a plug-in's editor moves focus to it, and
+                 * suppressing note keys there meant the computer keyboard went
+                 * dead the moment you touched a control -- z, x, c, v silent
+                 * until the on-screen keyboard was clicked to take focus back.
+                 * Tweak a sound and then play it is the ordinary way round to
+                 * do things, so that is the case to keep working.
+                 *
+                 * The key is still delivered to the plug-in as well: the note
+                 * test below deliberately does not swallow it when the editor
+                 * has focus. So a plug-in that wants the letter still gets it;
+                 * the cost is that typing into a text field inside an editor
+                 * plays a note alongside, which is the rarer half of the trade
+                 * and audible rather than destructive. */
                 /* A press carrying Ctrl, Alt or Meta is a command, whether or
                  * not anything here claims it. Qt eats the combinations that
                  * are real shortcuts before this, so what arrives is the ones
@@ -3392,6 +4005,24 @@ private:
         QAction *folders = settings->addAction("Plug-in &Folders...");
         connect(folders, &QAction::triggered, this, &Window::editPluginFolders);
 
+        /* Inputs: what the machine is listening to. A microphone or USB
+         * interface for audio, a keyboard for notes -- two different
+         * subsystems, but one question as far as anyone using this is
+         * concerned, so they are one menu. The same device list also sits in
+         * the left panel; this is where people look for it. */
+        QMenu *inputs = menuBar()->addMenu("&Inputs");
+        audioInMenu_ = inputs->addMenu("&Audio input");
+        midiInMenu_  = inputs->addMenu("&MIDI input");
+        inputs->addSeparator();
+        QAction *rescanIn = inputs->addAction("&Rescan devices");
+        connect(rescanIn, &QAction::triggered, this, [this] {
+            refreshAudioInputs();
+            if (midi_) midi_->rescan();
+            updateMidiSources();
+            statusBar()->showMessage("input devices rescanned", 3000);
+        });
+        connect(inputs, &QMenu::aboutToShow, this, [this] { rebuildInputMenus(); });
+
         /* Which build this is. Worth having in the window rather than only on
          * the command line: the usual way this gets asked is somebody
          * reporting behaviour from a copy neither of us can identify. */
@@ -3615,6 +4246,21 @@ private:
     QTabWidget   *tabs_;
     EditorHost   *editor_ = nullptr;
     PixelEditor  *pixelEditor_ = nullptr;
+    QMenu        *audioInMenu_ = nullptr, *midiInMenu_ = nullptr;
+    bool          deadReported_ = false;
+    bool          micMeterOn_ = false;   /* the input is the effect source */
+    bool          micShown_ = false;     /* the meter is on screen */
+    QProgressBar *inLevel_ = nullptr;
+    QSlider      *inGain_ = nullptr;
+    QCheckBox    *micVocoder_ = nullptr;
+    QLabel       *inLabel_ = nullptr;
+    QList<InputDevice> audioDevices_;
+    QString       audioInText_ = "not started";
+    uint64_t      audioInSeen_ = 0;
+    int           audioInTick_ = 0;
+    bool          fitPending_ = false;   /* an automatic fit still to be measured */
+    bool          fitAuto_ = false;      /* keep it fitted until a zoom is chosen */
+    QSize         lastViewport_;         /* to notice the pane changing size */
     QStackedWidget *editorStack_;
     QScrollArea  *editorScroll_;
     QSlider      *gain_;

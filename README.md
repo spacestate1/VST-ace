@@ -14,12 +14,13 @@ set of shims.
 | Windows VST3, x86-64 | 35 | 35 render, 34 open their own GUI |
 | Linux VST2 (`.so`), x86-64 | 39 | 37 render |
 | Linux VST3, x86-64 | 13 | 7 render, X11-embedded editors |
-| macOS VST2, x86-64 | 19 | 19 render, 19 open their own GUI |
-| macOS Audio Units, x86-64 | 42 | 41 render |
+| macOS VST2, x86-64 | 31 | 31 render, 30 open and drive their own GUI |
+| macOS VST3, x86-64 | 18 | 18 render, 18 open and drive their own GUI |
+| macOS Audio Units, x86-64 | 50 | 41 render, every one with a Cocoa view opens and drives it |
 
 `peload/README.md` has the long version, including what the remaining failures
 are and why most of them turned out to be host bugs wearing a plug-in's clothes.
-`PLUGINS.md` lists all 248 plug-ins the hosts are tested against.
+`PLUGINS.md` lists all 270 plug-ins the hosts are tested against.
 
 ![FB-7999 in pestudio](docs/fb-7999.png)
 
@@ -129,12 +130,14 @@ platform it holds; the list is kept in `~/.config/vst-ace/plugin-folders` and is
 shared, so a folder added in one window is searched by the other. The system VST
 directories and `VST_PATH`/`VST3_PATH` are searched without being asked for.
 
-Mac OS 9 plug-ins are browsed by default and have their own platform group.
-They are the most complete of the three macOS-family backends here: a
-`.vstclassic` loads, renders and draws its own editor through the CFM/PEF
-loader, the PowerPC interpreter and the QuickDraw path. Mach-O macOS hosting is
-still off in the windows (`-DPESTUDIO_MAC=1` / `-DPLUGVIEW_MAC=1` to try it);
-`-DPESTUDIO_CLASSIC=0` / `-DPLUGVIEW_CLASSIC=0` drop the Classic side.
+macOS and Mac OS 9 plug-ins are browsed by default and have their own platform
+groups: Mach-O VST2, VST3 and Audio Units on one side, and on the other a
+`.vstclassic`, which loads, renders and draws its own editor through the
+CFM/PEF loader, the PowerPC interpreter and the QuickDraw path.
+`-DPESTUDIO_MAC=0` / `-DPLUGVIEW_MAC=0` take the Mach-O family back out of the
+browser and `-DPESTUDIO_CLASSIC=0` / `-DPLUGVIEW_CLASSIC=0` drop the Classic
+side; the loaders are compiled in either way, and `va peload` on the command
+line has always reached them.
 
 For the command-line tools, point `VST_ROOT` at a directory holding `windows/`,
 `linux/` and `macos/`, or keep it at `~/vst`, which is where they look by
