@@ -128,6 +128,13 @@ typedef struct {
 
 static __thread teb32 *g_teb;
 
+/* The 64-bit host recycles thread-local slots between plug-ins and has to clear
+ * a reused one on every thread that holds a TEB -- see winstubs.h. This helper
+ * hosts exactly one plug-in for the life of the process, so no slot is ever
+ * handed out twice and there is nothing to clear. */
+static void teb_clear_slot(uint32_t i) { (void)i; }
+static void teb_clear_all_slots(void) { }
+
 static int teb_install(void)
 {
     struct user_desc d;

@@ -184,7 +184,18 @@ struct macho {
     void     *init_funcs;            /* &__mod_init_func */
     size_t    init_count;
 
+    /* The image's own Objective-C classes, from __DATA,__objc_classlist. The
+     * runtime has to be told about them: its "is this pointer an object?" test
+     * accepts only classes it knows, and a plugin's NSView subclass is not one
+     * of ours. See macobjc_register_image_classes. */
+    void *const *classlist;
+    size_t       nclass;
+
     char      bundle_id[128], bundle_name[128];
+    /* The executable inside the bundle. A plugin that wants to know which image
+     * its own code is in asks dyld, and dyld answers with this path -- see
+     * macshim_set_dyld_image. */
+    char      bin_path[4096];
     /* The bundle directory. A plugin loads its own artwork and presets relative
      * to this, so without it every resource lookup returns nothing -- which
      * presents as a plugin that renders silence or faults on a null bitmap
@@ -963,6 +974,7 @@ macho *macho_open(const char *path)
     if (!m) return NULL;
     g_err[0] = 0;
     if (resolve_bundle(m, path, bin, sizeof bin)) { free(m); return NULL; }
+    snprintf(m->bin_path, sizeof m->bin_path, "%s", bin);
 
     if ((fd = open(bin, O_RDONLY)) < 0) { fail("%s: %s", bin, strerror(errno)); free(m); return NULL; }
     if (fstat(fd, &st)) { close(fd); fail("fstat: %s", strerror(errno)); free(m); return NULL; }
@@ -1006,6 +1018,10 @@ macho *macho_open(const char *path)
     g_stub_owner = m;
     g_last_image = m;
     macshim_set_bundle(m->bundle_path);
+    /* And tell the dyld shims which image is loaded. A VSTGUI plugin finds its
+     * own bundle by asking dyld which image its code is in, and gets nowhere
+     * without an answer -- see macshim_set_dyld_image. */
+    macshim_set_dyld_image(m->bin_path, m->base, m->span);
     macshim_set_image(m);
     /* Before binding, not after: an image's own weak definitions are what some
      * of its imports refer to, and resolve() cannot see them otherwise. */
@@ -1020,7 +1036,7 @@ macho *macho_open(const char *path)
         if (bind_symbol_pointers(m))  { macho_close(m); return NULL; }
     }
 
-    /* Find __mod_init_func before protections go on. */
+    /* Find __mod_init_func and __objc_classlist before protections go on. */
     for (i = 0; i < (uint32_t)m->nseg; i++) {
         segment_command_64 *s = m->seg[i];
         const section_64 *sec = (const section_64 *)((const uint8_t *)s + sizeof *s);
@@ -1030,8 +1046,31 @@ macho *macho_open(const char *path)
                 m->init_funcs = m->base + sec[k].addr;
                 m->init_count = (size_t)(sec[k].size / 8);
             }
+            /* "__objc_classlist" is exactly sixteen characters, so the name in
+             * the section header has no terminator to compare past. */
+            if (!strncmp(sec[k].sectname, "__objc_classlist", 16)) {
+                m->classlist = (void *const *)(m->base + sec[k].addr);
+                m->nclass    = (size_t)(sec[k].size / sizeof(void *));
+            }
         }
     }
+    /* After binding, not before: a class's superclass field is an import --
+     * _OBJC_CLASS_$_NSView and the like -- so until do_bind has run it does not
+     * yet point at the class this runtime minted, and the chain a registered
+     * class is walked along would end nowhere.
+     *
+     * Registering at all is what makes a plugin's own subclass count as an
+     * object. macobjc_isa_named answers "is this an NSView?" and, to survive
+     * being handed something that is not an object at all, believes only
+     * classes the runtime knows. Nothing told it about the image's, so every
+     * instance of one answered no -- and the Foundation methods that gate on
+     * that quietly did nothing. An iPlug2 editor is exactly such a subclass:
+     * -setLayer: dropped its CAMetalLayer on the floor, -layer handed back nil,
+     * nanovg's renderCreate found no device and returned failure, and the
+     * plugin dereferenced the null NVGcontext that came back. Eighteen of the
+     * nineteen macOS VST2 editors here died at that one line. */
+    if (m->classlist) macobjc_register_image_classes(m->classlist, m->nclass);
+
     protect_segments(m);
 
     MLOG("  [macho] %d segment(s), %d export(s), %d import(s) resolved, %d stubbed\n",
@@ -1060,10 +1099,37 @@ void macho_close(macho *m)
     if (!m) return;
     /* Destructors first, while the code they live in is still mapped. */
     macshim_run_atexit(m);
+    /* Drop the image's classes before its pages go, so the registry does not
+     * keep pointers into an unmapped image -- and so a session that opens one
+     * plugin after another does not fill the table and start refusing to
+     * register the next one's. */
+    if (m->classlist) macobjc_forget_image_classes(m->classlist, m->nclass);
     if (g_stub_owner == m) g_stub_owner = NULL;
     if (g_last_image == m) g_last_image = NULL;
-    if (m->base) munmap(m->base, m->span);
-    if (m->file) munmap(m->file, m->filelen);
+    /* A block the plugin dispatched runs on a thread of its own, and the code it
+     * runs is in this image. Unmapping under one jumps into nothing -- and not
+     * here, but later, on a thread with no connection to whatever the host was
+     * doing: three plugins into a browsing session, the fourth load faulted in
+     * the third one's leftovers.
+     *
+     * So wait for them. If one will not finish, the mapping is retired rather
+     * than unmapped: leaking an image is a cost that grows slowly and stops
+     * there, where pulling the ground out from under a running thread is a
+     * crash in the host. Said once, because a plugin that does it once will do
+     * it every time. */
+    if (macshim_dyld_image_is(m->base)) macshim_set_dyld_image(NULL, NULL, 0);
+    if (macshim_gcd_drain(500)) {
+        if (m->base) munmap(m->base, m->span);
+        if (m->file) munmap(m->file, m->filelen);
+    } else {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [macho] %s left a dispatched block running; its "
+                            "image is kept mapped rather than unmapped under it\n",
+                    m->bundle_name[0] ? m->bundle_name : "a plugin");
+        }
+    }
     free(m);
 }
 
@@ -1113,6 +1179,9 @@ void macho_describe(const macho *m, const void *addr, char *out, size_t n)
 }
 
 const char *macho_bundle_path(const macho *m) { return m ? m->bundle_path : ""; }
+const char *macho_binary_path(const macho *m) { return m ? m->bin_path : ""; }
+const void *macho_image_base(const macho *m)  { return m ? (const void *)m->base : NULL; }
+size_t      macho_image_span(const macho *m)  { return m ? m->span : 0; }
 const char *macho_bundle_id(const macho *m)   { return m ? m->bundle_id : ""; }
 const char *macho_bundle_name(const macho *m) { return m ? m->bundle_name : ""; }
 

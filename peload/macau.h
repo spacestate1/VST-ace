@@ -50,6 +50,26 @@ int  macau_has_midi(const macau *a);
 int  macau_render(macau *a, const float *in_l, const float *in_r,
                   float *out_l, float *out_r, int frames, double *time);
 
+/* ---- the editor -------------------------------------------------------
+ *
+ * An AU builds its interface through a separate Cocoa view factory rather than
+ * through an open-editor call: kAudioUnitProperty_CocoaUI names a class in the
+ * unit's own bundle, and the host asks that class for an NSView. Once it
+ * exists, the plugin draws into a layer this host owns and the pixels come back
+ * the same way a macOS VST2's do.
+ *
+ * macau_editor_kind returns 2 (pixels) when the unit names a class this runtime
+ * can reach, and 0 otherwise -- an AU with no Cocoa view, or one whose view
+ * lives in a bundle of its own. */
+int  macau_editor_kind(macau *a);
+int  macau_editor_open(macau *a);
+void macau_editor_close(macau *a);
+void macau_editor_pump(macau *a);
+int  macau_editor_pixels(macau *a, const unsigned int **px, int *w, int *h);
+void macau_editor_size(macau *a, int *w, int *h);
+void macau_editor_mouse(macau *a, int x, int y, int msg, int buttons, int wheel);
+void macau_editor_key(macau *a, int vk, int down, int ch);
+
 #ifdef __cplusplus
 }
 #endif

@@ -24,6 +24,7 @@
 #include "macau.h"
 #include "macshim.h"
 #include "machoload.h"
+#include "macobjc.h"
 
 typedef int32_t OSStatus;
 
@@ -56,7 +57,10 @@ enum {
     P_STREAM_FORMAT    = 8,
     P_MAX_FRAMES       = 14,
     P_SET_RENDER_CALLBACK = 23,
-    P_ELEMENT_COUNT    = 11
+    P_ELEMENT_COUNT    = 11,
+    /* kAudioUnitProperty_CocoaUI. An AU does not open its own editor the way a
+     * VST2 does: it names a class, and the host builds the view. */
+    P_COCOA_UI         = 31
 };
 enum { SCOPE_GLOBAL = 0, SCOPE_INPUT = 1, SCOPE_OUTPUT = 2 };
 
@@ -128,11 +132,22 @@ typedef struct plugin_iface {
     void    *reserved;
 } plugin_iface;
 
+/* Marks a pointer as one of ours when it comes back from a plugin. The Cocoa
+ * view factory is handed this struct as its AudioUnit handle and passes it
+ * straight back to AudioUnitGetProperty, so the callback has to be able to tell
+ * that handle from anything else a plugin might invent. */
+#define MACAU_MAGIC 0x41556e69u          /* 'AUni' */
+
 struct macau {
+    uint32_t      magic;
     macho        *img;
     plugin_iface *iface;
     void         *self;
     int           opened, initialised;
+    /* The Cocoa editor: the factory object the unit named, and the NSView it
+     * built. Both are the plugin's own objects. */
+    void         *view_factory, *view;
+    int           editor_open;
     double        sr;
     uint32_t      maxframes, nchan;
     int           is_effect, interleaved;
@@ -224,6 +239,46 @@ static OSStatus pull_input(void *refCon, uint32_t *flags, const AudioTimeStamp *
     return 0;
 }
 
+/* ---------------------------------------------- what the plugin calls back
+ *
+ * A unit hands its Cocoa view factory an opaque AudioUnit handle and the factory
+ * calls AudioUnitGetProperty on it to find the object underneath. The handle it
+ * gets is this struct, so the callbacks recognise it by its magic word -- and
+ * fall back to the unit most recently opened for a handle from somewhere else,
+ * which is the honest best guess when only one is ever loaded at a time. */
+static macau *g_current;
+
+static macau *au_from_handle(void *h)
+{
+    macau *a = h;
+    if (a && a->magic == MACAU_MAGIC) return a;
+    return g_current;
+}
+
+static int32_t au_cb_get_parameter(void *h, uint32_t id, uint32_t scope,
+                                   uint32_t elem, float *out)
+{
+    macau *a = au_from_handle(h);
+    if (!a || !a->GetParameter) { if (out) *out = 0.0f; return -10867; }
+    return a->GetParameter(a->self, id, scope, elem, out);
+}
+
+static int32_t au_cb_get_property(void *h, uint32_t id, uint32_t scope,
+                                  uint32_t elem, void *data, uint32_t *size)
+{
+    macau *a = au_from_handle(h);
+    if (!a || !a->GetProperty) { if (size) *size = 0; return -10867; }
+    return a->GetProperty(a->self, id, scope, elem, data, size);
+}
+
+static int32_t au_cb_render(void *h, uint32_t *flags, const void *ts,
+                            uint32_t bus, uint32_t frames, void *bufs)
+{
+    macau *a = au_from_handle(h);
+    if (!a || !a->Render) return -10867;
+    return a->Render(a->self, flags, ts, bus, frames, bufs);
+}
+
 macau *macau_open(const char *bundle, double samplerate, int blocksize)
 {
     macau *a = calloc(1, sizeof *a);
@@ -233,6 +288,7 @@ macau *macau_open(const char *bundle, double samplerate, int blocksize)
     OSStatus st;
 
     if (!a) return NULL;
+    a->magic = MACAU_MAGIC;
     g_err[0] = 0;
     a->sr = samplerate > 0 ? samplerate : 44100.0;
     a->maxframes = (uint32_t)(blocksize > 0 ? blocksize : 512);
@@ -309,6 +365,14 @@ macau *macau_open(const char *bundle, double samplerate, int blocksize)
         macau_close(a); return NULL;
     }
     a->opened = 1;
+    /* The unit can now answer for itself, so let it. AudioUnitGetProperty and
+     * the two beside it are host calls a plugin makes back into whoever loaded
+     * it; nothing had ever filled them in, so every one returned "not
+     * initialised". That is exactly what an iPlug2 view factory calls to find
+     * the object behind the AudioUnit handle it was given -- so with these
+     * unset, no AU could ever have built an editor. */
+    macshim_set_au_callbacks(au_cb_get_parameter, au_cb_get_property, au_cb_render);
+    g_current = a;
     return a;
 }
 
@@ -533,9 +597,195 @@ int macau_is_effect(const macau *a) { return a ? a->is_effect : 0; }
 void macau_describe(const macau *a, const void *addr, char *out, size_t n)
 { macho_describe(a ? a->img : NULL, addr, out, n); }
 
+/* ------------------------------------------------------- the Cocoa editor
+ *
+ * An Audio Unit has no effEditOpen. It answers kAudioUnitProperty_CocoaUI with
+ * the name of a class compiled into its own bundle, and the host is expected to
+ * build that class, hand it the unit, and take the NSView it returns. Once the
+ * view exists the rest is identical to the VST2 side -- the plugin draws into a
+ * layer this host owns, and the pixels come back through the same two backends.
+ *
+ * AudioUnitCocoaViewInfo is a CFURLRef naming the bundle the class lives in,
+ * followed by one or more CFStringRef class names. The bundle location is
+ * ignored here: for every unit in this corpus the class is in the component's
+ * own binary, which is already mapped, and there is no separate bundle to open.
+ */
+typedef struct {
+    void *bundle_location;      /* CFURLRef */
+    void *class_names[8];       /* CFStringRef[]; the first is the one to use */
+} cocoa_view_info;
+
+typedef struct { double width, height; } NSSize;
+typedef struct { double x, y, width, height; } NSRect;
+
+/* Read the view class's name out of the property, or return 0. */
+static int cocoa_class_name(macau *a, char *out, int n)
+{
+    cocoa_view_info info;
+    uint32_t size = (uint32_t)sizeof info;
+    uint8_t writable = 0;
+
+    if (!a || !a->GetProperty || n <= 0) return 0;
+    /* Ask first: a unit with no Cocoa view answers the info call with an error,
+     * and that is the cheap way to find out -- GetProperty on a property the
+     * unit does not implement is not required to leave the buffer alone. */
+    if (a->GetPropertyInfo &&
+        a->GetPropertyInfo(a->self, P_COCOA_UI, SCOPE_GLOBAL, 0, &size, &writable) != 0)
+        return 0;
+    if (size < sizeof(void *) * 2 || size > sizeof info) size = (uint32_t)sizeof info;
+    memset(&info, 0, sizeof info);
+    if (a->GetProperty(a->self, P_COCOA_UI, SCOPE_GLOBAL, 0, &info, &size) != 0)
+        return 0;
+    if (!info.class_names[0]) return 0;
+    if (!macshim_cf_string_get(info.class_names[0], out, n)) return 0;
+    return out[0] != '\0';
+}
+
+int macau_editor_kind(macau *a)
+{
+    char name[128];
+    if (!a) return 0;
+    if (a->editor_open) return 2;
+    if (!cocoa_class_name(a, name, sizeof name)) return 0;
+    /* Named is not the same as reachable: the class has to be one this runtime
+     * knows, which for a compiled-in class means the image registered it. */
+    return macobjc_class(name) ? 2 : 0;
+}
+
+void macau_editor_pump(macau *a)
+{
+    if (!a || !a->editor_open) return;
+    macns_fire_timers();
+    macns_draw_dirty();
+}
+
+int macau_editor_pixels(macau *a, const unsigned int **px, int *w, int *h)
+{
+    if (!a || !a->editor_open) return 0;
+    if (macmetal_pixels(px, w, h)) return 1;
+    return macquartz_editor_pixels(px, w, h);
+}
+
+void macau_editor_size(macau *a, int *w, int *h)
+{
+    NSRect (*frame)(void *, const char *);
+    NSRect r;
+
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (!a || !a->view) return;
+    frame = (NSRect (*)(void *, const char *))macobjc_lookup(a->view, "frame");
+    if (!frame) return;
+    r = frame(a->view, "frame");
+    if (w) *w = (int)r.width;
+    if (h) *h = (int)r.height;
+}
+
+int macau_editor_open(macau *a)
+{
+    char name[128];
+    void *cls;
+    void *(*alloc)(void *, const char *);
+    void *(*init)(void *, const char *);
+    void *(*uiview)(void *, const char *, void *, NSSize);
+    NSSize want;
+    int k, w = 0, h = 0;
+
+    if (!a) return -1;
+    if (a->editor_open) return 0;
+    if (!cocoa_class_name(a, name, sizeof name)) {
+        snprintf(g_err, sizeof g_err, "the unit names no Cocoa view class");
+        return -1;
+    }
+    if (!(cls = macobjc_class(name))) {
+        snprintf(g_err, sizeof g_err, "view class %s is not in this image", name);
+        return -1;
+    }
+    ALOG("cocoa view");
+    alloc = (void *(*)(void *, const char *))macobjc_lookup(cls, "alloc");
+    if (!alloc) { snprintf(g_err, sizeof g_err, "%s does not answer +alloc", name); return -1; }
+    a->view_factory = alloc(cls, "alloc");
+    if (a->view_factory &&
+        (init = (void *(*)(void *, const char *))macobjc_lookup(a->view_factory, "init")))
+        a->view_factory = init(a->view_factory, "init");
+    if (!a->view_factory) {
+        snprintf(g_err, sizeof g_err, "%s would not allocate", name);
+        return -1;
+    }
+
+    uiview = (void *(*)(void *, const char *, void *, NSSize))
+             macobjc_lookup(a->view_factory, "uiViewForAudioUnit:withSize:");
+    if (!uiview) {
+        snprintf(g_err, sizeof g_err,
+                 "%s does not implement uiViewForAudioUnit:withSize:", name);
+        a->view_factory = NULL;
+        return -1;
+    }
+    /* Zero means "your preferred size", which is what a plugin that has one
+     * wants to be asked. The handle is this struct: the factory passes it back
+     * through AudioUnitGetProperty, and au_from_handle recognises it. */
+    want.width = 0.0; want.height = 0.0;
+    a->view = uiview(a->view_factory, "uiViewForAudioUnit:withSize:", (void *)a, want);
+    if (!a->view) {
+        snprintf(g_err, sizeof g_err, "%s built no view", name);
+        a->view_factory = NULL;
+        return -1;
+    }
+    a->editor_open = 1;
+
+    /* Seed the drawable, the same way the VST2 side does: the plugin paints its
+     * first frame into whatever is there, and an editor with no size yet gets
+     * nowhere to put it. */
+    macau_editor_size(a, &w, &h);
+    for (k = 0; k < 30 && (w <= 0 || h <= 0); k++) {
+        macau_editor_pump(a);
+        macau_editor_size(a, &w, &h);
+    }
+    if (w > 0 && h > 0) macmetal_set_size(w, h);
+
+    for (k = 0; k < 8; k++) {
+        const unsigned int *px; int pw = 0, ph = 0;
+        macau_editor_pump(a);
+        if (macau_editor_pixels(a, &px, &pw, &ph)) return 0;
+    }
+    snprintf(g_err, sizeof g_err, "%s drew nothing", name);
+    macau_editor_close(a);
+    return -1;
+}
+
+void macau_editor_close(macau *a)
+{
+    if (!a || !a->editor_open) return;
+    a->editor_open = 0;
+    /* The view and the factory are the plugin's own objects and are released by
+     * its own teardown; what has to go is anything of ours pointing at them --
+     * a timer left running fires into a view that is no longer being drawn. */
+    a->view = a->view_factory = NULL;
+    macns_reset_gui();
+    macmetal_reset();
+    /* And the Core Graphics side, like the other two backends: an Audio Unit
+     * whose view draws through drawRect: rather than Metal leaves a context
+     * behind otherwise. */
+    macquartz_reset_editor();
+}
+
+/* Post only -- the pump paints. See macvst_editor_mouse for why. */
+void macau_editor_mouse(macau *a, int x, int y, int msg, int buttons, int wheel)
+{
+    if (!a || !a->editor_open) return;
+    macns_post_mouse(x, y, msg, buttons, wheel);
+}
+
+void macau_editor_key(macau *a, int vk, int down, int ch)
+{
+    if (!a || !a->editor_open) return;
+    macns_post_key(vk, down, ch);
+}
+
 void macau_close(macau *a)
 {
     if (!a) return;
+    macau_editor_close(a);
     if (a->initialised && a->Uninitialize) a->Uninitialize(a->self);
     if (a->opened && a->iface && a->iface->Close) a->iface->Close(a->self);
     free(a->scratch);
@@ -543,6 +793,8 @@ void macau_close(macau *a)
      * and least of all past the point where its image is unmapped. */
     macns_reset_gui();
     macmetal_reset();
+    macquartz_reset_editor();
+    if (g_current == a) g_current = NULL;
     if (a->img) macho_close(a->img);
     free(a);
 }

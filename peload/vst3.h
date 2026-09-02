@@ -53,6 +53,13 @@ int  v3_editor_attach(v3host *h, unsigned long x11_window);
 /* Windows VST3: the editor wants an HWND, which the Win32 layer supplies. */
 int  v3_editor_is_hwnd(v3host *h);
 int  v3_editor_attach_hwnd(v3host *h, void *hwnd);
+/* macOS VST3: loaded by the Mach-O loader, and its editor wants an NSView. The
+ * host supplies one of the Objective-C runtime's own; the plugin draws into the
+ * layer and the pixels come back through the software Metal backend, exactly as
+ * a macOS VST2's do. */
+int  v3_is_macho(v3host *h);
+int  v3_editor_is_nsview(v3host *h);
+int  v3_editor_attach_nsview(v3host *h, void *nsview);
 void v3_editor_detach(v3host *h);
 /* Tell a resizable editor its new size. */
 void v3_editor_resized(v3host *h, int w, int h_px);
@@ -80,6 +87,7 @@ float v3_get_param(v3host *h, int i);
 void  v3_set_param(v3host *h, int i, float v);      /* queued */
 
 void  v3_midi(v3host *h, int status, int d1, int d2);  /* queued */
+void  v3_set_input_mask(v3host *h, unsigned mask);
 
 /* Interleaved stereo in (may be NULL) and out. Drains the queue first. */
 void  v3_render(v3host *h, const float *in, float *out, int frames);

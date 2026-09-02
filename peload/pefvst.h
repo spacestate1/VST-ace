@@ -127,6 +127,13 @@ ppc     *pefvst_machine(pefvst *v);
  * what this costs. */
 uint64_t pefvst_icount(pefvst *v);
 
+/* Import diagnostics: how many library symbols the shim bound, how many it had
+ * to leave unbound, and how many of those the guest then called anyway. The
+ * unbound names are available through `names` (comma-separated) when it is
+ * non-NULL and `namesz` is big enough. */
+int pefvst_import_stats(pefvst *v, int *bound, int *unbound, int *stub_calls,
+                        char *names, int namesz);
+
 #ifdef __cplusplus
 }
 #endif

@@ -251,7 +251,13 @@ void bridge_close(bridge *b)
             if (waitpid(b->pid, &st, WNOHANG) == b->pid) { b->pid = 0; break; }
             { struct timespec ts = { 0, 10000000 }; nanosleep(&ts, NULL); }
         }
-        if (b->pid > 0) { kill(b->pid, SIGKILL); waitpid(b->pid, &st, 0); }
+        if (b->pid > 0) {
+            /* The group, not just the helper: a plug-in that forked a child of
+             * its own leaves it behind otherwise. */
+            kill(-b->pid, SIGKILL);
+            kill(b->pid, SIGKILL);
+            waitpid(b->pid, &st, 0);
+        }
     }
     if (b->sh) munmap(b->sh, BRIDGE_SHM_SIZE);
     if (b->shm_name[0]) shm_unlink(b->shm_name);
@@ -314,6 +320,11 @@ bridge *bridge_open_helper(const char *dll, double samplerate, int blocksize,
     if (b->pid == 0) {
         /* child */
         char sr[32], bsz[32];
+        /* Its own process group, so a plug-in that forks a child of its own --
+         * and a couple of them wedge their audio thread that way on certain
+         * presets -- can be killed as a group rather than leaving the fork
+         * orphaned and spinning on a core. */
+        setpgid(0, 0);
         close(sv[0]);
         if (dup2(sv[1], 3) < 0) _exit(127);
         if (sv[1] != 3) close(sv[1]);
@@ -402,6 +413,14 @@ static void bridge_text(bridge *b, int op, int idx, char *buf, int n)
     if (n > 0) buf[0] = 0;
     if (!b || bridge_op(b, op, idx, 0, 0, 0, 0, &r) || !r.ok) return;
     snprintf(buf, (size_t)n, "%s", r.text);
+}
+
+int bridge_alive(const bridge *b) { return b && !b->dead; }
+void bridge_set_input_mask(bridge *b, unsigned mask)
+{
+    bridge_rep r;
+    if (!b || b->dead) return;
+    bridge_op(b, BR_INPUT_MASK, (int)mask, 0, 0, 0, 0, &r);
 }
 
 void bridge_param_name(bridge *b, int i, char *buf, int n)
@@ -547,12 +566,22 @@ void bridge_render_io(bridge *b, const float *in, float *out, int frames)
         /* Persistently behind means it is not coming back -- most likely its audio
          * thread died, which leaves the process alive and the socket open, so
          * nothing else notices. */
-        if (++b->behind == 200) {
+        if (++b->behind >= 200) {
             int st = 0;
+            int exited = (b->pid > 0 && waitpid(b->pid, &st, WNOHANG) == b->pid);
             fprintf(stderr, "bridge: the helper has stopped rendering (%d blocks "
                             "with no reply)%s\n", b->behind,
-                    (b->pid > 0 && waitpid(b->pid, &st, WNOHANG) == b->pid)
-                        ? " -- it exited" : " -- its audio thread is stuck or dead");
+                    exited ? " -- it exited"
+                           : " -- its audio thread is stuck; giving up on it");
+            /* Not coming back: a render that has produced nothing for a second
+             * is wedged inside the plug-in, not merely slow. Mark the helper
+             * dead so the host stops waiting on it and the window can say so --
+             * pehost_alive turns false and the editor and audio are reported
+             * gone rather than silently frozen. Kill its whole group first, so
+             * a plug-in that wedged itself by forking does not leave the fork
+             * spinning on a core for the rest of the session. */
+            if (!exited && b->pid > 0) { kill(-b->pid, SIGKILL); kill(b->pid, SIGKILL); }
+            b->dead = 1;
         }
         memset(out, 0, (size_t)frames * 2 * sizeof *out);
         return;
@@ -621,6 +650,17 @@ void bridge_editor_close(bridge *b)
     b->ed_open = 0;
 }
 
+/* Spin a few times, then sleep in short steps: a publish takes well under a
+ * millisecond and they are 16 ms apart, so a reader that lands in one is never
+ * waiting long. Bounded at roughly five milliseconds in total. */
+#define BRIDGE_ED_TRIES 64
+static void ed_backoff(int tries)
+{
+    if (tries < 8) { sched_yield(); return; }
+    { struct timespec ts = { 0, 100000 };      /* 0.1 ms */
+      nanosleep(&ts, NULL); }
+}
+
 /* The helper republishes pixels on its own 60 Hz pump, so there is nothing to
  * ask for -- just read whatever is current. */
 int bridge_editor_pixels(bridge *b, const unsigned int **px, int *w, int *h)
@@ -637,12 +677,23 @@ int bridge_editor_pixels(bridge *b, const unsigned int **px, int *w, int *h)
      * Copying is what makes this safe -- returning a pointer into the shared
      * buffer, as this used to, hands the caller memory that keeps changing under
      * it however carefully the counter is checked. */
-    for (tries = 0; tries < 8; tries++) {
+    /* Wait for the writer rather than give up on it.
+     *
+     * Eight spins and a sched_yield each is a shorter budget than the writer's
+     * critical section: publishing a 1096x586 editor is a two-and-a-half
+     * megabyte memcpy, and a reader that arrives inside one saw the same odd
+     * generation on all eight attempts and returned "no frame". With no earlier
+     * frame to fall back on -- which is exactly the situation on the first read
+     * after opening an editor -- that reached the host as "editor produced no
+     * pixels", and it is why no 32-bit editor ever appeared. The window is
+     * bounded by one copy, so the right thing is to keep looking for a few
+     * milliseconds. */
+    for (tries = 0; tries < BRIDGE_ED_TRIES; tries++) {
         uint32_t g0 = atomic_load_explicit(&sh->ed_gen, memory_order_acquire);
         int cw, ch;
         size_t bytes;
 
-        if (g0 & 1u) { b->ed_torn++; sched_yield(); continue; }  /* mid-write */
+        if (g0 & 1u) { b->ed_torn++; ed_backoff(tries); continue; }  /* mid-write */
         cw = sh->ed_w; ch = sh->ed_h;
         if (cw <= 0 || ch <= 0 || cw > BRIDGE_MAX_ED_W || ch > BRIDGE_MAX_ED_H)
             break;
@@ -656,7 +707,7 @@ int bridge_editor_pixels(bridge *b, const unsigned int **px, int *w, int *h)
         memcpy(b->ed_buf, bridge_pixels(sh), bytes);
         if (atomic_load_explicit(&sh->ed_gen, memory_order_acquire) != g0) {
             b->ed_torn++;
-            sched_yield();
+            ed_backoff(tries);
             continue;                                  /* it changed: try again */
         }
         b->ed_bw = cw; b->ed_bh = ch; b->ed_have = 1;

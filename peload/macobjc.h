@@ -17,6 +17,10 @@ void macobjc_nil_return(void);
 void macobjc_msgSend_stret(void);
 void macobjc_msgSendSuper2(void);
 void macobjc_msgSendSuper2_stret(void);
+/* The older super dispatch: its struct's class field is where the search
+ * starts, not the class to search above. Runtime-built classes use it. */
+void macobjc_msgSendSuper(void);
+void macobjc_msgSendSuper_stret(void);
 /* The legacy fixup dispatch ABI: the selector comes from a per-call-site
  * message_ref rather than from %rsi. See macobjc_msgsend.S. */
 void macobjc_msgSend_fixup(void);
@@ -26,6 +30,7 @@ void macobjc_msgSendSuper2_fixup(void);
 /* Called by the trampolines. */
 void (*macobjc_lookup(void *self, const char *sel))(void);
 void (*macobjc_lookup_super(void *super2, const char *sel))(void);
+void (*macobjc_lookup_super1(void *super, const char *sel))(void);
 void *macobjc_super_receiver(void *super2);
 
 /* Resolve _objc_* and _OBJC_CLASS_$_* / _OBJC_METACLASS_$_* names. */
@@ -46,8 +51,12 @@ int   macobjc_add_method(const char *cls, const char *sel, void *imp);
 /* True when obj's class or an ancestor is named `name`. */
 int   macobjc_isa_named(void *obj, const char *name);
 
-/* Note the image's own classes so a message to one can be traced. */
+/* Note the image's own classes, so an instance of one is recognised as an
+ * object by macobjc_isa_named and a message to one can be traced. Call after
+ * binding -- a class's superclass is an import. The second forgets them again
+ * when the image is unmapped. */
 void  macobjc_register_image_classes(void *const *classlist, size_t count);
+void  macobjc_forget_image_classes(void *const *classlist, size_t count);
 
 /* How many objects have been retired (released to zero). They are not freed --
  * see the note in macobjc.c -- so this is also the count of objects leaked. */

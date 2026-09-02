@@ -37,6 +37,9 @@
 #include "bridge_client.h"
 #include "macvsthost.h"
 #include "macau.h"
+/* The Cocoa stand-ins and the software Metal backend: a macOS VST3 draws
+ * through them directly rather than through a backend of its own. */
+#include "macshim.h"
 #include "pefvst.h"
 #include <sys/syscall.h>
 #include <asm/prctl.h>
@@ -128,6 +131,44 @@ typedef struct {
 
 static __thread teb_t *g_teb;
 
+/* Every thread that runs plug-in code, so a thread-local slot can be cleared
+ * everywhere it exists.
+ *
+ * Windows hands out a TlsAlloc slot that reads NULL on every thread. Once slots
+ * are recycled between plug-ins -- which they now are, or a session runs out of
+ * them -- a slot still holding the last plug-in's pointer on some other thread
+ * is a fault waiting for whichever thread reads it before writing it. The audio
+ * thread is exactly such a thread. */
+#define MAX_TEBS 64
+static teb_t          *g_tebs[MAX_TEBS];
+static int             g_nteb;
+static pthread_mutex_t g_teb_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void teb_register(teb_t *t)
+{
+    pthread_mutex_lock(&g_teb_lock);
+    if (g_nteb < MAX_TEBS) g_tebs[g_nteb++] = t;
+    pthread_mutex_unlock(&g_teb_lock);
+}
+static void teb_clear_slot(uint32_t i)
+{
+    int k;
+    if (i >= TLS_SLOTS) return;
+    pthread_mutex_lock(&g_teb_lock);
+    for (k = 0; k < g_nteb; k++)
+        if (g_tebs[k]) g_tebs[k]->slots[i] = NULL;
+    pthread_mutex_unlock(&g_teb_lock);
+}
+static void teb_clear_all_slots(void)
+{
+    int k;
+    pthread_mutex_lock(&g_teb_lock);
+    for (k = 0; k < g_nteb; k++)
+        if (g_tebs[k]) memset(g_tebs[k]->slots + 8, 0,
+                              (TLS_SLOTS - 8) * sizeof g_tebs[k]->slots[0]);
+    pthread_mutex_unlock(&g_teb_lock);
+}
+
 /* The module's TLS template. TLS is per-thread by definition, so each thread
  * that runs plugin code needs its own copy of this block, not a shared one --
  * without it the audio thread reads a NULL TLS pointer on first use. */
@@ -166,6 +207,7 @@ static int teb_install(void)
     }
     if (syscall(SYS_arch_prctl, ARCH_SET_GS, t->raw) != 0) { free(t->raw); free(t); return -1; }
     g_teb = t;
+    teb_register(t);
     tls_bind_current_thread();
     return 0;
 }
@@ -192,6 +234,7 @@ typedef struct { char dll[32], sym[96]; unsigned long calls; } imprec;
 static imprec  g_imp[MAX_IMPORTS];
 static int     g_nimp;
 static int      g_nresolved;      /* imports satisfied by a real stub */
+static pefvst  *g_last_classic;   /* for pehost_import_stats on a Classic plugin */
 
 /* Generated stubs live in executable pages of their own.
  *
@@ -771,11 +814,17 @@ static pe_module *real_module(const char *dll)
     return &g_real[i].m;
 }
 
+/* Names the C++ runtime a plug-in needed and could not have, for the caller to
+ * report. Empty when nothing was missing. */
+static char g_missing_real[64];
+
 static int resolve_imports(image *im)
 {
     DATA_DIR d = im->opt->DataDirectory[DIR_IMPORT];
     IMP_DESC *desc;
     int resolved = 0, stubbed = 0;
+
+    g_missing_real[0] = 0;
 
     if (!d.VirtualAddress) return 0;
     for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
@@ -802,6 +851,15 @@ static int resolve_imports(image *im)
             if (wants_real_image(dll) && !(*lookup & (1ull << 63))) {
                 pe_module *rm = real_module(dll);
                 if (rm) fn = pe_module_export(rm, sym);
+                /* A stub is a reasonable answer for one missing entry point and
+                 * a terrible one for a whole C++ library: the plug-in loads
+                 * with several hundred of them and faults the moment it calls
+                 * a constructor. Refusing here, with the name of what is
+                 * missing, is what the caller can act on -- and it is the
+                 * difference between one plug-in failing to open and the
+                 * session ending. */
+                else if (!g_missing_real[0])
+                    snprintf(g_missing_real, sizeof g_missing_real, "%s", dll);
             }
             if (!fn) fn = winstub_lookup(dll, sym);
             if (fn) { resolved++; }
@@ -820,7 +878,7 @@ static int resolve_imports(image *im)
     g_nresolved = resolved;
     if (pe_verbose())
         fprintf(stderr, "imports: %d implemented, %d stubbed\n", resolved, stubbed);
-    return 0;
+    return g_missing_real[0] ? -1 : 0;
 }
 
 static int setup_tls(image *im)
@@ -1464,7 +1522,12 @@ int pe_module_load(const char *path, pe_module *m, char *err, int errlen)
                   im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
                     ? im.base + im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
                     : NULL);
-    resolve_imports(&im);
+    if (resolve_imports(&im) < 0) {
+        snprintf(err, errlen, "%s is needed and was not found -- put a copy "
+                              "beside the plug-in, or name its directory in "
+                              "PELOAD_DLL_PATH", g_missing_real);
+        goto fail;
+    }
     protect_sections(&im);
     tImp = pe_now();
     setup_tls(&im);
@@ -1500,6 +1563,10 @@ fail:
 void pe_module_unload(pe_module *m)
 {
     if (!m || !m->base) return;
+    /* Out of the resource registry before it is out of the address space: an
+     * entry naming an unmapped base is worse than no entry at all. Losing the
+     * plug-in itself also frees the thread-local slots it was holding. */
+    if (winstubs_drop_image(m->base)) winstubs_reset_tls();
     munmap(m->base, m->size);
     m->base = NULL;
     m->size = 0;
@@ -1551,6 +1618,7 @@ static uint64_t mono_ns(void)
 
 struct pehost {
     int       is_v3;      /* VST3 goes through vst3.c, VST2 through here */
+    unsigned  in_mask;    /* which input channels the fed signal reaches; 0 = all */
     /* A 32-bit plugin cannot run in this process at all, so it runs in a
      * peload32 helper and every call below forwards over the bridge. Callers
      * see no difference: that is the point of dispatching here rather than
@@ -2008,6 +2076,7 @@ static pehost *classic_open(const char *path, double samplerate, int blocksize)
     h->cl_filelen = len;
     h->sr = samplerate;
     h->bs = blocksize > 0 ? blocksize : 512;
+    g_last_classic = v;    /* for pehost_import_stats */
     return h;
 }
 
@@ -2057,7 +2126,30 @@ pehost *pehost_open(const char *path, double samplerate, int blocksize)
         }
         if (mk == 2) {
             macau *au = macau_open(path, samplerate, blocksize);
-            if (!au) { snprintf(g_err, sizeof g_err, "%s", macau_last_error()); return NULL; }
+            if (!au) {
+                /* An Audio Unit that is a VST in a wrapper.
+                 *
+                 * Symbiosis takes a VST2 and bolts a Component Manager entry
+                 * point onto it; the result is one binary exporting both
+                 * SymbiosisEntry and VSTPluginMain, with no AudioComponent
+                 * factory and no AudioComponents key in its Info.plist -- so
+                 * the modern AU path has nothing to call. The VST2 inside is
+                 * the whole plugin, editor included, and this host already
+                 * knows how to run it. Every Audio Damage Audio Unit is one of
+                 * these. Only tried after the AU path has failed, and only
+                 * succeeds if the bundle really does export a VST entry, so a
+                 * genuinely broken AU still reports its own error. */
+                macvst *mv = macvst_open(path, samplerate, blocksize);
+                if (mv) {
+                    if (!(h = calloc(1, sizeof *h))) { macvst_close(mv); return NULL; }
+                    h->mv = mv;
+                    h->sr = samplerate;
+                    h->bs = blocksize > 0 ? blocksize : 512;
+                    return h;
+                }
+                snprintf(g_err, sizeof g_err, "%s", macau_last_error());
+                return NULL;
+            }
             if (macau_configure(au)) {
                 snprintf(g_err, sizeof g_err, "%s", macau_last_error());
                 macau_close(au); return NULL;
@@ -2134,6 +2226,10 @@ static pehost *open_vst3(const char *path, double samplerate, int blocksize)
     snprintf(h->vendor, sizeof h->vendor, "%s", v3_vendor(h->v3));
     h->nin  = v3_num_inputs(h->v3);
     h->nout = v3_num_outputs(h->v3);
+    /* Which loader took it, for labelling. A macOS bundle went through the
+     * Mach-O path, so pehost_is_macos should say so and the editor should be
+     * described as the backend that actually drew it. */
+    h->is_mac = v3_is_macho(h->v3);
     return h;
 }
 
@@ -2163,7 +2259,13 @@ static pehost *open_inproc_pe(const char *path, double samplerate, int blocksize
                   h->im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
                     ? h->im.base + h->im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
                     : NULL);
-    resolve_imports(&h->im);
+    if (resolve_imports(&h->im) < 0) {
+        snprintf(g_err, sizeof g_err, "%s is needed and was not found -- put a "
+                                      "copy beside the plug-in, or name its "
+                                      "directory in PELOAD_DLL_PATH",
+                 g_missing_real);
+        goto fail;
+    }
     protect_sections(&h->im);
     setup_tls(&h->im);
 
@@ -2483,8 +2585,10 @@ pehost_kind pehost_classify(const char *path, pehost_info *out)
         char macdir[1024];
         snprintf(macdir, sizeof macdir, "%s/Contents/MacOS", path);
         if (!stat(macdir, &mst) && S_ISDIR(mst.st_mode)) {
-            info_set(out, PEHOST_KIND_MAC_VST3, "macos", "x86-64", "VST3", 0);
-            snprintf(out->why, sizeof out->why, "macOS VST3 bundles are not hosted yet");
+            /* Hosted by the same SysV VST3 code that drives a native Linux
+             * bundle -- macOS x86-64 shares the ABI, so only the loader
+             * underneath differs. */
+            info_set(out, PEHOST_KIND_MAC_VST3, "macos", "x86-64", "VST3", 1);
             return out->kind;
         }
         if (pehost_resolve(path, bin, sizeof bin) != 0) {
@@ -2636,6 +2740,7 @@ void pehost_close(pehost *h)
      * event block belongs to the handle rather than to any one of them. */
     if (h) { free(h->evblk); h->evblk = NULL; h->evblk_n = 0; }
     if (h && h->cl) {
+        if (g_last_classic == h->cl) g_last_classic = NULL;
         pefvst_close(h->cl);
         free(h->cl_file);
         free(h->cl_io);
@@ -2650,7 +2755,21 @@ void pehost_close(pehost *h)
      * plugin's WndProc, and pumping after the unmap would jump into freed
      * memory. */
     w32_reset();
-    if (h->is_v3) { v3_close(h->v3); free(h); return; }
+    if (h->is_v3) {
+        /* A macOS VST3 draws through the Cocoa stand-ins and the software Metal
+         * backend, so it has the same teardown a macOS VST2 does: whatever is
+         * left pointing at its view or its layer has to go before its image
+         * does. Without this the next plugin's first mouse event went to a view
+         * in an unmapped image. */
+        if (v3_is_macho(h->v3)) {
+            macns_reset_gui();
+            macmetal_reset();
+            macquartz_reset_editor();
+        }
+        v3_close(h->v3);
+        free(h);
+        return;
+    }
     if (h->fx) {
         h->fx->dispatcher(h->fx, effMainsChanged, 0, 0, NULL, 0.0f);
         h->fx->dispatcher(h->fx, effClose, 0, 0, NULL, 0.0f);
@@ -3028,6 +3147,21 @@ void pehost_midi_stats(const pehost *h, unsigned *dropped, unsigned *spilled)
     if (spilled) *spilled = h ? h->ev_spilled : 0;
 }
 
+void pehost_set_input_mask(pehost *h, unsigned mask)
+{
+    if (!h) return;
+    h->in_mask = mask;
+    if (h->br) bridge_set_input_mask(h->br, mask);
+    if (h->is_v3) v3_set_input_mask(h->v3, mask);
+}
+
+int pehost_alive(const pehost *h)
+{
+    if (!h) return 0;
+    if (h->br) return bridge_alive(h->br);
+    return 1;                    /* in process: if it had died, so would we */
+}
+
 void pehost_note_on(pehost *h, int note, int vel)  { pehost_midi(h, 0x90, note, vel); }
 void pehost_note_off(pehost *h, int note)          { pehost_midi(h, 0x80, note, 0); }
 void pehost_all_notes_off(pehost *h)
@@ -3203,9 +3337,14 @@ static void render_io_block(pehost *h, const float *src, float *inter,
 no_events:
 
     for (k = 0; k < h->nin; k++) {
-        if (src) {
-            /* De-interleave stereo across however many inputs the plugin has;
-             * a mono or 4-in plugin still gets every channel filled. */
+        /* Which inputs the fed signal reaches. A plug-in with more than two
+         * inputs is often two separate things -- a modulator and a carrier, on
+         * FBVC -- and feeding a microphone to both puts the raw voice into the
+         * output as well as into the analysis. The mask lets a caller send it
+         * only where it belongs; the default is every channel, which is what a
+         * plain stereo effect wants. */
+        int fed = src && (h->in_mask == 0 || (h->in_mask & (1u << k)));
+        if (fed) {
             int c = k < 2 ? k : k % 2;
             for (i = 0; i < frames; i++) h->in[k][i] = src[2 * i + c];
         } else {
@@ -3265,8 +3404,8 @@ int pehost_editor_kind(pehost *h)
     if (h && h->cl) return (pefvst_flags(h->cl) & PV_FLAG_HAS_EDITOR)
                           ? PEHOST_EDITOR_PIXELS : PEHOST_EDITOR_NONE;
     /* A macOS VST2 editor draws through the software Metal backend and hands
-     * back pixels, the same shape as a Windows editor. Audio Units build their
-     * view through a separate factory and are not wired up yet. */
+     * back pixels, the same shape as a Windows editor. An Audio Unit reaches
+     * the same backend by a different road -- see macau_editor_kind. */
     if (h && h->mv) {
         if (!macvst_editor_kind(h->mv)) return PEHOST_EDITOR_NONE;
         /* A native Linux VST2 is an X11 client: it embeds into a window we give
@@ -3275,10 +3414,17 @@ int pehost_editor_kind(pehost *h)
          * holding a top-level window of its own. */
         return macvst_is_native(h->mv) ? PEHOST_EDITOR_X11 : PEHOST_EDITOR_PIXELS;
     }
-    if (h && h->au) return PEHOST_EDITOR_NONE;
+    if (h && h->au)
+        return macau_editor_kind(h->au) ? PEHOST_EDITOR_PIXELS : PEHOST_EDITOR_NONE;
     if (h && h->br) return bridge_editor_kind(h->br);
     if (!h) return PEHOST_EDITOR_NONE;
     if (h->is_v3) {
+        /* A macOS VST3 draws into a view of ours and hands back pixels, exactly
+         * as a macOS VST2 does -- asked first, because such a plugin supports
+         * neither of the other two platform types and would otherwise be
+         * reported as having no editor at all. */
+        if (v3_is_macho(h->v3))
+            return v3_editor_is_nsview(h->v3) ? PEHOST_EDITOR_PIXELS : PEHOST_EDITOR_NONE;
         /* A native Linux VST3 embeds into an X11 window; a Windows one goes
          * through the Win32 layer and gives us pixels. */
         if (v3_has_editor(h->v3)) return PEHOST_EDITOR_X11;
@@ -3288,11 +3434,45 @@ int pehost_editor_kind(pehost *h)
     return PEHOST_EDITOR_NONE;
 }
 
+/* Open a macOS VST3's editor.
+ *
+ * The one thing this needs that the other backends do not is a parent view:
+ * IPlugView::attached takes an NSView and a plugin handed nothing refuses. The
+ * runtime can mint one, so the host makes a container the size the plugin asked
+ * for, hands it over, and then pumps exactly as it does for a macOS VST2 --
+ * timers, then dirty rects, until a frame lands. */
+static int open_macho_v3_editor(pehost *h)
+{
+    void *parent;
+    int w = 0, ht = 0, k;
+
+    if (!v3_editor_is_nsview(h->v3)) return -1;
+    v3_editor_size(h->v3, &w, &ht);
+    if (!(parent = macns_make_view(w, ht))) return -1;
+    if (v3_editor_attach_nsview(h->v3, parent) != 0) return -1;
+
+    /* Ask again now the view exists: a plugin that sizes itself from artwork it
+     * had not loaded yet answers the first call with an empty rect. */
+    if (w <= 0 || ht <= 0) v3_editor_size(h->v3, &w, &ht);
+    if (w > 0 && ht > 0) macmetal_set_size(w, ht);
+
+    for (k = 0; k < 16; k++) {
+        const unsigned int *px; int pw = 0, ph = 0;
+        pehost_editor_pump(h);
+        if (pehost_editor_pixels(h, &px, &pw, &ph) && px && pw > 0 && ph > 0)
+            return 0;
+    }
+    v3_editor_detach(h->v3);
+    return -1;
+}
+
 int pehost_editor_open(pehost *h)
 {
     if (h && h->cl) return pefvst_editor_open(h->cl) ? 0 : -1;
     if (h && h->mv) return macvst_editor_open(h->mv);
+    if (h && h->au) return macau_editor_open(h->au);
     if (h && h->br) return bridge_editor_open(h->br);
+    if (h && h->is_v3 && v3_is_macho(h->v3)) return open_macho_v3_editor(h);
     void *container;
     int w = 0, ht = 0;
 
@@ -3405,7 +3585,15 @@ void pehost_editor_pump(pehost *h)
         return;
     }
     if (h && h->mv) { macvst_editor_pump(h->mv); return; }
+    if (h && h->au) { macau_editor_pump(h->au); return; }
     if (h && h->br) return;   /* the helper pumps its own editor */
+    if (h && h->is_v3 && v3_is_macho(h->v3)) {
+        /* No run loop here either, so the host fires the editor's timers and
+         * turns its dirty rects into draws. */
+        macns_fire_timers();
+        macns_draw_dirty();
+        return;
+    }
     w32_pump();
     /* VST2 editors animate off effEditIdle rather than a timer of their own. */
     if (h && !h->is_v3 && h->fx)
@@ -3420,7 +3608,10 @@ int pehost_editor_pixels(pehost *h, const unsigned int **px, int *w, int *height
         return p != NULL;
     }
     if (h && h->mv) return macvst_editor_pixels(h->mv, px, w, height);
+    if (h && h->au) return macau_editor_pixels(h->au, px, w, height);
     if (h && h->br) return bridge_editor_pixels(h->br, px, w, height);
+    if (h && h->is_v3 && v3_is_macho(h->v3))
+        return macmetal_pixels(px, w, height) || macquartz_editor_pixels(px, w, height);
     return w32_editor_pixels(px, w, height);
 }
 
@@ -3447,7 +3638,13 @@ void pehost_editor_mouse(pehost *h, int x, int y, int msg, int buttons, int whee
         return;
     }
     if (h && h->mv) { macvst_editor_mouse(h->mv, x, y, msg, buttons, wheel); return; }
+    if (h && h->au) { macau_editor_mouse(h->au, x, y, msg, buttons, wheel); return; }
     if (h && h->br) { bridge_editor_mouse(h->br, x, y, msg, buttons, wheel); return; }
+    if (h && h->is_v3 && v3_is_macho(h->v3)) {
+        /* Post only -- the pump paints. See macvst_editor_mouse. */
+        macns_post_mouse(x, y, msg, buttons, wheel);
+        return;
+    }
     (void)h;
     w32_mouse(x, y, msg, buttons, wheel);
 }
@@ -3456,11 +3653,19 @@ void pehost_editor_key(pehost *h, int vk, int down, int ch)
 {
     if (h && h->cl) { if (down) pefvst_editor_key(h->cl, ch ? ch : vk); return; }
     if (h && h->mv) { macvst_editor_key(h->mv, vk, down, ch); return; }
-    if (h && h->br) { bridge_editor_key(h->br, vk, down, ch); return; } (void)h; w32_key(vk, down, ch); }
+    if (h && h->au) { macau_editor_key(h->au, vk, down, ch); return; }
+    if (h && h->br) { bridge_editor_key(h->br, vk, down, ch); return; }
+    if (h && h->is_v3 && v3_is_macho(h->v3)) {
+        macns_post_key(vk, down, ch);
+        return;
+    } (void)h; w32_key(vk, down, ch); }
 
 /* True for a plugin loaded from a Mach-O bundle. Callers use it to label what
  * they are looking at, not to change behaviour. */
 int pehost_is_macos(pehost *h) { return h && (h->mv || h->au || h->is_mac || h->cl); }
+
+/* True for a plugin interpreted from a Classic bundle. */
+int pehost_is_classic(pehost *h) { return h && h->cl != NULL; }
 
 int pehost_has_editor(pehost *h)
 { return pehost_editor_kind(h) != PEHOST_EDITOR_NONE; }
@@ -3471,6 +3676,7 @@ void pehost_editor_size(pehost *h, int *w, int *height)
     if (!h) return;
     if (h->cl) { pefvst_editor_size(h->cl, w, height); return; }
     if (h->mv) { macvst_editor_size(h->mv, w, height); return; }
+    if (h->au) { macau_editor_size(h->au, w, height); return; }
     if (h->br) { bridge_editor_size(h->br, w, height); return; }
     if (h->is_v3) { v3_editor_size(h->v3, w, height); return; }
     if (h->fx) {
@@ -3494,6 +3700,7 @@ int pehost_editor_attach(pehost *h, unsigned long xid)
 void pehost_editor_detach(pehost *h)
 {
     if (h && h->mv) { macvst_editor_close(h->mv); return; }
+    if (h && h->au) { macau_editor_close(h->au); return; }
     if (h && h->br) { bridge_editor_close(h->br); return; }
     if (h && h->is_v3) v3_editor_detach(h->v3);
 }
@@ -3503,6 +3710,21 @@ void pehost_editor_resized(pehost *h, int w, int height)
 void pehost_import_stats(int *implemented, int *stubbed, int *called)
 {
     int i, c = 0;
+    /* A Classic plug-in has no PE import table; its numbers live in the cfm
+     * shim's binding table instead. */
+    if (g_last_classic) {
+        int bound = 0, unbound = 0, calls = 0;
+        char names[256] = "";
+        if (pefvst_import_stats(g_last_classic, &bound, &unbound, &calls,
+                                names, sizeof names) == 0) {
+            if (implemented) *implemented = bound;
+            if (stubbed)     *stubbed     = unbound;
+            if (called)      *called      = calls;
+            if (unbound)
+                fprintf(stderr, "imports with no implementation: %s\n", names);
+            return;
+        }
+    }
     for (i = 0; i < g_nimp; i++) if (g_imp[i].calls) c++;
     if (implemented) *implemented = g_nresolved;
     if (stubbed)     *stubbed     = g_nimp;

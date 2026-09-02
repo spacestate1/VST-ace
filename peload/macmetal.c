@@ -24,6 +24,8 @@
  * and the fragment shader's gradient/image/scissor maths.
  */
 #define _GNU_SOURCE
+#include <unistd.h>
+#include <pthread.h>
 #include <math.h>
 #include <time.h>
 #include <stdint.h>
@@ -225,6 +227,44 @@ static void chan_order(int fmt, int *r, int *g, int *b, int *a)
     else                 { *r = 0; *g = 1; *b = 2; *a = 3; }
 }
 
+/* ---- what the editor allocated -----------------------------------------
+ *
+ * A texture or a buffer is an Objective-C object, and objects here are retired
+ * rather than freed -- see macobjc.c for why. Their *payloads* are not objects
+ * though: they are plain allocations, and a font atlas plus a drawable plus the
+ * vertex and uniform buffers come to megabytes per editor. Nothing freed them,
+ * so opening one plugin after another grew the heap by about six megabytes a
+ * time -- a hundred plug-ins into a browsing session, half a gigabyte.
+ *
+ * They are recorded here and released by macmetal_reset, which the host already
+ * calls when a plugin closes and which already did exactly this for the layer's
+ * back buffer. The objects themselves stay retired; it is the pixels that
+ * mattered. */
+#define MAX_PAYLOAD 4096
+static void   *g_payload[MAX_PAYLOAD];
+static int     g_npayload;
+
+static void *payload_alloc(size_t n)
+{
+    void *p = calloc(1, n ? n : 1);
+    if (!p) return NULL;
+    if (g_npayload < MAX_PAYLOAD) g_payload[g_npayload++] = p;
+    return p;
+}
+static void payload_forget(void *p)
+{
+    int i;
+    if (!p) return;
+    for (i = 0; i < g_npayload; i++)
+        if (g_payload[i] == p) { g_payload[i] = g_payload[--g_npayload]; return; }
+}
+static void payload_free_all(void)
+{
+    int i;
+    for (i = 0; i < g_npayload; i++) free(g_payload[i]);
+    g_npayload = 0;
+}
+
 static mtl_texture *tex_make(int fmt, int w, int h)
 {
     mtl_texture *t = (mtl_texture *)new_of("MTLTexture");
@@ -233,7 +273,7 @@ static mtl_texture *tex_make(int fmt, int w, int h)
     if (h < 1) h = 1;
     t->fmt = fmt; t->w = w; t->h = h;
     t->bpp = bytes_per_pixel(fmt);
-    t->px = calloc((size_t)w * h, (size_t)t->bpp);
+    t->px = payload_alloc((size_t)w * (size_t)h * (size_t)t->bpp);
     return t;
 }
 
@@ -279,12 +319,15 @@ int macmetal_active(void) { return g_layer && g_layer->back; }
  * framebuffer sized for the last one. */
 void macmetal_reset(void)
 {
-    if (g_layer) {
-        free(g_layer->back ? g_layer->back->px : NULL);
-        if (g_layer->back) g_layer->back->px = NULL;
+    if (g_layer && g_layer->back) {
+        payload_forget(g_layer->back->px);
+        free(g_layer->back->px);
+        g_layer->back->px = NULL;
         g_layer->back = NULL;
     }
     g_layer = NULL;
+    /* And everything else the editor's textures and buffers were holding. */
+    payload_free_all();
 }
 
 void macmetal_set_size(int w, int h)
@@ -497,23 +540,44 @@ void macmetal_stats(unsigned long *tris, unsigned long *shaded, double *ms)
     g_raster_ms = 0.0;
 }
 
-/* One triangle, with the whole pipeline applied per pixel. Kept as a single
- * function because every draw call in nanovg reduces to this. */
+/* One triangle, with the whole pipeline applied per pixel.
+ *
+ * The per-pixel work is in raster_rows so that a big triangle can be split by
+ * scanline across cores -- see draw_bands below. Everything the inner loop
+ * needs that does not vary from row to row is gathered here first. */
+typedef struct {
+    mtl_encoder     *e;
+    const nvg_uniforms *u;
+    mtl_texture     *ct, *st;
+    mtl_pipeline    *pipe;
+    mtl_stencildesc *sd;
+    vtx    a, b, c;
+    float  area, sx, sy, ox, oy;
+    int    x0, x1;
+} tri_ctx;
+
+static void raster_rows(const tri_ctx *t, int y0, int y1, unsigned long *shaded);
+
+typedef struct { unsigned long tris, shaded; } raster_stats;
+
 static void raster_tri(mtl_encoder *e, const nvg_uniforms *u,
-                       const vtx *a, const vtx *b, const vtx *c)
+                       const vtx *a, const vtx *b, const vtx *c,
+                       int by0, int by1, raster_stats *rs)
 {
     mtl_texture *ct = e->color, *st = e->sten;
     mtl_pipeline *pipe = e->pipe;
     mtl_dsstate *ds = e->ds;
     mtl_stencildesc *sd = ds ? ds->front : NULL;
     float minx, maxx, miny, maxy, area;
-    int x0, x1, y0, y1, x, y;
+    int x0, x1, y0, y1;
     int clipx0, clipy0, clipx1, clipy1;
     vtx A, B, C;
     float sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
 
     if (!ct || !ct->px) return;
-    g_tris++;
+    /* Counted once per triangle, by whichever band starts at the top -- the
+     * others are the same triangle seen again. */
+    if (by0 == 0) rs->tris++;
 
     /* nanovg works in points and hands the shader a viewSize to divide by, while
      * the viewport is in pixels -- the difference is the backing scale factor.
@@ -553,6 +617,33 @@ static void raster_tri(mtl_encoder *e, const nvg_uniforms *u,
     if (x1 > clipx1) x1 = clipx1;
     if (y0 < clipy0) y0 = clipy0;
     if (y1 > clipy1) y1 = clipy1;
+
+    /* This band's rows only. */
+    if (y0 < by0) y0 = by0;
+    if (y1 > by1) y1 = by1;
+    if (y1 <= y0) return;
+
+    { tri_ctx t;
+      t.e = e; t.u = u; t.ct = ct; t.st = st; t.pipe = pipe; t.sd = sd;
+      t.a = *a; t.b = *b; t.c = *c;
+      t.area = area; t.sx = sx; t.sy = sy; t.ox = ox; t.oy = oy;
+      t.x0 = x0; t.x1 = x1;
+      raster_rows(&t, y0, y1, &rs->shaded); }
+}
+
+/* The pixels of one triangle, for the rows [y0, y1). */
+static void raster_rows(const tri_ctx *t, int y0, int y1, unsigned long *shaded)
+{
+    mtl_encoder *e = t->e;
+    const nvg_uniforms *u = t->u;
+    mtl_texture *ct = t->ct, *st = t->st;
+    mtl_pipeline *pipe = t->pipe;
+    mtl_stencildesc *sd = t->sd;
+    const vtx *a = &t->a, *b = &t->b, *c = &t->c;
+    const float area = t->area, sx = t->sx, sy = t->sy, ox = t->ox, oy = t->oy;
+    const int x0 = t->x0, x1 = t->x1;
+    unsigned long sh = 0;
+    int x, y;
 
     for (y = y0; y < y1; y++) {
         for (x = x0; x < x1; x++) {
@@ -598,7 +689,7 @@ static void raster_tri(mtl_encoder *e, const nvg_uniforms *u,
 
             off = ((size_t)y * ct->w + x) * (size_t)ct->bpp;
             dp = ct->px + off;
-            g_shaded++;
+            sh++;
             if (ct->bpp == 4) {
                 int ri, gi, bi, ai;
                 float d[4], o[4];
@@ -622,7 +713,9 @@ static void raster_tri(mtl_encoder *e, const nvg_uniforms *u,
             }
         }
     }
+    *shaded += sh;
 }
+
 
 static const nvg_uniforms *cur_uniforms(mtl_encoder *e)
 {
@@ -633,25 +726,220 @@ static const nvg_uniforms *cur_uniforms(mtl_encoder *e)
     return (const nvg_uniforms *)((uint8_t *)b->data + e->foff[0]);
 }
 
+
+/* ---- one draw call, banded ---------------------------------------------
+ *
+ * A call is a stream of triangles the plug-in issued in order. Give each band a
+ * horizontal strip of the target and let every band walk the whole stream,
+ * drawing only the rows it owns: a pixel is written by exactly one band, and
+ * within that band the triangles are applied in the order they arrived. The
+ * blending, the stencil read-modify-write and the overdraw are therefore
+ * unchanged, and the image is the one the single-threaded loop produced -- which
+ * is compared byte for byte across the corpus rather than assumed.
+ *
+ * Banding the call rather than the triangle is what makes it work for FB-7999,
+ * whose frame is twelve thousand small triangles: no one of them is worth a
+ * handoff, and together they are most of a second per twenty frames. */
+typedef struct {
+    mtl_encoder        *e;
+    const nvg_uniforms *u;
+    int                 prim;
+    const vtx          *v;
+    unsigned long       n;        /* vertices, for the non-indexed forms */
+    const void         *ix;       /* NULL unless indexed */
+    int                 itype;    /* 0 = uint16, else uint32 */
+    unsigned long       count;    /* indices */
+    mtl_buffer         *vb;
+    unsigned long       voff;
+} draw_job;
+
+static unsigned long job_ntri(const draw_job *j)
+{
+    if (j->ix) return j->count / 3;
+    if (j->prim == PRIM_TRISTRIP) return j->n >= 2 ? j->n - 2 : 0;
+    return j->n / 3;
+}
+
+/* The k'th triangle, or 0 when the buffers do not hold it. */
+static int job_tri(const draw_job *j, unsigned long k,
+                   const vtx **a, const vtx **b, const vtx **c)
+{
+    if (j->ix) {
+        unsigned long i = k * 3, ia, ib, ic;
+        if (j->itype == 0) {
+            const uint16_t *x = (const uint16_t *)j->ix;
+            ia = x[i]; ib = x[i + 1]; ic = x[i + 2];
+        } else {
+            const uint32_t *x = (const uint32_t *)j->ix;
+            ia = x[i]; ib = x[i + 1]; ic = x[i + 2];
+        }
+        if (j->voff + (ia + 1) * sizeof(vtx) > j->vb->len) return 0;
+        if (j->voff + (ib + 1) * sizeof(vtx) > j->vb->len) return 0;
+        if (j->voff + (ic + 1) * sizeof(vtx) > j->vb->len) return 0;
+        *a = &j->v[ia]; *b = &j->v[ib]; *c = &j->v[ic];
+        return 1;
+    }
+    if (j->prim == PRIM_TRISTRIP) {
+        /* Alternating winding, as a strip has. raster_tri does not cull, so
+         * this only matters for interpolation -- keep it faithful anyway. */
+        if (k & 1) { *a = &j->v[k + 1]; *b = &j->v[k]; *c = &j->v[k + 2]; }
+        else       { *a = &j->v[k];     *b = &j->v[k + 1]; *c = &j->v[k + 2]; }
+        return 1;
+    }
+    *a = &j->v[k * 3]; *b = &j->v[k * 3 + 1]; *c = &j->v[k * 3 + 2];
+    return 1;
+}
+
+/* Roughly how many pixels this call will touch: the triangles' bounding boxes,
+ * which overestimates by about half and is the same overestimate every time.
+ * Stops counting once the answer is past the threshold, so a big call pays for
+ * a few triangles rather than all of them. */
+static long job_work(const draw_job *j, long enough)
+{
+    unsigned long k, n = job_ntri(j);
+    long total = 0;
+    float sx = 1.0f, sy = 1.0f;
+    const mtl_encoder *e = j->e;
+    if (e->vsw > 0.0f && e->vw > 0.0) sx = (float)e->vw / e->vsw;
+    if (e->vsh > 0.0f && e->vh > 0.0) sy = (float)e->vh / e->vsh;
+    for (k = 0; k < n; k++) {
+        const vtx *a, *b, *c;
+        float x0, x1, y0, y1;
+        if (!job_tri(j, k, &a, &b, &c)) continue;
+        x0 = fminf(a->x, fminf(b->x, c->x)); x1 = fmaxf(a->x, fmaxf(b->x, c->x));
+        y0 = fminf(a->y, fminf(b->y, c->y)); y1 = fmaxf(a->y, fmaxf(b->y, c->y));
+        total += (long)((x1 - x0) * sx * (y1 - y0) * sy);
+        if (total >= enough) return total;
+    }
+    return total;
+}
+
+static void job_rows(const draw_job *j, int by0, int by1, raster_stats *rs)
+{
+    unsigned long k, n = job_ntri(j);
+    for (k = 0; k < n; k++) {
+        const vtx *a, *b, *c;
+        if (!job_tri(j, k, &a, &b, &c)) continue;
+        raster_tri(j->e, j->u, a, b, c, by0, by1, rs);
+    }
+}
+
+/* What a call has to be worth before it is split. The handoff is two condition
+ * variables and a dozen wakeups -- tens of microseconds -- so it pays only for
+ * a call that will shade a substantial part of a frame. Judging that by the
+ * size of the target instead was a fifty-millisecond mistake: FB-7999 issues
+ * twenty-three hundred draw calls a frame, eight triangles each, and banding
+ * every one of them cost twice what drawing them did. */
+#define RASTER_MIN_ROWS   64
+#define RASTER_MIN_WORK   150000    /* pixels, summed over the call's triangles */
+#define RASTER_MAX_BANDS  12
+
+static int             g_nband;                  /* 0 until the pool is up */
+static pthread_t       g_rthread[RASTER_MAX_BANDS - 1];
+static pthread_mutex_t g_rlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_rgo   = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_rdone = PTHREAD_COND_INITIALIZER;
+static const draw_job *g_rjob;
+static int             g_rgen, g_rleft, g_ry0, g_ry1;
+static raster_stats    g_rstats[RASTER_MAX_BANDS];
+
+static void band_range(int y0, int y1, int band, int *a, int *b)
+{
+    long span = y1 - y0;
+    *a = y0 + (int)(span * band / g_nband);
+    *b = y0 + (int)(span * (band + 1) / g_nband);
+}
+
+static void *raster_worker(void *arg)
+{
+    int id = (int)(long)arg, seen = 0;
+    for (;;) {
+        int a, b;
+        pthread_mutex_lock(&g_rlock);
+        while (g_rgen == seen) pthread_cond_wait(&g_rgo, &g_rlock);
+        seen = g_rgen;
+        pthread_mutex_unlock(&g_rlock);
+        band_range(g_ry0, g_ry1, id, &a, &b);
+        if (b > a) job_rows(g_rjob, a, b, &g_rstats[id]);
+        pthread_mutex_lock(&g_rlock);
+        if (--g_rleft == 0) pthread_cond_signal(&g_rdone);
+        pthread_mutex_unlock(&g_rlock);
+    }
+    return NULL;                                  /* not reached */
+}
+
+/* Brought up on the first call worth splitting, so a host that only ever shows
+ * Core Graphics editors never creates a thread. */
+static void raster_pool_start(void)
+{
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int i, n;
+    if (g_nband) return;
+    n = ncpu > 1 ? (int)ncpu : 1;
+    if (n > RASTER_MAX_BANDS) n = RASTER_MAX_BANDS;
+    g_nband = n;
+    for (i = 1; i < n; i++)
+        if (pthread_create(&g_rthread[i - 1], NULL, raster_worker,
+                           (void *)(long)i) != 0) {
+            g_nband = i;          /* however many started is however many bands */
+            break;
+        }
+}
+
+static void draw_bands(const draw_job *j)
+{
+    mtl_texture *ct = j->e ? j->e->color : NULL;
+    raster_stats rs;
+    int h, i, a, b;
+
+    if (!ct || !ct->px) return;
+    h = ct->h;
+    rs.tris = rs.shaded = 0;
+
+    if (h < RASTER_MIN_ROWS || job_ntri(j) < 2 ||
+        job_work(j, RASTER_MIN_WORK) < RASTER_MIN_WORK) {
+        job_rows(j, 0, h, &rs);
+        g_tris += rs.tris; g_shaded += rs.shaded;
+        return;
+    }
+    raster_pool_start();
+    if (g_nband < 2) {
+        job_rows(j, 0, h, &rs);
+        g_tris += rs.tris; g_shaded += rs.shaded;
+        return;
+    }
+
+    pthread_mutex_lock(&g_rlock);
+    g_rjob = j; g_ry0 = 0; g_ry1 = h;
+    for (i = 0; i < g_nband; i++) g_rstats[i].tris = g_rstats[i].shaded = 0;
+    g_rleft = g_nband - 1;
+    g_rgen++;
+    pthread_cond_broadcast(&g_rgo);
+    pthread_mutex_unlock(&g_rlock);
+
+    band_range(0, h, 0, &a, &b);
+    if (b > a) job_rows(j, a, b, &g_rstats[0]);
+
+    pthread_mutex_lock(&g_rlock);
+    while (g_rleft > 0) pthread_cond_wait(&g_rdone, &g_rlock);
+    pthread_mutex_unlock(&g_rlock);
+
+    for (i = 0; i < g_nband; i++)
+        { g_tris += g_rstats[i].tris; g_shaded += g_rstats[i].shaded; }
+}
+
 static void draw_range(mtl_encoder *e, int prim, const vtx *v, unsigned long n)
 {
-    const nvg_uniforms *u = cur_uniforms(e);
-    unsigned long i;
+    draw_job j;
     double t0 = now_ms();
 
-    if (prim == PRIM_TRI) {
-        for (i = 0; i + 2 < n; i += 3) raster_tri(e, u, &v[i], &v[i + 1], &v[i + 2]);
-    } else if (prim == PRIM_TRISTRIP) {
-        for (i = 0; i + 2 < n; i++) {
-            /* Alternate winding, as a strip does. raster_tri does not cull, so
-             * the order only matters for interpolation, but keep it faithful. */
-            if (i & 1) raster_tri(e, u, &v[i + 1], &v[i], &v[i + 2]);
-            else       raster_tri(e, u, &v[i], &v[i + 1], &v[i + 2]);
-        }
-    }
-    /* Points and lines: nanovg never emits them. */
+    if (prim != PRIM_TRI && prim != PRIM_TRISTRIP) return;   /* nanovg emits neither */
+    memset(&j, 0, sizeof j);
+    j.e = e; j.u = cur_uniforms(e); j.prim = prim; j.v = v; j.n = n;
+    draw_bands(&j);
     g_raster_ms += now_ms() - t0;
 }
+
 
 /* ------------------------------------------------------------ MTLDevice */
 
@@ -664,7 +952,7 @@ static id dev_new_buffer(id self, SEL sel, unsigned long len, unsigned long opts
     (void)self; (void)sel; (void)opts;
     if (!b) return NULL;
     b->len = len;
-    b->data = calloc(1, len ? len : 1);
+    b->data = payload_alloc(len);
     return b;
 }
 
@@ -929,33 +1217,30 @@ static void enc_draw_indexed(id self, SEL sel, unsigned long prim,
 {
     mtl_encoder *e = self;
     mtl_buffer *vb, *ib = ibufp;
-    const nvg_uniforms *u;
-    const vtx *v;
-    unsigned long i;
+    draw_job j;
+    unsigned long isz, room;
     double t0 = now_ms();
     (void)sel;
 
     if (!e || !(vb = e->vbuf[0]) || !vb->data || !ib || !ib->data) return;
-    v = (const vtx *)((uint8_t *)vb->data + e->voff[0]);
-    u = cur_uniforms(e);
-
     if (prim != PRIM_TRI) return;
-    for (i = 0; i + 2 < count; i += 3) {
-        unsigned long a, b, c;
-        if (itype == 0) {                                   /* uint16 */
-            const uint16_t *ix = (const uint16_t *)((uint8_t *)ib->data + ioff);
-            if (ioff + (i + 3) * 2 > ib->len) return;
-            a = ix[i]; b = ix[i + 1]; c = ix[i + 2];
-        } else {
-            const uint32_t *ix = (const uint32_t *)((uint8_t *)ib->data + ioff);
-            if (ioff + (i + 3) * 4 > ib->len) return;
-            a = ix[i]; b = ix[i + 1]; c = ix[i + 2];
-        }
-        if (e->voff[0] + (a + 1) * sizeof(vtx) > vb->len) continue;
-        if (e->voff[0] + (b + 1) * sizeof(vtx) > vb->len) continue;
-        if (e->voff[0] + (c + 1) * sizeof(vtx) > vb->len) continue;
-        raster_tri(e, u, &v[a], &v[b], &v[c]);
-    }
+
+    /* Trim to what the index buffer actually holds, once, rather than checking
+     * inside the loop -- the loop now runs on several threads. */
+    isz = itype == 0 ? 2 : 4;
+    if (ioff >= ib->len) return;
+    room = (ib->len - ioff) / isz;
+    if (count > room) count = room;
+
+    memset(&j, 0, sizeof j);
+    j.e = e; j.u = cur_uniforms(e); j.prim = PRIM_TRI;
+    j.v = (const vtx *)((uint8_t *)vb->data + e->voff[0]);
+    j.ix = (const uint8_t *)ib->data + ioff;
+    j.itype = itype == 0 ? 0 : 1;
+    j.count = count;
+    j.vb = vb;
+    j.voff = e->voff[0];
+    draw_bands(&j);
     g_raster_ms += now_ms() - t0;
 }
 

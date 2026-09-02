@@ -42,6 +42,11 @@ int bridge_num_params(const bridge *b);
 int bridge_num_inputs(const bridge *b);
 int bridge_num_outputs(const bridge *b);
 int bridge_is_synth(const bridge *b);
+/* Whether the helper is still there. A plug-in that faults takes its helper
+ * with it, and everything after that quietly returns nothing -- a frozen
+ * editor and silence, with no way for the window to say which. */
+int bridge_alive(const bridge *b);
+void bridge_set_input_mask(bridge *b, unsigned mask);
 int bridge_unique_id(const bridge *b);
 
 void  bridge_param_name(bridge *b, int i, char *buf, int n);

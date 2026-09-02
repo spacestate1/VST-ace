@@ -466,7 +466,8 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
      * different paths, and "it drew something" is the interesting part. */
     printf("\neditor: %s\n",
            kind == PEHOST_EDITOR_PIXELS
-               ? (pehost_is_macos(h) ? "pixel buffer (software Metal)"
+               ? (pehost_is_classic(h) ? "pixel buffer (QuickDraw shim)"
+                  : pehost_is_macos(h) ? "pixel buffer (software Metal)"
                                      : "pixel buffer (Win32 layer)")
            : kind == PEHOST_EDITOR_X11 ? "X11 embed (needs a window)"
                                        : "none");
@@ -529,7 +530,8 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
         /* The drag. Which parameter to watch is whichever the press moves --
          * the control under the pointer names itself by changing. */
         if (o->has_drag) {
-            int np = pehost_num_params(h), pi;
+            int np = pehost_num_params(h), pi, swept = 0;
+#define SWEEP_STEPS 16
             for (pi = 0; pi < np && pi < MAX_WATCH_PARAMS; pi++)
                 before[pi] = pehost_get_param(h, pi);
 
@@ -560,7 +562,24 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
                 pehost_editor_pump(h);
                 usleep(4000);
             }
-            if (!g_drag.released) {   /* never entered a tracking loop */
+            /* A Cocoa editor never enters that loop. It returns from mouseDown:
+             * and waits for the mouseDragged: events a run loop would deliver,
+             * so the host delivers them -- which is exactly what both windows do
+             * when the pointer moves with a button held. Without this the
+             * gesture was a press and a release with nothing in between, and a
+             * control that only moves while tracking never moved at all. */
+            if (g_drag.nseen == 0) {
+                for (swept = 1; swept <= SWEEP_STEPS; swept++) {
+                    int mx = o->drag[0] + (o->drag[2] - o->drag[0]) * swept / SWEEP_STEPS;
+                    int my = o->drag[1] + (o->drag[3] - o->drag[1]) * swept / SWEEP_STEPS;
+                    pehost_editor_mouse(h, mx, my, WM_MOUSEMOVE, 1, 0);
+                    if (g_drag.watch >= 0)
+                        g_drag.seen[swept - 1] = pehost_get_param(h, g_drag.watch);
+                    usleep(4000);
+                }
+                swept = SWEEP_STEPS;
+            }
+            if (!g_drag.released) {
                 g_drag.released = 1;
                 pehost_editor_mouse(h, o->drag[2], o->drag[3], WM_LBUTTONUP, 0, 0);
             }
@@ -570,7 +589,8 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
             {
                 int moved = 0;
                 printf("  dragged %d,%d -> %d,%d, %d pointer step(s) delivered",
-                       o->drag[0], o->drag[1], o->drag[2], o->drag[3], g_drag.nseen);
+                       o->drag[0], o->drag[1], o->drag[2], o->drag[3],
+                       g_drag.nseen ? g_drag.nseen : swept);
                 for (pi = 0; pi < np && pi < MAX_WATCH_PARAMS; pi++) {
                     float now = pehost_get_param(h, pi);
                     if (fabs(now - before[pi]) > 1e-6) {
@@ -582,9 +602,19 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
                 }
                 if (!moved) printf(" -- nothing moved");
                 printf("\n");
-                if (g_drag.nseen == 0)
+                if (g_drag.nseen == 0 && swept == 0)
                     printf("    (no steps delivered: the plug-in never entered a "
                            "tracking loop, so this was a click, not a drag)\n");
+                /* Whether the control tracked the sweep or merely landed on the
+                 * final value. A knob that only answers the release looks
+                 * identical at the end and completely different to use. */
+                if (g_drag.watch >= 0 && swept > 0) {
+                    int st, tracked = 0;
+                    for (st = 1; st < swept; st++)
+                        if (fabs(g_drag.seen[st] - g_drag.seen[st - 1]) > 1e-6) tracked++;
+                    printf("    tracked the sweep: %d of %d steps changed the value\n",
+                           tracked, swept - 1);
+                }
             }
         }
         if (pehost_editor_pixels(h, &px, &pw, &ph) && px && pw > 0 && ph > 0) {
@@ -646,8 +676,18 @@ int main(int argc, char **argv)
             printf("\nwrote %s (%d parameters)\n", o.patch_out, pehost_num_params(h));
     }
 
-    if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
-    if (o.shot) capture_editor(h, o.shot, &o);
+    /* Order matters when both are asked for. Normally the render comes first,
+     * so a WAV describes the state the listing above just printed. But a --click
+     * or --drag exists to change something, and the question it is asked to
+     * answer is whether the change reached the audio -- so the gesture goes
+     * first and the render records what came out afterwards. */
+    if (o.shot && (o.nclick || o.has_drag)) {
+        capture_editor(h, o.shot, &o);
+        if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
+    } else {
+        if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
+        if (o.shot) capture_editor(h, o.shot, &o);
+    }
 
     {
         int impl, stub, called;

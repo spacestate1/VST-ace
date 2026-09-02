@@ -64,6 +64,9 @@ struct macvst {
      * the native loader fills this; a Mach-O bundle answers from its own. */
     char              dir[1024];
 
+    /* The host-owned NSView an editor is grafted into. See macvst_editor_open. */
+    void             *parent;
+
     /* The transport handed back from audioMasterGetTime. It has to outlive the
      * callback, because the plugin keeps the pointer. */
     VstTimeInfo       time;
@@ -89,6 +92,32 @@ static intptr_t host_cb(AEffect *fx, int32_t op, int32_t idx, intptr_t val,
     case 33: case 34:
         if (ptr) snprintf(ptr, 64, "peload");
         return 1;
+    case 37: {
+        /* audioMasterCanDo. `ptr` names the thing being asked about.
+         *
+         * The one that matters on macOS is Cockos' "hasCockosViewAsConfig".
+         * Answering it with 0xbeef0000 is how a host says that the pointer it
+         * passes to effEditOpen is an NSView*, and not a Carbon WindowRef.
+         * iPlug1-era plugins read silence as "Carbon" and go off into
+         * HIToolbox, which is not implemented here and never will be -- so they
+         * built no view, drew nothing, and reported an empty rect. That is
+         * every Audio Damage editor in this corpus.
+         *
+         * The rest are the ordinary VST2 host capabilities. Answering them is
+         * not decoration: a plugin that asks whether it may send MIDI and is
+         * told nothing will not send any. */
+        const char *what = ptr;
+        if (!what) return 0;
+        if (!strcmp(what, "hasCockosViewAsConfig")) return (intptr_t)0xbeef0000;
+        if (!strcmp(what, "sendVstEvents")      || !strcmp(what, "sendVstMidiEvent") ||
+            !strcmp(what, "sendVstTimeInfo")    || !strcmp(what, "receiveVstEvents") ||
+            !strcmp(what, "receiveVstMidiEvent")|| !strcmp(what, "receiveVstTimeInfo") ||
+            !strcmp(what, "sizeWindow")         || !strcmp(what, "supplyIdle") ||
+            !strcmp(what, "startStopProcess")   || !strcmp(what, "acceptIOChanges") ||
+            !strcmp(what, "supportShell"))
+            return 1;
+        return 0;
+    }
     case 7:
         /* audioMasterGetTime. Filled fresh each ask, from the position the
          * render loop maintains. */
@@ -432,9 +461,16 @@ int macvst_editor_open(macvst *h)
     if (!h || !h->fx || !macvst_editor_kind(h)) return -1;
     if (h->editor_open) return 0;
     macvst_editor_size(h, &w, &hh);
-    /* NULL parent: the plugin builds its own NSView, and nothing here has a
-     * window to graft it into. It renders to its layer either way. */
-    h->fx->dispatcher(h->fx, effEditOpen, 0, 0, NULL, 0.0f);
+    /* A parent view, rather than NULL.
+     *
+     * An iPlug2 editor ignores what it is given and builds its own view either
+     * way, which is why NULL served for as long as the corpus was iPlug2. A
+     * VSTGUI editor does not: it grafts its frame into the view it is handed
+     * and, given nothing, decides it is being hosted through Carbon instead --
+     * a framework that is not here and is not coming. The runtime can mint an
+     * NSView, so it does. */
+    if (!h->parent) h->parent = macns_make_view(w, hh);
+    h->fx->dispatcher(h->fx, effEditOpen, 0, 0, h->parent, 0.0f);
     h->fx->dispatcher(h->fx, effEditTop, 0, 0, NULL, 0.0f);
     h->editor_open = 1;
 
@@ -532,16 +568,24 @@ int macvst_editor_pixels(macvst *h, const unsigned int **px, int *w, int *hh)
 
 /* Mouse and keys reach the editor as Cocoa events would. The plugin's view is
  * one of its own classes, so these are messages to it. */
+/* Post the event; do not paint.
+ *
+ * Painting here meant one full repaint per mouse event, and a mouse reports
+ * far faster than an editor can be drawn -- a pointer moving across Qyooo's
+ * editor asked for a 31 ms frame every few milliseconds, so the queue backed
+ * up and the dial arrived in lurches. The Win32 path never did this: it posts
+ * WM_MOUSEMOVE and lets the pump turn the invalid region into a WM_PAINT, so
+ * however many events arrive between frames, one frame is drawn. This is that,
+ * for Cocoa: the event marks the view dirty and macvst_editor_pump draws it,
+ * once, when the host asks for the next frame. */
 void macvst_editor_mouse(macvst *h, int x, int y, int msg, int buttons, int wheel)
 {
     if (!h || !h->editor_open) return;
     macns_post_mouse(x, y, msg, buttons, wheel);
-    macvst_editor_pump(h);
 }
 
 void macvst_editor_key(macvst *h, int vk, int down, int ch)
 {
     if (!h || !h->editor_open) return;
     macns_post_key(vk, down, ch);
-    macvst_editor_pump(h);
 }

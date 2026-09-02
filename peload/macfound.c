@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <math.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdint.h>
@@ -171,15 +172,90 @@ static int dw_closedir(void *dp)
 
 /* --------------------------------------------------------------- Blocks */
 
-/* A block is a struct whose third word is the function to call; the compiler
- * emits a reference to __NSConcreteStackBlock as its isa. Only the isa needs to
- * exist for a stack block -- invoking is the plugin's own business. */
+/* A block is a struct whose fourth word is the function to call; the compiler
+ * emits a reference to __NSConcreteStackBlock as its isa, and one to
+ * __NSConcreteMallocBlock for the heap copy anything asynchronous has to make.
+ *
+ * The copy is the part that matters. A block literal lives on the *stack*, and
+ * the contract is that whoever takes it beyond the enclosing call copies it to
+ * the heap first -- which is exactly what dispatch_async does. Keeping the
+ * stack pointer instead reads a frame that has since returned. It survives for
+ * as long as nothing reuses that stack, which is why it took three plug-ins in
+ * one browsing session to fault, on a thread with no connection to whatever the
+ * host was doing at the time. */
 static void *g_concrete_stack_block[8];
+static void *g_concrete_malloc_block[8];
 
+#define BLOCK_HAS_COPY_DISPOSE (1 << 25)
+#define BLOCK_NEEDS_FREE       (1 << 24)
+#define BLOCK_IS_GLOBAL        (1 << 28)
+
+struct block_descriptor   { unsigned long reserved, size; };
+/* Present only when BLOCK_HAS_COPY_DISPOSE says so, immediately after the
+ * first descriptor. */
+struct block_descriptor_2 { void (*copy)(void *dst, const void *src);
+                            void (*dispose)(const void *); };
+struct block_layout {
+    void *isa;
+    int   flags, reserved;
+    void (*invoke)(void *);
+    struct block_descriptor *descriptor;
+};
+
+static void *block_copy(void *p)
+{
+    struct block_layout *b = p, *c;
+    size_t sz;
+
+    if (!b || !b->descriptor) return b;
+    if (b->flags & BLOCK_IS_GLOBAL) return b;      /* nothing to copy */
+    if (b->flags & BLOCK_NEEDS_FREE) return b;     /* already on the heap */
+    sz = (size_t)b->descriptor->size;
+    /* A size outside this range is not a layout this understands, and copying
+     * by it would be worse than not copying at all. */
+    if (sz < sizeof *b || sz > (1u << 20)) return b;
+    if (!(c = malloc(sz))) return b;
+    memcpy(c, b, sz);
+    c->isa   = g_concrete_malloc_block;
+    c->flags = (b->flags & ~BLOCK_IS_GLOBAL) | BLOCK_NEEDS_FREE;
+    /* The compiler emits a helper to fix up whatever the block captured --
+     * objects to retain, other blocks to copy in turn. Skipping it leaves the
+     * copy sharing the original's captures, which is the bug again one level
+     * down. */
+    if (b->flags & BLOCK_HAS_COPY_DISPOSE) {
+        struct block_descriptor_2 *d2 = (struct block_descriptor_2 *)(b->descriptor + 1);
+        if (d2->copy) d2->copy(c, b);
+    }
+    return c;
+}
+
+static void block_release(void *p)
+{
+    struct block_layout *b = p;
+    if (!b || !(b->flags & BLOCK_NEEDS_FREE)) return;
+    if (b->flags & BLOCK_HAS_COPY_DISPOSE) {
+        struct block_descriptor_2 *d2 = (struct block_descriptor_2 *)(b->descriptor + 1);
+        if (d2->dispose) d2->dispose(b);
+    }
+    free(b);
+}
+
+/* BLOCK_FIELD_IS_BLOCK: a captured block is copied rather than borrowed, for
+ * the same reason the outer one is. Everything else is stored as-is -- objects
+ * here are retired rather than freed, so borrowing one is safe. */
+#define BLOCK_FIELD_IS_BLOCK 7
 static void bl_object_assign(void *dst, const void *src, int flags)
-{ (void)flags; if (dst) *(const void **)dst = src; }
+{
+    if (!dst) return;
+    if ((flags & 0xff) == BLOCK_FIELD_IS_BLOCK)
+        *(void **)dst = block_copy((void *)src);
+    else
+        *(const void **)dst = src;
+}
 static void bl_object_dispose(const void *obj, int flags)
-{ (void)obj; (void)flags; }
+{
+    if ((flags & 0xff) == BLOCK_FIELD_IS_BLOCK) block_release((void *)obj);
+}
 
 /* ----------------------------------------------------------------- GCD */
 
@@ -205,25 +281,139 @@ static long gcd_sem_wait(void *p, uint64_t timeout)
 /* A block invoked on a queue. Running it on a fresh thread preserves the
  * asynchrony a plugin is relying on; running it inline would deadlock anything
  * that dispatches from a callback and then waits. */
-typedef struct { void *(*invoke)(void *); void *blk; } gcd_job;
-struct block_layout { void *isa; int flags, reserved; void (*invoke)(void *); };
+/* In-flight jobs, so an image is never unmapped out from under one. A block's
+ * `invoke` points into the plugin, and munmap while a job is pending jumps into
+ * nothing -- see macshim_gcd_drain, which macho_close waits on. */
+static pthread_mutex_t g_gcd_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_gcd_idle = PTHREAD_COND_INITIALIZER;
+static int             g_gcd_inflight;
 
 static void *gcd_thread(void *ud)
 {
     struct block_layout *b = ud;
     if (b && b->invoke) b->invoke(b);
+    block_release(b);
+    pthread_mutex_lock(&g_gcd_lock);
+    if (--g_gcd_inflight == 0) pthread_cond_broadcast(&g_gcd_idle);
+    pthread_mutex_unlock(&g_gcd_lock);
     return NULL;
 }
 static void gcd_async(void *queue, void *block)
 {
     pthread_t t;
+    void *copy;
     (void)queue;
     if (!block) return;
-    if (pthread_create(&t, NULL, gcd_thread, block) == 0) pthread_detach(t);
+    /* Copied to the heap first: the caller's frame is gone by the time the
+     * thread runs. This is what real GCD does and what the compiler assumes. */
+    copy = block_copy(block);
+    pthread_mutex_lock(&g_gcd_lock);
+    g_gcd_inflight++;
+    pthread_mutex_unlock(&g_gcd_lock);
+    if (pthread_create(&t, NULL, gcd_thread, copy) == 0) {
+        pthread_detach(t);
+    } else {
+        pthread_mutex_lock(&g_gcd_lock);
+        if (--g_gcd_inflight == 0) pthread_cond_broadcast(&g_gcd_idle);
+        pthread_mutex_unlock(&g_gcd_lock);
+        block_release(copy);
+    }
+}
+
+/* Wait up to `ms` for every dispatched block to finish. 1 when they all did. */
+int macshim_gcd_drain(int ms)
+{
+    struct timespec ts;
+    int ok;
+
+    pthread_mutex_lock(&g_gcd_lock);
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    while (g_gcd_inflight > 0)
+        if (pthread_cond_timedwait(&g_gcd_idle, &g_gcd_lock, &ts) != 0) break;
+    ok = g_gcd_inflight == 0;
+    pthread_mutex_unlock(&g_gcd_lock);
+    return ok;
 }
 static void *g_main_queue[8];
 static void *gcd_data_create(const void *buf, size_t len, void *q, void *destructor)
 { (void)buf; (void)len; (void)q; (void)destructor; return NULL; }
+
+/* ------------------------------------------------------------------ dyld
+ *
+ * A plugin asks dyld which image its own code is in, and builds its bundle from
+ * the answer. VSTGUI does exactly that -- `InitMachOLibrary` calls `dladdr` on
+ * one of its own functions, walks the path up to the `.vst`, and hands the
+ * result to `CFBundleCreate`. With nothing to answer, `gBundleRef` stayed null,
+ * `CFBundleCopyResourceURL` found no artwork, the background bitmap was empty,
+ * and the editor sized itself to nothing. Twelve of the thirty-one macOS VST2
+ * bundles here stop at that one question.
+ *
+ * There is exactly one image, so the list has one entry. `dladdr` is shadowed
+ * deliberately: the host's own knows nothing about a mapping made with mmap,
+ * and would answer for whatever ELF happens to sit at that address. A guest
+ * address outside the image falls through to the real one, because a plugin
+ * asking about a host callback should get the truth about it. */
+static char        g_image_path[4096];
+static const void *g_image_base;
+static size_t      g_image_span;
+
+void macshim_set_dyld_image(const char *binpath, const void *base, size_t span)
+{
+    snprintf(g_image_path, sizeof g_image_path, "%s", binpath ? binpath : "");
+    g_image_base = base;
+    g_image_span = span;
+}
+int macshim_dyld_image_is(const void *base) { return base && base == g_image_base; }
+
+/* Does the loaded image cover `n` bytes at `p`? Asked before reading through a
+ * pointer the plugin supplied: anything the plugin can legitimately hand over
+ * that this host did not allocate is in its own mapping, and everything else
+ * is not worth reading. */
+int macshim_dyld_image_contains(const void *p, size_t n)
+{
+    const uint8_t *a = p, *lo = g_image_base;
+    if (!a || !lo || !g_image_span) return 0;
+    return a >= lo && a + n <= lo + g_image_span;
+}
+
+static uint32_t dyld_image_count(void) { return g_image_base ? 1u : 0u; }
+static const char *dyld_get_image_name(uint32_t i)
+{ return (i == 0 && g_image_base) ? g_image_path : NULL; }
+static const void *dyld_get_image_header(uint32_t i)
+{ return i == 0 ? g_image_base : NULL; }
+/* The image is mapped where its own load commands ask for, so nothing slid. */
+static long dyld_get_image_vmaddr_slide(uint32_t i) { (void)i; return 0; }
+
+typedef struct { const char *dli_fname; void *dli_fbase;
+                 const char *dli_sname; void *dli_saddr; } mac_dl_info;
+
+static int mac_dladdr(const void *addr, mac_dl_info *info)
+{
+    const uint8_t *p = addr;
+    if (!info) return 0;
+    if (g_image_base && p >= (const uint8_t *)g_image_base &&
+        p < (const uint8_t *)g_image_base + g_image_span) {
+        info->dli_fname = g_image_path;
+        info->dli_fbase = (void *)g_image_base;
+        /* No symbol name: this host has no symbolizer, and every caller here
+         * wants the file rather than the function. */
+        info->dli_sname = NULL;
+        info->dli_saddr = NULL;
+        return 1;
+    }
+    {   Dl_info host;
+        if (dladdr(addr, &host)) {
+            info->dli_fname = host.dli_fname;
+            info->dli_fbase = host.dli_fbase;
+            info->dli_sname = host.dli_sname;
+            info->dli_saddr = host.dli_saddr;
+            return 1;
+        } }
+    return 0;
+}
 
 /* --------------------------------------------------------- odds and ends */
 
@@ -291,8 +481,42 @@ static void *cf_url_from_string(void *alloc, void *str, void *base)
 { (void)alloc; (void)base; return str ? (void *)macshim_lookup_retain(str) : NULL; }
 
 /* The run loop exists so a plugin can schedule a repeating timer for its UI.
- * With no UI running there is nothing to drive, so a timer is accepted and never
- * fires -- which is honest, and better than refusing to create one. */
+ *
+ * Accepting one and never firing it was not as harmless as it looked. VSTGUI 4
+ * does not repaint a control when its value changes -- it marks the view dirty
+ * and lets CFrame::idle turn dirty views into invalidated rectangles, and idle
+ * is driven by exactly this timer. With it dead, dragging a knob on Tattoo
+ * moved the parameter on all sixty frames and repainted the picture on none of
+ * them: the sound followed the mouse and the knob sat still. Fired here, the
+ * host's pump drives the plugin's idle work the way a run loop would.
+ *
+ * Fired once per pump rather than on a clock, which is what the NSTimer path
+ * beside this does: the host's frame is the only clock here, and gating on wall
+ * time would make what an editor draws depend on how long the machine took to
+ * get there. A one-shot -- interval zero, which is how deferred work is
+ * scheduled -- fires once and retires. */
+typedef struct {
+    void (*cb)(void *timer, void *info);
+    void  *info;
+    double interval;
+    double due;                 /* frames still to wait */
+    int    scheduled, dead;
+} cf_timer;
+
+#define MAX_CF_TIMERS 64
+static cf_timer g_cf_timers[MAX_CF_TIMERS];
+static int      g_ncf_timers;
+
+/* CFRunLoopTimerContext, whose `info` is the argument the callback is given --
+ * the struct itself is the caller's and is not kept. */
+typedef struct {
+    long  version;
+    void *info;
+    void *(*retain)(const void *);
+    void  (*release)(const void *);
+    void *copy_description;
+} cf_timer_ctx;
+
 static void *g_main_runloop[8];
 static void *g_common_modes[8];
 static void *g_allocator_default;
@@ -300,11 +524,51 @@ static void *cf_runloop_get_main(void) { return g_main_runloop; }
 static void *cf_runloop_timer_create(void *alloc, double fire, double interval,
                                      uint32_t flags, long order,
                                      void (*cb)(void *, void *), void *ctx)
-{ (void)alloc;(void)fire;(void)interval;(void)flags;(void)order;(void)cb;(void)ctx;
-  return g_main_runloop; }
+{
+    cf_timer *t;
+    (void)alloc; (void)fire; (void)flags; (void)order;
+    if (!cb || g_ncf_timers >= MAX_CF_TIMERS) return g_main_runloop;
+    t = &g_cf_timers[g_ncf_timers++];
+    t->cb = cb;
+    t->info = ctx ? ((const cf_timer_ctx *)ctx)->info : NULL;
+    t->interval = interval;
+    t->due = 0.0;
+    t->scheduled = 0;
+    t->dead = 0;
+    return t;
+}
+static int cf_timer_is_ours(const void *p)
+{ return p && (const cf_timer *)p >= g_cf_timers
+           && (const cf_timer *)p < g_cf_timers + MAX_CF_TIMERS; }
 static void cf_runloop_add_timer(void *rl, void *t, void *mode)
-{ (void)rl; (void)t; (void)mode; }
-static void cf_runloop_timer_invalidate(void *t) { (void)t; }
+{ (void)rl; (void)mode; if (cf_timer_is_ours(t)) ((cf_timer *)t)->scheduled = 1; }
+static void cf_runloop_timer_invalidate(void *t)
+{ if (cf_timer_is_ours(t)) ((cf_timer *)t)->dead = 1; }
+
+/* One round of whatever the plugin scheduled. Called from macns_fire_timers, so
+ * a CFRunLoopTimer and an NSTimer are driven by the same pump. */
+void macshim_fire_cf_timers(void)
+{
+    int i;
+    for (i = 0; i < g_ncf_timers; i++) {
+        cf_timer *t = &g_cf_timers[i];
+        if (t->dead || !t->scheduled || !t->cb) continue;
+        if (t->interval > 0.0) {
+            /* Counted in frames rather than seconds. The host's pump is the
+             * only clock here, and gating on wall time would make what an
+             * editor draws depend on how long the machine took to get here --
+             * two runs of the same capture would not match. A frame is taken
+             * to be a sixtieth, which is what both windows pump at. */
+            t->due -= 1.0;
+            if (t->due > 0.0) continue;
+            t->due += t->interval * 60.0;
+            if (t->due < 0.0) t->due = 0.0;
+        } else {
+            t->dead = 1;                           /* one-shot */
+        }
+        t->cb(t, t->info);
+    }
+}
 
 /* HTTP is only ever an update check in this corpus. Failing to create the
  * request is the cleanest outcome: the plugin reports "could not check" and
@@ -322,15 +586,10 @@ static void *g_type_set_cb[8];
 
 /* ------------------------------------------------------------- CoreText */
 
-/* Text shaping is the one part of the GUI path that cannot be faked usefully:
- * these return nothing, so a plugin gets no font descriptor and draws no text.
- * The Windows side solves the same problem with FreeType behind DirectWrite, and
- * the same approach fits here -- it is just not written yet. */
-static void *ct_null1(void *a) { (void)a; return NULL; }
-static void *ct_null2(void *a, void *b) { (void)a; (void)b; return NULL; }
-static void *ct_font_with_graphics_font(void *g, double size, const void *m, void *attrs)
-{ (void)g;(void)size;(void)m;(void)attrs; return NULL; }
-static void *ct_descriptors_matching(void *d, void *set) { (void)d; (void)set; return NULL; }
+/* Text shaping is the one part of the GUI path that cannot be faked usefully.
+ * The fonts and descriptors themselves live in macquartz.c beside the other
+ * CoreText objects; what is left here are the attribute keys, which a plugin
+ * puts in a dictionary and never looks inside. */
 static void *g_ct_family_name, *g_ct_style_name, *g_ct_font_url;
 
 /* --------------------------------------------------- Foundation data/calls */
@@ -385,6 +644,10 @@ const macshim_entry macshim_foundation[] = {
     { "__Block_object_assign",  bl_object_assign },
     { "__Block_object_dispose", bl_object_dispose },
     { "__NSConcreteStackBlock", g_concrete_stack_block },
+    { "__NSConcreteMallocBlock", g_concrete_malloc_block },
+    { "__NSConcreteGlobalBlock", g_concrete_malloc_block },
+    { "__Block_copy",           block_copy },
+    { "__Block_release",        block_release },
 
     /* GCD */
     { "_dispatch_semaphore_create", gcd_sem_create },
@@ -427,11 +690,6 @@ const macshim_entry macshim_foundation[] = {
     { "_kCFHTTPVersion1_1",       &g_http_1_1 },
 
     /* CoreText -- present so the image binds; no shaping yet */
-    { "_CTFontCopyFontDescriptor",       ct_null1 },
-    { "_CTFontCreateWithGraphicsFont",   ct_font_with_graphics_font },
-    { "_CTFontDescriptorCopyAttribute",  ct_null2 },
-    { "_CTFontDescriptorCreateWithAttributes", ct_null1 },
-    { "_CTFontDescriptorCreateMatchingFontDescriptors", ct_descriptors_matching },
     { "_kCTFontFamilyNameAttribute", &g_ct_family_name },
     { "_kCTFontStyleNameAttribute",  &g_ct_style_name },
     { "_kCTFontURLAttribute",        &g_ct_font_url },
@@ -540,6 +798,12 @@ const macshim_entry macshim_mach[] = {
     { "_SetComponentInstanceStorage", set_component_instance_storage },
     { "_MIDIPacketListInit",   midi_packet_list_init },
     { "_MIDIPacketListAdd",    midi_packet_list_add },
+    /* dyld, so a plugin can find the image its own code is in. */
+    { "__dyld_image_count",    dyld_image_count },
+    { "__dyld_get_image_name", dyld_get_image_name },
+    { "__dyld_get_image_header", dyld_get_image_header },
+    { "__dyld_get_image_vmaddr_slide", dyld_get_image_vmaddr_slide },
+    { "_dladdr",               mac_dladdr },
     { "_NSAddImage",           ns_add_image },
     { "_NSLookupSymbolInImage", ns_lookup_symbol_in_image },
     { "_NSAddressOfSymbol",    ns_address_of_symbol },
@@ -633,18 +897,67 @@ static int tf_open(const char *path, int flags, ...)
  * them -- the SIGBUS that made three of them look like they crashed on load.
  *
  * An FSRef is documented as 80 opaque bytes and both ends of it are ours, so it
- * carries the path outright. That makes the whole family ordinary POSIX calls
- * and removes any need for a volume/directory-id table. */
-typedef struct { char path[80]; } fs_ref;
+ * used to carry the path outright, which made the whole family ordinary POSIX
+ * calls and removed any need for a table. Eighty bytes is not a path, though:
+ * a resource inside a bundle in this corpus is comfortably over that, and a
+ * truncated one opens nothing. So the eighty bytes carry a magic word and an
+ * index instead, and the paths live beside them. */
+#define FSREF_MAGIC 0x46537265u          /* 'FSre' */
+#define MAX_FSREF   128
+
+typedef struct { uint32_t magic; int32_t slot; uint8_t pad[72]; } fs_ref;
 enum { fsErr_none = 0, fsErr_notFound = -43, fsErr_param = -50, fsErr_io = -36 };
 
 /* HFSUniStr255: a length word followed by UTF-16. */
 typedef struct { uint16_t length; uint16_t unicode[255]; } hfs_uni_str;
 
-static void fs_set(fs_ref *r, const char *p)
-{ if (r) snprintf(r->path, sizeof r->path, "%s", p ? p : ""); }
+/* The paths the refs above point at. A ref is handed out and kept by the
+ * plugin for as long as it likes, so slots are not recycled while any could
+ * still be live; the table is small and a plugin makes a handful. */
+static struct { int used; char path[4096]; } g_fsrefs[MAX_FSREF];
+static pthread_mutex_t g_fsref_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int fs_ok(const fs_ref *r) { return r && r->path[0]; }
+static void fs_set(fs_ref *r, const char *p)
+{
+    int i;
+    if (!r) return;
+    memset(r, 0, sizeof *r);
+    if (!p || !*p) return;
+    pthread_mutex_lock(&g_fsref_lock);
+    for (i = 0; i < MAX_FSREF; i++) if (!g_fsrefs[i].used) break;
+    if (i == MAX_FSREF) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [fs] FSRef table full at %d -- refs are being "
+                            "recycled, and a stale one names the wrong file\n",
+                    MAX_FSREF);
+        }
+        i = 0;
+    }
+    g_fsrefs[i].used = 1;
+    snprintf(g_fsrefs[i].path, sizeof g_fsrefs[i].path, "%s", p);
+    pthread_mutex_unlock(&g_fsref_lock);
+    r->magic = FSREF_MAGIC;
+    r->slot = i;
+}
+
+/* The path a ref names, or NULL for anything that is not one of ours -- a
+ * plugin hands over stack garbage as an FSRef often enough that the magic word
+ * is the whole point. Read under the same lock that fills the table, because a
+ * dispatched block can be opening a file on a thread of its own. */
+static const char *fs_path(const fs_ref *r)
+{
+    const char *p = NULL;
+    if (!r || r->magic != FSREF_MAGIC) return NULL;
+    if (r->slot < 0 || r->slot >= MAX_FSREF) return NULL;
+    pthread_mutex_lock(&g_fsref_lock);
+    if (g_fsrefs[r->slot].used) p = g_fsrefs[r->slot].path;
+    pthread_mutex_unlock(&g_fsref_lock);
+    return p;
+}
+
+static int fs_ok(const fs_ref *r) { return fs_path(r) != NULL; }
 
 static int32_t fs_find_folder(int16_t vol, uint32_t type, uint8_t create, fs_ref *out)
 {
@@ -688,9 +1001,9 @@ static int32_t fs_make_ref_unicode(const fs_ref *parent, int32_t nlen,
     for (i = 0; i < n; i++) leaf[i] = (char)(name[i] & 0xff);
     leaf[n] = '\0';
     { char full[160];
-      snprintf(full, sizeof full, "%s/%s", parent->path, leaf);
+      snprintf(full, sizeof full, "%s/%s", fs_path(parent), leaf);
       fs_set(out, full); }
-    return access(out->path, F_OK) == 0 ? fsErr_none : fsErr_notFound;
+    return access(fs_path(out), F_OK) == 0 ? fsErr_none : fsErr_notFound;
 }
 
 /* The data fork has no name, which is exactly what this reports. */
@@ -707,7 +1020,7 @@ static int32_t fs_get_catalog_info(const fs_ref *ref, uint64_t whichInfo,
     struct stat st;
     (void)whichInfo; (void)fsSpec;
     if (!fs_ok(ref)) return fsErr_param;
-    if (stat(ref->path, &st)) return fsErr_notFound;
+    if (stat(fs_path(ref), &st)) return fsErr_notFound;
     if (info) {
         /* nodeFlags is the first field; bit 4 marks a directory. */
         unsigned char *ci = info;
@@ -717,8 +1030,8 @@ static int32_t fs_get_catalog_info(const fs_ref *ref, uint64_t whichInfo,
         { uint64_t sz = (uint64_t)st.st_size; memcpy(ci + 88, &sz, sizeof sz); }
     }
     if (outName) {
-        const char *slash = strrchr(ref->path, '/');
-        const char *leaf = slash ? slash + 1 : ref->path;
+        const char *slash = strrchr(fs_path(ref), '/');
+        const char *leaf = slash ? slash + 1 : fs_path(ref);
         int i, n = (int)strlen(leaf);
         if (n > 255) n = 255;
         for (i = 0; i < n; i++) outName->unicode[i] = (unsigned char)leaf[i];
@@ -727,7 +1040,7 @@ static int32_t fs_get_catalog_info(const fs_ref *ref, uint64_t whichInfo,
     if (parent) {
         char up[80];
         const char *slash;
-        snprintf(up, sizeof up, "%s", ref->path);
+        snprintf(up, sizeof up, "%s", fs_path(ref));
         if ((slash = strrchr(up, '/')) && slash != up) *(char *)slash = '\0';
         fs_set(parent, up);
     }
@@ -747,7 +1060,7 @@ static int32_t fs_open_fork(const fs_ref *ref, int32_t nameLen, const uint16_t *
     if (!fs_ok(ref) || !refnum) return fsErr_param;
     /* fsRdPerm 1, fsWrPerm 2, fsRdWrPerm 3. */
     fl = (perms & 2) ? ((perms & 1) ? O_RDWR : O_WRONLY) : O_RDONLY;
-    if ((fd = open(ref->path, fl)) < 0) return fsErr_notFound;
+    if ((fd = open(fs_path(ref), fl)) < 0) return fsErr_notFound;
     *refnum = (int16_t)(fd + FS_FORK_BIAS);
     return fsErr_none;
 }
@@ -770,6 +1083,47 @@ static int32_t fs_read_fork(int16_t refnum, uint16_t posMode, int64_t posOff,
     if (actual) *actual = (uint32_t)got;
     /* eofErr, which is how a reader knows to stop. */
     return (uint32_t)got < count ? -39 : fsErr_none;
+}
+
+/* FSGetForkSize(refnum, SInt64 *out). A plugin reading a fork whole asks how
+ * big it is first, allocates, and reads -- so without this it allocated
+ * nothing and the read had nowhere to go. */
+static int32_t fs_get_fork_size(int16_t refnum, int64_t *out)
+{
+    int fd = refnum - FS_FORK_BIAS;
+    off_t here, end;
+    if (out) *out = 0;
+    if (fd < 0) return fsErr_param;
+    here = lseek(fd, 0, SEEK_CUR);
+    end  = lseek(fd, 0, SEEK_END);
+    lseek(fd, here, SEEK_SET);
+    if (end < 0) return fsErr_io;
+    if (out) *out = (int64_t)end;
+    return fsErr_none;
+}
+
+/* CFURLGetFSRef(url, FSRef *out) -> Boolean, and its inverse.
+ *
+ * This is the door into everything above, and it was shut. Audio Damage's
+ * editors keep their bitmap font's glyph table in a file they reach this way,
+ * and with the call answering false the whole load was skipped -- leaving a
+ * field the constructor never zeroes holding whatever the allocator had left
+ * there, which the first call to getCharacterInfo dereferenced. Seven of the
+ * twelve VSTGUI editors here died on it, in a font routine, a long way from
+ * the question that had gone unanswered. */
+static unsigned char fs_url_get_ref(void *url, fs_ref *out)
+{
+    char path[4096];
+    if (!out || !url || !macshim_cf_string_get(url, path, sizeof path)) return 0;
+    if (access(path, F_OK) != 0) return 0;
+    fs_set(out, path);
+    return 1;
+}
+static void *fs_url_from_ref(void *alloc, const fs_ref *ref)
+{
+    const char *p = fs_path(ref);
+    (void)alloc;
+    return p ? macshim_cf_string(p) : NULL;
 }
 
 static int32_t fs_close_fork(int16_t refnum)
@@ -798,8 +1152,11 @@ const macshim_entry macshim_files[] = {
     { "_FSGetDataForkName",  fs_get_data_fork_name },
     { "_FSGetCatalogInfo",   fs_get_catalog_info },
     { "_FSOpenFork",         fs_open_fork },
+    { "_FSGetForkSize",      fs_get_fork_size },
     { "_FSReadFork",         fs_read_fork },
     { "_FSCloseFork",        fs_close_fork },
+    { "_CFURLGetFSRef",      fs_url_get_ref },
+    { "_CFURLCreateFromFSRef", fs_url_from_ref },
     { "_TickCount",          fs_tick_count },
     { NULL, NULL }
 };

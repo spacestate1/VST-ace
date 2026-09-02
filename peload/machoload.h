@@ -43,6 +43,11 @@ void        macho_describe(const macho *m, const void *addr, char *out, size_t n
 
 /* Bundle metadata from Contents/Info.plist, empty if absent. */
 const char *macho_bundle_path(const macho *m);
+/* The executable inside the bundle, and where it is mapped -- what the dyld
+ * shims answer with. */
+const char *macho_binary_path(const macho *m);
+const void *macho_image_base(const macho *m);
+size_t      macho_image_span(const macho *m);
 const char *macho_bundle_id(const macho *m);
 const char *macho_bundle_name(const macho *m);
 

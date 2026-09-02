@@ -52,7 +52,7 @@ typedef struct { const char *dll, *sym; void *fn; } winstub;
  * msvcp120.dll replaced the plugin's resource base with the runtime's, and a
  * stock Microsoft DLL carries nothing but a version resource. Every lookup
  * afterwards searched a directory holding one entry. */
-#define W32_MAX_IMAGES 8
+#define W32_MAX_IMAGES 16
 typedef struct { uint8_t *base, *rsrc; } w32_image;
 static w32_image g_images[W32_MAX_IMAGES];
 static uint8_t *g_image_base;   /* the plugin: what a NULL module handle means */
@@ -67,6 +67,37 @@ static void winstubs_add_image(void *base, void *rsrc)
             g_images[i].base = base; g_images[i].rsrc = rsrc; return;
         }
     }
+    /* Said out loud. Running off the end of this loop used to be silent, and a
+     * silent failure here does not look like a failure here: the image simply
+     * never gets registered, and every resource lookup it makes afterwards is
+     * answered from whichever image the table still holds. */
+    PLOG("  [w32] image table full (%d) -- %p not registered, its resources "
+         "will resolve against another image\n", W32_MAX_IMAGES, base);
+}
+
+/* Forget an image that has been unmapped.
+ *
+ * The table only ever gained entries. Nothing removed them when a plug-in was
+ * closed, so eight plug-ins into a browsing session it was full of bases that
+ * no longer existed, the ninth plug-in's image was never registered, and its
+ * resource lookups resolved against a predecessor's directory in memory that
+ * had been handed back to the kernel. From the outside that is an editor that
+ * gradually stops responding -- a control whose bitmap comes back empty draws
+ * but does not behave -- and then a fault. Switching between nine plug-ins was
+ * enough to reach it every time. */
+static int winstubs_drop_image(void *base)
+{
+    int i, primary = 0;
+    if (!base) return 0;
+    for (i = 0; i < W32_MAX_IMAGES; i++)
+        if (g_images[i].base == (uint8_t *)base) {
+            g_images[i].base = NULL;
+            g_images[i].rsrc = NULL;
+        }
+    if (g_image_base == (uint8_t *)base) {
+        g_image_base = NULL; g_rsrc = NULL; primary = 1;
+    }
+    return primary;             /* the caller reclaims the plug-in's TLS */
 }
 static void winstubs_init(void *base, void *rsrc)
 { g_image_base = base; g_rsrc = rsrc; winstubs_add_image(base, rsrc); }
@@ -329,10 +360,45 @@ static MS void *st_InterlockedCompareExchangePointer(void *volatile *p, void *xc
 
 /* -------------------------------------------------------------------- TLS */
 
-static uint32_t g_tls_next = 8;          /* 0..7 reserved for module TLS */
+/* Slots 0..7 belong to module TLS; the rest are handed out here.
+ *
+ * TlsFree used to accept and do nothing, and the allocator only counted upward,
+ * so every slot a plug-in took was gone for the life of the process. A hundred
+ * and twenty slots sounds like plenty until you notice that browsing spends
+ * them: about eighty plug-ins into a session TlsAlloc starts returning
+ * TLS_OUT_OF_INDEXES, the Microsoft runtime's DllMain fails on that, and every
+ * plug-in loaded afterwards is reported as "DllMain failed" -- the host
+ * refusing perfectly good plug-ins because of what it had already thrown away
+ * on their predecessors. */
+static uint32_t g_tls_used[(TLS_SLOTS + 31) / 32];
+
 static MS uint32_t st_TlsAlloc(void)
-{ return g_tls_next < TLS_SLOTS ? g_tls_next++ : 0xFFFFFFFFu; }
-static MS int32_t st_TlsFree(uint32_t i) { (void)i; return 1; }
+{
+    uint32_t i;
+    for (i = 8; i < TLS_SLOTS; i++)
+        if (!(g_tls_used[i >> 5] & (1u << (i & 31)))) {
+            g_tls_used[i >> 5] |= 1u << (i & 31);
+            teb_clear_slot(i);          /* NULL on every thread, as Windows does */
+            return i;
+        }
+    return 0xFFFFFFFFu;                          /* TLS_OUT_OF_INDEXES */
+}
+static MS int32_t st_TlsFree(uint32_t i)
+{
+    if (i < 8 || i >= TLS_SLOTS) return 0;
+    g_tls_used[i >> 5] &= ~(1u << (i & 31));
+    if (g_teb) g_teb->slots[i] = NULL;
+    return 1;
+}
+
+/* Every slot the outgoing plug-in held. A plug-in's runtime does not reliably
+ * free its own on the way out, and once its image is unmapped the slots are
+ * dead whether it freed them or not. */
+static void winstubs_reset_tls(void)
+{
+    memset(g_tls_used, 0, sizeof g_tls_used);
+    teb_clear_all_slots();
+}
 static MS void *st_TlsGetValue(uint32_t i)
 { return i < TLS_SLOTS && g_teb ? g_teb->slots[i] : NULL; }
 static MS int32_t st_TlsSetValue(uint32_t i, void *v)

@@ -214,6 +214,20 @@ double pehost_position(const pehost *h);
  * call from the GUI thread while the audio thread renders. */
 void  pehost_midi(pehost *h, int status, int d1, int d2);
 
+/* Whether the plug-in is still running. Only ever false for one hosted out of
+ * process whose helper has died -- in process, a plug-in that faults takes this
+ * process with it and there is nobody left to ask. A front end wants this so a
+ * dead plug-in reads as dead rather than as an editor that stopped repainting
+ * and audio that went quiet. */
+int   pehost_alive(const pehost *h);
+
+/* Which input channels the signal fed to pehost_render_io reaches, as a bitmask
+ * over channels (bit 0 = first input); 0 means all of them, which is the
+ * default. A plug-in with a separate modulator and carrier input -- a vocoder --
+ * wants the microphone on the modulator only, or the raw voice lands in the
+ * output as well as the analysis. Applies across VST2, VST3 and the bridge. */
+void  pehost_set_input_mask(pehost *h, unsigned mask);
+
 /* The same, but placed: `frame` is the offset within the next rendered block at
  * which the event should take effect. This is what a sequencer wants -- it knows
  * exactly where a note falls, and passing that through is the difference between
@@ -257,6 +271,9 @@ int  pehost_editor_pixels(pehost *h, const unsigned int **px, int *w, int *heigh
 /* Loaded from a Mach-O bundle, or interpreted from a Classic one. For labelling
  * only. */
 int  pehost_is_macos(pehost *h);
+
+/* Interpreted from a Classic (CFM/PEF, PowerPC) bundle. For labelling only. */
+int  pehost_is_classic(pehost *h);
 
 /* Is this file a Classic Mac OS (PEF/PowerPC) plug-in? True for a bare PEF and
  * for a resource fork carrying an 'aEff' resource. Such a plug-in is interpreted

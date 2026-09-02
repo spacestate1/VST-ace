@@ -19,6 +19,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -33,15 +34,74 @@ typedef unsigned char Boolean;
 typedef int32_t OSStatus;
 
 enum {
-    CF_STRING = 1, CF_ARRAY, CF_DICT, CF_DATA, CF_NUMBER, CF_FORMATTER, CF_LOCALE
+    CF_STRING = 1, CF_ARRAY, CF_DICT, CF_DATA, CF_NUMBER, CF_FORMATTER, CF_LOCALE,
+    /* A UUID carries its sixteen bytes inline, so it is not a CFData however
+     * much it looks like one -- see cf_uuid_create. */
+    CF_UUID,
+    CF_BOOLEAN
 };
 
 typedef struct cfobj {
     uint32_t         magic;
     CFTypeID         type;
     _Atomic long     refs;
+    /* See the registry below: every object this shim minted is on a list, so
+     * "is this one of ours?" can be answered without reading through it. */
+    struct cfobj    *reg_next;
 } cfobj;
 #define CFMAGIC 0x43466F62u          /* 'CFob' */
+
+/* ---- which pointers are ours ------------------------------------------
+ *
+ * A shim is asked constantly whether some pointer is a CoreFoundation object,
+ * and the obvious test -- read the magic word and compare -- reads through
+ * whatever it is handed. That is fine until a plugin hands over something that
+ * is not a pointer at all, which happens for a specific and recurring reason:
+ * an unresolved *data* import. A function import binds to a stub that reports
+ * itself when called, but a data import that nothing implements is simply left
+ * holding the image's own link-time value, and nothing says so. The plugin
+ * then puts that value in a dictionary, and the fault lands inside CFRetain.
+ *
+ * It has now happened twice, with kCFBooleanTrue and again with a constant
+ * this host has not identified, so the answer is structural: a hash set of
+ * every object minted here, keyed by address. The test costs a hash and a
+ * short walk, and it cannot fault. */
+#define CFREG_BUCKETS 1024
+static cfobj *g_cfreg[CFREG_BUCKETS];
+static pthread_mutex_t g_cfreg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned cfreg_bucket(const void *p)
+{ return (unsigned)((((uintptr_t)p) >> 4) * 2654435761u) % CFREG_BUCKETS; }
+
+static void cfreg_add(cfobj *o)
+{
+    unsigned b = cfreg_bucket(o);
+    pthread_mutex_lock(&g_cfreg_lock);
+    o->reg_next = g_cfreg[b];
+    g_cfreg[b] = o;
+    pthread_mutex_unlock(&g_cfreg_lock);
+}
+static void cfreg_del(cfobj *o)
+{
+    unsigned b = cfreg_bucket(o);
+    cfobj **pp;
+    pthread_mutex_lock(&g_cfreg_lock);
+    for (pp = &g_cfreg[b]; *pp; pp = &(*pp)->reg_next)
+        if (*pp == o) { *pp = o->reg_next; break; }
+    pthread_mutex_unlock(&g_cfreg_lock);
+}
+static int cfreg_has(const void *p)
+{
+    unsigned b;
+    cfobj *o;
+    int found = 0;
+    if (!p) return 0;
+    b = cfreg_bucket(p);
+    pthread_mutex_lock(&g_cfreg_lock);
+    for (o = g_cfreg[b]; o; o = o->reg_next) if (o == p) { found = 1; break; }
+    pthread_mutex_unlock(&g_cfreg_lock);
+    return found;
+}
 
 typedef struct { cfobj o; char *s; CFIndex len; } cfstring;
 typedef struct { cfobj o; const void **v; CFIndex n, cap; } cfarray;
@@ -63,15 +123,25 @@ typedef struct {
 
 static void *g_const_string_class = (void *)"CFConstantString";
 
+/* A CFSTR("...") literal is not one of ours, so it cannot be on the registry --
+ * and it is a real object, so it has to be recognised anyway.
+ *
+ * What makes reading it safe is where it lives: a literal is in the plugin's
+ * own __DATA, and the loader knows exactly which addresses that covers. So the
+ * test is a range check against the mapped image -- two comparisons, no
+ * syscall, and stricter than asking the kernel whether the page is mapped,
+ * which would also accept a stack address that happened to look like one. */
 static int is_const_string(const void *p)
 {
     const cfconststring *c = p;
-    return p && c->isa == (const void *)&g_const_string_class;
+    if (!p || !macshim_dyld_image_contains(p, sizeof *c)) return 0;
+    return c->isa == (const void *)&g_const_string_class;
 }
 static cfobj *as_obj(const void *p)
 {
     cfobj *o = (cfobj *)p;
-    return (o && o->magic == CFMAGIC) ? o : NULL;
+    if (!cfreg_has(p)) return NULL;
+    return (o->magic == CFMAGIC) ? o : NULL;
 }
 
 static void *obj_new(size_t sz, CFTypeID t)
@@ -81,6 +151,7 @@ static void *obj_new(size_t sz, CFTypeID t)
     o->magic = CFMAGIC;
     o->type = t;
     atomic_store(&o->refs, 1);
+    cfreg_add(o);
     return o;
 }
 
@@ -89,14 +160,17 @@ static void *obj_new(size_t sz, CFTypeID t)
 static CFTypeRef cf_retain(CFTypeRef p)
 {
     cfobj *o = as_obj(p);
-    if (o) atomic_fetch_add(&o->refs, 1);
+    if (o) { atomic_fetch_add(&o->refs, 1); return p; }
+    /* CoreGraphics objects are CoreFoundation objects too, and some of them
+     * have no typed retain at all. */
+    macquartz_cf_retain((void *)p);
     return p;
 }
 
 static void cf_release(CFTypeRef p)
 {
     cfobj *o = as_obj(p);
-    if (!o) return;                              /* constant strings never die */
+    if (!o) { macquartz_cf_release((void *)p); return; }
     if (atomic_fetch_sub(&o->refs, 1) != 1) return;
     switch (o->type) {
     case CF_STRING: free(((cfstring *)o)->s); break;
@@ -105,6 +179,7 @@ static void cf_release(CFTypeRef p)
     case CF_DATA:   free(((cfdata *)o)->b); break;
     default: break;
     }
+    cfreg_del(o);
     free(o);
 }
 
@@ -345,6 +420,35 @@ static CFTypeRef cf_number_create(void *alloc, int32_t type, const void *valp)
     return n;
 }
 
+/* ---- CFBoolean ---------------------------------------------------------
+ *
+ * Two singletons, and they have to be real objects rather than sentinels: a
+ * plugin puts kCFBooleanTrue into a dictionary, and the dictionary retains what
+ * it is given. Unbound, the slot still held the image's own link-time value,
+ * which CFRetain then dereferenced -- a fault inside a shim that was only asked
+ * to store something. */
+typedef struct { cfobj o; int v; } cfboolean;
+static cfboolean g_true  = { { CFMAGIC, CF_BOOLEAN, 2, NULL }, 1 };
+static cfboolean g_false = { { CFMAGIC, CF_BOOLEAN, 2, NULL }, 0 };
+/* Statically built, so they miss obj_new and have to join the registry by
+ * hand -- otherwise CFBooleanGetValue would not recognise its own singletons. */
+static void __attribute__((constructor)) cf_boolean_register(void)
+{ cfreg_add(&g_true.o); cfreg_add(&g_false.o); }
+static void *g_k_boolean_true  = &g_true;
+static void *g_k_boolean_false = &g_false;
+
+static Boolean cf_boolean_value(CFTypeRef p)
+{ cfobj *o = as_obj(p); return (o && o->type == CF_BOOLEAN) ? (Boolean)((cfboolean *)o)->v : 0; }
+static CFTypeID cf_boolean_typeid(void) { return CF_BOOLEAN; }
+
+/* A CFNumber from a plain integer, for the shims that build dictionaries of
+ * their own -- ImageIO's image properties are the case here. */
+void *macshim_cf_number_int(long v)
+{
+    int32_t i = (int32_t)v;
+    return (void *)cf_number_create(NULL, kCFNumberSInt32Type, &i);
+}
+
 static Boolean cf_number_get(CFTypeRef p, int32_t type, void *out)
 {
     cfobj *o = as_obj(p);
@@ -446,12 +550,17 @@ static const char g_dict_key_cb[64];
 static const char g_dict_val_cb[64];
 
 /* CFStringRef constants, as our own string objects so str_of() reads them. */
-static cfstring g_k_maxfrac = { { CFMAGIC, CF_STRING, 1 }, (char *)0, 0 };
-static cfstring g_k_minfrac = { { CFMAGIC, CF_STRING, 1 }, (char *)0, 0 };
+static cfstring g_k_maxfrac = { { CFMAGIC, CF_STRING, 1, NULL }, (char *)0, 0 };
+static cfstring g_k_minfrac = { { CFMAGIC, CF_STRING, 1, NULL }, (char *)0, 0 };
 static void __attribute__((constructor)) init_cf_constants(void)
 {
     g_k_maxfrac.s = (char *)k_maxfrac; g_k_maxfrac.len = (CFIndex)strlen(k_maxfrac);
     g_k_minfrac.s = (char *)k_minfrac; g_k_minfrac.len = (CFIndex)strlen(k_minfrac);
+    /* Built statically, so they missed obj_new and have to join the registry by
+     * hand -- an object the registry has not seen is not recognised as one, and
+     * these are handed to str_of like any other string. */
+    cfreg_add(&g_k_maxfrac.o);
+    cfreg_add(&g_k_minfrac.o);
 }
 static void *g_p_maxfrac = &g_k_maxfrac;
 static void *g_p_minfrac = &g_k_minfrac;
@@ -478,6 +587,10 @@ const macshim_entry macshim_corefoundation[] = {
     { "_CFDataGetBytePtr",          cf_data_ptr },
     { "_CFDataGetLength",           cf_data_len },
     { "_CFNumberCreate",            cf_number_create },
+    { "_kCFBooleanTrue",            &g_k_boolean_true },
+    { "_kCFBooleanFalse",           &g_k_boolean_false },
+    { "_CFBooleanGetValue",         cf_boolean_value },
+    { "_CFBooleanGetTypeID",        cf_boolean_typeid },
     { "_CFNumberGetValue",          cf_number_get },
     { "_CFNumberFormatterCreate",   cf_formatter_create },
     { "_CFNumberFormatterSetProperty", cf_formatter_set },
@@ -1048,20 +1161,45 @@ static CFIndex cf_string_get_length(CFTypeRef p)
 static CFIndex cf_string_max_size(CFIndex len, uint32_t enc)
 { return (enc == 0x0100 || enc == 0x0101) ? len * 2 + 2 : len * 4 + 1; }
 
-static CFIndex cf_string_get_bytes(CFTypeRef p, void *range, uint32_t enc,
+/* CFRange is two CFIndexes, and CFStringGetBytes takes one *by value*. On
+ * System V a 16-byte struct of two integers goes in two registers rather than
+ * through a pointer, so declaring the parameter as a `void *` shifted every
+ * argument after it by one register: `buf` arrived where `cap` was read, `cap`
+ * where `used` was, and the write-back pointer was a stack address the callee
+ * then stored through. Deputy's VST3 asks for all 2191 of its parameter names
+ * this way and faulted on the first. */
+typedef struct { CFIndex location, length; } CFRange;
+
+static CFIndex cf_string_get_bytes(CFTypeRef p, CFRange range, uint32_t enc,
                                    uint8_t loss, unsigned char ext,
                                    uint8_t *buf, CFIndex cap, CFIndex *used)
 {
     CFIndex n = 0;
     const char *s = str_of(p, &n);
-    (void)range; (void)loss; (void)ext;
-    if (!s) { if (used) *used = 0; return 0; }
+    (void)loss; (void)ext;
+    if (used) *used = 0;
+    if (!s) return 0;
+    /* The range is in characters. These strings are ASCII -- see below -- so it
+     * is a byte range too. Clamped rather than trusted: a range past the end is
+     * a plugin's arithmetic, not something to read through. */
+    if (range.location < 0 || range.location > n) return 0;
+    s += range.location;
+    n -= range.location;
+    if (range.length >= 0 && range.length < n) n = range.length;
+
     if (enc == 0x0100 || enc == 0x0101) {
         /* UTF-8 back to UTF-16, ASCII-only fast path: these strings are
-         * parameter names, so anything else is rare and lossy either way. */
+         * parameter names, so anything else is rare and lossy either way.
+         * A NULL buffer is a caller asking how much room to reserve, which is
+         * the documented way to use this call and must not write anything. */
         CFIndex i, w = 0;
-        for (i = 0; i < n && (w + 1) * 2 <= cap; i++)
-            ((uint16_t *)buf)[w++] = (uint8_t)s[i];
+        for (i = 0; i < n; i++) {
+            if (buf) {
+                if ((w + 1) * 2 > cap) break;
+                ((uint16_t *)buf)[w] = (uint8_t)s[i];
+            }
+            w++;
+        }
         if (used) *used = w * 2;
         return w;
     }
@@ -1227,7 +1365,11 @@ static void *g_allocator_null;
 typedef struct { cfobj o; uint8_t b[16]; } cfuuid;
 static CFTypeRef cf_uuid_create(void *alloc)
 {
-    cfuuid *u = obj_new(sizeof *u, CF_DATA);
+    /* Its own type, not CF_DATA. A cfdata's first field after the header is a
+     * pointer to its bytes; a cfuuid's is the bytes themselves. Tagged as data,
+     * releasing one sent sixteen random bytes' first eight to free() --
+     * "free(): invalid pointer", from a plugin that had done nothing wrong. */
+    cfuuid *u = obj_new(sizeof *u, CF_UUID);
     int i;
     (void)alloc;
     if (!u) return NULL;
@@ -1259,11 +1401,189 @@ static void __attribute__((constructor)) init_bundle(void)
 {
     g_main_bundle_info = (cfdict *)cf_dict_create_mutable(NULL, 8, NULL, NULL);
     g_main_bundle = g_main_bundle_info;
+    /* Held forever, deliberately. CFBundleGetInfoDictionary is a Get, so a
+     * plugin does not own what it returns -- but a plugin that releases it
+     * anyway would take the host's only info dictionary with it, and the *next*
+     * plugin would then find an empty one and look up nothing. That is not
+     * hypothetical: it is why a second VSTGUI editor in one session could not
+     * find the font its Info.plist names, and asked the bundle for a file
+     * called ".png". */
+    if (g_main_bundle_info) atomic_fetch_add(&g_main_bundle_info->o.refs, 1000);
 }
 
-/* Set by the loader once it knows which bundle is being opened. */
+/* ---- Info.plist -------------------------------------------------------
+ *
+ * The bundle's info dictionary was an empty one, which is enough for a plugin
+ * that only asks whether a key exists and quite a lot less than enough for one
+ * that keeps *data* there. Audio Damage's editors do: the Info.plist names the
+ * font each of their bitmap fonts is stored in --
+ *
+ *     <key>FontrastInfo_20000</key> <string>tahoma9</string>
+ *
+ * -- and the editor reads that key, asks the bundle for `tahoma9.tab`, and
+ * loads the glyph table from it. With the dictionary empty the lookup returned
+ * nothing and the whole load was skipped, which is where the crash seven of
+ * these editors died in began.
+ *
+ * The parser is a scan for <key> followed by its value, not an XML reader:
+ * these files are machine-written and the elements that carry anything a
+ * plugin reads are strings, integers and booleans. Keys inside a nested dict
+ * or array are skipped, so an AudioComponents entry cannot shadow a top-level
+ * one. */
+static const char *plist_tag(const char *p, const char *end, const char *tag,
+                             const char **body, CFIndex *len)
+{
+    char open[32], close[32];
+    const char *a, *b;
+    snprintf(open, sizeof open, "<%s>", tag);
+    snprintf(close, sizeof close, "</%s>", tag);
+    if (!(a = memmem(p, (size_t)(end - p), open, strlen(open)))) return NULL;
+    a += strlen(open);
+    if (!(b = memmem(a, (size_t)(end - a), close, strlen(close)))) return NULL;
+    *body = a;
+    *len = (CFIndex)(b - a);
+    return b + strlen(close);
+}
+
+/* Turn &amp; and friends back into what they were. */
+static void plist_unescape(char *s)
+{
+    char *r = s, *w = s;
+    while (*r) {
+        if (*r == '&') {
+            if (!strncmp(r, "&amp;", 5))       { *w++ = '&';  r += 5; continue; }
+            if (!strncmp(r, "&lt;", 4))        { *w++ = '<';  r += 4; continue; }
+            if (!strncmp(r, "&gt;", 4))        { *w++ = '>';  r += 4; continue; }
+            if (!strncmp(r, "&quot;", 6))      { *w++ = '"';  r += 6; continue; }
+            if (!strncmp(r, "&apos;", 6))      { *w++ = '\''; r += 6; continue; }
+        }
+        *w++ = *r++;
+    }
+    *w = 0;
+}
+
+#define PLIST_MAX (1u << 20)      /* an Info.plist is a few kilobytes */
+
+static void plist_load(const char *path, void *dict)
+{
+    char key[256], val[1024];
+    char *file = NULL;
+    const char *p, *end, *body;
+    CFIndex n = 0, len;
+    FILE *f = fopen(path, "rb");
+    long size;
+    size_t got;
+    int depth = 0;
+
+    if (!f) return;
+    /* Read the whole file rather than a fixed buffer's worth. A truncated
+     * Info.plist is worse than none: the keys a plugin reads sit at the end as
+     * often as the start, and losing them fails much later and looks like
+     * something else entirely. */
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0 || (unsigned long)size > PLIST_MAX) { fclose(f); return; }
+    if (!(file = malloc((size_t)size + 1))) { fclose(f); return; }
+    got = fread(file, 1, (size_t)size, f);
+    fclose(f);
+    file[got] = 0;
+    p = file; end = file + got;
+
+    /* Past the outermost <dict>, then key by key. */
+    while (p < end) {
+        const char *k = memmem(p, (size_t)(end - p), "<key>", 5);
+        const char *nest = memmem(p, (size_t)(end - p), "<dict>", 6);
+        const char *arr  = memmem(p, (size_t)(end - p), "<array>", 7);
+        const char *nend = memmem(p, (size_t)(end - p), "</dict>", 7);
+        const char *aend = memmem(p, (size_t)(end - p), "</array>", 8);
+        const char *first = k;
+        if (nest && (!first || nest < first)) first = nest;
+        if (arr  && (!first || arr  < first)) first = arr;
+        if (nend && (!first || nend < first)) first = nend;
+        if (aend && (!first || aend < first)) first = aend;
+        if (!first) break;
+        if (first == nest) { depth++; p = nest + 6; continue; }
+        if (first == arr)  { depth++; p = arr + 7;  continue; }
+        if (first == nend) { depth--; p = nend + 7; continue; }
+        if (first == aend) { depth--; p = aend + 8; continue; }
+
+        /* first == k: a key. */
+        p = plist_tag(k, end, "key", &body, &len);
+        if (!p) break;
+        if (depth != 1) continue;            /* nested: not ours to publish */
+        if (len >= (CFIndex)sizeof key) len = (CFIndex)sizeof key - 1;
+        memcpy(key, body, (size_t)len); key[len] = 0;
+        plist_unescape(key);
+
+        /* The value is whatever element comes next. */
+        {   const char *q = p;
+            while (q < end && (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r')) q++;
+            if (q + 8 <= end && !strncmp(q, "<string>", 8)) {
+                const char *e = memmem(q, (size_t)(end - q), "</string>", 9);
+                if (!e) break;
+                len = (CFIndex)(e - (q + 8));
+                if (len >= (CFIndex)sizeof val) len = (CFIndex)sizeof val - 1;
+                memcpy(val, q + 8, (size_t)len); val[len] = 0;
+                plist_unescape(val);
+                macshim_cf_dict_set_pub(dict, macshim_cf_string(key),
+                                        macshim_cf_string(val));
+                p = e + 9;
+            } else if (q + 9 <= end && !strncmp(q, "<integer>", 9)) {
+                const char *e = memmem(q, (size_t)(end - q), "</integer>", 10);
+                if (!e) break;
+                len = (CFIndex)(e - (q + 9));
+                if (len >= (CFIndex)sizeof val) len = (CFIndex)sizeof val - 1;
+                memcpy(val, q + 9, (size_t)len); val[len] = 0;
+                macshim_cf_dict_set_pub(dict, macshim_cf_string(key),
+                                        macshim_cf_number_int(atol(val)));
+                p = e + 10;
+            } else if (q + 7 <= end && !strncmp(q, "<true/>", 7)) {
+                macshim_cf_dict_set_pub(dict, macshim_cf_string(key), &g_true);
+                p = q + 7;
+            } else if (q + 8 <= end && !strncmp(q, "<false/>", 8)) {
+                macshim_cf_dict_set_pub(dict, macshim_cf_string(key), &g_false);
+                p = q + 8;
+            }
+            /* Anything else -- a nested dict or array -- is left for the walk
+             * above to step over on the next pass. */
+        }
+        n++;
+    }
+    if (getenv("MACCF_VERBOSE"))
+        fprintf(stderr, "  [cf] Info.plist: %ld key(s) from %s\n", (long)n, path);
+    free(file);
+}
+
+/* Empty a dictionary, keeping the object. */
+static void cf_dict_clear(CFTypeRef p)
+{
+    cfobj *o = as_obj(p);
+    cfdict *d = (cfdict *)o;
+    CFIndex i;
+    if (!o || o->type != CF_DICT) return;
+    for (i = 0; i < d->n; i++) { cf_release(d->k[i]); cf_release(d->v[i]); }
+    d->n = 0;
+}
+
+/* Set by the loader once it knows which bundle is being opened.
+ *
+ * The info dictionary is emptied first, because "the main bundle" means the
+ * plugin that is loaded *now*. Left to accumulate, a plugin read the previous
+ * one's keys -- and since two of these keep the name of their bitmap font
+ * under the same key, the second one to load looked up a font belonging to the
+ * first, read a glyph table that did not describe it, and crashed on the first
+ * character it drew. */
 void macshim_set_bundle(const char *path)
-{ snprintf(g_bundle_path, sizeof g_bundle_path, "%s", path ? path : ""); }
+{
+    char plist[4200];
+    snprintf(g_bundle_path, sizeof g_bundle_path, "%s", path ? path : "");
+    if (!g_main_bundle_info) return;
+    cf_dict_clear(g_main_bundle_info);
+    if (!g_bundle_path[0]) return;
+    snprintf(plist, sizeof plist, "%s/Contents/Info.plist", g_bundle_path);
+    plist_load(plist, g_main_bundle_info);
+}
 const char *macshim_bundle_path(void) { return g_bundle_path; }
 
 static void *cf_bundle_get_main(void) { return g_main_bundle; }
@@ -1328,6 +1648,81 @@ static unsigned char cf_url_fsrep(CFTypeRef url, unsigned char resolve,
     buf[n] = 0;
     return 1;
 }
+/* ---- URLs -------------------------------------------------------------
+ *
+ * A URL here is one of this shim's CFStrings carrying a POSIX path, which is
+ * enough for everything a plugin does with one: build it from a path, walk up a
+ * directory or two, hand it to CFBundleCreate, and read it back as a path.
+ * VSTGUI's `InitMachOLibrary` does exactly that -- ask dyld which image its code
+ * is in, turn the answer into a URL, delete the last three path components to
+ * get from Contents/MacOS/Foo to Foo.vst, and create the bundle. */
+static CFTypeRef cf_url_from_fsrep(void *alloc, const uint8_t *buf, CFIndex len,
+                                   unsigned char isdir)
+{
+    char path[4096];
+    CFIndex n = len;
+    (void)alloc; (void)isdir;
+    if (!buf) return NULL;
+    if (n < 0 || n >= (CFIndex)sizeof path) n = (CFIndex)sizeof path - 1;
+    memcpy(path, buf, (size_t)n);
+    path[n] = 0;
+    return (CFTypeRef)cf_string_create(NULL, path, 0);
+}
+static CFTypeRef cf_url_with_fspath(void *alloc, CFTypeRef path, long style,
+                                    unsigned char isdir)
+{
+    CFIndex n = 0;
+    const char *s = str_of(path, &n);
+    (void)alloc; (void)style; (void)isdir;
+    return s ? (CFTypeRef)cf_string_create(NULL, s, 0) : NULL;
+}
+/* The parent directory. A trailing slash is dropped first, so that deleting the
+ * last component of "/a/b/" gives "/a" rather than "/a/b". */
+static CFTypeRef cf_url_delete_last(void *alloc, CFTypeRef url)
+{
+    char path[4096];
+    CFIndex n = 0;
+    const char *s = str_of(url, &n);
+    char *slash;
+    (void)alloc;
+    if (!s) return NULL;
+    snprintf(path, sizeof path, "%s", s);
+    n = (CFIndex)strlen(path);
+    while (n > 1 && path[n - 1] == '/') path[--n] = 0;
+    if ((slash = strrchr(path, '/')) && slash != path) *slash = 0;
+    else if (slash) slash[1] = 0;
+    return (CFTypeRef)cf_string_create(NULL, path, 0);
+}
+static CFTypeRef cf_url_copy_fspath(void *alloc, CFTypeRef url, long style)
+{
+    CFIndex n = 0;
+    const char *s = str_of(url, &n);
+    (void)alloc; (void)style;
+    return s ? (CFTypeRef)cf_string_create(NULL, s, 0) : NULL;
+}
+static CFTypeRef cf_url_copy_last(void *alloc, CFTypeRef url)
+{
+    CFIndex n = 0;
+    const char *s = str_of(url, &n);
+    const char *slash;
+    (void)alloc;
+    if (!s) return NULL;
+    slash = strrchr(s, '/');
+    return (CFTypeRef)cf_string_create(NULL, slash ? slash + 1 : s, 0);
+}
+static CFTypeRef cf_url_append(void *alloc, CFTypeRef url, CFTypeRef comp,
+                               unsigned char isdir)
+{
+    char path[4096];
+    CFIndex n = 0, m = 0;
+    const char *s = str_of(url, &n), *c = str_of(comp, &m);
+    (void)alloc; (void)isdir;
+    if (!s) return NULL;
+    snprintf(path, sizeof path, "%s%s%s", s,
+             (n && s[n - 1] == '/') ? "" : "/", c ? c : "");
+    return (CFTypeRef)cf_string_create(NULL, path, 0);
+}
+
 static void *g_k_bundle_version;
 static void *g_type_array_cb[8];
 
@@ -1403,6 +1798,13 @@ const macshim_entry macshim_cf2[] = {
     { "_CFBundleUnloadExecutable",   cf_bundle_unload },
     { "_CFBundleGetFunctionPointerForName", cf_bundle_function },
     { "_CFURLGetFileSystemRepresentation",  cf_url_fsrep },
+    { "_CFURLCreateFromFileSystemRepresentation", cf_url_from_fsrep },
+    { "_CFURLCreateWithFileSystemPath",     cf_url_with_fspath },
+    { "_CFURLCreateCopyDeletingLastPathComponent", cf_url_delete_last },
+    { "_CFURLCreateCopyAppendingPathComponent", cf_url_append },
+    { "_CFURLCopyFileSystemPath",           cf_url_copy_fspath },
+    { "_CFURLCopyLastPathComponent",        cf_url_copy_last },
+    { "_CFURLCopyPath",                     cf_url_copy_fspath },
     { "_CFRunLoopRemoveTimer",       cf_runloop_remove_timer },
     { "_kCFAllocatorNull",           &g_allocator_null },
     { "_kCFBundleVersionKey",        &g_k_bundle_version },
@@ -1477,7 +1879,8 @@ void *macshim_lookup(const char *sym)
         macshim_vdsp, macshim_corefoundation, macshim_libsystem,
         macshim_pthread, macshim_audiounit, macshim_foundation,
         macshim_quartz, macshim_quartz2, macshim_quartz3,
-        macshim_cf2, macshim_mach, macshim_files, macshim_metal, NULL
+        macshim_cf2, macshim_mach, macshim_files, macshim_metal,
+        macshim_imageio, NULL
     };
     int t, i;
     if (!sym) return NULL;

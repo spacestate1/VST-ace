@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <string.h>
 
 #include "macshim.h"
@@ -93,15 +94,71 @@ static class_ro_t *class_ro(objc_class *c)
 typedef struct { objc_class *isa; } obj_header;
 
 #define OBJ_MAGIC 0x6f626a6331706531ull            /* "objc1pe1" */
-typedef struct { unsigned long magic; long refs; } obj_prefix;
+typedef struct obj_prefix {
+    unsigned long      magic;
+    long               refs;
+    struct obj_prefix *reg_next;   /* see the registry below */
+} obj_prefix;
+
+/* ---- which pointers this runtime allocated -----------------------------
+ *
+ * `obj_pre` answers "did we make this?", and it used to answer by reading the
+ * sixteen bytes *before* the pointer and comparing a magic word. That is a read
+ * through a pointer this runtime did not make, and it is asked constantly:
+ * every retain, every release, every ARC helper.
+ *
+ * A plugin supplies pointers we did not make all the time, and legitimately.
+ * dispatch objects are Objective-C objects on macOS, so ARC emits
+ * objc_retainAutoreleasedReturnValue on a dispatch_semaphore_t -- and this
+ * host's semaphores are a plain struct with nothing in front of them.
+ * AddressSanitizer caught it reading sixteen bytes before one.
+ *
+ * So the same answer as the CoreFoundation side: a hash set of what we
+ * allocated, keyed by address, with the link stored in the prefix so there is
+ * nothing extra to allocate. An entry is removed when the object is retired,
+ * which is also exactly when obj_pre should start saying no.
+ *
+ * Locked, because a plugin's dispatched blocks run on threads of their own and
+ * allocate objects there -- see gcd_async. The bucket count is generous so the
+ * chains stay at one or two entries and the lock is held for a handful of
+ * instructions; this is on the path of every retain and every release. */
+#define OBJREG_BUCKETS 8192
+static obj_prefix *g_objreg[OBJREG_BUCKETS];
+static pthread_mutex_t g_objreg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned objreg_bucket(const void *p)
+{ return (unsigned)((((uintptr_t)p) >> 4) * 2654435761u) % OBJREG_BUCKETS; }
+
+static void objreg_add(obj_prefix *pre)
+{
+    unsigned b = objreg_bucket(pre + 1);
+    pthread_mutex_lock(&g_objreg_lock);
+    pre->reg_next = g_objreg[b];
+    g_objreg[b] = pre;
+    pthread_mutex_unlock(&g_objreg_lock);
+}
+static void objreg_del(obj_prefix *pre)
+{
+    unsigned b = objreg_bucket(pre + 1);
+    obj_prefix **pp;
+    pthread_mutex_lock(&g_objreg_lock);
+    for (pp = &g_objreg[b]; *pp; pp = &(*pp)->reg_next)
+        if (*pp == pre) { *pp = pre->reg_next; break; }
+    pthread_mutex_unlock(&g_objreg_lock);
+}
 
 /* The bookkeeping for `p`, or NULL if we did not allocate it. */
 static obj_prefix *obj_pre(void *p)
 {
-    obj_prefix *pre;
+    obj_prefix *pre, *found = NULL;
+    unsigned b;
     if (!p) return NULL;
-    pre = (obj_prefix *)p - 1;
-    return pre->magic == OBJ_MAGIC ? pre : NULL;
+    b = objreg_bucket(p);
+    pthread_mutex_lock(&g_objreg_lock);
+    for (pre = g_objreg[b]; pre; pre = pre->reg_next)
+        if ((void *)(pre + 1) == p) { found = pre; break; }
+    pthread_mutex_unlock(&g_objreg_lock);
+    return (found && found->magic == OBJ_MAGIC) ? found : NULL;
 }
 
 static int oc_verbose(void)
@@ -155,7 +212,22 @@ static const char *class_name(objc_class *c)
 
 static void register_class(objc_class *c)
 {
-    if (!c || g_nclasses >= MAX_CLASSES) return;
+    if (!c) return;
+    if (g_nclasses >= MAX_CLASSES) {
+        /* Said once, and out loud rather than through OLOG: a full table is not
+         * a lost log line. An unregistered class is not recognised as one, so
+         * every instance of it stops being an object as far as
+         * macobjc_isa_named is concerned -- which is silent, and shows up much
+         * later as a Foundation method that did nothing. */
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [objc] class table full at %d -- %s and any "
+                            "later class will not be recognised\n",
+                    MAX_CLASSES, class_name(c));
+        }
+        return;
+    }
     g_classes[g_nclasses++] = c;
     OLOG("  [objc] class %s\n", class_name(c));
 }
@@ -256,6 +328,12 @@ void (*macobjc_lookup(void *selfp, const char *selname))(void)
     return nil_return;                           /* never NULL: see find_method */
 }
 
+/* Defined with the class registry further down. Declared here because the type
+ * tests and the class accessors below have to refuse anything that is not a
+ * class this runtime minted -- they are asked about pointers that are not
+ * objects at all. */
+static int known_class(const objc_class *c);
+
 /* objc_msgSendSuper2 gets a struct { receiver, current class } and starts the
  * search at that class's superclass. */
 typedef struct { id receiver; objc_class *cls; } super2;
@@ -271,8 +349,34 @@ void (*macobjc_lookup_super(void *sp, const char *selname))(void)
     note_missed(s->cls ? class_name(s->cls) : "?", sel);
     return nil_return;
 }
+/* The older objc_msgSendSuper: s->cls is already where the search starts, not
+ * the class to search above it. The two structs are the same shape, so only the
+ * lookup differs -- and getting them the wrong way round is silent, because a
+ * class that inherits the method it is overriding still finds *a* method. */
+void (*macobjc_lookup_super1(void *sp, const char *selname))(void)
+{
+    ensure_installed();
+    super2 *s = sp;
+    SEL sel = selname;
+    IMP imp;
+    if (!s || !s->receiver) return nil_return;
+    if ((imp = find_method(s->cls, sel))) return imp;
+    note_missed(s->cls ? class_name(s->cls) : "?", sel);
+    return nil_return;
+}
+
 void *macobjc_super_receiver(void *sp)
 { super2 *s = sp; return s ? s->receiver : NULL; }
+
+/* class_getSuperclass / class_getName / object_getClass. A class built at
+ * runtime is walked by the code that built it, which is the one case where a
+ * plugin asks the runtime about a class rather than messaging it. */
+static void *oc_class_get_superclass(void *cls)
+{ return (cls && known_class(cls)) ? ((objc_class *)cls)->superclass : NULL; }
+static const char *oc_class_get_name(void *cls)
+{ return (cls && known_class(cls)) ? class_name(cls) : ""; }
+static void *oc_object_get_class(void *obj)
+{ return obj ? ((obj_header *)obj)->isa : NULL; }
 
 /* --------------------------------------------------- NSObject and stand-ins */
 
@@ -284,8 +388,20 @@ static id ns_alloc(id self, SEL sel)
     objc_class *cls = (objc_class *)self;        /* a class message */
     class_ro_t *ro = class_ro(cls);
     /* Our own classes lay a struct over the instance, so never allocate less
-     * than the two words those structs begin with. */
+     * than the two words those structs begin with.
+     *
+     * And then some slack, because instanceSize is not reliably the size of the
+     * instance here. Objective-C's modern runtime slides a subclass's ivars at
+     * class realization, against whatever its superclass turned out to be;
+     * nothing here realizes classes, so a plugin's subclass keeps the offsets
+     * the compiler wrote against Apple's headers and this host's stand-in
+     * superclass is a different size. AddressSanitizer caught the result: an
+     * Audio Unit's Cocoa view factory reading eight bytes off the end of the
+     * thirty-two it had been given, from inside a Metal completion handler. The
+     * slack turns that from a heap overflow into a read of zeroes -- which is
+     * what a field the plugin has not written should be anyway. */
     size_t sz = ro && ro->instanceSize > 16 ? ro->instanceSize : 16;
+    sz += 256;
     obj_prefix *pre = calloc(1, sizeof *pre + sz);
     obj_header *o;
     (void)sel;
@@ -294,6 +410,7 @@ static id ns_alloc(id self, SEL sel)
     pre->refs = 1;
     o = (obj_header *)(pre + 1);
     o->isa = cls;
+    objreg_add(pre);
     return o;
 }
 static id  ns_init(id self, SEL sel)          { (void)sel; return self; }
@@ -306,6 +423,7 @@ static unsigned long g_retired;
 static void obj_retire(obj_prefix *pre)
 {
     if (!pre) return;
+    objreg_del(pre);
     pre->magic = 0;          /* a further release finds no header and does nothing */
     g_retired++;
 }
@@ -322,9 +440,91 @@ static void ns_dealloc(id self, SEL sel)
 { (void)sel; obj_retire(obj_pre(self)); }
 static id  ns_class(id self, SEL sel)
 { (void)sel; return self ? ((obj_header *)self)->isa : NULL; }
+/* +class, which is not -class.
+ *
+ * An instance's -class is its isa; a class's +class is the class itself. One
+ * implementation cannot serve both, and the instance form applied to a class
+ * hands back the *metaclass*. That is not a cosmetic difference: VSTGUI builds
+ * its NSView subclass with objc_allocateClassPair([NSView class], ...), so it
+ * was handed NSView's metaclass, its subclass inherited from the class-side of
+ * the pair, and [super initWithFrame:] then looked for an instance method among
+ * class methods and found nothing. Every VSTGUI editor in this corpus stopped
+ * exactly there. */
+static id  ns_class_self(id self, SEL sel) { (void)sel; return self; }
 static signed char ns_responds(id self, SEL sel, SEL q)
 { (void)sel; return self && find_method(((obj_header *)self)->isa, q) ? 1 : 0; }
 static signed char ns_no(id self, SEL sel)    { (void)self; (void)sel; return 0; }
+
+/* isKindOfClass:, answered rather than refused.
+ *
+ * This used to return NO for everything, which is a lie about every object the
+ * runtime hands out. The chain walk is bounded and gated on classes this
+ * runtime knows, for the same reason macobjc_isa_named is: the question gets
+ * asked about things that are not objects. */
+static signed char ns_is_kind(id self, SEL sel, void *cls)
+{
+    objc_class *c;
+    int depth = 0;
+    (void)sel;
+    if (!self || !cls) return 0;
+    c = ((obj_header *)self)->isa;
+    if (!known_class(c) || !known_class((const objc_class *)cls)) return 0;
+    for (; c && depth < 64; c = c->superclass, depth++) {
+        if (c == (objc_class *)cls) return 1;
+        if (c->superclass && !known_class(c->superclass)) break;
+    }
+    return 0;
+}
+
+/* isMemberOfClass: is the exact class, not the chain -- a separate question
+ * from isKindOfClass:, and answering both the same way would tell a plugin its
+ * subclass is its superclass. */
+static signed char ns_is_member(id self, SEL sel, void *cls)
+{
+    (void)sel;
+    if (!self || !cls) return 0;
+    return known_class(((obj_header *)self)->isa) &&
+           ((obj_header *)self)->isa == (objc_class *)cls;
+}
+
+/* performSelector: and its two argument-carrying forms.
+ *
+ * Not decoration: a plugin uses these exactly when it cannot name a selector at
+ * compile time, which is what a class it built at runtime forces. VSTGUI does
+ * that to reach its own NSView subclass's initialiser --
+ * [[VSTGUI_NSView alloc] performSelector:@selector(initWithFrame:andCFrame:)
+ *                                 withObject:.. withObject:..] -- so with these
+ * missing the send returned nil, the frame was never built, and the editor
+ * reported an empty rect. Every VSTGUI editor in this corpus stopped there.
+ *
+ * A selector the receiver does not implement gets nil, which is what Objective-C
+ * does for an unhandled message rather than what it does for performSelector:
+ * (which raises). Nothing here can raise, and nil is the answer the caller
+ * already has to survive. */
+static id ns_perform(id self, SEL sel, SEL q)
+{
+    IMP imp;
+    (void)sel;
+    if (!self || !q) return NULL;
+    imp = find_method(((obj_header *)self)->isa, q);
+    return imp ? ((id (*)(id, SEL))imp)(self, q) : NULL;
+}
+static id ns_perform1(id self, SEL sel, SEL q, id a)
+{
+    IMP imp;
+    (void)sel;
+    if (!self || !q) return NULL;
+    imp = find_method(((obj_header *)self)->isa, q);
+    return imp ? ((id (*)(id, SEL, id))imp)(self, q, a) : NULL;
+}
+static id ns_perform2(id self, SEL sel, SEL q, id a, id b)
+{
+    IMP imp;
+    (void)sel;
+    if (!self || !q) return NULL;
+    imp = find_method(((obj_header *)self)->isa, q);
+    return imp ? ((id (*)(id, SEL, id, id))imp)(self, q, a, b) : NULL;
+}
 
 static method_t g_nsobject_methods[] = {
     { "alloc",              "@@:",   (IMP)ns_alloc },
@@ -337,8 +537,12 @@ static method_t g_nsobject_methods[] = {
     { "dealloc",            "v@:",   (IMP)ns_dealloc },
     { "class",              "#@:",   (IMP)ns_class },
     { "respondsToSelector:", "c@::", (IMP)ns_responds },
-    { "isKindOfClass:",     "c@:#",  (IMP)ns_no },
-    { "conformsToProtocol:", "c@:@", (IMP)ns_no }
+    { "isKindOfClass:",     "c@:#",  (IMP)ns_is_kind },
+    { "isMemberOfClass:",   "c@:#",  (IMP)ns_is_member },
+    { "conformsToProtocol:", "c@:@", (IMP)ns_no },
+    { "performSelector:",   "@@::",  (IMP)ns_perform },
+    { "performSelector:withObject:", "@@::@", (IMP)ns_perform1 },
+    { "performSelector:withObject:withObject:", "@@::@@", (IMP)ns_perform2 }
 };
 static method_list_t *g_nsobject_ml;
 
@@ -359,6 +563,7 @@ static const char *const g_apple_classes[] = {
     "MTLRenderPassDescriptor", "MTLRenderPipelineDescriptor",
     "MTLDepthStencilDescriptor", "MTLTextureDescriptor", "MTLSamplerDescriptor",
     "MTKView", "MTLStencilDescriptor", "MTLVertexDescriptor",
+    "NSCell", "NSControl",
     "NSAffineTransform", "NSAnimationContext", "NSBitmapImageRep",
     "NSDraggingItem", "NSFormatter", "NSMutableCharacterSet", "NSMutableString",
     "NSPasteboardItem", "NSProcessInfo", "NSRunLoop", "NSTextFieldCell",
@@ -379,19 +584,23 @@ typedef struct {
 
 #define MAX_IVARS 8
 
+/* An Ivar, as the runtime hands it out: a pointer to this record. It lives in
+ * the class table and so stays valid for the life of the class, which is what
+ * the API promises. */
+typedef struct { char name[32]; uint32_t off, size; } synth_ivar;
+
 static struct {
     objc_class cls, meta;
     class_ro_t ro, mro;
     synth_ml   ml, mml;
     char name[64];
     int  used;
-    /* Ivars added at runtime -- see objc_allocateClassPair below. Names are kept
-     * even though nothing looks an offset up yet: the moment a plugin imports
-     * object_getInstanceVariable this is what it would be answered from, and a
-     * bump pointer alone could not answer it. */
+    /* Ivars added at runtime -- see objc_allocateClassPair below. A class the
+     * plugin assembled has no compiled-in offsets to reach its own fields by,
+     * so it asks the runtime; class_getInstanceVariable answers from here. */
     uint32_t ivar_next;
     int      nivar;
-    struct { char name[32]; uint32_t off, size; } ivar[MAX_IVARS];
+    synth_ivar ivar[MAX_IVARS];
 } g_synth[MAX_SYNTH];
 static int g_nsynth;
 static objc_class *g_nsobject;
@@ -425,12 +634,16 @@ static objc_class *synth_class(const char *name, objc_class *super)
     g_synth[i].mro.baseMethods = (method_list_t *)&g_synth[i].mml;
 
     /* The root class holds NSObject's behaviour on both sides, so alloc/init/
-     * retain/release resolve for every instance and every class. */
+     * retain/release resolve for every instance and every class. The two sides
+     * are the same list except where the class form differs from the instance
+     * one -- see ns_class_self. */
     if (!super) {
         size_t k, n = sizeof g_nsobject_methods / sizeof *g_nsobject_methods;
         for (k = 0; k < n && k < MAX_METHODS; k++) {
             g_synth[i].ml.m[k] = g_nsobject_methods[k];
             g_synth[i].mml.m[k] = g_nsobject_methods[k];
+            if (!strcmp(g_nsobject_methods[k].name, "class"))
+                g_synth[i].mml.m[k].imp = (IMP)ns_class_self;
         }
         g_synth[i].ml.count = (uint32_t)(n < MAX_METHODS ? n : MAX_METHODS);
         g_synth[i].mml.count = g_synth[i].ml.count;
@@ -462,6 +675,24 @@ void macobjc_register_image_classes(void *const *classlist, size_t count)
     for (i = 0; i < count; i++) {
         objc_class *c = classlist[i];
         if (c) register_class(c);
+    }
+}
+
+/* The other half, for when the image goes. The registry is a plain array
+ * searched linearly, so a slot is freed by moving the last entry into it --
+ * order carries no meaning here. */
+void macobjc_forget_image_classes(void *const *classlist, size_t count)
+{
+    size_t i;
+    int k;
+    for (i = 0; i < count; i++) {
+        objc_class *c = classlist[i];
+        if (!c) continue;
+        for (k = 0; k < g_nclasses; k++)
+            if (g_classes[k] == c) {
+                g_classes[k] = g_classes[--g_nclasses];
+                break;
+            }
     }
 }
 
@@ -530,6 +761,38 @@ static void __attribute__((constructor)) init_objc(void)
     for (i = 0; i < n; i++) {
         if (!strcmp(g_apple_classes[i], "NSObject")) continue;
         synth_class(g_apple_classes[i], g_nsobject);
+    }
+    /* Then the hierarchy. Every stand-in above is minted as a direct NSObject
+     * subclass, which is enough for anything a plugin only messages -- and
+     * wrong the moment it *subclasses* one. An NSTextField is an NSView, so a
+     * plugin's IGraphicsTextField expects [super initWithFrame:] to find
+     * NSView's; with the chain flat it found nothing, the field was never
+     * built, and clicking a control that offers text entry took the host down.
+     *
+     * Only the relationships a plugin actually leans on are named. The rest
+     * stay flat, because inventing a hierarchy nothing needs is a way to move a
+     * method resolution somewhere surprising. */
+    {
+        static const struct { const char *cls, *super; } parents[] = {
+            { "NSControl",       "NSView"    },
+            { "NSTextField",     "NSControl" },
+            { "NSTextView",      "NSView"    },
+            { "NSScrollView",    "NSView"    },
+            { "NSClipView",      "NSView"    },
+            { "NSButton",        "NSControl" },
+            { "NSPopUpButton",   "NSButton"  },
+            { "NSSlider",        "NSControl" },
+            { "NSTextFieldCell", "NSCell"    },
+            { NULL, NULL }
+        };
+        int k;
+        for (k = 0; parents[k].cls; k++) {
+            objc_class *c = macobjc_class(parents[k].cls);
+            objc_class *p = macobjc_class(parents[k].super);
+            if (!c || !p) continue;
+            c->superclass = p;
+            c->isa->superclass = p->isa;   /* the metaclass chain runs alongside */
+        }
     }
 }
 
@@ -606,8 +869,18 @@ void *macobjc_define_class(const char *name)
 void *macobjc_class(const char *name)
 {
     int i;
+    if (!name) return NULL;
+    /* Our stand-ins first. A plugin that asks for "NSView" wants the class its
+     * own subclasses were bound against, not some image's like-named one. */
     for (i = 0; i < g_nsynth; i++)
         if (g_synth[i].used && !strcmp(g_synth[i].name, name)) return &g_synth[i].cls;
+    /* Then the image's own. NSClassFromString is how an Audio Unit's host is
+     * meant to reach the Cocoa view class the unit names in
+     * kAudioUnitProperty_CocoaUI -- the class is compiled into the plugin, so
+     * answering only for stand-ins meant the name never resolved and the view
+     * was never built. */
+    for (i = 0; i < g_nclasses; i++)
+        if (!strcmp(class_name(g_classes[i]), name)) return g_classes[i];
     return NULL;
 }
 
@@ -720,6 +993,72 @@ static int oc_class_add_ivar(void *cls, const char *name, size_t size,
     return 1;
 }
 
+/* ---- reaching a runtime class's fields ---------------------------------
+ *
+ * A class assembled at runtime has no compiled-in ivar offsets, so the code
+ * that built it asks the runtime where its fields went. VSTGUI keeps the CFrame
+ * its view draws through in exactly such an ivar: with the lookup missing the
+ * store went nowhere, and the view was built, marked itself dirty a hundred and
+ * fifty times, and then drew nothing, because drawRect: could not find the
+ * frame it was meant to draw.
+ *
+ * Every accessor bounds-checks the offset against the instance it is handed.
+ * The offsets come from our own table, but the object does not have to. */
+static void *oc_class_get_instance_variable(void *cls, const char *name)
+{
+    int i = synth_index(cls, NULL), k;
+    if (i < 0 || !name) return NULL;
+    for (k = 0; k < g_synth[i].nivar; k++)
+        if (!strcmp(g_synth[i].ivar[k].name, name)) return &g_synth[i].ivar[k];
+    return NULL;
+}
+static const char *oc_ivar_get_name(void *iv)
+{ return iv ? ((synth_ivar *)iv)->name : ""; }
+static long oc_ivar_get_offset(void *iv)
+{ return iv ? (long)((synth_ivar *)iv)->off : 0; }
+
+/* Where in `obj` an ivar sits, or NULL if it cannot be placed there. */
+static void *ivar_slot(id obj, const synth_ivar *iv)
+{
+    class_ro_t *ro;
+    if (!obj || !iv) return NULL;
+    ro = class_ro(((obj_header *)obj)->isa);
+    if (!ro || iv->off + iv->size > ro->instanceSize) return NULL;
+    return (uint8_t *)obj + iv->off;
+}
+
+static void oc_object_set_ivar(id obj, void *iv, id value)
+{ void *p = ivar_slot(obj, iv); if (p) memcpy(p, &value, sizeof value); }
+static id oc_object_get_ivar(id obj, void *iv)
+{ void *p = ivar_slot(obj, iv); id v = NULL; if (p) memcpy(&v, p, sizeof v); return v; }
+
+/* The older, name-keyed pair. Both return the Ivar they found, as Apple's do. */
+static void *oc_object_set_instance_variable(id obj, const char *name, void *value)
+{
+    synth_ivar *iv;
+    void *p;
+    if (!obj) return NULL;
+    iv = oc_class_get_instance_variable(((obj_header *)obj)->isa, name);
+    if ((p = ivar_slot(obj, iv))) memcpy(p, &value, sizeof value);
+    return iv;
+}
+static void *oc_object_get_instance_variable(id obj, const char *name, void **out)
+{
+    synth_ivar *iv;
+    void *p;
+    if (out) *out = NULL;
+    if (!obj) return NULL;
+    iv = oc_class_get_instance_variable(((obj_header *)obj)->isa, name);
+    if ((p = ivar_slot(obj, iv)) && out) memcpy(out, p, sizeof *out);
+    return iv;
+}
+
+static size_t oc_class_get_instance_size(void *cls)
+{
+    class_ro_t *ro = (cls && known_class(cls)) ? class_ro(cls) : NULL;
+    return ro ? ro->instanceSize : 0;
+}
+
 /* The class is already in the table and already dispatchable, so there is
  * nothing to finalise. Kept because the plugin calls it and a missing import is
  * what started this. */
@@ -786,6 +1125,8 @@ const macshim_entry macshim_objc[] = {
     { "_objc_msgSendSuper2_fixup", (void *)(void (*)(void))macobjc_msgSendSuper2_fixup },
     { "_objc_msgSendSuper2",      (void *)(void (*)(void))macobjc_msgSendSuper2 },
     { "_objc_msgSendSuper2_stret", (void *)(void (*)(void))macobjc_msgSendSuper2_stret },
+    { "_objc_msgSendSuper",       (void *)(void (*)(void))macobjc_msgSendSuper },
+    { "_objc_msgSendSuper_stret", (void *)(void (*)(void))macobjc_msgSendSuper_stret },
     { "_objc_retain",             oc_retain },
     { "_objc_release",            oc_release },
     { "_objc_autorelease",        oc_autorelease },
@@ -810,6 +1151,17 @@ const macshim_entry macshim_objc[] = {
     { "_objc_disposeClassPair",    oc_dispose_class_pair },
     { "_class_addMethod",          oc_class_add_method },
     { "_class_addIvar",            oc_class_add_ivar },
+    { "_class_getSuperclass",      oc_class_get_superclass },
+    { "_class_getName",            oc_class_get_name },
+    { "_class_getInstanceSize",    oc_class_get_instance_size },
+    { "_class_getInstanceVariable", oc_class_get_instance_variable },
+    { "_ivar_getName",             oc_ivar_get_name },
+    { "_ivar_getOffset",           oc_ivar_get_offset },
+    { "_object_setIvar",           oc_object_set_ivar },
+    { "_object_getIvar",           oc_object_get_ivar },
+    { "_object_setInstanceVariable", oc_object_set_instance_variable },
+    { "_object_getInstanceVariable", oc_object_get_instance_variable },
+    { "_object_getClass",          oc_object_get_class },
     { NULL, NULL }
 };
 

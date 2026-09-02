@@ -452,6 +452,13 @@ typedef struct { double x, y; } NSPoint;
 typedef struct { double w, h; } NSSize;
 typedef struct { NSPoint origin; NSSize size; } NSRect;
 
+/* The screen this host pretends to have. One number, because a plugin converts
+ * between screen coordinates counted from the bottom and window coordinates
+ * counted from the top and expects both to be measured against the same
+ * display -- see the pointer section further down for what disagreeing cost. */
+#define SCREEN_W 1920
+#define SCREEN_H 1080
+
 /* A view's state deliberately lives *outside* the object.
  *
  * Objective-C's modern runtime has non-fragile ivars: the compiler emits a
@@ -472,7 +479,15 @@ typedef struct view_state {
     id     subviews;                 /* an NSMutableArray */
     id     window;
     int    needs_display, hidden;
+    /* What actually needs repainting. A view that says "this knob changed" and
+     * is told to redraw its whole self repaints every control it owns, which on
+     * a 858x648 editor is most of a million pixels for a dial that covers a few
+     * thousand -- see the dirty-rect note above macns_draw_dirty. */
+    NSRect dirty;
     void  *layer;
+    /* An NSControl's cell, for the text-entry path: the plugin builds one, hands
+     * it over with -setCell:, and reads it back. */
+    id     cell;
 } nsview;
 
 #define VIEW_BUCKETS 64
@@ -504,6 +519,7 @@ static id view_init_frame(id self, SEL sel, NSRect r)
     v->superview = v->window = NULL;
     v->layer = NULL;
     v->needs_display = v->hidden = 0;
+    memset(&v->dirty, 0, sizeof v->dirty);
     v->frame = r;
     /* A view's bounds start at the origin with the frame's size. */
     v->bounds.origin.x = 0.0; v->bounds.origin.y = 0.0;
@@ -511,6 +527,28 @@ static id view_init_frame(id self, SEL sel, NSRect r)
     v->subviews = arr_make();
     return self;
 }
+/* An initialiser that only has to return the object. Enough for the cells and
+ * the odds and ends that carry no state this host keeps. */
+static id view_init_self(id self, SEL sel, id arg)
+{ (void)sel; (void)arg; return self; }
+
+/* ---- NSControl and NSCell ---------------------------------------------
+ *
+ * A plugin's text entry is a stack of three: an NSTextField subclass, an
+ * NSTextFieldCell subclass inside it, and a string. Almost every message it
+ * sends them is configuration -- editable, bordered, background, alignment --
+ * which nothing here draws and which therefore only has to be accepted. What
+ * does have to be real is the cell: the plugin sets one and reads it back, and
+ * a nil answer is a control it then sends messages to. */
+static void ctl_set1(id self, SEL sel, id arg)
+{ (void)self; (void)sel; (void)arg; }
+static void ctl_set_flag(id self, SEL sel, signed char v)
+{ (void)self; (void)sel; (void)v; }
+static void ctl_set_cell(id self, SEL sel, id c)
+{ nsview *v = as_view(self); (void)sel; if (v) v->cell = c; }
+static id   ctl_cell(id self, SEL sel)
+{ nsview *v = as_view(self); (void)sel; return v ? v->cell : NULL; }
+static id   ctl_nil(id self, SEL sel) { (void)self; (void)sel; return NULL; }
 static id view_init(id self, SEL sel)
 {
     NSRect z;
@@ -572,32 +610,227 @@ static id   view_superview(id self, SEL sel)
 { nsview *v = as_view(self); (void)sel; return v ? v->superview : NULL; }
 static id   view_subviews(id self, SEL sel)
 { nsview *v = as_view(self); (void)sel; return v ? v->subviews : NULL; }
-static id   view_window(id self, SEL sel)
-{ nsview *v = as_view(self); (void)sel; return v ? v->window : NULL; }
+/* The view a layer was installed on, or the first to ask to be redrawn -- the
+ * one the editor actually draws into, and the one input is delivered to. */
 static id g_editor_view;
+
+/* The editor view, but only while it is still one.
+ *
+ * A view belongs to the plugin that built it, and its class lives in that
+ * plugin's image. When the image is unmapped the pointer stays behind, and the
+ * next thing to message it walks a class structure that is no longer there --
+ * which is a fault in the host, on whatever the *next* plugin was doing.
+ * as_view answers no for an object whose class the runtime no longer knows,
+ * which is exactly the question worth asking here, so a close path that forgot
+ * to reset costs nothing rather than the process. */
+static id live_editor_view(void)
+{
+    if (g_editor_view && !as_view(g_editor_view)) g_editor_view = NULL;
+    return g_editor_view;
+}
+
+
+/* ---- the window --------------------------------------------------------
+ *
+ * There is no window server here, and for a long time no window either: a view
+ * answered `nil` and that seemed harmless, because nothing is ever shown. It is
+ * not harmless. A plugin that grabs a control asks its window to convert the
+ * cursor's screen position into window coordinates, and a message to nil
+ * returns zero -- so iPlug2 stored the mouse-down position as (0,0), and the
+ * first drag after the press moved the control by the entire distance from the
+ * top-left corner. Every macOS editor here could be clicked and not dragged.
+ *
+ * So there is a window, and its geometry is chosen to make the two coordinate
+ * systems agree with what macns_post_mouse already synthesises: an event's
+ * locationInWindow is the pointer's position measured from the *view's* bottom
+ * edge, which puts the window's origin at the top-left of the screen. Everything
+ * below follows from that one placement. */
+static double editor_height(void)
+{
+    nsview *v = as_view(g_editor_view);
+    return v ? v->bounds.size.h : 0.0;
+}
+static double editor_width(void)
+{
+    nsview *v = as_view(g_editor_view);
+    return v ? v->bounds.size.w : 0.0;
+}
+/* Screen y of the window's bottom edge: the window is flush with the top of the
+ * screen, so its bottom is a view's height down from the top. */
+static double window_origin_y(void) { return (double)SCREEN_H - editor_height(); }
+
+static id   view_window(id self, SEL sel)
+{
+    static id cached;
+    nsview *v = as_view(self);
+    (void)sel;
+    if (v && v->window) return v->window;
+    if (!cached) cached = ns_new_of("NSWindow");
+    if (v) v->window = cached;
+    return cached;
+}
+
+static NSRect win_frame(id self, SEL sel)
+{
+    NSRect r;
+    (void)self; (void)sel;
+    r.origin.x = 0.0;
+    r.origin.y = window_origin_y();
+    r.size.w = editor_width();
+    r.size.h = editor_height();
+    return r;
+}
+/* Where the pointer is, in the window's coordinates.
+ *
+ * A control that tracks a gesture by polling rather than by waiting for
+ * mouseDragged: asks this, and Dr. Device's XY pad is one of them: it reads the
+ * pointer four times across a drag and puts its handle wherever the answer
+ * says. Unimplemented, the answer was the zero point every time, so the pad
+ * animated -- the picture changed on fifty-eight of fifty-nine frames -- while
+ * the handle sat in the corner and the parameters never moved. It looked like
+ * the control ignoring the mouse; it was the control being told the mouse was
+ * at the origin.
+ *
+ * Same convention and same virtual pointer as the events carry, so a plugin
+ * that mixes the two sees one pointer rather than two. */
+static NSPoint win_mouse_location(id self, SEL sel)
+{
+    NSPoint p;
+    double h = editor_height();
+    (void)self; (void)sel;
+    macns_pointer(&p.x, &p.y);
+    if (h > 0.0) p.y = h - p.y;
+    return p;
+}
+/* A control asking to take the keyboard is told it did. Answering nil here is a
+ * "no", and a control that checks gives up whatever it was starting. */
+static signed char win_make_first_responder(id self, SEL sel, id who)
+{ (void)self; (void)sel; (void)who; return 1; }
+
+static NSRect win_rect_from_screen(id self, SEL sel, NSRect r)
+{ (void)self; (void)sel; r.origin.y -= window_origin_y(); return r; }
+static NSRect win_rect_to_screen(id self, SEL sel, NSRect r)
+{ (void)self; (void)sel; r.origin.y += window_origin_y(); return r; }
+static NSPoint win_point_from_screen(id self, SEL sel, NSPoint p)
+{ (void)self; (void)sel; p.y -= window_origin_y(); return p; }
+static NSPoint win_point_to_screen(id self, SEL sel, NSPoint p)
+{ (void)self; (void)sel; p.y += window_origin_y(); return p; }
+static id win_content_view(id self, SEL sel) { (void)self; (void)sel; return g_editor_view; }
+static long win_number(id self, SEL sel) { (void)self; (void)sel; return 1; }
 
 /* A view that asks to be redrawn is the view that draws, which is how an editor
  * with no layer is recognised -- g_editor_view is otherwise only set when a
  * CAMetalLayer is installed, and a Core Graphics editor never installs one. */
+/* The rectangle drawRect: is running for, so the two questions a plugin asks
+ * from inside it -- getRectsBeingDrawn:count: and needsToDrawRect: -- have the
+ * same answer AppKit would give. Empty outside a draw. */
+static NSRect g_draw_rect;
+
+static int rect_empty(NSRect r)
+{ return r.size.w <= 0.0 || r.size.h <= 0.0; }
+
+/* The smallest rectangle covering both. An empty one contributes nothing --
+ * without that, a union starting from a zeroed rect always includes the
+ * origin and the "dirty" area is the whole top-left quadrant. */
+static NSRect rect_union(NSRect a, NSRect b)
+{
+    double x0, y0, x1, y1;
+    if (rect_empty(a)) return b;
+    if (rect_empty(b)) return a;
+    x0 = a.origin.x < b.origin.x ? a.origin.x : b.origin.x;
+    y0 = a.origin.y < b.origin.y ? a.origin.y : b.origin.y;
+    x1 = a.origin.x + a.size.w > b.origin.x + b.size.w
+       ? a.origin.x + a.size.w : b.origin.x + b.size.w;
+    y1 = a.origin.y + a.size.h > b.origin.y + b.size.h
+       ? a.origin.y + a.size.h : b.origin.y + b.size.h;
+    a.origin.x = x0; a.origin.y = y0; a.size.w = x1 - x0; a.size.h = y1 - y0;
+    return a;
+}
+static NSRect rect_intersect(NSRect a, NSRect b)
+{
+    double x0, y0, x1, y1;
+    NSRect r;
+    x0 = a.origin.x > b.origin.x ? a.origin.x : b.origin.x;
+    y0 = a.origin.y > b.origin.y ? a.origin.y : b.origin.y;
+    x1 = a.origin.x + a.size.w < b.origin.x + b.size.w
+       ? a.origin.x + a.size.w : b.origin.x + b.size.w;
+    y1 = a.origin.y + a.size.h < b.origin.y + b.size.h
+       ? a.origin.y + a.size.h : b.origin.y + b.size.h;
+    r.origin.x = x0; r.origin.y = y0;
+    r.size.w = x1 - x0 > 0.0 ? x1 - x0 : 0.0;
+    r.size.h = y1 - y0 > 0.0 ? y1 - y0 : 0.0;
+    return r;
+}
+static int rect_meets(NSRect a, NSRect b)
+{ return !rect_empty(rect_intersect(a, b)); }
+
 static void view_set_needs_display(id self, SEL sel, signed char yes)
 {
     nsview *v = as_view(self);
     (void)sel;
     if (!v) return;
     v->needs_display = yes ? 1 : 0;
+    /* No rectangle given means the whole view. */
+    if (yes) v->dirty = v->bounds;
+    else     memset(&v->dirty, 0, sizeof v->dirty);
     if (yes && !g_editor_view) g_editor_view = self;
 }
 static void view_set_needs_display_rect(id self, SEL sel, NSRect r)
 {
     nsview *v = as_view(self);
-    (void)sel; (void)r;
+    (void)sel;
     if (!v) return;
     v->needs_display = 1;
+    v->dirty = rect_union(v->dirty, r);
     if (!g_editor_view) g_editor_view = self;
 }
+/* Which rectangles drawRect: is being asked to draw.
+ *
+ * This one has to be implemented rather than left to the nil return, because it
+ * answers through *out-parameters*: an unimplemented selector zeroes the return
+ * registers and leaves the caller's own locals alone, so the plugin read a
+ * count and an array pointer that were whatever the stack happened to hold.
+ * With one set of stack contents the count came out zero and the loop was
+ * skipped; with another -- loading libc++ was enough to change it -- the count
+ * was large and the array pointer was not one, and VSTGUI walked it. The
+ * editor's own drawing was fine either way; the crash was the host declining to
+ * answer a question the caller could not tell had gone unanswered.
+ *
+ * One rect: whatever drawRect: was handed, which is the union of what the
+ * plugin invalidated. Answering "the whole view" here is what made a dial cost
+ * a full repaint -- iPlug2 draws exactly the rectangles this reports. The
+ * storage is static because the caller keeps the pointer for the length of the
+ * call, and there is one editor. */
+static void view_rects_being_drawn(id self, SEL sel, NSRect **rects, long *count)
+{
+    static NSRect one;
+    nsview *v = as_view(self);
+    (void)sel;
+    if (!rect_empty(g_draw_rect))  one = g_draw_rect;
+    else if (v)                    one = v->bounds;
+    else                           memset(&one, 0, sizeof one);
+    if (rects) *rects = &one;
+    if (count) *count = rect_empty(one) ? 0 : 1;
+}
+/* Whether a control has to repaint. Answering yes to everything is safe but
+ * costs the caller a full redraw; the rect being drawn is the honest answer. */
+static signed char view_needs_to_draw(id self, SEL sel, NSRect r)
+{
+    (void)self; (void)sel;
+    if (rect_empty(g_draw_rect)) return 1;
+    return rect_meets(r, g_draw_rect) ? 1 : 0;
+}
+
 static void view_set_hidden(id self, SEL sel, signed char yes)
 { nsview *v = as_view(self); (void)sel; if (v) v->hidden = yes ? 1 : 0; }
 static signed char view_yes(id self, SEL sel) { (void)self; (void)sel; return 1; }
+/* NSView's own default for -isFlipped is NO: a view counts from the bottom
+ * unless it says otherwise. Answering YES here instead cost every editor whose
+ * class does not override it -- iPlug2 overrides and returns YES, so those were
+ * right by luck, while Automaton and Tattoo hit-tested a click at `height - y`
+ * and answered for whatever control was mirrored opposite the one under the
+ * pointer. Their editors drew correctly and could not be operated. */
+static signed char view_no(id self, SEL sel) { (void)self; (void)sel; return 0; }
 static void view_void(id self, SEL sel) { (void)self; (void)sel; }
 static void *view_layer(id self, SEL sel)
 { nsview *v = as_view(self); (void)sel; return v ? v->layer : NULL; }
@@ -611,12 +844,55 @@ static void view_set_layer(id self, SEL sel, void *l)
     if (l) g_editor_view = self;
 }
 
-/* Coordinate conversion with no transform in play: the identity, which is what
- * an unrotated, unscaled view hierarchy gives. */
+/* Window coordinates to view coordinates.
+ *
+ * There is one view and no window to offset against, so the only work left is
+ * the flip -- and the flip is the whole point. An NSEvent's locationInWindow
+ * has its origin at the bottom left, because that is what Cocoa windows use;
+ * a *flipped* view, which every plugin editor here is, counts from the top, and
+ * AppKit does that conversion here. Returning the point unchanged meant every
+ * click landed at `height - y`: the editor was mirrored vertically, so a slider
+ * at the bottom answered for one at the top and, more often, nothing answered
+ * at all. The editors drew perfectly and could not be operated.
+ *
+ * Whether to flip is the view's own answer, not an assumption: `isFlipped` is
+ * a method the plugin overrides, and a VSTGUI view says no where an iPlug2 one
+ * says yes. `from` is nil for a window-relative point, which is the only case a
+ * plugin here uses. */
+static int view_flipped(id v)
+{
+    signed char (*imp)(id, SEL) =
+        (signed char (*)(id, SEL))macobjc_lookup(v, "isFlipped");
+    return imp ? imp(v, "isFlipped") != 0 : 0;
+}
 static NSPoint view_convert_point(id self, SEL sel, NSPoint p, id from)
-{ (void)self; (void)sel; (void)from; return p; }
+{
+    nsview *v = as_view(self);
+    int fl;
+    (void)sel; (void)from;
+    fl = view_flipped(self);
+    if (v && v->bounds.size.h > 0.0 && fl)
+        p.y = v->bounds.size.h - p.y;
+    return p;
+}
+/* The same flip, about the rectangle's far edge rather than its origin -- a
+ * flipped rect keeps its height and moves its top to where its bottom was. */
 static NSRect view_convert_rect(id self, SEL sel, NSRect r, id from)
-{ (void)self; (void)sel; (void)from; return r; }
+{
+    nsview *v = as_view(self);
+    (void)sel; (void)from;
+    if (v && v->bounds.size.h > 0.0 && view_flipped(self))
+        r.origin.y = v->bounds.size.h - r.origin.y - r.size.h;
+    return r;
+}
+/* The other direction: view coordinates out to the window's. The flip is its own
+ * inverse, so these are the same arithmetic -- they exist because a plugin that
+ * warps the cursor converts outward, and a missing selector there is a zero
+ * rather than an error. */
+static NSPoint view_convert_point_to(id self, SEL sel, NSPoint p, id to)
+{ return view_convert_point(self, sel, p, to); }
+static NSRect view_convert_rect_to(id self, SEL sel, NSRect r, id to)
+{ return view_convert_rect(self, sel, r, to); }
 
 
 /* Fast enumeration -- what `for (id x in array)` compiles to. Returning zero
@@ -666,10 +942,43 @@ static NSRect screen_frame(id self, SEL sel)
     NSRect r;
     (void)self; (void)sel;
     r.origin.x = 0.0; r.origin.y = 0.0;
-    r.size.w = 1920.0; r.size.h = 1080.0;
+    r.size.w = (double)SCREEN_W; r.size.h = (double)SCREEN_H;
     return r;
 }
 static double screen_scale(id self, SEL sel) { (void)self; (void)sel; return 1.0; }
+
+/* ---- NSGraphicsContext -------------------------------------------------
+ *
+ * What a view draws into. AppKit focuses a context on the view before calling
+ * drawRect: and the view fetches it back with `[[NSGraphicsContext
+ * currentContext] graphicsPort]`; nothing here did that, so every VSTGUI editor
+ * asked for its context, got nil, and dereferenced it a few instructions later.
+ *
+ * The context is a bitmap the host owns, which is also the editor's
+ * framebuffer -- see macquartz_editor_context. There is one, because there is
+ * one editor. */
+typedef struct { void *isa; long refs; void *cg; } nsgctx;
+
+static id g_gcontext;
+
+/* Point the current context at a CGContextRef, before drawRect: is called. */
+void macns_set_graphics_port(void *cg)
+{
+    nsgctx *g;
+    if (!g_gcontext) g_gcontext = ns_new_of("NSGraphicsContext");
+    if ((g = (nsgctx *)g_gcontext)) g->cg = cg;
+}
+
+static id   gctx_current(id self, SEL sel)
+{ (void)self; (void)sel; return g_gcontext; }
+static void *gctx_port(id self, SEL sel)
+{ nsgctx *g = (nsgctx *)self; (void)sel; return g ? g->cg : NULL; }
+static id   gctx_with_port(id self, SEL sel, void *cg, signed char flipped)
+{ (void)self; (void)sel; (void)flipped; macns_set_graphics_port(cg); return g_gcontext; }
+static void gctx_set_current(id self, SEL sel, id ctx)
+{ (void)self; (void)sel; if (ctx) g_gcontext = ctx; }
+static void gctx_void(id self, SEL sel) { (void)self; (void)sel; }
+static signed char gctx_flipped(id self, SEL sel) { (void)self; (void)sel; return 1; }
 
 /* NSAnimationContext groups implicit animations. With nothing animating, the
  * grouping calls only need to nest without complaint. */
@@ -816,12 +1125,68 @@ static id timer_make(id self, SEL sel, double interval, id target, SEL action,
 /* Drop everything tied to the plugin that is going away. A timer left behind
  * fires into a torn-down editor on the next pump, and the editor view pointer
  * would otherwise still name an object whose image has been unmapped. */
+/* ---- the pointer ------------------------------------------------------
+ *
+ * There is one editor view and no window to offset against, so this host's
+ * screen, window and view coordinates are the same thing: the position the host
+ * last posted, with the origin at the top left. Everything that reports where
+ * the pointer is has to agree on that one number, because a plugin does not
+ * merely read it -- it does arithmetic across the two conventions.
+ *
+ * iPlug2 is the instructive case. Grabbing a control makes it hide the cursor
+ * and store the position through `[NSEvent mouseLocation]`, which is in *screen*
+ * coordinates counted from the bottom, and it converts with
+ * `CGDisplayPixelsHigh() - mouse.y`. With mouseLocation unimplemented and so
+ * answering (0,0), the stored position was a thousand pixels away from the
+ * pointer, and the first mouseDragged: after the press moved the control by the
+ * whole distance: a one-pixel drag took a slider from 0.43 to full scale, in
+ * whichever direction it was dragged. Every macOS editor here was operable only
+ * by clicking, never by dragging.
+ *
+ * SCREEN_H is what CGDisplayPixelsHigh and NSScreen's frame both report -- see
+ * macns_screen_height, which macquartz.c asks rather than repeating.
+ *
+ * There are two positions, not one, and the difference is the whole reason a
+ * drag behaves. `real` is where the host says the pointer is -- a Qt or GTK
+ * coordinate, ultimately the X pointer. `virt` is where the *plugin* thinks it
+ * is, and a plugin moves it: grabbing a knob makes iPlug2 hide the cursor and
+ * warp it back to the grab point after every event, so that what it reads next
+ * is the physical movement since then and nothing else. On a real Mac the
+ * window server does that warp and the next event arrives from the new place.
+ * Nothing warps an X pointer here, so the host does it in software: each event
+ * advances `virt` by however far `real` moved, and a warp sets `virt` outright.
+ *
+ * Without it the plugin measured every event against the point it had warped
+ * to, so each one moved the control by the whole distance from the press rather
+ * than by one step. A drag accelerated away and hit the end of its range in
+ * five pixels -- smooth-looking, and unusable. */
+static double g_real_x, g_real_y;      /* where the host says the pointer is */
+static double g_virt_x, g_virt_y;      /* where the plugin thinks it is */
+static int    g_have_last;
+
+int macns_screen_height(void) { return SCREEN_H; }
+
+/* Where the pointer is, as the plugin sees it, in top-left coordinates. */
+void macns_pointer(double *x, double *y)
+{ if (x) *x = g_virt_x; if (y) *y = g_virt_y; }
+
+/* A warp. CGDisplayMoveCursorToPoint is how a plugin pins the cursor while
+ * dragging, and the position it reads back afterwards has to be the one it
+ * asked for -- while the real pointer, which nothing here can move, carries on
+ * where it was. */
+void macns_set_pointer(double x, double y)
+{ g_virt_x = x; g_virt_y = y; }
+
 void macns_reset_gui(void)
 {
     int i;
     for (i = 0; i < g_ntimers; i++) g_timers[i] = NULL;
     g_ntimers = 0;
     g_editor_view = NULL;
+    /* See macns_post_mouse: a pointer delta measured against the previous
+     * plugin's editor is worse than no delta at all. */
+    g_have_last = 0;
+    g_real_x = g_real_y = g_virt_x = g_virt_y = 0.0;
 }
 
 /* Nothing here runs a real Cocoa run loop, so nothing turns "this view is dirty"
@@ -830,22 +1195,45 @@ void macns_reset_gui(void)
  * existed, was never once asked to paint. */
 void macns_draw_dirty(void)
 {
-    nsview *v = as_view(g_editor_view);
+    id self = live_editor_view();
+    nsview *v = as_view(self);
     void (*imp)(id, SEL, NSRect);
-    NSRect r;
+    NSRect full, r;
 
-    if (!g_editor_view || !v || !v->needs_display) return;
+    if (!v || !v->needs_display) return;
     v->needs_display = 0;
-    r = v->bounds;
-    if (r.size.w <= 0.0 || r.size.h <= 0.0) r = v->frame;
-    if (r.size.w <= 0.0 || r.size.h <= 0.0) return;
-    imp = (void (*)(id, SEL, NSRect))macobjc_lookup(g_editor_view, "drawRect:");
-    if (imp) imp(g_editor_view, "drawRect:", r);
+    full = v->bounds;
+    if (rect_empty(full)) full = v->frame;
+    if (rect_empty(full)) return;
+    /* What the plugin asked for, clipped to the view. A plugin that only ever
+     * says setNeedsDisplay: still gets the whole thing; one that names the knob
+     * it changed gets the knob. Falling back to the whole view when the union
+     * came out empty keeps a plugin that marks itself dirty by some route this
+     * does not model painting at all rather than not at all. */
+    r = rect_intersect(v->dirty, full);
+    if (rect_empty(r)) r = full;
+    memset(&v->dirty, 0, sizeof v->dirty);
+    /* Focus a context on the view first. AppKit hands drawRect: a context that
+     * is already set up; a plugin that fetches it and finds nil dereferences
+     * what it gets a few instructions later. The context is the whole editor --
+     * it is the framebuffer, and sizing it to the dirty rect would throw the
+     * rest of the picture away every time a dial moved. */
+    {   void *ctx = macquartz_editor_context((int)full.size.w, (int)full.size.h);
+        macquartz_begin_draw(ctx, view_flipped(self), full.size.h);
+        macns_set_graphics_port(ctx); }
+    imp = (void (*)(id, SEL, NSRect))macobjc_lookup(self, "drawRect:");
+    if (!imp) return;
+    g_draw_rect = r;
+    imp(self, "drawRect:", r);
+    memset(&g_draw_rect, 0, sizeof g_draw_rect);
 }
 
 void macns_fire_timers(void)
 {
     int i;
+    /* Run-loop timers as well as NSTimers: VSTGUI 4 schedules its redraw on
+     * the former, and a plugin does not care which kind the host understands. */
+    macshim_fire_cf_timers();
     for (i = 0; i < g_ntimers; i++) {
         nstimer *t = g_timers[i];
         void (*imp)(id, SEL, id);
@@ -1043,6 +1431,17 @@ static id      ev_chars(id self, SEL sel)
 { nsevent *e = as_event(self); (void)sel; return e ? e->chars : NULL; }
 static signed char ev_no(id self, SEL sel) { (void)self; (void)sel; return 0; }
 static double  ev_pressure(id self, SEL sel) { (void)self; (void)sel; return 1.0; }
+/* +mouseLocation: where the pointer is, in screen coordinates with the origin at
+ * the bottom left. The host keeps it in its own top-left coordinates, so this is
+ * the one conversion. */
+static NSPoint ev_mouse_location(id self, SEL sel)
+{
+    NSPoint p;
+    (void)self; (void)sel;
+    p.x = g_virt_x;
+    p.y = (double)SCREEN_H - g_virt_y;
+    return p;
+}
 static id      ev_nil(id self, SEL sel) { (void)self; (void)sel; return NULL; }
 
 static nsevent *event_make(long type, double x, double y)
@@ -1060,9 +1459,10 @@ static nsevent *event_make(long type, double x, double y)
 static void send_event(const char *sel, nsevent *e)
 {
     void (*imp)(id, SEL, id);
-    if (!g_editor_view || !e) return;
-    imp = (void (*)(id, SEL, id))macobjc_lookup(g_editor_view, sel);
-    if (imp) imp(g_editor_view, sel, e);
+    id v = live_editor_view();
+    if (!v || !e) return;
+    imp = (void (*)(id, SEL, id))macobjc_lookup(v, sel);
+    if (imp) imp(v, sel, e);
 }
 
 void macns_post_mouse(int x, int y, int msg, int buttons, int wheel)
@@ -1071,16 +1471,41 @@ void macns_post_mouse(int x, int y, int msg, int buttons, int wheel)
     enum { WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202,
            WM_LBUTTONDBLCLK = 0x0203, WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205,
            WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208, WM_MOUSEWHEEL = 0x020A };
-    nsview *v = as_view(g_editor_view);
+    nsview *v = as_view(live_editor_view());
     double h = v ? v->bounds.size.h : 0.0;
     nsevent *e;
+    double dx, dy;
     long type;
     const char *sel;
 
-    if (!g_editor_view) return;
-    /* Cocoa's y grows upward from the bottom of the view. */
-    e = event_make(0, (double)x, h > 0.0 ? h - (double)y : (double)y);
+    if (!v) return;
+
+    /* Advance the plugin's pointer by however far the real one moved, and start
+     * a fresh gesture from wherever the button actually went down -- a press is
+     * the one moment the two are certainly the same place. See the pointer
+     * section above for why there are two of them. */
+    dx = g_have_last ? (double)x - g_real_x : 0.0;
+    dy = g_have_last ? (double)y - g_real_y : 0.0;
+    if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN ||
+        msg == WM_MBUTTONDOWN || !g_have_last) {
+        g_virt_x = (double)x; g_virt_y = (double)y;
+    } else {
+        g_virt_x += dx;
+        g_virt_y += dy;
+    }
+    g_real_x = (double)x; g_real_y = (double)y; g_have_last = 1;
+
+    /* The event carries the virtual position, in Cocoa's convention: y grows
+     * upward from the bottom of the view. It also carries how far the pointer
+     * moved, because a control that tracks a gesture by accumulating deltas --
+     * most knobs, and any slider with gearing -- moves not at all when the
+     * delta is always zero. That one is in the host's own top-left direction,
+     * which is what AppKit reports and what iPlug2's `mValue -= dY` is written
+     * against. */
+    e = event_make(0, g_virt_x, h > 0.0 ? h - g_virt_y : g_virt_y);
     if (!e) return;
+    e->dx = dx;
+    e->dy = dy;
 
     switch (msg) {
     case WM_LBUTTONDOWN:   type = EV_LMOUSEDOWN; sel = "mouseDown:";      break;
@@ -1203,15 +1628,92 @@ static const entry g_table[] = {
     { "NSView", "setHidden:",            view_set_hidden },
     { "NSView", "isHidden",              view_void },
     { "NSView", "acceptsFirstResponder", view_yes },
-    { "NSView", "isFlipped",             view_yes },
+    { "NSView", "isFlipped",             view_no },
     { "NSView", "setWantsLayer:",        view_set_needs_display },
     { "NSView", "layer",                 view_layer },
     { "NSView", "setLayer:",             view_set_layer },
     { "NSView", "display",               view_void },
     { "NSView", "convertPoint:fromView:", view_convert_point },
     { "NSView", "convertRect:fromView:",  view_convert_rect },
+    { "NSView", "convertPoint:toView:",   view_convert_point_to },
+    { "NSView", "getRectsBeingDrawn:count:", view_rects_being_drawn },
+    { "NSView", "needsToDrawRect:",       view_needs_to_draw },
+    { "NSView", "convertRect:toView:",    view_convert_rect_to },
 
     /* screen, animation, paths, file manager, layer */
+    { "NSWindow", "frame",                win_frame },
+    { "NSWindow", "contentView",          win_content_view },
+    { "NSWindow", "convertRectFromScreen:",  win_rect_from_screen },
+    { "NSWindow", "convertRectToScreen:",    win_rect_to_screen },
+    { "NSWindow", "convertPointFromScreen:", win_point_from_screen },
+    { "NSWindow", "convertPointToScreen:",   win_point_to_screen },
+    { "NSWindow", "convertScreenToBase:",    win_point_from_screen },
+    { "NSWindow", "convertBaseToScreen:",    win_point_to_screen },
+    { "NSWindow", "screen",               screen_main },
+    { "NSWindow", "windowNumber",         win_number },
+    { "NSWindow", "mouseLocationOutsideOfEventStream", win_mouse_location },
+    { "NSWindow", "makeFirstResponder:",  win_make_first_responder },
+    { "NSWindow", "backingScaleFactor",   screen_scale },
+    /* An NSCell is initialised by a text or image, not by a frame -- and a
+     * plugin's cell subclass calls up to it. */
+    { "NSCell", "initTextCell:",          view_init_self },
+    { "NSCell", "initImageCell:",         view_init_self },
+    { "NSTextFieldCell", "initTextCell:", view_init_self },
+    /* Configuration a plugin's text entry sets and nothing here draws. */
+    { "NSControl", "setCell:",            ctl_set_cell },
+    { "NSControl", "cell",                ctl_cell },
+    { "NSControl", "setEditable:",        ctl_set_flag },
+    { "NSControl", "setSelectable:",      ctl_set_flag },
+    { "NSControl", "setEnabled:",         ctl_set_flag },
+    { "NSControl", "setBordered:",        ctl_set_flag },
+    { "NSControl", "setBezeled:",         ctl_set_flag },
+    { "NSControl", "setDrawsBackground:", ctl_set_flag },
+    { "NSControl", "setUsesSingleLineMode:", ctl_set_flag },
+    { "NSControl", "setRefusesFirstResponder:", ctl_set_flag },
+    { "NSControl", "setStringValue:",     ctl_set1 },
+    { "NSControl", "setFont:",            ctl_set1 },
+    { "NSControl", "setTextColor:",       ctl_set1 },
+    { "NSControl", "setBackgroundColor:", ctl_set1 },
+    { "NSControl", "setDelegate:",        ctl_set1 },
+    { "NSControl", "setTarget:",          ctl_set1 },
+    { "NSControl", "setAction:",          ctl_set1 },
+    { "NSControl", "setFormatter:",       ctl_set1 },
+    { "NSControl", "setAlignment:",       ctl_set1 },
+    { "NSControl", "setLineBreakMode:",   ctl_set1 },
+    { "NSControl", "setFocusRingType:",   ctl_set1 },
+    { "NSControl", "selectText:",         ctl_set1 },
+    { "NSControl", "stringValue",         ctl_nil },
+    { "NSControl", "currentEditor",       ctl_nil },
+    { "NSControl", "abortEditing",        view_yes },
+    { "NSControl", "validateEditing",     view_void },
+    { "NSCell", "setWraps:",              ctl_set_flag },
+    { "NSCell", "setScrollable:",         ctl_set_flag },
+    { "NSCell", "setEditable:",           ctl_set_flag },
+    { "NSCell", "setSelectable:",         ctl_set_flag },
+    { "NSCell", "setBordered:",           ctl_set_flag },
+    { "NSCell", "setBezeled:",            ctl_set_flag },
+    { "NSCell", "setDrawsBackground:",    ctl_set_flag },
+    { "NSCell", "setUsesSingleLineMode:", ctl_set_flag },
+    { "NSCell", "setTitle:",              ctl_set1 },
+    { "NSCell", "setStringValue:",        ctl_set1 },
+    { "NSCell", "setFont:",               ctl_set1 },
+    { "NSCell", "setTextColor:",          ctl_set1 },
+    { "NSCell", "setBackgroundColor:",    ctl_set1 },
+    { "NSCell", "setAlignment:",          ctl_set1 },
+    { "NSCell", "setLineBreakMode:",      ctl_set1 },
+    { "NSCell", "setFocusRingType:",      ctl_set1 },
+    { "NSCell", "stringValue",            ctl_nil },
+    { "NSGraphicsContext", "+currentContext",      gctx_current },
+    { "NSGraphicsContext", "+setCurrentContext:",  gctx_set_current },
+    { "NSGraphicsContext", "+graphicsContextWithGraphicsPort:flipped:", gctx_with_port },
+    { "NSGraphicsContext", "+saveGraphicsState",   gctx_void },
+    { "NSGraphicsContext", "+restoreGraphicsState", gctx_void },
+    { "NSGraphicsContext", "saveGraphicsState",    gctx_void },
+    { "NSGraphicsContext", "restoreGraphicsState", gctx_void },
+    { "NSGraphicsContext", "graphicsPort",         gctx_port },
+    { "NSGraphicsContext", "CGContext",            gctx_port },
+    { "NSGraphicsContext", "flushGraphics",        gctx_void },
+    { "NSGraphicsContext", "isFlipped",            gctx_flipped },
     { "NSScreen", "+mainScreen",          screen_main },
     { "NSScreen", "+deepestScreen",       screen_main },
     { "NSScreen", "frame",                screen_frame },
@@ -1263,6 +1765,9 @@ static const entry g_table[] = {
     { "NSEvent", "hasPreciseScrollingDeltas", ev_no },
     { "NSEvent", "isDirectionInvertedFromDevice", ev_no },
     { "NSEvent", "pressure",              ev_pressure },
+    /* Screen coordinates, counted from the bottom -- the one place this host
+     * has to speak Cocoa's convention rather than its own. */
+    { "NSEvent", "+mouseLocation",        ev_mouse_location },
     { "NSEvent", "window",                ev_nil },
     { "NSRunLoop", "+currentRunLoop",     runloop_current },
     { "NSRunLoop", "+mainRunLoop",        runloop_current },
@@ -1300,6 +1805,26 @@ static const entry g_table[] = {
 /* Read any string, ours or CoreFoundation's, as UTF-8. macmetal.c needs this to
  * read a shader function name out of an @"..." literal. */
 const char *macns_utf8(void *str) { return str_bytes(str, NULL); }
+
+/* A host-owned NSView, for a plugin that needs a parent to graft its own view
+ * into. VST2 on macOS is handed NULL and makes its own top-level view, but VST3
+ * has no such convention -- IPlugView::attached wants a real NSView, and a
+ * plugin handed nothing simply refuses. This is that container: an instance of
+ * the same stand-in class the plugin's own views inherit from, so addSubview:
+ * and the geometry calls all behave. */
+void *macns_make_view(int w, int h)
+{
+    id v = ns_new_of("NSView");
+    NSRect r;
+    id (*initf)(id, SEL, NSRect);
+
+    if (!v) return NULL;
+    r.origin.x = 0.0; r.origin.y = 0.0;
+    r.size.w = w > 0 ? (double)w : 0.0;
+    r.size.h = h > 0 ? (double)h : 0.0;
+    initf = (id (*)(id, SEL, NSRect))macobjc_lookup(v, "initWithFrame:");
+    return initf ? initf(v, "initWithFrame:", r) : v;
+}
 
 void macns_install(void)
 {

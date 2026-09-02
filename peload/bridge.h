@@ -166,6 +166,7 @@ enum {
     BR_EDITOR_KEY,       /* -> vk,down,ch                                    */
     BR_ALL_NOTES_OFF,
     BR_IMPORT_STATS,     /*                       <- implemented,stubbed,hit */
+    BR_INPUT_MASK,       /* -> mask                                          */
     BR_QUIT
 };
 

@@ -35,6 +35,8 @@ typedef struct {
      * separate member. See VSTEVENTS32_BYTES. */
     void          *evbuf;
     VstMidiEvent32 evm[BRIDGE_MIDIQ];
+    unsigned      in_mask;         /* which input channels get the fed signal; 0 = all */
+    double        last_publish;    /* ms; caps the pump at ~80 Hz */
 } serve_state;
 
 /* Idle poll timeout. With an editor open the loop doubles as its 60 Hz pump, so
@@ -133,9 +135,14 @@ static void *sv_audio_thread(void *ud)
 
         sv_drain(s);
 
-        for (i = 0; i < s->nin; i++)
-            for (j = 0; j < n; j++)
-                s->ins[i][j] = sh->in[(size_t)j * BRIDGE_MAX_CHAN + (i % BRIDGE_MAX_CHAN)];
+        for (i = 0; i < s->nin; i++) {
+            int fed = (s->in_mask == 0 || (s->in_mask & (1u << i)));
+            if (fed)
+                for (j = 0; j < n; j++)
+                    s->ins[i][j] = sh->in[(size_t)j * BRIDGE_MAX_CHAN + (i % BRIDGE_MAX_CHAN)];
+            else
+                memset(s->ins[i], 0, (size_t)n * sizeof **s->ins);
+        }
         for (i = 0; i < s->nout; i++) memset(s->outs[i], 0, (size_t)n * sizeof **s->outs);
 
         s->fx->processReplacing(s->fx, s->nin ? s->ins : NULL, s->outs, n);
@@ -154,6 +161,58 @@ static void *sv_audio_thread(void *ud)
 static void sv_text(bridge_rep *r, const char *s)
 { snprintf(r->text, sizeof r->text, "%s", s ? s : ""); }
 
+/* Editor input, which the host leaves in shared memory rather than sending as
+ * a request.
+ *
+ * peserve.c has always drained this queue; this side never did, so a 32-bit
+ * editor drew perfectly and ignored the mouse -- every click and drag the host
+ * wrote went into the ring and stayed there. The legacy BR_EDITOR_MOUSE case
+ * below is what used to carry these, and the host stopped sending it.
+ *
+ * Also installed as the win32 input pump, so a control that tracks a drag in a
+ * message loop of its own still sees the pointer move and the button come up:
+ * without that, a knob grabs the mouse and never learns it was released.
+ * Delivering an event runs the plug-in's wndproc, which may poll and re-enter
+ * here, hence the depth guard. */
+static void sv_drain_input(serve_state *s)
+{
+    static int depth;
+    bridge_shm *sh = s->sh;
+    uint32_t t, hd;
+
+    if (!sh || depth > 4) return;
+    depth++;
+    t  = atomic_load_explicit(&sh->in_tail, memory_order_relaxed);
+    hd = atomic_load_explicit(&sh->in_head, memory_order_acquire);
+    for (; t != hd; t++) {
+        bridge_input e = sh->inq[t % BRIDGE_INQ];
+        atomic_store_explicit(&sh->in_tail, t + 1, memory_order_release);
+        if (e.kind == BRIDGE_IN_KEY) w32_key(e.a, e.b, e.c);
+        else                         w32_mouse(e.a, e.b, e.c, e.d, e.e);
+    }
+    depth--;
+}
+
+static void sv_publish_editor(serve_state *s);
+
+/* Called from inside the plug-in while it spins in a loop of its own. Input has
+ * to reach it, and -- just as important -- the frames it draws mid-drag have to
+ * reach the host, or the whole drag renders as one jump at the end because the
+ * main loop that normally republishes is parked inside this very call. That is
+ * what peserve.c does for a 64-bit editor, and what made its dials follow the
+ * pointer; a 32-bit one now gets the same. Re-entrant into the plug-in by
+ * construction, which is why `inside` guards it. */
+static void sv_on_pump_input(void *ud)
+{
+    static int inside;
+    serve_state *s = ud;
+    if (!s || inside) return;
+    inside = 1;
+    sv_drain_input(s);
+    sv_publish_editor(s);
+    inside = 0;
+}
+
 static void sv_publish_editor(serve_state *s)
 {
     const uint32_t *px;
@@ -161,9 +220,36 @@ static void sv_publish_editor(serve_state *s)
     bridge_shm *sh = s->sh;
 
     if (!s->editor_open) return;
+    /* Never mid-repaint: a frame captured between BeginPaint and EndPaint is
+     * part old and part new. This runs from inside the plug-in as well as from
+     * the idle poll, which is exactly when a paint is likely to be open.
+     * Skipping costs nothing -- the next tick publishes the whole frame. */
+    if (w32_paint_in_progress()) return;
+    {
+        struct timespec now;
+        double t;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        t = (double)now.tv_sec * 1e3 + (double)now.tv_nsec / 1e6;
+        if (t - s->last_publish < 12.0) return;          /* ~80 Hz ceiling */
+        s->last_publish = t;
+    }
     ed_pump(s->fx);
     if (!w32_editor_pixels(&px, &w, &h) || !px || w <= 0 || h <= 0) return;
     if (w > BRIDGE_MAX_ED_W || h > BRIDGE_MAX_ED_H) return;
+    /* A sequence lock around the copy, the same one peserve.c writes: odd
+     * generation means "being written", even means the frame is whole.
+     *
+     * Only the trailing increment was here, so the counter simply alternated
+     * odd and even and never said anything about whether a write was in
+     * progress. bridge_client.c has always read it as a sequence lock and
+     * rejects an odd value as torn -- so every frame that happened to land on
+     * an odd count was thrown away, eight retries saw the same odd count
+     * because nothing was writing, and the reader gave up. The host reported
+     * "editor produced no pixels", and it reported it for every 32-bit
+     * plug-in, because the parity does not depend on the plug-in. The editors
+     * were being drawn the whole time: peload32 --editor-png writes the same
+     * frame out at 98.8% painted. */
+    atomic_fetch_add_explicit(&sh->ed_gen, 1, memory_order_release);
     sh->ed_w = w; sh->ed_h = h;
     memcpy(bridge_pixels(sh), px, (size_t)w * h * 4);
     atomic_fetch_add_explicit(&sh->ed_gen, 1, memory_order_release);
@@ -206,6 +292,9 @@ static int serve_run(AEffect32 *fx, int sock, const char *shm_path)
         return 1;
     }
 
+    /* So a plug-in spinning in its own modal loop still gets the pointer. */
+    w32_set_input_pump(sv_on_pump_input, &S);
+
     for (;;) {
         bridge_req q;
         bridge_rep r;
@@ -216,10 +305,18 @@ static int serve_run(AEffect32 *fx, int sock, const char *shm_path)
          * requests -- a VST2 editor only redraws when it is pumped. */
         pfd.fd = sock; pfd.events = POLLIN; pfd.revents = 0;
         if (poll(&pfd, 1, sv_poll_ms(&S)) < 0 && errno != EINTR) break;
-        if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) { sv_publish_editor(&S); continue; }
+        if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+            sv_drain_input(&S);
+            sv_publish_editor(&S);
+            continue;
+        }
 
         n = recv(sock, &q, sizeof q, MSG_WAITALL);
         if (n != (ssize_t)sizeof q) break;               /* host went away */
+
+        /* A steady stream of requests keeps poll busy, so the idle path above
+         * may never run; pick up whatever input has arrived regardless. */
+        sv_drain_input(&S);
 
         memset(&r, 0, sizeof r);
         r.ok = 1;
@@ -302,6 +399,7 @@ static int serve_run(AEffect32 *fx, int sock, const char *shm_path)
         case BR_EDITOR_KEY:
             w32_key(q.a, q.b, q.c);
             break;
+        case BR_INPUT_MASK:    S.in_mask = (unsigned)q.a; break;
         case BR_ALL_NOTES_OFF: {
             int ch;
             for (ch = 0; ch < 16; ch++) {

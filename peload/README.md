@@ -10,8 +10,9 @@ Six hosts share one set of shims:
 | Linux VST2 (`.so`), x86-64 | `peload` | 39 | 37 render |
 | Windows VST3, x86-64 | `peload` | 35 | 35 render, 34 show their own GUI |
 | Linux VST3, x86-64 | `peload` | 13 | 7 render, 0 crash, X11-embedded editors |
-| macOS VST2, x86-64 | `peload` | 19 | 19 render, 19 show their own GUI |
-| macOS Audio Units, x86-64 | `peload` | 42 | 41 render |
+| macOS VST2, x86-64 | `peload` | 31 | 31 render, 30 show and drive their own GUI |
+| macOS VST3, x86-64 | `peload` | 18 | 18 render, 18 show and drive their own GUI |
+| macOS Audio Units, x86-64 | `peload` | 50 | 41 render, 18 of the 18 with a Cocoa view drive it |
 
 The i386 and x86-64 hosts now reach the same result on the same 36 plugins:
 35 render, 34 open their editors, and the two that fail are the same two for the
@@ -103,6 +104,144 @@ The exception is native Linux plugins. Their editors are X11 windows embedded in
 one of ours, and the bridge carries pixels, not window ids -- so `pehost` keeps
 those in process regardless of the isolation setting. `PEHOST_ISOLATE=0` turns the
 default off; `=1` forces it on for `peload` too.
+
+## Audio input, and what a vocoder needs
+
+Everything an effect was ever fed came from inside the host: silence, a
+sawtooth per held key, or noise. That is enough to tell whether a compressor is
+working and no use at all for Full Bucket's vocoder, which wants a real voice on
+its modulator input. Both windows opened their audio streams `PW_DIRECTION_OUTPUT`
+and there was no capture path anywhere.
+
+`pestudio` now opens a second PipeWire stream the other way. The two streams are
+not called in lockstep, so a small lock-free ring carries what one writes to the
+other; when the reader is behind, the oldest samples are dropped rather than the
+newest, because a vocoder wants the current word and not a growing delay. Short
+of a whole block the remainder is silence rather than the previous block again --
+a stutter of the last five milliseconds of a word is worse than a gap.
+
+The devices come from PipeWire's registry, which is the only thing that knows
+about them, through a short-lived connection of its own rather than reaching
+into the one the audio thread is using. Audio/Source nodes, listed with their
+descriptions, refreshed on demand: plugging in a USB interface is exactly when
+the list is wrong, and rescanning the graph on a timer would be rude. Settings
+grows an **Audio input** box beside the MIDI one -- a device menu, a Rescan
+button and a line saying whether anything is actually arriving, because a device
+that is connected and silent and one that is not connected look identical until
+you count frames.
+
+`Effect in` gains a fourth choice, `input`, alongside silence, keys and noise.
+
+Verified against the machine's own USB headset: the enumerator finds
+`alsa_input.usb-GN_Netcom_A_S_Jabra_EVOLVE_LINK_...` as "Jabra EVOLVE LINK
+Mono", selecting it connects the stream to that node, and frames arrive at
+exactly 48,000 a second with a peak of 0.225 -- a real signal rather than
+digital silence.
+
+A four-input plug-in like FBVC gets the signal on every input: the de-interleave
+is `c = k < 2 ? k : k % 2`, so both its carrier and its modulator pairs are fed.
+With FBVC's own Keyboard mode on it generates its carrier from MIDI, which is
+what the VC-10 it models did, so a USB keyboard for notes and a microphone for
+the voice is the whole arrangement.
+
+`dwstudio`, the GTK window, is still output-only.
+
+## No 32-bit editor ever appeared, and the reason was patience
+
+Every 32-bit Windows plug-in reported "editor produced no pixels". Not some --
+all of them, every time, while their 64-bit twins drew perfectly through the
+same helper protocol. A failure that uniform is usually one thing, and it was
+not the editors: `peload32 --editor-png` on the helper alone writes fb-3200's
+editor out at 1256x520, 98.8% painted. The pixels were being drawn and were not
+arriving.
+
+The buffer is guarded by a sequence lock. The writer publishes a frame and
+bumps a generation; the reader takes the generation, copies, and checks it did
+not move, treating an odd value as "a write is in progress". Two things were
+wrong with that.
+
+`serve32.h` only incremented *after* the copy, where `peserve.c` -- the 64-bit
+helper, same protocol -- increments on both sides of it. So the 32-bit
+generation was never odd during a write and never said anything at all; that is
+now fixed, and it was worth fixing, but it was not the reason.
+
+The reason is that the reader gave up too early. Eight spins with a
+`sched_yield` between them is a shorter budget than the writer's critical
+section: publishing a 1096x586 editor is a two-and-a-half megabyte `memcpy`.
+A reader that arrived inside one saw the same odd generation on all eight
+attempts and returned "no frame" -- and on the first read after opening an
+editor there is no earlier frame to fall back on, so that reached the host as
+"editor produced no pixels". Traced from both ends at once, the helper's
+counter went 280, 282, 284 and the host read 285.
+
+A publish takes well under a millisecond and they are sixteen apart, so a
+reader that lands in one is never waiting long. It now spins eight times and
+then sleeps in tenth-millisecond steps, bounded at about five milliseconds.
+
+35 of the 40 32-bit plug-ins draw their editors now, where none did. Of the
+rest, four are the Native Instruments plug-ins, whose 32-bit builds fault inside
+the helper while loading -- reported, not fatal, because that is what the helper
+is for -- and `brokenmini` refuses its own editor over a font, as it does at 64
+bits too.
+
+## Switching plug-ins all session: what ran out
+
+Three things in the Win32 layer counted upward and never came back down, so a
+browsing session degraded with use rather than failing outright. All three were
+found the same way -- load every plug-in in the corpus, in one process, several
+times over, and after each one ask whether its editor still answers the mouse.
+
+**The image registry, at nine.** A base and its resource directory travel
+together, because an RVA means nothing without knowing which image it is
+relative to. Entries were added on load and never removed on unload, and
+`winstubs_add_image` ran off the end of its loop in silence when the table was
+full. Eight plug-ins in, the table held eight bases that no longer existed; the
+ninth plug-in's image was never registered, and every resource it asked for was
+answered from a predecessor's directory in memory that had been handed back to
+the kernel. What that looks like is an editor that gradually stops responding --
+a control whose bitmap comes back empty draws but does not behave -- and then a
+fault. `pe_module_unload` drops the entry now, and a full table says so.
+
+**Thread-local slots, at about eighty.** `TlsFree` accepted its argument and did
+nothing, and the allocator only ever counted upward, so every slot a plug-in's
+runtime took was gone for the life of the process. There are 120 to spend and a
+plug-in spends one or two. Around the eightieth load `TlsAlloc` starts returning
+`TLS_OUT_OF_INDEXES`, the Microsoft runtime's `DllMain` fails on that, and from
+then on every plug-in is reported as "DllMain failed" -- the host refusing good
+plug-ins because of what it had already spent on their predecessors. There is a
+free list now, and losing the plug-in's image reclaims whatever it still held.
+
+**A missing C++ runtime, immediately.** A plug-in importing `MSVCP120.dll` with
+no copy to be found had every one of those imports stubbed and was then allowed
+to run. A stub is a fair answer for one missing entry point and a terrible one
+for a whole C++ library: the plug-in loads with several hundred of them and
+faults on the first constructor it calls. That is now a refusal that names what
+is missing, which is the difference between one plug-in failing to open and the
+session ending.
+
+Two configurations, eight rounds, every 64-bit Windows plug-in in the corpus:
+
+| | loads | crashes | RSS |
+|---|---|---|---|
+| isolated, as `pestudio` runs | 320 | 0 | 7.4 MB -> 12.3 MB, then flat |
+| in process, `PEHOST_ISOLATE=0` | 304 | 0 | flat |
+
+The isolated column is the one that matters for a session: `pestudio` and
+`dwstudio` both host out of process by default, so a plug-in that faults in its
+own code costs a subprocess and is reported, and the helper exits with the
+plug-in it was hosting. The in-process column is what the command-line tools and
+the helper itself use, and is where all three of these lived.
+
+One thing is measured and deliberately not fixed. Hosting in process, the
+resident set grows about 790 KB a plug-in and does not level off. Mappings stay
+flat and the descriptors stay flat; the growth is the plug-in's own `HeapAlloc`
+memory, which Windows reclaims by destroying the process heap and which here
+outlives the plug-in that asked for it. Reclaiming it means tracking every block
+the plug-in allocates, and plug-ins mix `HeapFree` with the C runtime's `free`
+on the same pointers -- so a table that misses one path frees a block twice at
+unload, on the allocator the audio thread is using. A leak in a configuration
+that is not the default is a better outcome than that, and the isolated path
+does not have it: 312 loads at 12.8 MB, flat.
 
 ## Modal drag loops, and why op 13 hung
 
@@ -197,10 +336,59 @@ cmpwi/beq not taken          99        ok
 load from 0xffff0000         caught and named, not a host segfault
 ```
 
-Still to do, in order: the PEF loader (sections, relocations, TVector and TOC
-setup), floating point (a DSP needs it), the seventy host functions, the VST 1.0
-CFM calling convention -- the plug-in's entry point is a TVector, so the host
-callback must be one too -- and PICT decoding for the editor.
+## Classic editors: what the corpus actually needed
+
+The first Classic editors drew their background and nothing else, and a corpus
+capture (`peload <plugin> --editor out.ppm` over all 57 `.vstclassic` files)
+showed why. The Destroy FX editors -- the bulk of the corpus -- draw text over
+everything: labels, value readouts, the whole informational page the "Food"
+plugins show instead of controls. None of the text calls existed, so the Food
+editors came out as one flat rectangle of background colour.
+
+The fix, in order of how many plug-ins it unblocked:
+
+- **Text.** `DrawString`/`DrawText`/`StringWidth`/`TextWidth`/`CharWidth`,
+  `TextFont`/`TextFace`/`TextSize`, `GetFontInfo`, `c2pstr`/`p2cstr` -- backed by
+  a small proportional bitmap font embedded in `macfont.h` (rendered from DejaVu
+  Sans at 9px and 13px; the corpus asks for 9-12pt almost everywhere). The font
+  is only approximately Geneva, but `StringWidth` and `GetFontInfo` report the
+  same metrics the drawing uses, so right-aligned labels land where the plug-in
+  intended. Mac Roman's curly quotes and dashes fold to ASCII.
+- **Pattern fills.** `FillRect`'s second argument is an 8x8 Pattern, and the
+  Classic way to shade a background is a dither between two colours built inline
+  with `StuffHex`. Filling solid with the fore colour instead is what flattened
+  every shaded panel.
+- **Rectangles and regions.** The full `Rect` algebra (`SectRect`, `InsetRect`,
+  `OffsetRect`, `PtInRect`, ...), and regions as exactly what a Classic
+  rectangular region is on disk: `{ rgnSize = 10; rgnBBox }`. The corpus clips
+  only to rectangles, so the clip region is a rect per port, honoured by every
+  plotting path.
+- **Pen state.** `PenSize`, `PenNormal`, pen modes (copy/or/xor/bic),
+  `GetPen`, `Move`/`Line`.
+- **TextEdit, single-line.** The dfx numeric-entry fields: a real `TERec`
+  layout in guest memory, `TESetText`/`TEGetText`/`TEKey`/`TEClick`/
+  `TESetSelect`/`TEUpdate`, drawn with the same text stack, with a caret and an
+  inverted-selection highlight.
+- **Miscellany.** `tan`/`atan`/`acos`/`asin`/`nan`/`dec2num`/`__fpclassifyf`,
+  `GetDateTime`, `GetNextEvent`/`WaitNextEvent` (no event is ever pending, but
+  the host gets pumped), `Delay`, `SetOrigin`/`GlobalToLocal`/`LocalToGlobal`,
+  `InvalRect` and friends (the host redraws everything anyway), and Internet
+  Config declining politely.
+
+What did not get fixed, with reasons:
+
+- **Audio Damage's Mayhem bundle** (Crush, Filterpod, MasterDestrukto,
+  TimeFnk) reads a 40-byte `com.audiodamage.mayhem settings` file from the
+  support directory at startup and declines to run without a valid one -- the
+  registration record the Mayhem installer wrote. Existence is not enough; the
+  content is validated. Nothing legitimate to synthesize, so these still refuse
+  to load, and the error message says why.
+- **mda Looplex and the dfx-dev block tests** import 230-290 Toolbox symbols
+  apiece -- a VSTGUI-class surface (Window, Menu and Control Managers, the
+  Printing Manager, AppleEvents, Unicode text encoding). Three plug-ins do not
+  justify a third of the Toolbox.
+- The other mda plug-ins have no editor at all and say so: eight to eleven
+  imports, none graphical. "editor: none" is the correct answer for them.
 
 ## Telling the Mac eras apart
 
@@ -480,6 +668,634 @@ what changed, so after the first frame the rasterizer is handed nothing at all
 until a control moves. The one-off cost on open is the price, and the pixel
 counts show why — ModulAir shades nearly four screens' worth of overdraw for its
 layered panels.
+
+## Nothing told the runtime about the plugin's own classes
+
+Eighteen of the nineteen macOS VST2 editors here died on one line, and it was
+always the same line:
+
+```
+$ tools/macsym.py MPS.vst 0x91c93
+0x91c93      _nvgCreateImage+0x73
+```
+
+`nvgCreateImage` loads a file and then, at +0x73, dereferences the NVGcontext it
+was given for the first time. The context was NULL, because
+`nvgCreateContext` had failed, because `renderCreate` found no Metal device,
+because `_metalLayer` was nil -- and it was nil because `[view setLayer:]` had
+quietly dropped the layer on the floor.
+
+The Foundation methods gate on `macobjc_isa_named(obj, "NSView")`, a question
+that has to survive being handed things that are not objects at all, so it
+believes only classes the runtime minted. Nothing had ever told it about the
+image's own. `macobjc_register_image_classes` existed for exactly this, with a
+comment saying so, and had no caller: `machoload.c` never looked for
+`__DATA,__objc_classlist`. Every instance of a plugin-defined class therefore
+answered "no, I am not an NSView", and every method that gated on it did
+nothing and said nothing.
+
+It is registered now, after binding (a class's superclass is an import, so
+before `do_bind` it points nowhere useful) and forgotten again when the image is
+unmapped. macOS VST2 editors went from 1 of 31 to 19 of 31 -- and Ragnarok, the
+one that had been drawing, went from 0 pixels of 427680 to all of them.
+
+Two things this cost that are worth naming. `register_class` used to drop
+silently when its table filled, which would have reintroduced exactly this bug
+one plugin at a time in a long browsing session; it now says so once. And
+`macobjc_class` -- `NSClassFromString`, `objc_getClass` -- searched only the
+runtime's own stand-ins, so a plugin asking for a class compiled into itself got
+nil. That is what an Audio Unit's Cocoa view is.
+
+## Audio Units build their editor through a factory
+
+An AU has no `effEditOpen`. It answers `kAudioUnitProperty_CocoaUI` with the
+*name* of a class inside its own bundle, and the host is expected to find that
+class, build it, hand it the unit and take the `NSView` it returns:
+
+```
+MPS.component:  -[MPS_View uiViewForAudioUnit:withSize:]
+```
+
+Two things had to exist first. The class had to be findable by name, which is
+the registration above. And `AudioUnitGetProperty` had to work: it is the call a
+view factory makes to find the object behind the opaque `AudioUnit` handle it
+was given, and `macshim_set_au_callbacks` -- which fills in that callback and
+the two beside it -- had no caller either, so every such call returned "not
+initialised". The handle the host hands out is now the `macau` struct itself,
+recognised on the way back in by a magic word.
+
+After that the editor is the same machinery a macOS VST2 uses: the plugin draws
+into a layer this host owns, the software Metal backend hands back the pixels,
+and the host fires the timers because there is no run loop. Eighteen of the
+fifty Audio Units here name a Cocoa view; all eighteen draw. The other
+thirty-two name none -- the Michael Norris spectral set expects a host to build
+a generic parameter interface -- which is not a failure, and is now reported as
+`editor: none` rather than as nothing at all.
+
+## The editors drew, and could not be operated
+
+Every macOS editor painted and none of them could be used. A drag moved
+nothing, on any of the three backends, where the same gesture on the same
+plugin's Windows build moved a slider from 0.843 to 0.802. Three separate
+things were wrong, and each hid the next.
+
+**Every click landed at `height - y`.** An NSEvent's `locationInWindow` has its
+origin at the bottom left, because that is what Cocoa windows use, and a
+*flipped* view -- which every plugin editor here is -- counts from the top.
+AppKit does that conversion in `convertPoint:fromView:`, and this host's was the
+identity. So the editor was mirrored vertically: a click meant for a slider at
+230 arrived at 122, and mostly hit nothing at all. The flip is now the view's
+own answer to `isFlipped` rather than an assumption, because a VSTGUI view says
+no where an iPlug2 one says yes.
+
+**There was no window.** `[view window]` answered nil, which had seemed
+harmless -- nothing is ever shown. It is not harmless: grabbing a control makes
+iPlug2 ask its window to convert the cursor's screen position into window
+coordinates, and a message to nil returns zero. The mouse-down position was
+stored as (0,0), so the first drag moved the control by the entire distance from
+the top-left corner. A one-pixel drag took a slider from 0.43 to full scale, in
+whichever direction it was dragged. There is a window now, and its origin is
+placed to make `locationInWindow` mean what the event already said it meant --
+flush with the top of a screen whose height `CGDisplayPixelsHigh`, `NSScreen`
+and `[NSEvent mouseLocation]` all now agree on, because a plugin converts
+between the two conventions and compares the results.
+
+**The pointer is two positions, not one.** A plugin dragging a locked control
+warps the cursor back to where the gesture started after every event, so that
+what it reads next is the physical movement since then and nothing else. On a
+real Mac the window server performs that warp and the next event arrives from
+the new place; nothing warps an X pointer, so the host does it in software.
+`CGDisplayMoveCursorToPoint` moves a virtual pointer, and each incoming event
+advances it by however far the real one moved. Without that the plugin measured
+every event against the point it had warped to, and a drag accelerated away and
+reached the end of its range in five pixels -- smooth-looking, and unusable.
+
+Measured on MPS, dragging its Vivid slider 40 pixels, the same gesture the
+Windows build answers with an even 0.02325 per step:
+
+| | steps that changed the value | trajectory |
+|---|---|---|
+| Windows VST2 | 15 of 15 | 0.4533 → 0.8021, evenly |
+| macOS VST2 | 15 of 15 | 0.4533 → 0.8951, evenly |
+| macOS Audio Unit | 15 of 15 | identical to the VST2 |
+| macOS VST3 | 15 of 15 | identical to the VST2 |
+
+The three macOS backends agree to the fourth decimal because they are the same
+plugin reaching the same rasterizer by three different roads. The rate matches
+Windows per pixel; the endpoints differ only because the two harnesses quantise
+the sweep differently.
+
+Three things were then checked rather than assumed, because "the number moved"
+is not the same as "it works":
+
+- **The picture follows.** Two clicks at different points on the same slider
+  produce framebuffers differing in 2342 bytes, against 2299 for the Windows
+  build of the same editor.
+- **The sound follows.** A WAV rendered after the drag differs from one rendered
+  before it, on all four backends. `peload` puts the render after the gesture
+  when both are asked for, because that is the question a gesture is asked to
+  answer.
+- **It is fast enough to feel like dragging.** A drag frame on MPS's 608x352
+  editor -- deliver the event, let the plugin redraw, rasterize -- costs a mean
+  of 8.0 ms and a worst of 12.2 ms, inside `pestudio`'s 16 ms pump. Opening the
+  editor costs 33 ms, and 200 ms for the largest here.
+
+## The twelve editors that drew nothing
+
+Twelve of the thirty-one macOS VST2 bundles build their interface with VSTGUI 3
+rather than iPlug2 -- the whole Audio Damage side of the corpus, and four others
+-- and not one of them drew a pixel. They are a single chain of missing pieces,
+each one hiding the next, and the first is a long way from anything to do with
+drawing.
+
+**A plugin has to be able to find its own bundle.** VSTGUI's `InitMachOLibrary`
+asks dyld which image its own code is in, walks the path up to the `.vst`, and
+builds a `CFBundleRef` from it. Nothing here answered for dyld, so `gBundleRef`
+stayed null and every resource lookup after it returned nothing. There is one
+image, so `_dyld_image_count` is 1 and `dladdr` answers for it -- shadowing the
+host's own, which knows nothing about a mapping made with `mmap` and would
+happily describe whatever ELF happens to sit at that address.
+
+**Then it has to read its own Info.plist.** The bundle's info dictionary was an
+empty one, which is enough for a plugin that only asks whether a key exists and
+nothing like enough for one that keeps data there. Audio Damage's do:
+
+```
+<key>FontrastInfo_20000</key> <string>tahoma9</string>
+```
+
+That names the bitmap font the editor draws its labels with. The parser is a
+scan for `<key>` and the element after it, not an XML reader -- these files are
+machine-written -- and it skips anything nested, so an `AudioComponents` entry
+cannot shadow a top-level key.
+
+**Then it opens that file through Carbon.** `CFURLGetFSRef` and
+`FSOpenFork`/`FSGetForkSize`/`FSReadFork` -- the File Manager was already here,
+but the door into it was not, and `CFURLGetFSRef` answering false meant the
+whole branch was skipped. The field it would have filled is one the constructor
+does not zero, so the object carried a garbage pointer that the first call to
+`getCharacterInfo` dereferenced. Seven editors died there, in a font routine, a
+long way from the question that had gone unanswered. The FSRef also stopped
+carrying its path inline while this was being fixed: eighty opaque bytes is not
+a path, and a truncated one opens nothing.
+
+**Then it decodes its artwork.** A VSTGUI editor is several hundred images and
+nothing else -- background, knob filmstrips, button states -- loaded through
+`CGImageSourceCreateWithURL`. Nothing in this host had needed image *decoding*
+before: the Metal path is handed pixels by the plugin and the Windows side has
+its own DIB reader. So `peload/png_in.h` is a PNG reader, inflate included.
+
+Deflate is implemented rather than linked, for the same reason the writer beside
+it emits stored blocks: this host has no zlib dependency, and one added for a
+plugin's artwork would have to be carried by every package. It is about two
+hundred lines and it is checked rather than trusted --
+`tools/regress.py`'s `png-decoder` builds thirty images covering every colour
+type, interlaced and progressive, at sizes that leave awkward remainders in the
+Adam7 passes, and compares every component against Python's own reader. The 551
+PNGs the corpus actually carries were checked the same way. Four of the twelve
+keep some artwork as Windows BMP instead, so that is read too, and the caller
+sniffs rather than trusting the extension.
+
+**Then it needs somewhere to draw.** AppKit focuses a context on a view before
+calling `drawRect:`, and the view fetches it back with `[[NSGraphicsContext
+currentContext] graphicsPort]`. There was no such thing here, so every editor
+asked for its context, got nil, and dereferenced it a few instructions later.
+It is a bitmap this host owns, which is also the editor's framebuffer.
+
+**And the context needs a state.** This was the last one and the largest. The
+transform and clip calls accepted their arguments and returned, which is fine
+while the only thing drawing is a plugin compositing into a bitmap of its own at
+the identity. A VSTGUI editor does not work that way: it clips to a control's
+rectangle, translates the origin onto that control, flips the y axis, and draws
+the whole filmstrip. Ignoring all of that put every bitmap on top of every other
+one at the canvas origin -- the first editor to get this far drew three vertical
+bands of stripes. With a real CTM, a real clip and a real save/restore stack, it
+draws its interface.
+
+One more piece belongs to the same session and is worth naming separately: the
+info dictionary is a singleton this host hands out, and
+`CFBundleGetInfoDictionary` is a Get -- the caller does not own it. A plugin
+that releases it anyway took the host's only one with it, and the *next* plugin
+then found an empty dictionary, looked up nothing, and asked its bundle for a
+file called ".png". It is held forever now. That is the difference between one
+VSTGUI editor working and two of them working, which is the difference that
+matters to a browser.
+
+Two things fell out that were not about VSTGUI at all:
+
+- **An unimplemented selector with out-parameters is not safe.** A missing
+  method returns nil and leaves the caller's own locals alone, so
+  `getRectsBeingDrawn:count:` handed back a count and an array pointer that were
+  whatever the stack happened to hold. With one set of stack contents the count
+  came out zero and the loop was skipped; with another -- loading libc++ was
+  enough to change it -- the count was large and the pointer was not an array.
+  The editor's own drawing was fine either way.
+- **An unresolved *data* import fails silently.** A function import binds to a
+  stub that reports itself when called; a data import that nothing implements is
+  left holding the image's own link-time value, and nothing says so. The plugin
+  then puts that value in a dictionary and the fault lands inside `CFRetain`.
+  `kCFBooleanTrue` was one. Rather than chase them one at a time, the two type
+  tests that were reading through plugin-supplied pointers -- "is this a
+  CoreFoundation object?" and "did this runtime allocate this?" -- now answer
+  from a hash set of what was actually minted, with the link stored in the
+  object's own header so there is nothing extra to allocate.
+
+Result: **30 of the 31 macOS VST2 editors paint**, up from 19. The one that does
+not is `model-e`, which is VSTGUI 4 driving a `.uidesc` layout through the
+Resource Manager -- a different architecture, and the `Get1Resource` family is
+not implemented. Its audio works.
+
+## The editors drew upside down, and it took a dirty rectangle to notice
+
+Eight macOS editors -- six of the eight Audio Damage plug-ins, `neon` and `vb1`
+-- painted a picture that looked completely right and could not be operated. Automaton drew
+its title, its sequencer grids, its tab strip and its logo, all the right way up
+and all legible. Clicking any of them did nothing. Clicking a hundred and six
+pixels *below* a button pressed it.
+
+Two explanations fit that, and they are hard to tell apart from the outside:
+either the clicks arrive mirrored, or the picture is drawn mirrored and the
+clicks are fine. The picture argued for the first -- text was upright, panels had
+their titles at the top, the brand was at the bottom, and a vertically mirrored
+editor should have looked like none of those things. That reading was wrong, and
+what settled it was asking the plug-in rather than looking at its output:
+
+```
+[invalidate] rect 33,293 37x38   (view height 523)
+```
+
+Automaton says the button it just changed is at y=293. It was appearing at
+y=192, and 523 - 293 - 38 = 192. The plug-in's own account of where its controls
+are is the one thing in the system that cannot be a matter of opinion, and it
+said the drawing was mirrored. Text stayed upright through the mirror because
+these editors draw text from a bitmap font -- each glyph is an image placed by
+its own rectangle, so a flipped canvas moves the glyphs and does not turn them
+over.
+
+The cause is one line of AppKit that was not there. A Core Graphics bitmap
+context has its origin at the bottom left. A *flipped* view -- `isFlipped`
+returning YES, which is what these plug-ins' view classes do -- draws with y
+counting down from the top, and AppKit arranges that by concatenating a flip
+onto the context before it calls `drawRect:`. This host handed over the context
+unflipped, so every rectangle the plug-in drew landed at `height - y` while
+every click it received was measured honestly from the top.
+
+`macquartz_begin_draw` now puts the context into the state AppKit hands
+`drawRect:`, flip included, and resets the transform and clip while it is there
+-- a plug-in that leaves a translate behind at the end of one `drawRect:` would
+otherwise begin the next one inside it.
+
+The check is mechanical, and it is worth having because "the editor looks right"
+demonstrably is not: click a grid over every macOS editor, and for each click
+that changes the picture, ask whether the pixels that changed contain the point
+clicked or its mirror image. Across all ninety-nine, before: fourteen answering
+only at the mirror -- eight distinct plug-ins, six of which are in the corpus as
+Audio Units as well. After: 872 clicks landing where they were aimed, and none
+at the mirror.
+
+## Nothing was drawn with a path, and that is where the dials were
+
+Fifty-eight Core Graphics entry points were accepting their arguments and
+returning. Most of them deserve to -- line dash, miter limit, font smoothing
+hints -- but among them were `CGContextMoveToPoint`, `AddLineToPoint`, `AddArc`,
+`FillPath`, `StrokePath`, `FillEllipseInRect`, `SetLineWidth`,
+`SetRGBStrokeColor` and `RotateCTM`. Every path call in the API. Nothing was
+rasterized from a path at all.
+
+This hid unusually well. An editor's fixed furniture is bitmaps -- the panel, the
+labels, the knob body -- and bitmaps drew correctly, so the editors looked
+finished. What is drawn with a path is the part that *moves*: the pointer on a
+knob, the needle on a meter, the curve in an envelope, the highlight on the
+selected step. Tattoo's knobs were plain discs, its two envelope displays were
+empty boxes, and its mod sequencer was a blank strip. Dragging a knob moved the
+parameter on all sixty frames of a drag and changed the picture on none of them
+-- the sound followed the mouse and the knob sat still, which is the worst way
+for a control to be broken.
+
+There is now a path rasterizer: subpaths flattened to device-space points as
+they are added, filled by scanline with four sub-scanlines a row and exact
+horizontal coverage, nonzero or even-odd, and stroked by turning each segment
+into a quad and each joint into a small polygon and filling the union. Curves
+and arcs are flattened; `CGContextClip` reduces a path to its bounding box,
+which is the same approximation the rest of the clip handling makes, and
+consumes the path as Core Graphics does.
+
+Fifty-five of the seventy-five editors that paint changed as a result, and the
+comparison that matters is that none of them got worse -- no picture lost its
+ink or its colours. Tattoo's knobs have pointers, its envelopes have curves, its
+sequencer has bars, and its dials now repaint on every frame of a drag that
+changes their value.
+
+## An Audio Unit has no size until it has a view
+
+WhispAir and Tricent showed a corner of themselves and a pair of scrollbars --
+but only as `.component`, never as `.vst`, which is the clue that says where to
+look. The editors are identical; the two are the same plug-in in different
+wrappers, and both render pixel-for-pixel the same picture at the same size.
+
+What differs is when that size can be asked for:
+
+```
+WhispAir.vst        before open 1127x776    after open 1127x776
+WhispAir.component  before open 0x0         after open 1127x776
+```
+
+An Audio Unit's editor size comes from its Cocoa view, and there is no view
+until the editor is opened. `pestudio` asked first and opened second, and its
+whole editor-sizing block is guarded on the answer being non-zero -- so for
+every AU it was skipped entirely. The window then believed there was no editor:
+no size, no zoom applied, no automatic fit, and the Fit button disabled because
+a window with no editor has nothing to fit. Meanwhile the editor widget grew to
+the size the plug-in was actually drawing, inside a page still sized 0x0. That
+is the crop, and the scrollbars.
+
+Measured with the fix taken back out again, which is the only way to be sure
+that is what it was:
+
+```
+without:  editor 0x0        zoom 1.000   page 0x0
+with:     editor 1127x776   zoom 0.486   page 548x377   (pane 601x377)
+```
+
+`plugview` opens the editor first and asks afterwards, so it never had this;
+the two windows had drifted apart on the one ordering that matters. `pestudio`
+now asks again once the editor exists, and failing that takes the framebuffer's
+own dimensions -- whatever the plug-in is drawing into is the truth.
+
+Both windows also keep the editor fitted now, rather than fitting it once on
+opening: the automatic fit is retried until the pane can actually be measured,
+and re-run when the pane changes size, until the zoom controls are touched. A
+chosen zoom is a decision and the window stops arguing with it from then on.
+
+## A control that polls for the pointer instead of waiting for it
+
+Dr. Device's XY pad could not be moved. Not "moved the wrong amount" -- grabbing
+a handle and dragging did nothing at all to the parameters, while the picture
+changed on fifty-eight frames out of fifty-nine, so the pad was clearly alive
+and clearly not listening.
+
+It was listening, to a different question. Most controls take the position out
+of the `mouseDragged:` event they are handed. This one asks the window instead
+-- `mouseLocationOutsideOfEventStream`, four times across a drag -- which is
+what a control tracks with when it wants the pointer *now* rather than where it
+was when the event was queued. That selector was unimplemented, so every poll
+returned the zero point and the pad put its handle in the corner and left it
+there.
+
+Implemented against the same virtual pointer the events carry, so a plug-in that
+mixes the two sees one pointer and not two. Both handles now follow the mouse on
+both axes, and the parameters they drive move in step: dragging the left handle
+up 86 pixels takes `Left Y` from 0.292 to 0.754 in even increments, with
+`FiltResn` following it.
+
+`makeFirstResponder:` went in beside it. It was returning nil, which is a "no",
+and a control that checks gives up whatever it was starting.
+
+## One repaint per mouse event
+
+The Win32 path posts `WM_MOUSEMOVE` and lets the pump turn the invalid region
+into a `WM_PAINT`: however many mouse events arrive between frames, one frame is
+drawn. All three macOS backends painted inside the mouse handler instead.
+
+A mouse reports far faster than a software rasterizer can draw an editor. At
+Qyooo's thirty-one milliseconds a frame and a pointer reporting every four, the
+queue backed up and the dial arrived in lurches -- which is exactly what "janky"
+describes. The three `*_editor_mouse` functions now post the event and nothing
+else; the pump draws. Delivering four events per displayed frame instead of one
+costs the same as delivering one, where before it cost four times as much.
+
+## An Audio Unit that is a VST in a wrapper
+
+Nine of the fifty `.component` bundles refused to load with "no AU factory
+export found". Eight of them are Audio Damage's, and they are Symbiosis
+wrappers: one binary exporting both `SymbiosisEntry` -- the pre-AudioComponent
+Component Manager entry point -- and `VSTPluginMain`, with no `AudioComponents`
+key in the Info.plist for the modern path to read. The VST2 inside is the whole
+plug-in, editor included, and this host already knows how to run it.
+
+So when the AU path has failed and the bundle turns out to export a VST entry,
+the VST2 is loaded instead. All eight now load, render, and show their editors,
+and each renders a byte-identical WAV to its own `.vst` build -- which is the
+check worth making, because it is the same code either way. The ninth,
+Ragnarok's, is a Component Manager unit with no VST entry at all and still
+declines.
+
+## Splitting a frame across cores
+
+An iPlug2 editor renders its whole interface every frame: NanoVG has no
+partial-frame mode, so honouring the dirty rectangle buys nothing there -- it was
+tried, and the shaded-pixel count did not move. The work is one pass over
+independent pixels, which is the shape of thing that splits.
+
+It splits by scanline. Each band gets a horizontal strip of the target and walks
+the whole stream of triangles, drawing only its own rows. A pixel is written by
+exactly one band, and within a band the triangles are applied in the order the
+plug-in issued them, so the blending, the stencil read-modify-write and the
+depth of overdraw are all unchanged. That is a claim worth testing rather than
+asserting: every macOS editor captured twice, once banded and once not, compared
+byte for byte.
+
+The first attempt was slower than no threading at all. Deciding whether to split
+by the size of the *target* meant splitting every call, and FB-7999 issues
+twenty-three hundred draw calls a frame at eight triangles each -- two thousand
+barriers, and a frame that went from 59 to 113 milliseconds. The decision has to
+be made on the work in the call, which is a cheap pass over the triangles'
+bounding boxes that gives up as soon as the answer is past the threshold. Two to
+four calls a frame are split now, and they are the ones that matter.
+
+| dragging a knob | before | after |
+|---|---|---|
+| MPS, 608x352 | 11.9 ms | **3.9 ms** |
+| Qyooo, 858x648 | 31.2 ms | **6.2 ms** |
+| FB-7999, 1150x718 | 58.7 ms | **34.8 ms** |
+
+FB-7999 is the largest editor here and is also, since its display timer started
+firing, drawing twice what it was: 1.93 million shaded pixels a frame against
+960,000. Per unit of work it is three times quicker; in wall-clock it is not yet
+at sixty frames a second, and it is the only one that is not.
+
+## One plugin after another, in one process
+
+A browser loads a plugin, shows it, closes it and loads the next, and this fell
+over on the third. Two lifetimes were wrong.
+
+**`dispatch_async` did not copy the block.** A block literal lives on the stack,
+and the contract is that whoever takes it beyond the enclosing call copies it to
+the heap first -- that is the whole meaning of `__NSConcreteStackBlock`. Keeping
+the stack pointer and running it on another thread reads a frame that has since
+returned, which survives for exactly as long as nothing reuses that stack. It is
+copied now, with the compiler's own copy helper for whatever it captured, and
+released when the job finishes.
+
+**An image was unmapped while a dispatched block was still running.** The block's
+code is *in* that image. Unmapping under it jumps into nothing -- not there, but
+later, on a thread with no connection to whatever the host was doing.
+`macho_close` waits for the outstanding jobs; if one will not finish, the mapping
+is retired rather than unmapped, because leaking an image is a cost that stops
+growing and pulling the ground out from under a running thread is a crash in the
+host.
+
+**And a view outlived its plugin.** Closing a macOS VST3 left the Cocoa and Metal
+state pointing at a view whose image had gone, so the next plugin's first mouse
+event walked a class structure that was no longer there. That close path now
+resets them like the other two -- and, so that a close path which forgets again
+costs nothing, the input and drawing paths refuse a view whose class the runtime
+no longer knows. That test is free: image classes are unregistered when the image
+is unmapped, which is exactly the question worth asking.
+
+The last of these needed one more thing. Every Apple stand-in was minted as a
+direct `NSObject` subclass, which is enough for a class a plugin only messages
+and wrong the moment it *subclasses* one: an `NSTextField` is an `NSView`, so a
+plugin's own text field expected `[super initWithFrame:]` to find `NSView`'s and
+found nothing. The relationships a plugin actually leans on are declared now --
+control, text field, cell, scroll and clip view, button, popup, slider -- and no
+others, because inventing a hierarchy nothing needs is a way to move a method
+resolution somewhere surprising.
+
+Six plugins, mixed across all three macOS backends, opened, painted, poked and
+closed twice each in one process:
+
+```
+round 1
+  MPS.vst           608x352   99.7% lit   click: a control answered
+  Qyooo.vst         858x648   99.5% lit   click: a control answered
+  Blooo.component  1096x586   99.9% lit   click: a control answered
+  Stigma.vst3      1104x488   98.7% lit   click: a control answered
+  Ragnarok.vst     1080x396  100.0% lit   click: no control answered
+  MPS.component     608x352   99.7% lit   click: a control answered
+round 2
+  ... the same
+every plug-in opened, painted and closed
+```
+
+Ragnarok's line is the probe missing rather than the editor failing -- its grid
+lands on artwork. Clicked where a control actually is, it answers, and the
+pixels that change are the ones under the pointer: a click at 800,330 repaints
+busiest at 816,288 and 768,312, and the same click mirrored to 800,66 changes
+nothing. That is the check worth running on both editor backends, because it
+catches the mirror above without needing to know what the plugin's controls are
+called -- MPS, on the Metal path, repaints at 288..336 x 192..240 for a click at
+307,230.
+
+Across the whole corpus, every macOS editor -- 30 VST2, 18 Audio Unit, 18 VST3
+-- survives a fifteen-point grid of clicks, each in its own process.
+
+Under AddressSanitizer the host itself is clean -- three VSTGUI editors, two
+rounds each, no error from any of this code. Two findings remain and both are
+in the plugins:
+
+- One allocates with `operator new` and releases with `free`. That is fine
+  wherever both reach the same allocator, which is true on macOS and true here;
+  ASan is stricter than either, and `alloc_dealloc_mismatch=0` is the honest
+  setting for running foreign binaries.
+- An Audio Unit's own teardown frees a pointer sixty bytes past a four-byte
+  allocation. That is a real defect in the plugin, in its destructor, and it
+  only ever surfaces under a sanitizer: with the ordinary allocator the address
+  lands somewhere `free` accepts and the sequence runs, repeatedly, without
+  complaint.
+
+## What a browsing session costs
+
+An editor that opens once and is measured once looks fine. Opening one after
+another for an afternoon is the thing a browser actually does, and it was
+leaking megabytes a time -- six and a half of them per open for MPS, three and a
+half for Dr. Device. None of it was subtle once measured: resident memory
+against opens, and whether it was heap or mappings.
+
+Two allocations were never released:
+
+- **Every Metal texture and buffer payload.** A texture is an Objective-C object
+  and objects here are retired rather than freed, which is documented and
+  deliberate -- but their *pixels* are a plain allocation, and a font atlas plus
+  a drawable plus the vertex and uniform buffers is megabytes. `macmetal_reset`
+  already freed the layer's back buffer when a plugin closed; it now frees the
+  rest of what it handed out.
+- **Every decoded image, and the framebuffer they composite into.** A VSTGUI
+  editor is hundreds of PNGs, and a plugin does not reliably release them --
+  `CGImageSourceRef` has no typed release at all, so it goes through `CFRelease`,
+  which knew nothing about these objects. `CFRelease` reaches them now, and
+  whatever is still outstanding when the editor closes is swept.
+
+| opened repeatedly | before | after |
+|---|---|---|
+| MPS (iPlug2, Metal) | 6.63 MB each | 0.86 MB |
+| Automaton (VSTGUI) | 3.67 MB each | 0.70 MB |
+| Dr. Device (VSTGUI) | 3.50 MB each | 0.28 MB |
+
+All thirty-one macOS VST2 editors opened in one process now come to 2.73 MB
+apiece, and every one of them still renders byte-for-byte what it did before --
+which is the check that made the sweep safe to make at all.
+
+## What a frame costs, and what it is not worth optimising
+
+An idle editor costs nothing: zero milliseconds a frame, on every backend here.
+That is the number that matters most, because an editor spends almost all its
+time not being touched.
+
+Dragging a control costs what the software rasterizer costs, and nothing else:
+
+| | frame while dragging | of which the rasterizer |
+|---|---|---|
+| MPS, 608x352 | 7.2 ms | 7.3 ms |
+| Qyooo, 858x648 | 18.3 ms | 18.8 ms |
+| Dr. Device, 728x431 (Core Graphics) | 0.21 ms | none |
+
+The Core Graphics path -- the one the VSTGUI editors use -- does not register.
+Nor does the image decoder: 563 images, 53 megapixels, in 1.3 seconds, which is
+why a VSTGUI editor opens in under eight milliseconds with all its artwork.
+Nor do the three pointer registries: about ten thousand lookups in a session.
+
+The Metal rasterizer is therefore the whole cost, and three attempts to make it
+cheaper are *not* in this tree. Replacing `p[i] / 255.0f` with a lookup table,
+hoisting the reciprocal of the triangle area out of the pixel loop, and lifting
+the channel-order branch out of the sampler all looked like wins on a single
+run. Benchmarked properly -- best of five, against the same code without them --
+they were noise: 7.17 against 7.19 ms, 18.26 against 18.26. The reciprocal was
+the only one with a real effect, about five percent, and it changed the output
+of fifty-four of the sixty-seven editors by a few hundred bytes each. Five
+percent is not worth giving up "the renderer produces exactly what it produced
+before" as a test, so all three came back out.
+
+What would actually make a difference is not a micro-optimisation: Qyooo shades
+384,005 pixels for one knob moving, on an editor of 555,984. The plugin is
+redrawing two thirds of its interface per frame, and no amount of tightening the
+pixel loop changes that.
+
+Changing the *shape* of the work does. Those pixels are independent, so the
+rasterizer now splits a large draw call by scanline across cores -- see
+"Splitting a frame across cores" above. Qyooo drags at 6.2 ms rather than 31.2,
+and the three micro-optimisations above are still not in this tree, because they
+were still noise.
+
+## macOS VST3: the same host, a different loader
+
+The two halves had existed separately for a while: `vst3.c` compiled for System V
+vtables, and a Mach-O loader. macOS x86-64 *is* System V, so the only thing
+between them was the twenty lines that decide how the module gets into memory --
+`dlopen` for a Linux bundle, `macho_open` for a macOS one, and `bundleEntry`
+where Linux has `ModuleEntry`. The bundle is handed over whole rather than the
+binary inside it, because the plugin's own artwork is found relative to the
+bundle.
+
+Their editors want an `NSView`, which is a third platform type beside the X11
+and HWND ones already there. The runtime can mint one, so the host makes a
+container, hands it to `IPlugView::attached`, and reads the pixels back through
+the same software Metal backend. All eighteen render; all eighteen draw.
+
+Getting there turned up two bugs that had nothing to do with VST3:
+
+- **`CFUUIDCreate` returned a CFData.** A `cfdata`'s first field after the header
+  is a pointer to its bytes; a `cfuuid`'s *is* the bytes. Tagged as data,
+  releasing one handed the first eight of sixteen random bytes to `free()`.
+  "free(): invalid pointer", from a plugin that had done nothing wrong.
+- **`CFStringGetBytes` took its `CFRange` by pointer.** It is passed by value,
+  and on System V a 16-byte struct of two integers goes in two registers -- so
+  every argument after it was read one register early: `buf` arrived as `cap`,
+  and the write-back pointer was a stack address the callee then stored through.
+  Deputy's VST3 asks for all 2191 of its parameter names this way and faulted on
+  the first. This is the same class of mistake the i386 checks in
+  `tools/regress.py` exist to catch on the Windows side, and there is no
+  equivalent check here.
 
 ## Hosting 32-bit plugins from the 64-bit host
 
@@ -1049,15 +1865,47 @@ the realistic case:
 
 ## Not done
 
-- **macOS Audio Unit editors.** An AU builds its view through a separate
-  factory (`kAudioUnitProperty_CocoaUI`) rather than `effEditOpen`, so the same
-  Metal backend is not wired to them yet. Their audio works.
-- **Component Manager Audio Units.** Ragnarok's `.component` exports
-  `_Ragnarok_Entry`, the pre-AudioComponent entry point --
+- **`model-e`'s editor**, the one macOS VST2 that still draws nothing. It is
+  VSTGUI 4 driving a `.uidesc` layout rather than compiled controls, and it
+  reads that description through the Resource Manager -- `Get1Resource` and the
+  handle calls around it, none of which are implemented. Its twelve images load
+  and its audio works; nothing is drawn with them.
+- **Typing a value into an iPlug2 control.** Clicking a control that offers text
+  entry builds the field -- an `NSTextField` finally being an `NSView` was what
+  that took -- and the field does not accept anything typed into it, because
+  nothing here shapes text and there would be no glyph to show for a keystroke.
+  Knobs, sliders and menus are unaffected.
+
+  Getting that far turned out to be worth more than the crash it removed. Five
+  CoreText calls -- `CTFontCreateWithGraphicsFont`, `CTFontCopyFontDescriptor`
+  and the three `CTFontDescriptor` ones -- returned NULL, and iPlug2 keeps what
+  they hand back. Two things followed from that. A control asking for text entry
+  read a size out of the null descriptor, so clicking MPS's program-name field
+  read a double from address 8 and took the host down -- a crash, on a click, on
+  a control, which a twelve-by-twelve grid of drags reaches on four editors
+  where the five-by-three grid this used to be checked with did not. And the
+  font the editor loads from its own bundle never registered, so NanoVG had no
+  glyphs and every string an iPlug2 editor draws at run time came out blank.
+
+  They return real objects now, carrying a face and a size. The click does
+  nothing instead of ending the process, and fifty-four editors gained the text
+  they draw through their own font: MPS shows its program name, its program
+  number and its value readout where it showed empty boxes.
+- **Text in a VSTGUI editor is drawn by its own bitmap font, not by ours.** That
+  is how those plugins work and it is why their labels appear. What this host
+  still does not rasterize is CoreGraphics *text* -- `CTLineDraw` and the fill
+  and stroke calls are accepted and dropped -- so an editor that draws a string
+  through Core Graphics rather than from a glyph sheet leaves a gap where it
+  should be. Nothing in this corpus depends on it for more than a caption.
+- **Component Manager Audio Units.** One of the fifty `.component` bundles still
+  exports only the pre-AudioComponent entry point -- Ragnarok's `_Ragnarok_Entry`,
   `ComponentResult(ComponentParameters *, void *)` -- which is a different ABI
-  from the factory the AU host speaks. It now says so and declines instead of
-  calling it as a factory and crashing on the garbage it returns. The VST2 build
-  of the same plugin works, so nothing is actually lost.
+  from the factory the AU host speaks. It says so and declines rather than
+  calling it as a factory and crashing on the garbage it returns. Its VST2 and
+  VST3 builds load, so nothing is actually lost; what is lost is that
+  `pehost_classify` cannot tell in advance, so the browser offers it and the
+  failure only arrives on the click. The other eight that used to fail this way
+  are handled -- see "An Audio Unit that is a VST in a wrapper" above.
 - **One macOS editor at a time.** `macmetal.c` keeps a single CAMetalLayer, so
   the host can find the framebuffer without being handed a pointer. `pestudio`
   hosts one plugin at a time, so this costs nothing today; hosting two at once
@@ -1075,8 +1923,6 @@ the realistic case:
   already fits — it just needs a 64-bit build of the server side.
 - **CLAP (5 present) and LV2 (43 present) are not implemented.** CLAP is a clean
   C ABI and would be a small host; LV2 needs Turtle parsing, so it wants lilv.
-- **macOS VST3 (18 bundles) is not hosted.** They bind, but nothing drives the
-  VST3 API against a Mach-O image yet -- the two halves exist separately.
 - **SEH.** `__try` regions work only insofar as nothing throws; real unwinding
   means parsing `.pdata`/`.xdata`.
 - **A 32-bit C++ runtime, to go with the 32-bit loader.** `peload32` can load

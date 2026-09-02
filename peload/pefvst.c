@@ -123,6 +123,18 @@ static int call_tv(pefvst *v, uint32_t tvector, const uint32_t *gpr, int ngpr,
 
     if (!tvector) return fail(v, "the plug-in left this entry point null");
 
+    /* Re-entry on this thread means the guest is already running here and has
+     * pumped the host's event loop from inside a modal drag loop -- and the
+     * event that arrived (a key, a parameter change) is now trying to dispatch
+     * back into the interpreter. Running it would corrupt the machine state the
+     * first call is still using; waiting would deadlock on the lock below,
+     * which is not recursive. Decline instead: the event is dropped, the drag
+     * continues. pefvst_editor_mouse and editor_draw carry this same check
+     * earlier because they can do something smarter than refuse. No error is
+     * recorded: the call that is actually running owns v->err. */
+    if (v->in_guest && pthread_equal(v->guest_thread, pthread_self()))
+        return -1;
+
     pthread_mutex_lock(&v->lock);
     code = gw(v, tvector);
     toc  = gw(v, tvector + 4);
@@ -382,6 +394,18 @@ int pefvst_unique_id(pefvst *v){ return v ? v->unique_id : 0; }
 int pefvst_version(pefvst *v)  { return v ? v->version : 0; }
 const char *pefvst_error(pefvst *v) { return v && v->err[0] ? v->err : NULL; }
 uint64_t pefvst_icount(pefvst *v)   { return v ? v->m->icount : 0; }
+
+int pefvst_import_stats(pefvst *v, int *bound, int *unbound, int *stub_calls,
+                        char *names, int namesz)
+{
+    int unb;
+    if (!v || !v->c || !v->p) return -1;
+    unb = cfm_unbound(v->c, names, namesz > 0 ? (size_t)namesz : 0);
+    if (bound)      *bound       = (int)v->p->nimports - unb;
+    if (unbound)    *unbound     = unb;
+    if (stub_calls) *stub_calls  = cfm_stub_calls(v->c, NULL);
+    return 0;
+}
 uint32_t pefvst_scratch(pefvst *v)  { return v ? v->scratch : 0; }
 ppc     *pefvst_machine(pefvst *v)  { return v ? v->m : NULL; }
 

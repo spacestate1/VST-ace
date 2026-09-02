@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include "peimage.h"
 #include "pehost.h"
+#include "machoload.h"
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -84,6 +85,10 @@ static const TUID IID_IParameterChanges= TU(0xA4779663,0x0BB64A56,0xB44384A8,0x4
 static const TUID IID_IParamValueQueue = TU(0x01263A18,0xED074F6F,0x98C9D356,0x4686F9BA);
 static const TUID IID_IConnectionPoint = TU(0x70A4156F,0x6E6E4026,0x989148BF,0xAA60D8D1);
 static const TUID IID_IUnitHandler     = TU(0x4B5147F8,0x4654486B,0x8CDF2A25,0x634BB74C);
+/* How a controller says which parameter a MIDI controller drives. VST3 has no
+ * event for a pitch bend or a CC: they are parameters, and this is the only
+ * thing that knows which. */
+static const TUID IID_IMidiMapping     = TU(0xDF0FF9F7,0x49B74669,0xB63AB732,0x7ADBF5E5);
 static const TUID IID_IComponentHandler2=TU(0xF040B4B3,0xA36045EC,0xABCDC045,0xB4D5A2CC);
 static const TUID IID_IPlugView        = TU(0x5BC32507,0xD06049EA,0xA6151B52,0x2B755B29);
 static const TUID IID_IPlugFrame       = TU(0x367FAF01,0xAFA94693,0x8D4DA2A0,0xED0882A3);
@@ -95,6 +100,7 @@ static const TUID IID_ITimerHandler    = TU(0x10BDD94F,0x41424774,0x821FAD8F,0xE
 
 #define PLATFORM_X11 "X11EmbedWindowID"
 #define PLATFORM_HWND "HWND"
+#define PLATFORM_NSVIEW "NSView"
 
 /* media types / bus directions */
 #define MT_AUDIO 0
@@ -232,6 +238,20 @@ typedef struct {
     void *(V3CALL *createView)(void *, const char *name);
 } IEditControllerVtbl;
 typedef struct { const IEditControllerVtbl *vt; } IEditController;
+
+/* IMidiMapping. One method: given a bus, a channel and a MIDI controller
+ * number, which parameter does it drive. The controller numbers are the CC
+ * numbers, with two past the end of them -- 128 is channel aftertouch and 129
+ * is the pitch bend. */
+enum { V3_CTRL_AFTERTOUCH = 128, V3_CTRL_PITCHBEND = 129 };
+typedef struct {
+    FUNKNOWN_SLOTS;
+    tresult (V3CALL *getMidiControllerAssignment)(void *, int32_t busIndex,
+                                                  int16_t channel,
+                                                  int16_t midiControllerNumber,
+                                                  uint32_t *id);
+} IMidiMappingVtbl;
+typedef struct { const IMidiMappingVtbl *vt; } IMidiMapping;
 
 /* IConnectionPoint: the component and controller are separate objects and the
  * host is responsible for introducing them. Plugins built on JUCE fetch their
@@ -824,10 +844,13 @@ typedef struct { unsigned char type, a, b, c; float v; } qev_t;
 struct v3host {
     void            *dl;      /* ELF path */
     pe_module        pe;      /* PE path  */
+    macho           *img;     /* Mach-O path (macOS bundles) */
     IPluginFactory  *factory;
     IComponent      *comp;
     IAudioProcessor *proc;
     IEditController *ctrl;
+    IMidiMapping    *midimap;      /* NULL when the plug-in offers none */
+    unsigned         in_mask;      /* input channels fed; 0 = all */
     int              ctrl_is_comp;  /* single-component plugin: same object */
 
     Handler   handler;
@@ -888,6 +911,41 @@ static void qpush(v3host *h, unsigned char t, unsigned char a, unsigned char b,
 }
 
 /* A .vst3 bundle is a directory; the code lives under Contents/<arch>/. */
+/* A macOS .vst3 is a bundle whose binary sits in Contents/MacOS with no
+ * extension at all, so the name cannot be the test. Recognise the layout, and
+ * hand the *bundle* over rather than the binary: the Mach-O loader resolves
+ * Contents/MacOS itself, reads Info.plist for the bundle identifier, and finds
+ * the plugin's own artwork relative to the bundle. Also answers for a bare
+ * Mach-O file, which is what --as mac-vst3 on a loose binary gives.
+ *
+ * Sets *out to what macho_open should be given. */
+static int macos_bundle(const char *path, char *out, size_t n)
+{
+    struct stat st;
+    char p[1024];
+
+    if (stat(path, &st)) return 0;
+    if (S_ISDIR(st.st_mode)) {
+        snprintf(p, sizeof p, "%s/Contents/MacOS", path);
+        if (stat(p, &st) || !S_ISDIR(st.st_mode)) return 0;
+        snprintf(out, n, "%s", path);
+        return 1;
+    }
+    {   unsigned char m[4] = { 0, 0, 0, 0 };
+        FILE *f = fopen(path, "rb");
+        size_t got = f ? fread(m, 1, 4, f) : 0;
+        if (f) fclose(f);
+        if (got < 4) return 0;
+        /* MH_MAGIC_64 little-endian, or either width of universal binary. */
+        if (!(m[0] == 0xcf && m[1] == 0xfa && m[2] == 0xed && m[3] == 0xfe) &&
+            !(m[0] == 0xca && m[1] == 0xfe && m[2] == 0xba &&
+              (m[3] == 0xbe || m[3] == 0xbf)))
+            return 0;
+    }
+    snprintf(out, n, "%s", path);
+    return 1;
+}
+
 static int find_binary(const char *path, char *out, size_t n)
 {
     struct stat st;
@@ -966,6 +1024,7 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
     int (*modentry)(void *);
 #endif
     PFactoryInfo fi;
+    int is_macho = 0;
     int32_t nclasses, i, chosen = -1;
     PClassInfo ci;
     TUID ctrlcid;
@@ -973,7 +1032,8 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
 
 #define FAIL(msg) do { snprintf(err, errlen, "%s", msg); V3N(v3_close)(h); return NULL; } while (0)
 
-    if (find_binary(path, bin, sizeof bin)) {
+    is_macho = macos_bundle(path, bin, sizeof bin);
+    if (!is_macho && find_binary(path, bin, sizeof bin)) {
         snprintf(err, errlen, "no VST3 binary inside %s", path);
         return NULL;
     }
@@ -1001,6 +1061,23 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
     getfac = (IPluginFactory *(V3CALL *)(void))pe_module_export(&h->pe, "GetPluginFactory");
     if (!getfac) FAIL("no GetPluginFactory export");
 #else
+    if (is_macho) {
+        /* macOS x86-64 is System V, so this is the same code that drives a
+         * native Linux bundle -- only the loader underneath differs. What VST3
+         * calls ModuleEntry on Linux is bundleEntry here, and it takes the
+         * bundle rather than a dlopen handle. */
+        int (*bentry)(void *);
+        if (!(h->img = macho_open(bin))) {
+            snprintf(err, errlen, "%s", macho_last_error());
+            free(h);
+            return NULL;
+        }
+        macho_run_init(h->img);
+        if ((bentry = (int (*)(void *))macho_symbol(h->img, "bundleEntry")))
+            bentry(h->img);
+        if (!(getfac = (IPluginFactory *(*)(void))macho_symbol(h->img, "GetPluginFactory")))
+            FAIL("no GetPluginFactory export");
+    } else {
     if (!(h->dl = dlopen(bin, RTLD_NOW | RTLD_LOCAL))) {
         snprintf(err, errlen, "dlopen: %s", dlerror());
         free(h);
@@ -1011,6 +1088,7 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
 
     if (!(getfac = (IPluginFactory *(*)(void))dlsym(h->dl, "GetPluginFactory")))
         FAIL("no GetPluginFactory export");
+    }
 #endif
     if (!(h->factory = getfac())) FAIL("GetPluginFactory returned NULL");
 
@@ -1213,6 +1291,18 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
     fprintf(stderr, "vst3: %s -- %s, %d param(s), in %d out %d%s\n",
             h->name, h->vendor, h->nparams, h->nin, h->nout,
             h->synth ? ", synth" : "");
+    /* Which parameter the wheel and the controllers drive, if the plug-in says.
+     *
+     * VST3 has no event for a pitch bend or a control change: they are
+     * parameters, and IMidiMapping is the only thing that knows which. Without
+     * asking, a wheel or a mod wheel simply does nothing -- which is what every
+     * VST3 here did, while the same plug-in's VST2 build bent perfectly. */
+    if (h->ctrl &&
+        h->ctrl->vt->queryInterface(h->ctrl, IID_IMidiMapping,
+                                    (void **)&h->midimap) != V3_OK)
+        h->midimap = NULL;
+    VLOG("  midi mapping: %s\n", h->midimap ? "yes" : "not offered");
+
     /* Program list, if the plugin publishes one. */
     h->prog_param = -1;
     if (h->ctrl &&
@@ -1297,6 +1387,16 @@ void V3N(v3_close)(v3host *h)
     if (h->dl) {
         int (*modexit)(void) = (int (*)(void))dlsym(h->dl, "ModuleExit");
         if (modexit) modexit();
+    }
+    if (h->img) {
+        /* bundleExit is bundleEntry's partner, for the same reason ModuleExit is
+         * ModuleEntry's. Unlike the ELF path the image really is unmapped after
+         * it, so a module that skipped its own teardown would be torn down by
+         * nothing at all. */
+        int (*bexit)(void) = (int (*)(void))macho_symbol(h->img, "bundleExit");
+        if (bexit) bexit();
+        macho_close(h->img);
+        h->img = NULL;
     }
     /* Still no dlclose. Measured: it reclaimed nothing (the plugins hold their
      * own references) and crashed Odin2 and CardinalSynth outright. */
@@ -1404,6 +1504,8 @@ void V3N(v3_set_param)(v3host *h, int i, float v)
         qpush(h, Q_PARAM, (unsigned char)(i & 0xff), (unsigned char)(i >> 8), 0, v);
 }
 
+void V3N(v3_set_input_mask)(v3host *h, unsigned mask) { if (h) h->in_mask = mask; }
+
 void V3N(v3_midi)(v3host *h, int status, int d1, int d2)
 {
     if (h) qpush(h, Q_MIDI, (unsigned char)status,
@@ -1456,6 +1558,34 @@ int V3N(v3_editor_is_hwnd)(v3host *h)
 {
     IPlugView *v = view_of(h);
     return v ? (v->vt->isPlatformTypeSupported(v, PLATFORM_HWND) == V3_OK) : 0;
+}
+
+/* Was this module loaded by the Mach-O loader? Callers use it to decide which
+ * editor road to take before asking the plugin anything, because the answer
+ * also decides where the pixels come from. */
+int V3N(v3_is_macho)(v3host *h) { return (h && h->img) ? 1 : 0; }
+
+int V3N(v3_editor_is_nsview)(v3host *h)
+{
+    IPlugView *v = view_of(h);
+    return v ? (v->vt->isPlatformTypeSupported(v, PLATFORM_NSVIEW) == V3_OK) : 0;
+}
+
+/* Attach to a host-owned NSView. Unlike VST2 on macOS, which is handed NULL and
+ * makes its own top-level view, VST3 has no such convention -- a plugin given no
+ * parent refuses. The view is one of the runtime's own stand-ins; the plugin
+ * adds its own as a subview and draws into the layer, which is what the software
+ * Metal backend hands back. */
+int V3N(v3_editor_attach_nsview)(v3host *h, void *nsview)
+{
+    IPlugView *v = view_of(h);
+    tresult r;
+    if (!v || !nsview) return -1;
+    if (v->vt->isPlatformTypeSupported(v, PLATFORM_NSVIEW) != V3_OK) return -1;
+    r = v->vt->attached(v, nsview, PLATFORM_NSVIEW);
+    VLOG("vst3: attached(NSView %p) -> %d\n", nsview, r);
+    if (r == V3_OK) h->view_attached = 1;
+    return r == V3_OK ? 0 : -1;
 }
 
 int V3N(v3_editor_attach_hwnd)(v3host *h, void *hwnd)
@@ -1564,8 +1694,30 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
                 ev->u.noteOff.noteId   = -1;
                 events.n++;
             }
-            /* CC and pitch bend map to VST3 parameters rather than events and
-             * are left out here rather than sent as something they are not. */
+            /* A control change, a channel aftertouch or a pitch bend is a
+             * parameter in VST3, not an event. Ask the plug-in which one and
+             * queue a change on it; with no IMidiMapping there is nothing
+             * sensible to send and it is dropped, as before. */
+            else if (h->midimap &&
+                     (cmd == 0xB0 || cmd == 0xD0 || cmd == 0xE0)) {
+                int32_t ctrl = cmd == 0xE0 ? V3_CTRL_PITCHBEND
+                             : cmd == 0xD0 ? V3_CTRL_AFTERTOUCH
+                                           : (e.b & 0x7f);
+                uint32_t id = 0;
+                if (h->midimap->vt->getMidiControllerAssignment(
+                        h->midimap, 0, (int16_t)ch, (int16_t)ctrl, &id) == V3_OK) {
+                    int32_t at = 0;
+                    ParamQueue *q = pc_add(&changes, &id, &at);
+                    if (q) {
+                        /* Bend is fourteen bits across both data bytes and sits
+                         * at 0.5 when the wheel is centred; the other two are
+                         * one byte. */
+                        q->value = cmd == 0xE0
+                            ? (double)((e.b & 0x7f) | ((e.c & 0x7f) << 7)) / 16383.0
+                            : (double)(e.c & 0x7f) / 127.0;
+                    }
+                }
+            }
         }
     }
     atomic_store_explicit(&h->tail, tl, memory_order_release);

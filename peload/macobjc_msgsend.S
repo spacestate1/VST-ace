@@ -117,6 +117,50 @@ macobjc_msgSendSuper2:
     jmp     *%r11
     .size   macobjc_msgSendSuper2, .-macobjc_msgSendSuper2
 
+/* id objc_msgSendSuper(struct objc_super *s, SEL sel, ...)
+ *
+ * The older of the two, and a different contract: s->cls is already the class to
+ * start searching in, where super2's is the class to search *above*. Runtime-
+ * built classes use this one, because code that assembles a class by hand has no
+ * compiler emitting the super2 form for it -- which is how every VSTGUI editor
+ * here got as far as allocating its NSView subclass and no further. */
+    .globl  macobjc_msgSendSuper
+    .type   macobjc_msgSendSuper, @function
+macobjc_msgSendSuper:
+    subq    $FRAME, %rsp
+    SAVE_ARGS
+    movq    0x00(%rsp), %rdi          /* the objc_super */
+    movq    0x08(%rsp), %rsi          /* sel */
+    call    macobjc_lookup_super1@PLT
+    movq    %rax, IMPSLOT(%rsp)
+    movq    0x00(%rsp), %rdi
+    call    macobjc_super_receiver@PLT
+    movq    %rax, 0x00(%rsp)          /* the callee must see the object */
+    RESTORE_ARGS
+    movq    IMPSLOT(%rsp), %r11
+    addq    $FRAME, %rsp
+    jmp     *%r11
+    .size   macobjc_msgSendSuper, .-macobjc_msgSendSuper
+
+/* void objc_msgSendSuper_stret(void *ret, struct objc_super *s, SEL sel, ...) */
+    .globl  macobjc_msgSendSuper_stret
+    .type   macobjc_msgSendSuper_stret, @function
+macobjc_msgSendSuper_stret:
+    subq    $FRAME, %rsp
+    SAVE_ARGS
+    movq    0x08(%rsp), %rdi
+    movq    0x10(%rsp), %rsi
+    call    macobjc_lookup_super1@PLT
+    movq    %rax, IMPSLOT(%rsp)
+    movq    0x08(%rsp), %rdi
+    call    macobjc_super_receiver@PLT
+    movq    %rax, 0x08(%rsp)
+    RESTORE_ARGS
+    movq    IMPSLOT(%rsp), %r11
+    addq    $FRAME, %rsp
+    jmp     *%r11
+    .size   macobjc_msgSendSuper_stret, .-macobjc_msgSendSuper_stret
+
 /* void objc_msgSendSuper2_stret(void *ret, struct objc_super2 *s, SEL sel, ...) */
     .globl  macobjc_msgSendSuper2_stret
     .type   macobjc_msgSendSuper2_stret, @function

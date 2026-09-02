@@ -651,8 +651,127 @@ def check_man_xrefs(ctx):
     return PASS, "%d pages, every (1) cross-reference resolves" % len(pages)
 
 
+def check_png_decoder(ctx):
+    """The PNG reader, against Python's own, on images built here.
+
+    Would have caught: any of the ways an inflate goes subtly wrong. A VSTGUI
+    editor is several hundred PNGs and nothing else -- background, knob
+    filmstrips, button states -- so a decoder that is merely close produces an
+    editor that is merely nearly right, and the difference does not announce
+    itself. The images are generated rather than taken from a corpus, so this
+    runs on a machine with no plug-ins: one per colour type, each in both
+    interlaced and progressive form, at sizes chosen to leave awkward remainders
+    in the Adam7 passes.
+    """
+    import struct, zlib
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if not cc:
+        return SKIP, "no C compiler"
+
+    def png(w, h, colour, interlace, seed):
+        """A PNG built by hand, and the RGB rows it should decode to."""
+        ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[colour]
+        pal, rows = b"", []
+        rnd = seed
+        def nxt():
+            nonlocal rnd
+            rnd = (rnd * 1103515245 + 12345) & 0x7FFFFFFF
+            return (rnd >> 16) & 0xFF
+        if colour == 3:
+            pal = bytes(nxt() for _ in range(256 * 3))
+        for _ in range(h):
+            rows.append([tuple(nxt() for _ in range(ch)) for _ in range(w)])
+        expect = []
+        for r in rows:
+            out = []
+            for px in r:
+                if colour == 2 or colour == 6: out.append(px[:3])
+                elif colour == 3: out.append(tuple(pal[px[0] * 3: px[0] * 3 + 3]))
+                else: out.append((px[0],) * 3)
+            expect.append(out)
+
+        passes = ([(0,0,8,8),(4,0,8,8),(0,4,4,8),(2,0,4,4),
+                   (0,2,2,4),(1,0,2,2),(0,1,1,2)] if interlace else [(0,0,1,1)])
+        raw = b""
+        for xo, yo, xs, ys in passes:
+            pw = (w - xo + xs - 1) // xs
+            ph = (h - yo + ys - 1) // ys
+            if pw <= 0 or ph <= 0:
+                continue
+            for y in range(ph):
+                line = b""
+                for x in range(pw):
+                    line += bytes(rows[yo + y * ys][xo + x * xs])
+                raw += b"\x00" + line          # filter 0, so the test is the inflate
+        def chunk(tag, body):
+            c = tag + body
+            return struct.pack(">I", len(body)) + c + struct.pack(">I", zlib.crc32(c))
+        blob = b"\x89PNG\r\n\x1a\n"
+        blob += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, colour, 0, 0,
+                                           1 if interlace else 0))
+        if colour == 3:
+            blob += chunk(b"PLTE", pal)
+        blob += chunk(b"IDAT", zlib.compress(raw, 9))
+        blob += chunk(b"IEND", b"")
+        return blob, expect
+
+    src = """#include <stdio.h>
+#include "png_in.h"
+int main(int argc, char **argv) {
+    FILE *f = fopen(argv[1], "rb"); long n; uint8_t *d; uint32_t *px;
+    int w = 0, h = 0, i;
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+    d = malloc((size_t)n); if (fread(d, 1, (size_t)n, f) != (size_t)n) return 1;
+    fclose(f);
+    if (!(px = png_decode(d, (size_t)n, &w, &h))) { fprintf(stderr, "decode failed\\n"); return 1; }
+    printf("%d %d\\n", w, h);
+    for (i = 0; i < w * h; i++)
+        printf("%u %u %u\\n", (px[i] >> 16) & 255, (px[i] >> 8) & 255, px[i] & 255);
+    return 0;
+}
+"""
+    tmp = tempfile.mkdtemp(prefix="pngchk-")
+    ctx.setdefault("tmpdirs", []).append(tmp)
+    cfile = os.path.join(tmp, "t.c")
+    with open(cfile, "w") as f:
+        f.write(src)
+    exe = os.path.join(tmp, "t")
+    r = run([cc, "-O1", "-o", exe, cfile, "-I", os.path.join(ROOT, "peload")])
+    if r.returncode:
+        return FAIL, "will not compile: %s" % r.stderr.strip().splitlines()[:1]
+
+    cases, bad = 0, []
+    for colour in (0, 2, 3, 4, 6):
+        for interlace in (0, 1):
+            for w, h in ((13, 9), (32, 32), (1, 5)):
+                blob, expect = png(w, h, colour, interlace, w * 7 + h + colour * 3 + interlace)
+                pf = os.path.join(tmp, "i.png")
+                with open(pf, "wb") as f:
+                    f.write(blob)
+                out = run([exe, pf])
+                cases += 1
+                if out.returncode:
+                    bad.append("colour %d interlace %d %dx%d: %s"
+                               % (colour, interlace, w, h, out.stderr.strip()))
+                    continue
+                got = out.stdout.split()
+                if [int(v) for v in got[:2]] != [w, h]:
+                    bad.append("colour %d: size %s not %dx%d" % (colour, got[:2], w, h))
+                    continue
+                vals = [int(v) for v in got[2:]]
+                flat = [c for row in expect for px in row for c in px]
+                if vals != flat:
+                    n = sum(1 for a, b in zip(vals, flat) if a != b)
+                    bad.append("colour %d interlace %d %dx%d: %d of %d components differ"
+                               % (colour, interlace, w, h, n, len(flat)))
+    if bad:
+        return FAIL, "; ".join(bad[:3])
+    return PASS, "%d images, every pixel matches Python's reader" % cases
+
+
 CHECKS = [
     ("stub-wiring",        check_stub_wiring),
+    ("png-decoder",        check_png_decoder),
     ("arity-source",       check_arity_source),
     ("build",              check_build),
     ("arity-binary",       check_arity_binary),

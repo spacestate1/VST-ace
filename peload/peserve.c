@@ -187,6 +187,7 @@ static int handle_request(server *s, const bridge_req *qp, bridge_rep *rp)
                                pehost_editor_mouse(s->h, q.a, q.b, q.c, q.d, q.e); break;
         case BR_EDITOR_KEY:    pehost_editor_key(s->h, q.a, q.b, q.c); break;
         case BR_ALL_NOTES_OFF: pehost_all_notes_off(s->h); break;
+        case BR_INPUT_MASK:    pehost_set_input_mask(s->h, (unsigned)q.a); break;
         case BR_IMPORT_STATS:  pehost_import_stats(&r.a, &r.b, &r.c); break;
         case BR_QUIT:
             return 1;                            /* the caller leaves the loop */

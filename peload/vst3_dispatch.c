@@ -34,6 +34,7 @@
     float pfx##_v3_get_param(void *, int); \
     void  pfx##_v3_set_param(void *, int, float); \
     void  pfx##_v3_midi(void *, int, int, int); \
+    void  pfx##_v3_set_input_mask(void *, unsigned); \
     void  pfx##_v3_render(void *, const float *, float *, int); \
     int   pfx##_v3_has_editor(void *); \
     void  pfx##_v3_editor_size(void *, int *, int *); \
@@ -41,6 +42,9 @@
     int   pfx##_v3_editor_attach(void *, unsigned long); \
     int   pfx##_v3_editor_is_hwnd(void *); \
     int   pfx##_v3_editor_attach_hwnd(void *, void *); \
+    int   pfx##_v3_is_macho(void *); \
+    int   pfx##_v3_editor_is_nsview(void *); \
+    int   pfx##_v3_editor_attach_nsview(void *, void *); \
     void  pfx##_v3_editor_detach(void *); \
     void  pfx##_v3_editor_resized(void *, int, int); \
     void  pfx##_v3_set_runloop_hooks(const v3_runloop_hooks *); \
@@ -69,6 +73,15 @@ static int resolve_binary(const char *path, char *out, size_t n)
     if (stat(path, &st)) return -1;
     if (S_ISREG(st.st_mode)) { snprintf(out, n, "%s", path); return 0; }
 
+    /* macOS first, and the bundle rather than the binary. A .vst3 built for
+     * macOS keeps its code in Contents/MacOS with no extension to recognise it
+     * by, and the Mach-O loader wants the bundle anyway -- it reads Info.plist
+     * and resolves Contents/MacOS itself. */
+    {   char p[1024];
+        snprintf(p, sizeof p, "%s/Contents/MacOS", path);
+        if (!stat(p, &st) && S_ISDIR(st.st_mode)) { snprintf(out, n, "%s", path); return 0; }
+    }
+
     for (i = 0; arch[i]; i++) {
         char dir[1024];
         DIR *d;
@@ -90,19 +103,31 @@ static int resolve_binary(const char *path, char *out, size_t n)
     return -1;
 }
 
-/* 1 = PE (Windows), 0 = ELF, -1 = neither. */
+/* 1 = PE (Windows), 0 = ELF or a macOS bundle, -1 = neither.
+ *
+ * macOS and Linux share an answer because they share an ABI: both are System V,
+ * so both are driven by the sv_ build. What differs is the loader underneath,
+ * and that is vst3.c's business rather than this file's -- it recognises the
+ * bundle layout again on the way in. A directory reaching here is that bundle,
+ * since resolve_binary returns a file for every other layout. */
 static int binary_is_pe(const char *bin)
 {
     unsigned char magic[4] = { 0, 0, 0, 0 };
-    FILE *f = fopen(bin, "rb");
+    struct stat st;
+    FILE *f;
     size_t got;
 
-    if (!f) return -1;
+    if (!stat(bin, &st) && S_ISDIR(st.st_mode)) return 0;
+    if (!(f = fopen(bin, "rb"))) return -1;
     got = fread(magic, 1, 4, f);
     fclose(f);
     if (got < 4) return -1;
     if (magic[0] == 'M' && magic[1] == 'Z') return 1;
     if (magic[0] == 0x7F && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') return 0;
+    /* MH_MAGIC_64, or either width of universal binary. */
+    if (magic[0] == 0xcf && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe) return 0;
+    if (magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba &&
+        (magic[3] == 0xbe || magic[3] == 0xbf)) return 0;
     return -1;
 }
 
@@ -173,6 +198,7 @@ void v3_param_display(v3host *h, int i, char *b, int n)
 float v3_get_param(v3host *h, int i) { FWD_RET(float, v3_get_param, 0.0f, i); }
 void v3_set_param(v3host *h, int i, float v) { FWD_VOID(v3_set_param, i, v); }
 void v3_midi(v3host *h, int st, int d1, int d2) { FWD_VOID(v3_midi, st, d1, d2); }
+void v3_set_input_mask(v3host *h, unsigned m) { FWD_VOID(v3_set_input_mask, m); }
 
 /* Run-loop plumbing is process-wide rather than per-plugin, so both builds get
  * the same hooks and either may call back. */
@@ -209,6 +235,18 @@ int v3_editor_attach_hwnd(v3host *h, void *hwnd)
 { if (!h || !h->inner) return -1;
   return h->ms ? ms_v3_editor_attach_hwnd(h->inner, hwnd)
                : sv_v3_editor_attach_hwnd(h->inner, hwnd); }
+
+/* Only the SysV build ever loads a Mach-O, so these three need no ms_ arm --
+ * but they still go through the wrapper, because the caller holds a v3host and
+ * has no business knowing which build owns it. */
+int v3_is_macho(v3host *h)
+{ return (h && h->inner && !h->ms) ? sv_v3_is_macho(h->inner) : 0; }
+
+int v3_editor_is_nsview(v3host *h)
+{ return (h && h->inner && !h->ms) ? sv_v3_editor_is_nsview(h->inner) : 0; }
+
+int v3_editor_attach_nsview(v3host *h, void *nsview)
+{ return (h && h->inner && !h->ms) ? sv_v3_editor_attach_nsview(h->inner, nsview) : -1; }
 
 void v3_editor_detach(v3host *h)
 { if (!h || !h->inner) return;
