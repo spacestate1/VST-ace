@@ -2007,6 +2007,113 @@ static MSCRT char   *st__strdup(const char *s)                    { return strdu
 static MSCRT size_t  st_wcslen(const uint16_t *s)
 { size_t n = 0; while (s && s[n]) n++; return n; }
 
+/* The rest of the wide-character C runtime.
+ *
+ * wcslen alone was here because it was the only one anything had needed. The
+ * 2015 toolchain changed that: its CRT arrives as the api-ms-win-crt-* apisets
+ * (see crt_alias), and a plug-in built with it does every string and number
+ * operation through these rather than through the narrow entry points. A
+ * SynthEdit plug-in parses its whole patch database out of UTF-16 XML this way.
+ *
+ * Stubbed, none of this fails loudly. wcsrchr returns null and a path walk
+ * quietly finds no extension; wcstod returns 0 and every number in the patch
+ * reads as zero. The plug-in then walks off the end of its own data, a long way
+ * from here.
+ *
+ * wchar_t is UTF-16 on Windows and 32-bit here, so the host's own wcs* cannot be
+ * called with these pointers -- each one is written out against uint16_t.
+ * Const in, non-const out, as the Windows prototypes have it and for the same
+ * reason strchr above does. */
+static MSCRT uint16_t *st_wcschr(const uint16_t *s, uint16_t c)
+{ for (; s && *s; s++) if (*s == c) return (uint16_t *)s;
+  return (s && !c) ? (uint16_t *)s : NULL; }
+static MSCRT uint16_t *st_wcsrchr(const uint16_t *s, uint16_t c)
+{ const uint16_t *r = NULL; for (; s && *s; s++) if (*s == c) r = s;
+  return (uint16_t *)((!r && s && !c) ? s : r); }
+static MSCRT int st_wcscmp(const uint16_t *a, const uint16_t *b)
+{ while (*a && *a == *b) { a++; b++; } return (int)*a - (int)*b; }
+static MSCRT int st_wcsncmp(const uint16_t *a, const uint16_t *b, size_t n)
+{ for (; n && *a && *a == *b; n--, a++, b++) { }
+  return n ? (int)*a - (int)*b : 0; }
+/* Case folding is ASCII-only, which is what every caller here compares:
+ * file extensions, XML element names, parameter identifiers. */
+static uint16_t w_lower(uint16_t c)
+{ return (c >= 'A' && c <= 'Z') ? (uint16_t)(c + 32) : c; }
+static MSCRT int st__wcsicmp(const uint16_t *a, const uint16_t *b)
+{ while (*a && w_lower(*a) == w_lower(*b)) { a++; b++; }
+  return (int)w_lower(*a) - (int)w_lower(*b); }
+static MSCRT int st__wcsnicmp(const uint16_t *a, const uint16_t *b, size_t n)
+{ for (; n && *a && w_lower(*a) == w_lower(*b); n--, a++, b++) { }
+  return n ? (int)w_lower(*a) - (int)w_lower(*b) : 0; }
+static MSCRT uint16_t *st_wcscpy(uint16_t *d, const uint16_t *s)
+{ uint16_t *r = d; while ((*d++ = *s++) != 0) { } return r; }
+static MSCRT uint16_t *st_wcsncpy(uint16_t *d, const uint16_t *s, size_t n)
+{ uint16_t *r = d; for (; n && *s; n--) *d++ = *s++; while (n--) *d++ = 0; return r; }
+static MSCRT uint16_t *st_wcscat(uint16_t *d, const uint16_t *s)
+{ uint16_t *r = d; while (*d) d++; while ((*d++ = *s++) != 0) { } return r; }
+static MSCRT uint16_t *st_wcsstr(const uint16_t *h, const uint16_t *n)
+{
+    size_t i, j;
+    if (!h || !n) return NULL;
+    if (!*n) return (uint16_t *)h;
+    for (i = 0; h[i]; i++) {
+        for (j = 0; n[j] && h[i + j] == n[j]; j++) { }
+        if (!n[j]) return (uint16_t *)(h + i);
+    }
+    return NULL;
+}
+static MSCRT uint16_t *st__wcsdup(const uint16_t *s)
+{
+    size_t n = st_wcslen(s), i;
+    uint16_t *d = (uint16_t *)malloc((n + 1) * sizeof *d);
+    if (!d) return NULL;
+    for (i = 0; i <= n; i++) d[i] = s[i];
+    return d;
+}
+
+/* Wide numeric conversion, on top of the host's narrow parsers.
+ *
+ * A number is ASCII in every locale that reaches here, so the leading run of
+ * ASCII is copied down to a narrow buffer and parsed there. Copying one
+ * character per character is what keeps the end pointer exact -- the offset the
+ * narrow parser stopped at is the same offset in the wide string. A non-ASCII
+ * character ends the copy, which is where a number would have ended anyway. */
+#define W_NUMBUF 160
+static size_t w_narrow_prefix(const uint16_t *s, char *buf, size_t n)
+{
+    size_t i = 0;
+    if (!s) { buf[0] = 0; return 0; }
+    while (s[i] && s[i] < 0x80 && i + 1 < n) { buf[i] = (char)s[i]; i++; }
+    buf[i] = 0;
+    return i;
+}
+#define W_NUM(name, type, call)                                               \
+    static MSCRT type st_##name(const uint16_t *s, uint16_t **end, int base)  \
+    {                                                                         \
+        char b[W_NUMBUF], *e = b;                                             \
+        type v;                                                               \
+        (void)base;                                                           \
+        w_narrow_prefix(s, b, sizeof b);                                      \
+        v = call;                                                             \
+        if (end) *end = (uint16_t *)s + (size_t)(e - b);                      \
+        return v;                                                             \
+    }
+W_NUM(wcstol,  long,          strtol(b, &e, base))
+W_NUM(wcstoul, unsigned long, strtoul(b, &e, base))
+static MSCRT double st_wcstod(const uint16_t *s, uint16_t **end)
+{
+    char b[W_NUMBUF], *e = b;
+    double v;
+    w_narrow_prefix(s, b, sizeof b);
+    v = strtod(b, &e);
+    if (end) *end = (uint16_t *)s + (size_t)(e - b);
+    return v;
+}
+static MSCRT int st__wtoi(const uint16_t *s)
+{ char b[W_NUMBUF]; w_narrow_prefix(s, b, sizeof b); return atoi(b); }
+static MSCRT double st__wtof(const uint16_t *s)
+{ char b[W_NUMBUF]; w_narrow_prefix(s, b, sizeof b); return atof(b); }
+
 /* Maths. A synthesiser reaches these on every block, so leaving them stubbed
  * to 0 does not fail loudly -- it renders silence or NaNs, which is worse. */
 #define M1(f) static MSCRT double st_##f(double x) { return f(x); }
@@ -5432,6 +5539,15 @@ static const winstub g_stubs[] = {
     S("msvcrt.dll", strcat), S("msvcrt.dll", strcmp), S("msvcrt.dll", strncmp),
     S("msvcrt.dll", _stricmp), S("msvcrt.dll", strchr), S("msvcrt.dll", strrchr),
     S("msvcrt.dll", strstr), S("msvcrt.dll", _strdup), S("msvcrt.dll", wcslen),
+    /* The wide CRT. Reached under msvcrt.dll for every 2015-and-later spelling
+     * too -- crt_alias maps the api-ms-win-crt-* apisets and vcruntime onto
+     * this table rather than duplicating it per name. */
+    S("msvcrt.dll", wcschr), S("msvcrt.dll", wcsrchr), S("msvcrt.dll", wcsstr),
+    S("msvcrt.dll", wcscmp), S("msvcrt.dll", wcsncmp), S("msvcrt.dll", _wcsicmp),
+    S("msvcrt.dll", _wcsnicmp), S("msvcrt.dll", wcscpy), S("msvcrt.dll", wcsncpy),
+    S("msvcrt.dll", wcscat), S("msvcrt.dll", _wcsdup),
+    S("msvcrt.dll", wcstol), S("msvcrt.dll", wcstoul), S("msvcrt.dll", wcstod),
+    S("msvcrt.dll", _wtoi), S("msvcrt.dll", _wtof),
     /* maths */
     S("msvcrt.dll", sqrt), S("msvcrt.dll", sin), S("msvcrt.dll", cos),
     S("msvcrt.dll", tan), S("msvcrt.dll", asin), S("msvcrt.dll", acos),
@@ -5721,10 +5837,32 @@ static const winstub g_stubs[] = {
  * msvcr90/100/110/120, the msvcp C++ halves, vcruntime140, ucrtbase -- so a
  * stub registered once against msvcrt.dll answers for all of them. Matching
  * the literal name instead would need a fresh copy of the table per vintage. */
+/* Every spelling of the C runtime resolves to the one implementation here.
+ *
+ * The 2015 toolchain split the CRT into fifteen apiset DLLs --
+ * api-ms-win-crt-runtime-l1-1-0.dll, -stdio-, -heap-, -math- and so on -- each
+ * a forwarder onto ucrtbase. A plug-in built with MSVC 2015 or later imports
+ * every CRT function through those names rather than through msvcrt.dll, so
+ * without them here the whole C runtime missed the table and fell through to
+ * the generic do-nothing stub.
+ *
+ * The one that made it fatal rather than merely wrong is _initterm_e. It walks
+ * an array of initialiser function pointers and calls each one, which is how a
+ * C++ module runs its static constructors; stubbed out, it returns success
+ * having run none of them. A side-loaded MSVCP140 therefore mapped, reported
+ * that it had initialised, and left every locale and iostream global null --
+ * and the plug-in that went on to use one faulted a long way from the cause.
+ * The implementation was already here and registered under msvcrt.dll; only
+ * the name was missing.
+ *
+ * Prefix rather than exact match: the apiset names carry a version suffix that
+ * changes between Windows releases (-l1-1-0 today), and the import table's copy
+ * is truncated by some plug-ins besides. */
 static const char *crt_alias(const char *dll)
 {
     if (!strncasecmp(dll, "msvcr", 5) || !strncasecmp(dll, "msvcp", 5) ||
-        !strncasecmp(dll, "vcruntime", 9) || !strncasecmp(dll, "ucrtbase", 8))
+        !strncasecmp(dll, "vcruntime", 9) || !strncasecmp(dll, "ucrtbase", 8) ||
+        !strncasecmp(dll, "api-ms-win-crt-", 15))
         return "msvcrt.dll";
     return NULL;
 }
