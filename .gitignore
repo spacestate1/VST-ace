@@ -38,8 +38,12 @@ runtime32/
 runtime32
 peload/thirdparty/
 
-# Local Claude Code permissions, per-machine.
-.claude/settings.local.json
+# Claude Code's own directory: per-machine permissions, and the worktrees it
+# checks out under .claude/worktrees -- each of which is a second copy of this
+# tree, 8 MB a piece. Ignored whole rather than file by file, because a
+# worktree is not source and an untracked one here is what got staged into a
+# source tarball.
+.claude/
 
 # A stale copy of the loader left in the source directory before the build moved
 # under peload/build.

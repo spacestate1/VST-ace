@@ -57,6 +57,7 @@ SRC_TOP="vst-ace-$VERSION"
 mkdir -p "$WORK_DIR/$SRC_TOP"
 rsync -a \
     --exclude='.git' \
+    --exclude='.claude/' \
     --exclude='build/' \
     --exclude='obj-*/' \
     --exclude='release/' \

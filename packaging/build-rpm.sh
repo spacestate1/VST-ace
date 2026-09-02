@@ -51,13 +51,14 @@ SRC_TOP="vst-ace-$VERSION"
 mkdir -p "$WORK_DIR/$SRC_TOP"
 rsync -a \
     --exclude='.git' \
+    --exclude='.claude/' \
     --exclude='build/' \
     --exclude='obj-*/' \
     --exclude='release/' \
     --exclude='__pycache__/' \
     --exclude='*.o' \
     --exclude='*.d' \
-    --exclude='/dw' \
+    --exclude='/va' \
     --exclude='/out/' \
     --exclude='/project/' \
     --exclude='/renders/' \

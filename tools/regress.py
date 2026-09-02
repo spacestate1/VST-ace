@@ -376,6 +376,64 @@ def check_shell_syntax(ctx):
     return PASS, "all packaging/*.sh parse"
 
 
+# The trees the build compiles from. A source file here that git does not know
+# about is one this machine can see and a clone cannot.
+SOURCE_DIRS = ("peload", "gui", "c")
+SOURCE_SUFFIXES = (".c", ".h", ".cpp", ".hpp", ".S")
+
+
+def check_sources_tracked(ctx):
+    """Every source file the build reads is tracked by git.
+
+    Would have caught: macfont.h and png_in.h -- the Classic text shims' bitmap
+    fonts and the PNG decoder behind every VSTGUI editor -- written, #included
+    by cfmlib.c and macquartz.c, and never added. Both packaging scripts stage
+    the working tree with rsync rather than git, so every build here found them
+    and a fresh clone compiled neither file.
+    """
+    if run(["git", "-C", ROOT, "rev-parse", "--is-inside-work-tree"]).returncode:
+        return SKIP, "not a git checkout"
+    r = run(["git", "-C", ROOT, "ls-files", "--others", "--exclude-standard",
+             "--"] + list(SOURCE_DIRS))
+    if r.returncode != 0:
+        return FAIL, "git ls-files failed: " + r.stderr.strip()
+    stray = sorted(l for l in r.stdout.splitlines()
+                   if l.endswith(SOURCE_SUFFIXES))
+    if stray:
+        return FAIL, "untracked source: " + ", ".join(stray)
+    return PASS, "no untracked sources under " + ", ".join(SOURCE_DIRS)
+
+
+# build-deb.sh copies packaging/debian into place as debian/ once the pristine
+# tarball is captured, so it alone excludes that name. Everything else is the
+# same tree staged for the same reason, and must be excluded the same way.
+STAGING_EXCLUDE_ALLOWED = {"debian/"}
+
+
+def rsync_excludes(name):
+    src = open(rel("packaging", name), encoding="utf-8").read()
+    return set(re.findall(r"--exclude='([^']*)'", src))
+
+
+def check_staging_excludes(ctx):
+    """The two packaging scripts stage the source tree the same way.
+
+    Would have caught: renaming the launcher from dw to va fixed
+    build-deb.sh's --exclude='/dw' and left build-rpm.sh's behind, so every
+    .rpm source tarball shipped the built launcher inside it -- the same bug,
+    on the other script, after it had already been found once.
+    """
+    deb, rpm = rsync_excludes("build-deb.sh"), rsync_excludes("build-rpm.sh")
+    parts = []
+    for label, only in (("build-deb.sh", deb - rpm - STAGING_EXCLUDE_ALLOWED),
+                        ("build-rpm.sh", rpm - deb - STAGING_EXCLUDE_ALLOWED)):
+        if only:
+            parts.append("only %s: %s" % (label, ", ".join(sorted(only))))
+    if parts:
+        return FAIL, "; ".join(parts)
+    return PASS, "%d staging excludes, both scripts agree" % len(deb & rpm)
+
+
 def apt_i386_from_install_deps():
     s = open(rel("packaging", "install-deps.sh"), encoding="utf-8").read()
     i = s.index("    I386=(gcc-multilib")
@@ -780,6 +838,8 @@ CHECKS = [
     ("cmake-skip-path",    check_cmake_skip_path),
     ("pkgconfig32-env",    check_pkgconfig32_env),
     ("shell-syntax",       check_shell_syntax),
+    ("sources-tracked",    check_sources_tracked),
+    ("staging-excludes",   check_staging_excludes),
     ("i386-deps-match",    check_i386_deps_match),
     ("rules-staging-dirs", check_rules_staging_dirs),
     ("rpm-spec",           check_rpm_spec),
