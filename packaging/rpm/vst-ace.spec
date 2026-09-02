@@ -21,7 +21,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 
 Name:           vst-ace
-Version:        0.1.1
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Run Windows, macOS and Linux audio plug-ins natively, without Wine
 
@@ -177,6 +177,23 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %{_mandir}/man1/dwstudio.1*
 
 %changelog
+* Tue Sep 02 2026 Connor McRann <cmcrann@protonmail.com> - 0.2.0-1
+- Host macOS VST3 plug-ins, which never loaded before: the bundle search only
+  knew the Windows and Linux layouts, and there was no path that took a Mach-O
+  image. All 18 in the test corpus render and drive their own editors.
+- Draw and operate macOS editors. The Objective-C runtime was not told about a
+  plug-in's own classes, Quartz drew no paths, and frames arrived upside down;
+  12 editors that showed nothing now work. macOS VST2 goes from 19 to 31
+  rendering, 30 with a working GUI.
+- Load the eight Audio Damage Audio Units that are Symbiosis wrappers as the
+  VST2 they contain, rather than failing them. 41 of 50 Audio Units render.
+- Offer macOS VST2 and VST3 in both windows by default. Audio Units are behind
+  -DPESTUDIO_AU=1 / -DPLUGVIEW_AU=1, since each duplicates a .vst beside it.
+- Add macfont.h and png_in.h to the source package. Both were #included by the
+  build and had never been committed, so only a working copy could compile.
+- Stop staging the built launcher into the source tarball, which build-rpm.sh
+  had kept doing under the launcher's old name.
+
 * Mon Aug 31 2026 Connor McRann <cmcrann@protonmail.com> - 0.1.1-1
 - Fix both desktop entries, which named the launcher by its old name and so
   failed to start either window from the desktop menu.

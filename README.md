@@ -81,8 +81,8 @@ Packages are on the
 [releases page](https://github.com/spacestate1/VST-ace/releases) — a `.deb` for
 Ubuntu 24.04 and Debian 13 or newer, and an `.rpm` for Fedora 40 or newer:
 
-    sudo apt install ./vst-ace_0.1.1-1_amd64.deb        # Debian, Ubuntu
-    sudo dnf install ./vst-ace-0.1.1-1.fc43.x86_64.rpm  # Fedora
+    sudo apt install ./vst-ace_0.2.0-1_amd64.deb        # Debian, Ubuntu
+    sudo dnf install ./vst-ace-0.2.0-1.fc43.x86_64.rpm  # Fedora
 
 `apt install`, not `dpkg -i`. The leading `./` is what makes apt read the
 argument as a file rather than a package name, and apt is what pulls in GTK 4,

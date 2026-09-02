@@ -11,7 +11,7 @@ project(peload C CXX ASM)
 if(DEFINED ENV{VSTACE_VERSION})
   set(VSTACE_VERSION "$ENV{VSTACE_VERSION}")
 else()
-  set(VSTACE_VERSION "0.1.1")
+  set(VSTACE_VERSION "0.2.0")
 endif()
 
 # SOURCE_DATE_EPOCH is honoured because Debian and Fedora set it to keep builds
