@@ -168,6 +168,45 @@ typedef struct {
     void *processContext;
 } ProcessData;
 
+/* The transport, which the host has to describe even when there is not one.
+ *
+ * processContext is optional in the spec and was left null here, which most
+ * plug-ins tolerate. A tempo-aware one does not: with no context there is no
+ * sample position and no tempo, so anything clocked -- an LFO synced to the
+ * beat, a delay whose time is derived from BPM -- has nothing to advance
+ * against and sits at zero. MinimogueVA carries both, and rendered silence
+ * with process() still returning success.
+ *
+ * The layout is the SDK's and the order matters; the trailing members are
+ * declared so the struct is the size the plug-in expects to read. */
+typedef struct {
+    uint32_t state;
+    double   sampleRate;
+    int64_t  projectTimeSamples;
+    int64_t  systemTime;
+    int64_t  continousTimeSamples;
+    double   projectTimeMusic;
+    double   barPositionMusic;
+    double   cycleStartMusic, cycleEndMusic;
+    double   tempo;
+    int32_t  timeSigNumerator, timeSigDenominator;
+    uint8_t  chordKeyNote, chordRootNote;
+    int16_t  chordMask;
+    int32_t  smpteOffsetSubframes;
+    uint32_t frameRate_fps, frameRate_flags;
+    int32_t  samplesToNextClock;
+} ProcessContext;
+
+/* Which of the fields above are worth reading. Anything not flagged is ignored
+ * by the plug-in, so claiming only what is actually filled in is the honest
+ * thing -- and a plug-in that checks before using is then right to. */
+#define PC_PLAYING            (1u << 1)
+#define PC_TEMPO_VALID        (1u << 10)
+#define PC_PROJECT_MUSIC_VALID (1u << 9)
+#define PC_BAR_VALID          (1u << 11)
+#define PC_TIMESIG_VALID      (1u << 13)
+#define PC_CONT_TIME_VALID    (1u << 17)
+
 /* ------------------------------------------------------------ the vtables */
 
 #define FUNKNOWN_SLOTS \
@@ -853,6 +892,8 @@ struct v3host {
     unsigned         in_mask;      /* input channels fed; 0 = all */
     int              ctrl_is_comp;  /* single-component plugin: same object */
     int              process_complained;  /* the one process() error, said once */
+    int64_t          proj_samples;        /* transport position, in frames */
+    double           samplerate;          /* what setupProcessing was told */
 
     Handler   handler;
     HostApp   hostapp;
@@ -1265,6 +1306,7 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
         su.sampleRate = samplerate;
         if (h->proc->vt->setupProcessing(h->proc, &su) != V3_OK)
             FAIL("setupProcessing rejected 32-bit realtime");
+        h->samplerate = samplerate;
     }
 
     if (alloc_bufs(h, blocksize)) FAIL("buffer allocation failed");
@@ -1689,6 +1731,7 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
     ParamChanges  outchanges;
     EventList     outevents;
     ProcessData   pd;
+    ProcessContext ctx;
     unsigned      hd, tl;
     int           i;
 
@@ -1806,11 +1849,33 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
     pd.inputEvents  = events.n ? (void *)&events : NULL;
     pd.outputEvents = (void *)&outevents;
 
+    {   /* A transport that is always rolling at 120bpm from the top of a bar.
+         * There is no real one to report -- this host renders and plays rather
+         * than sequencing -- and "stopped at zero for ever" is the one answer
+         * guaranteed to be wrong for anything tempo-clocked. */
+        static const double kTempo = 120.0;
+        double qn = (h->samplerate > 0)
+                  ? (double)h->proj_samples / h->samplerate * (kTempo / 60.0) : 0.0;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.state = PC_PLAYING | PC_TEMPO_VALID | PC_PROJECT_MUSIC_VALID |
+                    PC_BAR_VALID | PC_TIMESIG_VALID | PC_CONT_TIME_VALID;
+        ctx.sampleRate = h->samplerate > 0 ? h->samplerate : 48000.0;
+        ctx.projectTimeSamples   = h->proj_samples;
+        ctx.continousTimeSamples = h->proj_samples;
+        ctx.projectTimeMusic = qn;
+        ctx.barPositionMusic = 4.0 * (double)((int64_t)(qn / 4.0));
+        ctx.tempo = kTempo;
+        ctx.timeSigNumerator = 4;
+        ctx.timeSigDenominator = 4;
+        pd.processContext = &ctx;
+    }
+
     {
         tresult pr = h->proc->vt->process(h->proc, &pd);
         /* Once, and only when it is not success: a per-block message would
          * bury the log, and a plug-in that refuses to process is the one thing
          * that explains silence with no other symptom. */
+        h->proj_samples += frames;      /* the transport rolls on */
         if (pr != V3_OK && !h->process_complained) {
             h->process_complained = 1;
             VLOG("vst3: process -> %d (0x%08x)\n", (int)pr, (unsigned)pr);

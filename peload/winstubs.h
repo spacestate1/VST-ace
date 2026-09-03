@@ -1229,6 +1229,28 @@ static MS void *st_CreateEventA(void *sa, int32_t manual, int32_t initial, const
 }
 static MS void *st_CreateEventW(void *sa, int32_t manual, int32_t initial, const uint16_t *name)
 { (void)name; return st_CreateEventA(sa, manual, initial, NULL); }
+
+/* Directory change notification.
+ *
+ * A plug-in watches its own folder so it can pick up a skin or a module
+ * dropped in beside it while it runs. Nothing here rewrites a plug-in's
+ * directory underneath it, so a handle that is valid and never signals is the
+ * honest answer -- and it is what the caller needs, because the *handle* is
+ * what gets checked. Returning NULL was read as a failure of the host rather
+ * than as "no changes": SynthEdit printed "ERROR: Unexpected NULL from
+ * FindFirstChangeNotification" and abandoned building its DSP graph, which
+ * then rendered silence with no other symptom.
+ *
+ * An unsignalled event is exactly the right object: WaitForSingleObject on it
+ * times out, which is what a watcher polling for changes expects to see. */
+static MS void *st_FindFirstChangeNotificationA(const char *path, int32_t sub, uint32_t filter)
+{ (void)path; (void)sub; (void)filter; return st_CreateEventA(NULL, 1, 0, NULL); }
+static MS void *st_FindFirstChangeNotificationW(const uint16_t *path, int32_t sub, uint32_t filter)
+{ (void)path; (void)sub; (void)filter; return st_CreateEventA(NULL, 1, 0, NULL); }
+static MS int32_t st_FindNextChangeNotification(void *h)
+{ return h != NULL; }
+static MS int32_t st_FindCloseChangeNotification(void *h)
+{ return st_CloseHandle(h); }
 static MS void *st_CreateEventExW(void *sa, const uint16_t *name, uint32_t flags, uint32_t acc)
 {
     (void)acc; (void)name;
@@ -1280,6 +1302,45 @@ static MS uint32_t st_WaitForSingleObject(void *h, uint32_t ms)
 }
 static MS uint32_t st_WaitForSingleObjectEx(void *h, uint32_t ms, int32_t alert)
 { (void)alert; return st_WaitForSingleObject(h, ms); }
+
+/* WaitForMultipleObjects.
+ *
+ * A stub for this is worse than a missing one: it returns 0, which is
+ * WAIT_OBJECT_0 -- "the first handle signalled". A plug-in watching its own
+ * directory reads that as "your files changed" and does so again on every
+ * pass, so a watcher that should idle instead rebuilds for ever.
+ *
+ * Polled rather than waited on properly. A correct implementation needs one
+ * condition variable shared by every object in the set, which the handle table
+ * here is not built for; polling costs a millisecond of latency on a path that
+ * is waiting for something to happen anyway, and it gets the *answers* right,
+ * which is the part callers branch on.
+ *
+ * bWaitAll asks for every handle at once; anything else returns as soon as one
+ * is ready, and the index of that one is the return value. */
+static MS uint32_t st_WaitForMultipleObjects(uint32_t n, void *const *h,
+                                             int32_t all, uint32_t ms)
+{
+    uint32_t waited = 0, i;
+    if (!n || !h) return 0xFFFFFFFFu;                     /* WAIT_FAILED */
+    for (;;) {
+        uint32_t ready = 0;
+        for (i = 0; i < n; i++) {
+            if (st_WaitForSingleObject(h[i], 0) == 0) {
+                if (!all) return i;                        /* WAIT_OBJECT_0 + i */
+                ready++;
+            }
+        }
+        if (all && ready == n) return 0;
+        if (ms == 0) return 0x102;                         /* WAIT_TIMEOUT */
+        if (ms != 0xFFFFFFFFu && waited >= ms) return 0x102;
+        { struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL); }
+        waited++;
+    }
+}
+static MS uint32_t st_WaitForMultipleObjectsEx(uint32_t n, void *const *h,
+                                               int32_t all, uint32_t ms, int32_t alert)
+{ (void)alert; return st_WaitForMultipleObjects(n, h, all, ms); }
 static MS void *st_CreateSemaphoreA(void *sa, int32_t init, int32_t max, const char *n)
 {
     void *h = h_new(H_SEM);
@@ -6346,6 +6407,11 @@ static const winstub g_stubs[] = {
     /* module / loader */
     S("kernel32.dll", GetModuleHandleA), S("kernel32.dll", GetModuleHandleW),
     S("kernel32.dll", GetModuleHandleExW), S("kernel32.dll", GetModuleHandleExA),
+    S("kernel32.dll", WaitForMultipleObjects), S("kernel32.dll", WaitForMultipleObjectsEx),
+    S("kernel32.dll", FindFirstChangeNotificationA),
+    S("kernel32.dll", FindFirstChangeNotificationW),
+    S("kernel32.dll", FindNextChangeNotification),
+    S("kernel32.dll", FindCloseChangeNotification),
     S("kernel32.dll", GetModuleFileNameA), S("kernel32.dll", GetModuleFileNameW),
     S("kernel32.dll", LoadLibraryA), S("kernel32.dll", LoadLibraryW),
     S("kernel32.dll", LoadLibraryExW), S("kernel32.dll", FreeLibrary),
