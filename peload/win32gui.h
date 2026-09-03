@@ -857,6 +857,17 @@ static MS int32_t st_UnregisterClassA(const char *n, void *inst)
 static MS int32_t st_UnregisterClassW(const uint16_t *n, void *inst)
 { char b[64]; return st_UnregisterClassA(w32_cls_name(n, b, sizeof b, 1), inst); }
 
+/* The window procedure a class was registered with, or NULL if it was not.
+ * GetClassInfo answers from this. */
+static void *w32_class_proc(const char *name)
+{
+    int i;
+    if (!name) return NULL;
+    for (i = 1; i < W32_MAX_CLS; i++)
+        if (W.cls[i].used && !strcmp(W.cls[i].name, name)) return W.cls[i].proc;
+    return NULL;
+}
+
 static void *w32_create(const char *cls, int x, int y, int w, int h, void *parent,
                         void *param, uint32_t style, uint32_t exstyle)
 {
@@ -2674,6 +2685,9 @@ static void w32_text_at(w32_dc *d, w32_surf *t, int x, int y,
     }
     dw_text_draw(t->px, t->w, t->h, x, y + asc, s, n, em,
                  w32_cr(d->text_color), pclip);
+    PLOG("  [w32] text \"%.*s\" at %d,%d %dpx colour %06x -> %s#%d\n",
+         n > 24 ? 24 : n, s, x, y, em, (unsigned)w32_cr(d->text_color),
+         d->bitmap ? "bmp" : "wnd", d->bitmap ? d->bitmap : d->wnd);
     w32_dib_out(d, x, y, x + tw, y + th);
 }
 

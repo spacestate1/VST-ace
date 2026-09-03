@@ -2177,6 +2177,74 @@ static MS void st_CoUninitialize(void) { }
 #include "gdiplus_shim.h"
 #include "d3d_shim.h"
 #include "msvcp_shim.h"
+
+/* The last few stubs this corpus actually reaches.
+ *
+ * lstrcpyn is the one that matters: it is a string copy, and a stub that copies
+ * nothing leaves the caller with whatever its buffer already held. Nobody
+ * checks a string copy. A plug-in assembling the name of a skin image it is
+ * about to load gets an empty name and loads nothing, and what you see is a
+ * missing picture rather than a failed call. */
+static MS char *st_lstrcpynA(char *dst, const char *src, int32_t n)
+{
+    int32_t i;
+    if (!dst || n <= 0) return dst;
+    if (!src) { dst[0] = 0; return dst; }
+    for (i = 0; i < n - 1 && src[i]; i++) dst[i] = src[i];
+    dst[i] = 0;
+    return dst;
+}
+static MS uint16_t *st_lstrcpynW(uint16_t *dst, const uint16_t *src, int32_t n)
+{
+    int32_t i;
+    if (!dst || n <= 0) return dst;
+    if (!src) { dst[0] = 0; return dst; }
+    for (i = 0; i < n - 1 && src[i]; i++) dst[i] = src[i];
+    dst[i] = 0;
+    return dst;
+}
+/* Milliseconds since the host started, which is what timeGetTime means. A stub
+ * answering 0 does not read as an error -- there is no error value -- it reads
+ * as "no time has passed", every time it is asked. Anything driving an
+ * animation, a debounce or a first-frame test from it never advances. */
+static MS uint32_t st_timeGetTime(void)
+{
+    static double t0;
+    double now = w32_now_ms();
+    if (t0 == 0.0) t0 = now;
+    return (uint32_t)(now - t0);
+}
+static MS uint32_t st_timeBeginPeriod(uint32_t ms) { (void)ms; return 0; }
+static MS uint32_t st_timeEndPeriod(uint32_t ms)   { (void)ms; return 0; }
+
+/* Whether a class name is registered, and what with. A caller uses this to
+ * decide whether to register its own -- MFC asks before every window it
+ * creates -- and answering "no" for a class we do have makes it register a
+ * second one over the top. */
+static MS int32_t st_GetClassInfoA(void *inst, const char *name, void *out)
+{
+    (void)inst;
+    if (!name || !out) return 0;
+    {
+        void *proc = w32_class_proc(name);
+        if (!proc) return 0;
+        /* WNDCLASSA: style, lpfnWndProc, cbClsExtra, cbWndExtra, hInstance,
+         * hIcon, hCursor, hbrBackground, lpszMenuName, lpszClassName. */
+        memset(out, 0, 40);
+        *(void **)((char *)out + 4) = proc;
+        *(const char **)((char *)out + 36) = name;
+        return 1;
+    }
+}
+
+/* A halftone palette is meaningless at 32 bits per pixel, and a caller that
+ * gets NULL for one concludes the display cannot be drawn on. */
+static MS void *st_CreateHalftonePalette(void *hdc)
+{ (void)hdc; return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_BRUSH, 0, 0, 0)); }
+static MS void *st_SelectPalette(void *hdc, void *pal, int32_t force)
+{ (void)hdc; (void)force; return pal; }
+static MS uint32_t st_RealizePalette(void *hdc) { (void)hdc; return 0; }
+
 #endif
 
 /* ------------------------------------------------------------- registry */
@@ -7048,9 +7116,6 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", GetLocaleInfoW), S("kernel32.dll", GetUserDefaultLCID),
     S("kernel32.dll", IsValidLocale), S("kernel32.dll", GetStringTypeW),
     S("kernel32.dll", EnumSystemLocalesW), S("kernel32.dll", GetTimeZoneInformation),
-    S("kernel32.dll", lstrlenA), S("kernel32.dll", lstrcpyA),
-    S("kernel32.dll", lstrcatA), S("kernel32.dll", lstrcmpA),
-    S("kernel32.dll", lstrcmpiA),
     /* SEH */
     S("kernel32.dll", RtlCaptureContext), S("kernel32.dll", RtlLookupFunctionEntry),
     S("kernel32.dll", RtlVirtualUnwind), S("kernel32.dll", RtlPcToFileHeader),
@@ -7164,6 +7229,14 @@ static const winstub g_stubs[] = {
     S("gdi32.dll", GetTextMetricsA), S("gdi32.dll", GetTextMetricsW),
     S("gdi32.dll", GetTextExtentPointA),
     S("user32.dll", DrawTextA), S("user32.dll", DrawTextW),
+    S("winmm.dll", timeGetTime), S("winmm.dll", timeBeginPeriod),
+    S("winmm.dll", timeEndPeriod), S("user32.dll", GetClassInfoA),
+    S("gdi32.dll", CreateHalftonePalette), S("gdi32.dll", SelectPalette),
+    S("gdi32.dll", RealizePalette),
+    S("kernel32.dll", lstrlenA), S("kernel32.dll", lstrcpyA),
+    S("kernel32.dll", lstrcatA), S("kernel32.dll", lstrcmpA),
+    S("kernel32.dll", lstrcmpiA),
+    S("kernel32.dll", lstrcpynA), S("kernel32.dll", lstrcpynW),
     S("gdi32.dll", SetDIBits), S("gdi32.dll", GetDIBits),
     S("gdi32.dll", CreateDIBitmap),
     S("gdi32.dll", SetRectRgn), S("gdi32.dll", CombineRgn),
