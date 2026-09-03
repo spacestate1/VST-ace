@@ -624,10 +624,6 @@ static int32_t gp_shape(void *graphics, void *style, int is_pen, int kind,
     if (!g || !style) return GP_INVALIDARG;
     memset(&p, 0, sizeof p);
     p.fillmode = 1;
-    switch (kind) {
-    case 0: st_GdipAddPathRectangle(NULL, 0, 0, 0, 0);      /* never taken */
-    default: break;
-    }
     if (kind == 0) {
         gp_moveto(&p, x, y); gp_lineto(&p, x + w, y);
         gp_lineto(&p, x + w, y + h); gp_lineto(&p, x, y + h);
