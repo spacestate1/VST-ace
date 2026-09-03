@@ -1,0 +1,552 @@
+/* Direct3D 11 and Direct2D, far enough for a plug-in to draw with them.
+ *
+ * A SynthEdit VST3 builds its editor on D3D11: it makes a device, hangs a
+ * Direct2D device context off it, and does every bit of its drawing through
+ * that context. There is no GPU here and no prospect of one, but the drawing
+ * itself is ordinary 2D -- filled rounded rectangles, bitmaps, text -- and the
+ * rasteriser written for GDI+ already does all of it.
+ *
+ * So D3D11 exists here only as far as the plug-in needs to walk through it to
+ * reach Direct2D: a device, a DXGI surface standing for the back buffer, and
+ * the query-interface chain between them. Everything that would actually touch
+ * hardware answers "no". Direct2D is where the work happens, and it renders
+ * into the same w32_surf a GDI+ graphics object writes to.
+ *
+ * Objects reuse the dwprobe machinery from dwrite_shim.h: a full-length vtable
+ * of probes, with the slots that matter overwritten. A slot nobody implemented
+ * says so under PELOAD_VERBOSE and returns E_NOTIMPL, which is how the list
+ * below was arrived at -- run it, read what it asked for, implement that.
+ */
+#ifndef PELOAD_D3D_SHIM_H
+#define PELOAD_D3D_SHIM_H
+
+#define D3D_OK        0
+#define D3D_NOTIMPL   ((int32_t)0x80004001)
+#define D3D_FAIL      ((int32_t)0x80004005)
+
+/* The surface Direct2D is currently pointed at. A device context's target is
+ * set by the plug-in from the swap chain's back buffer; both resolve to the
+ * window's pixels, which is what the host presents. */
+typedef struct {
+    int       tag;
+    w32_surf *surf;
+    gp_image *img;
+} d2_target;
+
+/* The window the swap chain was made for. A plug-in nests its own drawing
+ * window inside the one it was given -- VSTGUI inside the container, and the
+ * GMPI drawing surface inside that -- and it is the innermost one that
+ * Direct2D targets. Taking the display window instead drew into a buffer
+ * nothing was reading. */
+static int g_d2_hwnd;
+
+static w32_surf *d2_window_surface(void)
+{
+    int i = g_d2_hwnd;
+    if (!i || !W.wnd[i].used) i = W.display ? W.display : W.host;
+    if (!i || !W.wnd[i].used) return NULL;
+    /* A window created before its size was known has no buffer yet. */
+    if (!W.wnd[i].surf.px && W.wnd[i].w > 0 && W.wnd[i].h > 0)
+        w32_surf_size(&W.wnd[i].surf, W.wnd[i].w, W.wnd[i].h);
+    return &W.wnd[i].surf;
+}
+
+/* ---- ID3D11Device, and the little of DXGI it is reached through --------- */
+
+static MS int32_t d3d_qi_noop(void *self, const void *iid, void **out)
+{ (void)self; (void)iid; if (out) *out = NULL; return D3D_NOTIMPL; }
+
+static dwprobe *g_d3d_device;
+static dwprobe *g_dxgi_surface;
+
+static dwprobe *d3d_device(void);
+
+/* ID3D11Device::QueryInterface. A plug-in asks the device for IDXGIDevice on
+ * its way to Direct2D, and for ID3D11Device1 and friends on the way to
+ * nothing. Handing back the device itself for the DXGI interfaces is enough:
+ * every method it then calls is one of ours. */
+/* A GUID, printed the way it is written down, so an unknown interface can be
+ * looked up rather than guessed at from a slot number. */
+static const char *d3d_guid(const uint8_t *g, char *buf, size_t n)
+{
+    if (!g) return "(null)";
+    snprintf(buf, n, "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+             *(const uint32_t *)g, *(const uint16_t *)(g + 4),
+             *(const uint16_t *)(g + 6),
+             g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+    return buf;
+}
+
+static MS uint32_t d3d_addref(void *self) { (void)self; return 2; }
+static MS uint32_t d3d_release(void *self) { (void)self; return 1; }
+
+/* One object per interface, so a probe report names the interface it is really
+ * about. Returning the same object for every QueryInterface made slot numbers
+ * from four different vtables collide in the log, which is worse than useless.
+ *
+ * The interfaces are singletons: there is one device, one adapter and one
+ * swap chain here, and a plug-in that asks twice means the same thing twice. */
+static dwprobe *dxgi_device(void);
+static dwprobe *dxgi_adapter(void);
+static dwprobe *dxgi_factory(void);
+static dwprobe *d2d_factory_obj(void);
+/* Defined below, once the objects they hand back exist. */
+static MS int32_t dxgi_CreateSwapChainForHwnd(void *self, void *dev, void *hwnd,
+                                              const void *desc, const void *fs,
+                                              void *restrict_to, void **out);
+static MS int32_t d3d_CheckFormatSupport(void *self, uint32_t fmt, uint32_t *support);
+
+/* The GUIDs a plug-in asks this device for, first four bytes each -- enough to
+ * tell them apart, and the full value is logged when none matches. */
+#define GUID32(p) (*(const uint32_t *)(p))
+#define IID_IDXGIDevice32   0x54EC77FAu
+#define IID_IDXGIDevice1_32 0x77DB970Fu
+#define IID_ID3D11Device1   0xA04BFB29u
+
+static MS int32_t d3d_device_qi(void *self, const uint8_t *iid, void **out)
+{
+    char b[64];
+    (void)self;
+    if (!out) return D3D_NOTIMPL;
+    *out = NULL;
+    if (iid && (GUID32(iid) == IID_IDXGIDevice32 || GUID32(iid) == IID_IDXGIDevice1_32)) {
+        *out = dxgi_device();
+        PLOG("  [d3d] ID3D11Device::QueryInterface(IDXGIDevice)\n");
+        return *out ? D3D_OK : D3D_NOTIMPL;
+    }
+    /* Anything else is another face of the device itself. */
+    *out = d3d_device();
+    PLOG("  [d3d] ID3D11Device::QueryInterface(%s) -> self\n",
+         d3d_guid(iid, b, sizeof b));
+    return D3D_OK;
+}
+
+/* ---- IDXGIDevice / IDXGIAdapter / IDXGIFactory --------------------------
+ *
+ * The walk a plug-in makes from a device to the factory that can give it a
+ * swap chain. None of it does anything: the "swap chain" presents into the
+ * window's own pixel buffer, which is what this host reads back. */
+
+static MS int32_t dxgi_GetParent(void *self, const uint8_t *iid, void **out)
+{
+    char b[64];
+    (void)self;
+    if (!out) return D3D_NOTIMPL;
+    *out = dxgi_factory();
+    PLOG("  [d3d] IDXGIObject::GetParent(%s) -> factory\n", d3d_guid(iid, b, sizeof b));
+    return *out ? D3D_OK : D3D_NOTIMPL;
+}
+static MS int32_t dxgi_dev_GetAdapter(void *self, void **out)
+{
+    (void)self;
+    if (!out) return D3D_NOTIMPL;
+    *out = dxgi_adapter();
+    PLOG("  [d3d] IDXGIDevice::GetAdapter\n");
+    return *out ? D3D_OK : D3D_NOTIMPL;
+}
+static MS int32_t dxgi_qi_self(void *self, const uint8_t *iid, void **out)
+{
+    char b[64];
+    if (!out) return D3D_NOTIMPL;
+    *out = self;
+    PLOG("  [d3d] QueryInterface(%s) -> self\n", d3d_guid(iid, b, sizeof b));
+    return D3D_OK;
+}
+
+static dwprobe *dxgi_device(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("IDXGIDevice")) != NULL) {
+        dwp_set(o, 0, (void *)dxgi_qi_self);
+        dwp_set(o, 1, (void *)d3d_addref);
+        dwp_set(o, 2, (void *)d3d_release);
+        dwp_set(o, 6, (void *)dxgi_GetParent);
+        dwp_set(o, 7, (void *)dxgi_dev_GetAdapter);
+    }
+    return o;
+}
+static dwprobe *dxgi_adapter(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("IDXGIAdapter")) != NULL) {
+        dwp_set(o, 0, (void *)dxgi_qi_self);
+        dwp_set(o, 1, (void *)d3d_addref);
+        dwp_set(o, 2, (void *)d3d_release);
+        dwp_set(o, 6, (void *)dxgi_GetParent);
+    }
+    return o;
+}
+static dwprobe *dxgi_factory(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("IDXGIFactory2")) != NULL) {
+        dwp_set(o, 0,  (void *)dxgi_qi_self);
+        dwp_set(o, 1,  (void *)d3d_addref);
+        dwp_set(o, 2,  (void *)d3d_release);
+        dwp_set(o, 15, (void *)dxgi_CreateSwapChainForHwnd);
+    }
+    return o;
+}
+
+/* ---- the swap chain ----------------------------------------------------
+ *
+ * There is nothing to swap. The "back buffer" is the window's own pixel
+ * buffer, which is what this host reads back and presents, so a plug-in
+ * drawing into the surface it gets from GetBuffer is drawing exactly where it
+ * needs to and Present has nothing left to do. */
+static dwprobe *dxgi_surface(void);
+
+static MS int32_t dxgi_sc_GetBuffer(void *self, uint32_t idx, const uint8_t *iid, void **out)
+{
+    char b[64];
+    (void)self; (void)idx;
+    if (!out) return D3D_NOTIMPL;
+    *out = dxgi_surface();
+    PLOG("  [d3d] IDXGISwapChain::GetBuffer(%u, %s)\n", idx, d3d_guid(iid, b, sizeof b));
+    return *out ? D3D_OK : D3D_NOTIMPL;
+}
+static MS int32_t dxgi_sc_Present(void *self, uint32_t sync, uint32_t flags)
+{ (void)self; (void)sync; (void)flags; return D3D_OK; }
+static MS int32_t dxgi_sc_Present1(void *self, uint32_t sync, uint32_t flags, const void *p)
+{ (void)self; (void)sync; (void)flags; (void)p; return D3D_OK; }
+static MS int32_t dxgi_sc_ResizeBuffers(void *self, uint32_t n, uint32_t w, uint32_t h,
+                                        uint32_t fmt, uint32_t flags)
+{ (void)self; (void)n; (void)w; (void)h; (void)fmt; (void)flags; return D3D_OK; }
+static MS int32_t dxgi_sc_GetDevice(void *self, const uint8_t *iid, void **out)
+{ (void)self; (void)iid; if (out) *out = d3d_device(); return D3D_OK; }
+
+static dwprobe *dxgi_swapchain(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("IDXGISwapChain1")) != NULL) {
+        dwp_set(o, 0,  (void *)dxgi_qi_self);
+        dwp_set(o, 1,  (void *)d3d_addref);
+        dwp_set(o, 2,  (void *)d3d_release);
+        dwp_set(o, 6,  (void *)dxgi_GetParent);
+        dwp_set(o, 7,  (void *)dxgi_sc_GetDevice);
+        dwp_set(o, 8,  (void *)dxgi_sc_Present);
+        dwp_set(o, 9,  (void *)dxgi_sc_GetBuffer);
+        dwp_set(o, 13, (void *)dxgi_sc_ResizeBuffers);
+        dwp_set(o, 22, (void *)dxgi_sc_Present1);
+    }
+    return o;
+}
+
+/* IDXGISurface, which is only ever a way of naming the back buffer. Direct2D
+ * turns it into a render target, and that is where it becomes real again. */
+static MS int32_t dxgi_surf_GetDesc(void *self, void *desc)
+{
+    w32_surf *s = d2_window_surface();
+    uint32_t *d = desc;
+    (void)self;
+    if (!d) return D3D_NOTIMPL;
+    d[0] = (uint32_t)(s ? s->w : 0);          /* Width  */
+    d[1] = (uint32_t)(s ? s->h : 0);          /* Height */
+    d[2] = 87;                                /* DXGI_FORMAT_B8G8R8A8_UNORM */
+    d[3] = 1; d[4] = 0;                       /* SampleDesc */
+    return D3D_OK;
+}
+static dwprobe *dxgi_surface(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("IDXGISurface")) != NULL) {
+        dwp_set(o, 0, (void *)dxgi_qi_self);
+        dwp_set(o, 1, (void *)d3d_addref);
+        dwp_set(o, 2, (void *)d3d_release);
+        dwp_set(o, 6, (void *)dxgi_GetParent);
+        dwp_set(o, 8, (void *)dxgi_surf_GetDesc);
+    }
+    return o;
+}
+
+/* IDXGIFactory2::CreateSwapChainForHwnd(device, hwnd, desc1, fullscreen,
+ *                                       restrictTo, IDXGISwapChain1**) */
+static MS int32_t dxgi_CreateSwapChainForHwnd(void *self, void *dev, void *hwnd,
+                                              const void *desc, const void *fs,
+                                              void *restrict_to, void **out)
+{
+    (void)self; (void)dev; (void)desc; (void)fs; (void)restrict_to;
+    {   /* Remember which window this chain presents to; everything Direct2D
+         * draws goes into its pixels. */
+        w32_wnd *w = w32_wget(hwnd);
+        int i;
+        g_d2_hwnd = 0;
+        for (i = 1; w && i < W32_MAX_WND; i++)
+            if (&W.wnd[i] == w) { g_d2_hwnd = i; break; }
+    }
+    PLOG("  [d3d] IDXGIFactory2::CreateSwapChainForHwnd(window #%d)\n", g_d2_hwnd);
+    if (!out) return D3D_NOTIMPL;
+    *out = dxgi_swapchain();
+    return *out ? D3D_OK : D3D_NOTIMPL;
+}
+
+/* ID3D11Device::CheckFormatSupport. Everything is supported: the formats a
+ * plug-in asks about are all 32-bit colour, and the rasteriser behind this
+ * works in exactly one of them. */
+static MS int32_t d3d_CheckFormatSupport(void *self, uint32_t fmt, uint32_t *support)
+{
+    (void)self; (void)fmt;
+    if (support) *support = 0x20 | 0x80 | 0x4000;   /* TEXTURE2D | RENDER_TARGET | DISPLAY */
+    return D3D_OK;
+}
+
+static dwprobe *d3d_device(void)
+{
+    if (!g_d3d_device) {
+        g_d3d_device = dwp_new("ID3D11Device");
+        if (g_d3d_device) {
+            dwp_set(g_d3d_device, 0, (void *)d3d_device_qi);
+            dwp_set(g_d3d_device, 1, (void *)d3d_addref);
+            dwp_set(g_d3d_device, 2, (void *)d3d_release);
+            dwp_set(g_d3d_device, 29, (void *)d3d_CheckFormatSupport);
+        }
+    }
+    return g_d3d_device;
+}
+
+/* D3D11CreateDevice(adapter, driverType, software, flags, featureLevels,
+ *                   nLevels, sdkVersion, ppDevice, pFeatureLevel, ppContext) */
+static MS int32_t st_D3D11CreateDevice(void *adapter, int32_t driver, void *sw,
+                                       uint32_t flags, const uint32_t *levels,
+                                       uint32_t nlevels, uint32_t sdk,
+                                       void **device, uint32_t *level, void **ctx)
+{
+    (void)adapter; (void)driver; (void)sw; (void)flags; (void)levels;
+    (void)nlevels; (void)sdk;
+    PLOG("  [d3d] D3D11CreateDevice(driverType=%d)\n", (int)driver);
+    if (device) *device = d3d_device();
+    if (level)  *level = 0xb000;                      /* D3D_FEATURE_LEVEL_11_0 */
+    if (ctx)    *ctx = d3d_device();
+    return (device && !*device) ? D3D_FAIL : D3D_OK;
+}
+
+
+
+/* ---- Direct2D -----------------------------------------------------------
+ *
+ * This is where the drawing actually happens. Everything above exists so the
+ * plug-in can walk from a device to a device context; from here on the calls
+ * are ordinary 2D and go to the same rasteriser GDI+ uses.
+ *
+ * The context draws into the window's own pixel buffer. Direct2D's model --
+ * BeginDraw, a pile of Fill/Draw calls, EndDraw -- maps onto that directly,
+ * because there is no queue and nothing to flush. */
+
+static dwprobe *d2d_context(void);
+
+typedef struct { int tag; uint32_t argb; } d2_brush;
+
+/* D2D1_COLOR_F is four floats, straight-alpha and in 0..1. */
+static uint32_t d2_color(const float *c)
+{
+    uint32_t r, g, b, a;
+    if (!c) return 0xFF000000u;
+    r = (uint32_t)(c[0] * 255.0f + 0.5f); g = (uint32_t)(c[1] * 255.0f + 0.5f);
+    b = (uint32_t)(c[2] * 255.0f + 0.5f); a = (uint32_t)(c[3] * 255.0f + 0.5f);
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    if (a > 255) a = 255;
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+/* A graphics object over the window surface, made fresh per call: the
+ * rasteriser keeps no state worth caching and the transform lives on the
+ * context. */
+static gp_graphics *d2_gfx(dwprobe *ctx)
+{
+    static gp_graphics g;
+    w32_surf *s = d2_window_surface();
+    memset(&g, 0, sizeof g);
+    g.tag = GPO_GRAPHICS;
+    g.surf = s;
+    gp_ident(&g.xf);
+    (void)ctx;
+    return s ? &g : NULL;
+}
+
+static MS int32_t d2_CreateSolidColorBrush(void *self, const float *color,
+                                           const void *props, void **out)
+{
+    PLOG("  [d2d] CreateSolidColorBrush\n");
+    d2_brush *b;
+    (void)self; (void)props;
+    if (!out) return D3D_NOTIMPL;
+    if (!(b = calloc(1, sizeof *b))) return D3D_FAIL;
+    b->tag = GPO_BRUSH;
+    b->argb = d2_color(color);
+    /* Handed back as a probe so the caller can Release it and set its colour;
+     * the colour is what any drawing call actually reads. */
+    {
+        dwprobe *o = dwp_new("ID2D1SolidColorBrush");
+        if (!o) { free(b); return D3D_FAIL; }
+        o->ctx = b;
+        dwp_set(o, 1, (void *)d3d_addref);
+        dwp_set(o, 2, (void *)d3d_release);
+        *out = o;
+    }
+    return D3D_OK;
+}
+static uint32_t d2_brush_argb(void *brush)
+{
+    dwprobe *o = brush;
+    d2_brush *b = o ? o->ctx : NULL;
+    return b ? b->argb : 0xFF000000u;
+}
+
+/* D2D1_RECT_F is left, top, right, bottom. */
+static MS int32_t d2_FillRectangle(void *self, const float *rc, void *brush)
+{
+    gp_graphics *g = d2_gfx(self);
+    gp_brush b;
+    gp_path p;
+    if (!g || !rc) return D3D_NOTIMPL;
+    memset(&b, 0, sizeof b); b.tag = GPO_BRUSH; b.kind = GPB_SOLID;
+    b.argb = d2_brush_argb(brush);
+    memset(&p, 0, sizeof p); p.fillmode = 1;
+    gp_moveto(&p, rc[0], rc[1]); gp_lineto(&p, rc[2], rc[1]);
+    gp_lineto(&p, rc[2], rc[3]); gp_lineto(&p, rc[0], rc[3]);
+    if (p.n) p.ty[p.n - 1] |= 0x80;
+    gp_fill_path_brush(g, &p, &b);
+    free(p.pt); free(p.ty);
+    return D3D_OK;
+}
+static MS int32_t d2_Clear(void *self, const float *color)
+{
+    gp_graphics *g = d2_gfx(self);
+    int W, H;
+    uint32_t *px = gp_pixels(g, &W, &H), c = d2_color(color);
+    int i;
+    if (!px) return D3D_NOTIMPL;
+    for (i = 0; i < W * H; i++) px[i] = c | 0xFF000000u;
+    return D3D_OK;
+}
+static MS void d2_BeginDraw(void *self)
+{ (void)self; PLOG("  [d2d] BeginDraw\n"); }
+static MS int32_t d2_EndDraw(void *self, uint64_t *tag1, uint64_t *tag2)
+{
+    (void)self;
+    if (tag1) *tag1 = 0;
+    if (tag2) *tag2 = 0;
+    /* Nothing to swap: the pixels went straight into the window's own buffer.
+     * They still have to reach the window the host actually presents, which is
+     * an ancestor of this one -- there is no compositor here to walk the child
+     * windows, and this is the only child that draws. */
+    {
+        int disp = W.display ? W.display : W.host;
+        if (g_d2_hwnd && disp && g_d2_hwnd != disp &&
+            W.wnd[g_d2_hwnd].surf.px && W.wnd[disp].surf.px) {
+            w32_surf *src = &W.wnd[g_d2_hwnd].surf, *dst = &W.wnd[disp].surf;
+            int y, rows = src->h < dst->h ? src->h : dst->h;
+            int cols = src->w < dst->w ? src->w : dst->w;
+            for (y = 0; y < rows; y++)
+                memcpy(dst->px + (size_t)y * dst->w,
+                       src->px + (size_t)y * src->w, (size_t)cols * 4);
+        }
+        w32_present(disp);
+    }
+    return D3D_OK;
+}
+/* ID2D1DeviceContext::CreateBitmapFromDxgiSurface(surface, props, ID2D1Bitmap1**)
+ * The back buffer, named as something Direct2D can draw into. It is the
+ * window's pixel buffer either way, so the object only has to exist and be
+ * accepted by SetTarget. */
+static MS int32_t d2_CreateBitmapFromDxgiSurface(void *self, void *surface,
+                                                 const void *props, void **out)
+{
+    dwprobe *o;
+    (void)self; (void)surface; (void)props;
+    if (!out) return D3D_NOTIMPL;
+    if (!(o = dwp_new("ID2D1Bitmap1"))) return D3D_FAIL;
+    dwp_set(o, 0, (void *)dxgi_qi_self);
+    dwp_set(o, 1, (void *)d3d_addref);
+    dwp_set(o, 2, (void *)d3d_release);
+    PLOG("  [d2d] CreateBitmapFromDxgiSurface -> the window's own pixels\n");
+    *out = o;
+    return D3D_OK;
+}
+static MS int32_t d2_SetTarget(void *self, void *target)
+{ (void)self; PLOG("  [d2d] SetTarget(%p)\n", target); return D3D_OK; }
+static MS void d2_SetTransform(void *self, const float *m) { (void)self; (void)m; }
+static MS void d2_SetDpi(void *self, float x, float y) { (void)self; (void)x; (void)y; }
+static MS void d2_GetDpi(void *self, float *x, float *y)
+{ (void)self; if (x) *x = 96.0f; if (y) *y = 96.0f; }
+
+static dwprobe *d2d_context(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("ID2D1DeviceContext")) != NULL) {
+        dwp_set(o, 0,  (void *)dxgi_qi_self);
+        dwp_set(o, 1,  (void *)d3d_addref);
+        dwp_set(o, 2,  (void *)d3d_release);
+        dwp_set(o, 8,  (void *)d2_CreateSolidColorBrush);
+        dwp_set(o, 17, (void *)d2_FillRectangle);
+        dwp_set(o, 30, (void *)d2_SetTransform);
+        dwp_set(o, 47, (void *)d2_Clear);
+        dwp_set(o, 48, (void *)d2_BeginDraw);
+        dwp_set(o, 49, (void *)d2_EndDraw);
+        dwp_set(o, 51, (void *)d2_SetDpi);
+        dwp_set(o, 52, (void *)d2_GetDpi);
+        dwp_set(o, 62, (void *)d2_CreateBitmapFromDxgiSurface);
+        dwp_set(o, 74, (void *)d2_SetTarget);
+    }
+    return o;
+}
+
+static MS int32_t d2d_dev_CreateDeviceContext(void *self, uint32_t opts, void **out)
+{
+    (void)self; (void)opts;
+    PLOG("  [d2d] ID2D1Device::CreateDeviceContext\n");
+    if (!out) return D3D_NOTIMPL;
+    *out = d2d_context();
+    return *out ? D3D_OK : D3D_FAIL;
+}
+static dwprobe *d2d_device(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("ID2D1Device")) != NULL) {
+        dwp_set(o, 0, (void *)dxgi_qi_self);
+        dwp_set(o, 1, (void *)d3d_addref);
+        dwp_set(o, 2, (void *)d3d_release);
+        dwp_set(o, 4, (void *)d2d_dev_CreateDeviceContext);
+    }
+    return o;
+}
+static MS int32_t d2d_fac_CreateDevice(void *self, void *dxgidev, void **out)
+{
+    (void)self; (void)dxgidev;
+    PLOG("  [d2d] ID2D1Factory1::CreateDevice\n");
+    if (!out) return D3D_NOTIMPL;
+    *out = d2d_device();
+    return *out ? D3D_OK : D3D_FAIL;
+}
+static MS void d2d_fac_GetDesktopDpi(void *self, float *x, float *y)
+{ (void)self; if (x) *x = 96.0f; if (y) *y = 96.0f; }
+
+static dwprobe *d2d_factory_obj(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("ID2D1Factory1")) != NULL) {
+        dwp_set(o, 0,  (void *)dxgi_qi_self);
+        dwp_set(o, 1,  (void *)d3d_addref);
+        dwp_set(o, 2,  (void *)d3d_release);
+        dwp_set(o, 4,  (void *)d2d_fac_GetDesktopDpi);
+        dwp_set(o, 17, (void *)d2d_fac_CreateDevice);
+    }
+    return o;
+}
+
+/* D2D1CreateFactory(type, riid, options, void **factory) -- imported by
+ * ordinal 1, which is how d2d1.dll exports it. */
+static MS int32_t st_D2D1CreateFactory(uint32_t type, const uint8_t *iid,
+                                       const void *opts, void **out)
+{
+    char b[64];
+    (void)type; (void)opts;
+    PLOG("  [d2d] D2D1CreateFactory(%s)\n", d3d_guid(iid, b, sizeof b));
+    if (!out) return D3D_NOTIMPL;
+    *out = d2d_factory_obj();
+    return *out ? D3D_OK : D3D_FAIL;
+}
+
+#endif /* PELOAD_D3D_SHIM_H */

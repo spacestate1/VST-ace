@@ -32,7 +32,12 @@
 /* Slot counts including the three IUnknown entries. Over-allocating is safe --
  * an unused slot is simply never called -- and under-allocating would let a
  * call run off the end of the table. */
-#define DWP_MAX_SLOTS 64
+/* Wide enough for the biggest vtable a plug-in reaches through here.
+ * ID3D11DeviceContext has 108 methods and ID2D1DeviceContext is not far
+ * behind; a probe shorter than the interface means a call past the end lands
+ * on whatever follows the array, which presents as a jump to a null address
+ * with no clue as to why. */
+#define DWP_MAX_SLOTS 160
 
 typedef struct dwprobe {
     void       **vtbl;               /* the object's vtable pointer */
@@ -47,7 +52,7 @@ typedef struct dwprobe {
 /* One JIT'd stub per (object, slot) so a call can name both. Objects are
  * addressed by table index rather than by pointer, because packing a slot into
  * the low bits of a pointer would destroy the pointer. */
-#define DWP_MAX_OBJS 64
+#define DWP_MAX_OBJS 512
 static uint8_t *g_dwp_code;
 static size_t   g_dwp_used;
 static dwprobe *g_dwp_objs[DWP_MAX_OBJS];
@@ -83,11 +88,11 @@ static void *dwp_stub(dwprobe *o, int slot)
     uintptr_t packed;
 
     if (!g_dwp_code) {
-        g_dwp_code = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC,
+        g_dwp_code = mmap(NULL, 1 << 22, PROT_READ | PROT_WRITE | PROT_EXEC,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (g_dwp_code == MAP_FAILED) return NULL;
     }
-    if (g_dwp_used + 32 > (1u << 20)) return NULL;   /* arena exhausted */
+    if (g_dwp_used + 32 > (1u << 22)) return NULL;   /* arena exhausted */
     p = g_dwp_code + g_dwp_used;
     g_dwp_used += 32;
 
@@ -344,6 +349,68 @@ static MS int32_t wicc_Initialize(void *self, void *src, const void *fmt, uint32
 static MS int32_t wicc_CanConvert(void *self, const void *from, const void *to, int32_t *can)
 { (void)self; (void)from; (void)to; if (can) *can = 1; return DW_S_OK; }
 
+/* IWICBitmapLock, and IWICBitmap::Lock behind it.
+ *
+ * A plug-in that composes its own artwork locks a bitmap and writes into the
+ * pixels directly. The buffer is handed over rather than copied, which is the
+ * whole point of locking, and the rectangle only shifts where it starts. */
+static MS int32_t wicl_GetSize(void *self, uint32_t *w, uint32_t *h)
+{ return wic_GetSize(self, w, h); }
+static MS int32_t wicl_GetStride(void *self, uint32_t *stride)
+{
+    dwprobe *o = self;
+    wic_image *im = o ? o->ctx : NULL;
+    if (!im || !stride) return DW_E_NOTIMPL;
+    *stride = (uint32_t)im->w * 4;
+    return DW_S_OK;
+}
+static MS int32_t wicl_GetDataPointer(void *self, uint32_t *size, uint8_t **data)
+{
+    dwprobe *o = self;
+    wic_image *im = o ? o->ctx : NULL;
+    if (!im || !size || !data) return DW_E_NOTIMPL;
+    *size = (uint32_t)(im->w * im->h * 4);
+    *data = (uint8_t *)im->px;
+    return DW_S_OK;
+}
+static MS int32_t wicb_Lock(void *self, const int32_t *rc, uint32_t flags, void **out)
+{
+    dwprobe *o = self, *l;
+    (void)flags;
+    if (!out) return DW_E_NOTIMPL;
+    *out = NULL;
+    if (!o || !o->ctx) return DW_E_NOTIMPL;
+    if (!(l = dwp_new("IWICBitmapLock"))) return DW_E_NOTIMPL;
+    l->ctx = o->ctx;
+    ((wic_image *)l->ctx)->refs++;
+    dwp_set(l, 3, (void *)wicl_GetSize);
+    dwp_set(l, 4, (void *)wicl_GetStride);
+    dwp_set(l, 5, (void *)wicl_GetDataPointer);
+    dwp_set(l, 6, (void *)wic_GetPixelFormat);
+    (void)rc;
+    *out = l;
+    return DW_S_OK;
+}
+
+/* IWICImagingFactory::CreateBitmapFromSource(source, cacheOption, IWICBitmap**)
+ * A cached copy of a decoded image. It is already in memory, so the "copy" is
+ * another reference to the same pixels behaving as a source. */
+static MS int32_t wic_CreateBitmapFromSource(void *self, void *src, uint32_t cache, void **out)
+{
+    dwprobe *s2 = src, *b;
+    (void)self; (void)cache;
+    if (!out) return DW_E_NOTIMPL;
+    *out = NULL;
+    if (!s2 || !s2->ctx) return DW_E_NOTIMPL;
+    if (!(b = dwp_new("IWICBitmap"))) return DW_E_NOTIMPL;
+    b->ctx = s2->ctx;
+    ((wic_image *)b->ctx)->refs++;
+    wic_source_slots(b);
+    dwp_set(b, 8, (void *)wicb_Lock);
+    *out = b;
+    return DW_S_OK;
+}
+
 static MS int32_t wic_CreateFormatConverter(void *self, void **out)
 {
     dwprobe *c;
@@ -410,6 +477,7 @@ static void *wic_factory(void)
         if (g_wic_factory) {
             dwp_set(g_wic_factory,  3, (void *)wic_CreateDecoderFromFilename);
             dwp_set(g_wic_factory, 10, (void *)wic_CreateFormatConverter);
+            dwp_set(g_wic_factory, 18, (void *)wic_CreateBitmapFromSource);
         }
     }
     if (g_wic_factory) g_wic_factory->refs++;
@@ -718,6 +786,94 @@ static MS int32_t dwff_GetLoader(void *self, void **loader)
     return DW_S_OK;
 }
 
+/* Drops the open FreeType face so the next measurement reopens it from the
+ * bytes just installed. Defined with the face itself, further down. */
+static void dw_font_changed(void);
+
+/* IDWriteFactory::CreateFontFileReference(WCHAR const*, FILETIME const*,
+ *                                          IDWriteFontFile**)
+ *
+ * A font named by path rather than handed over as bytes. The file is read here
+ * and becomes the face everything else measures and draws with, which is how a
+ * plug-in shipping its own font gets to use it rather than whatever happened to
+ * be registered first. */
+static MS int32_t dwf_CreateFontFileReference(void *self, const uint16_t *path,
+                                              const void *writetime, void **out)
+{
+    char n[1024], fixed[1024];
+    dwprobe *ff;
+    dw_fontfile *f;
+    FILE *fp;
+    long len;
+
+    (void)self; (void)writetime;
+    if (!out) return DW_E_NOTIMPL;
+    *out = NULL;
+    w2c(path, n, sizeof n);
+    path_fix(n, fixed, sizeof fixed);
+    PLOG("  [dwrite] IDWriteFactory::CreateFontFileReference(\"%s\")\n", fixed);
+
+    if ((fp = fopen(fixed, "rb")) != NULL) {
+        fseek(fp, 0, SEEK_END); len = ftell(fp); fseek(fp, 0, SEEK_SET);
+        if (len > 0) {
+            uint8_t *bytes = malloc((size_t)len);
+            if (bytes && fread(bytes, 1, (size_t)len, fp) == (size_t)len) {
+                /* Replaces whatever was registered before: a font asked for by
+                 * name is the one the caller means to draw with. */
+                free(g_font_bytes);
+                g_font_bytes = bytes;
+                g_font_size = (uint32_t)len;
+                dw_font_changed();
+            } else {
+                free(bytes);
+            }
+        }
+        fclose(fp);
+    }
+
+    if (!(ff = dwp_new("IDWriteFontFile"))) return DW_E_NOTIMPL;
+    if (!(f = calloc(1, sizeof *f))) return DW_E_NOTIMPL;
+    ff->ctx = f;
+    dwp_set(ff, 3, (void *)dwff_GetReferenceKey);
+    dwp_set(ff, 4, (void *)dwff_GetLoader);
+    dwp_set(ff, 5, (void *)dwff_Analyze);
+    *out = ff;
+    return DW_S_OK;
+}
+
+/* Rendering parameters: gamma, contrast and the ClearType geometry. Nothing
+ * here reads them -- glyphs come back from FreeType as coverage -- but the
+ * object has to exist, because a caller stores it and passes it on. */
+static MS int32_t dwf_CreateRenderingParams(void *self, void **out)
+{
+    (void)self;
+    if (!out) return DW_E_NOTIMPL;
+    *out = dwp_new("IDWriteRenderingParams");
+    return *out ? DW_S_OK : DW_E_NOTIMPL;
+}
+static MS int32_t dwf_CreateCustomRenderingParams(void *self, float gamma, float contrast,
+                                                  float cleartype, uint32_t geom,
+                                                  uint32_t mode, void **out)
+{
+    (void)self; (void)gamma; (void)contrast; (void)cleartype; (void)geom; (void)mode;
+    if (!out) return DW_E_NOTIMPL;
+    *out = dwp_new("IDWriteRenderingParams");
+    return *out ? DW_S_OK : DW_E_NOTIMPL;
+}
+/* The DirectWrite 2 form, which takes two more knobs and is the one a modern
+ * plug-in reaches for. Same answer. */
+static MS int32_t dwf_CreateCustomRenderingParams2(void *self, float gamma, float contrast,
+                                                   float grayscale, float cleartype,
+                                                   uint32_t geom, uint32_t mode,
+                                                   uint32_t gridfit, void **out)
+{
+    (void)self; (void)gamma; (void)contrast; (void)grayscale; (void)cleartype;
+    (void)geom; (void)mode; (void)gridfit;
+    if (!out) return DW_E_NOTIMPL;
+    *out = dwp_new("IDWriteRenderingParams");
+    return *out ? DW_S_OK : DW_E_NOTIMPL;
+}
+
 /* IDWriteFactory::CreateCustomFontFileReference(void const*, UINT32,
  *                                               IDWriteFontFileLoader*, IDWriteFontFile**) */
 static MS int32_t dwf_CreateCustomFontFileReference(void *self, const void *key, uint32_t keysz,
@@ -999,6 +1155,9 @@ static MS void dwfa_GetMetrics(void *self, void *out)
  * handles every cmap subtable format correctly. */
 static FT_Library g_ft;
 static FT_Face    g_ftface;
+
+static void dw_font_changed(void)
+{ if (g_ftface) { FT_Done_Face(g_ftface); g_ftface = NULL; } }
 
 static FT_Face dw_ftface(void)
 {
@@ -1505,6 +1664,10 @@ static MS int32_t st_DWriteCreateFactory(uint32_t type, const void *iid, void **
             g_dwrite_factory->iid_known = IID_IDWriteFactory_b;
             dwp_set(g_dwrite_factory,  3, (void *)dwf_GetSystemFontCollection);
             dwp_set(g_dwrite_factory, 17, (void *)dwf_GetGdiInterop);
+            dwp_set(g_dwrite_factory,  7, (void *)dwf_CreateFontFileReference);
+            dwp_set(g_dwrite_factory, 10, (void *)dwf_CreateRenderingParams);
+            dwp_set(g_dwrite_factory, 12, (void *)dwf_CreateCustomRenderingParams);
+            dwp_set(g_dwrite_factory, 29, (void *)dwf_CreateCustomRenderingParams2);
             dwp_set(g_dwrite_factory, 15, (void *)dwf_CreateTextFormat);
             dwp_set(g_dwrite_factory, 18, (void *)dwf_CreateTextLayout);
             dwp_set(g_dwrite_factory,  8, (void *)dwf_CreateCustomFontFileReference);

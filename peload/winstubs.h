@@ -1829,6 +1829,7 @@ static MS void st_CoUninitialize(void) { }
 #include "win32gui.h"
 #include "dwrite_shim.h"
 #include "gdiplus_shim.h"
+#include "d3d_shim.h"
 #endif
 
 /* ------------------------------------------------------------- registry */
@@ -6269,6 +6270,13 @@ static const winstub g_stubs[] = {
     S("gdiplus.dll", GdipClosePathFigure), S("gdiplus.dll", GdipGetPathLastPoint), S("gdiplus.dll", GdipAddPathLine),
     S("gdiplus.dll", GdipAddPathArc), S("gdiplus.dll", GdipAddPathBezier), S("gdiplus.dll", GdipAddPathRectangle),
     S("gdiplus.dll", GdipAddPathEllipse), S("gdiplus.dll", GdipAddPathString), S("gdiplus.dll", GdipSetPathFillMode),
+#endif
+#ifndef PELOAD_NO_GUI_LAYER
+    { "d3d11.dll", "D3D11CreateDevice", (void *)st_D3D11CreateDevice },
+    /* d2d1.dll exports D2D1CreateFactory as ordinal 1, and that is how a
+     * plug-in imports it -- there is no name in the import table to match. */
+    { "d2d1.dll", "ordinal#1", (void *)st_D2D1CreateFactory },
+    { "d2d1.dll", "D2D1CreateFactory", (void *)st_D2D1CreateFactory },
 #endif
     S("gdi32.dll", GetDeviceCaps),
     S("gdi32.dll", SetDIBitsToDevice), S("gdi32.dll", GetClipBox),

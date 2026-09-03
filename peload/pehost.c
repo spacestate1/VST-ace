@@ -409,14 +409,6 @@ static uint64_t stub_failure_value(const char *dll, const char *sym)
             if (!strcasecmp(g_failvals[i].dll, "msvcrt.dll") &&
                 !strcmp(g_failvals[i].sym, sym))
                 return g_failvals[i].val;
-    /* Direct3D and Direct2D. Same trap as GDI+ in reverse: an HRESULT of 0 is
-     * S_OK, so an unimplemented D3D11CreateDevice was reporting that it had
-     * made a device and leaving the pointer null. E_FAIL instead -- there is no
-     * GPU API here and there never will be one by accident. */
-    if (!strncasecmp(dll, "d3d", 3) || !strncasecmp(dll, "d2d", 3) ||
-        !strncasecmp(dll, "dxgi", 4))
-        return 0x80004005ull;                              /* E_FAIL */
-
     if (ntdll_status_call(dll, sym)) return FV_STATUS;
     return 0;
 }
@@ -3489,19 +3481,6 @@ void pehost_render_io(pehost *h, const float *src, float *inter, int frames)
 
 int pehost_editor_kind(pehost *h)
 {
-    /* Refused before it is attempted. Saying "no editor" costs a window the
-     * plug-in could not have drawn anyway; opening it costs the plug-in. */
-    if (h && g_image_wants_d3d) {
-        static int said;
-        if (!said) {
-            said = 1;
-            fprintf(stderr, "editor: this plug-in builds its editor on Direct3D, "
-                            "which is not implemented here -- reporting no editor "
-                            "rather than opening one that would take the plug-in "
-                            "down with it. Audio is unaffected.\n");
-        }
-        return PEHOST_EDITOR_NONE;
-    }
 
 
     /* A Classic editor draws into a GWorld -- guest memory -- so what comes

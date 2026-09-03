@@ -381,7 +381,11 @@ static MS uint16_t st_RegisterClassA(const W32WNDCLASSA *c)
 {
     int i;
     if (!c || !c->lpszClassName) return 0;
-    PLOG("  [w32] RegisterClass '%s' proc=%p\n", c->lpszClassName, c->lpfnWndProc);
+    /* The offset matters more than the address: it is what a disassembler wants,
+     * and the address moves every run. */
+    PLOG("  [w32] RegisterClass '%s' proc=%p (image+0x%lx)\n", c->lpszClassName,
+         c->lpfnWndProc,
+         g_image_base ? (unsigned long)((uint8_t *)c->lpfnWndProc - g_image_base) : 0ul);
     for (i = 1; i < W32_MAX_CLS; i++) {
         if (W.cls[i].used) continue;
         W.cls[i].used = 1;
