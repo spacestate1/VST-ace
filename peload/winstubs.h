@@ -38,6 +38,18 @@ typedef struct { const char *dll, *sym; void *fn; } winstub;
 #define MSCRT MS
 #endif
 
+/* MSVC's C++ *member* functions are __thiscall on i386: `this` arrives in ECX
+ * and only the remaining arguments are on the stack. Declaring them stdcall
+ * like the rest of the Win32 surface shifts every argument along by one, so
+ * exception(char const *const &, int) read the int as the message pointer and
+ * dereferenced 1 -- which is what took all four 32-bit NI plug-ins down inside
+ * a static initialiser. At 64-bit there is one convention and this is MS. */
+#ifdef __i386__
+#define MSTHIS __attribute__((thiscall))
+#else
+#define MSTHIS MS
+#endif
+
 #include "mscxxeh.h"
 
 #define PLOG(...) do { if (pe_verbose()) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -763,7 +775,23 @@ static MS void st_RaiseException(uint32_t code, uint32_t f, uint32_t n,
         }
         return;
     }
+    /* Naming every C++ throw, not just the ones nobody catches, is what turns
+     * "it stopped" into "it stopped on this". A throw that is caught two frames
+     * up is normal and says nothing; one thrown during a plug-in's start-up
+     * usually names the Win32 call that disappointed it. */
 #if defined(__i386__)
+    if (code == 0xE06D7363u && n >= 3 && a && pe_verbose()) {
+        ms_exc_rec32 probe;
+        const char *tn;
+        memset(&probe, 0, sizeof probe);
+        probe.ExceptionCode    = code;
+        probe.NumberParameters = 3;
+        probe.ExceptionInformation[0] = (uint32_t)a[0];
+        probe.ExceptionInformation[1] = (uint32_t)a[1];
+        probe.ExceptionInformation[2] = (uint32_t)a[2];
+        tn = ms_throw_typename32(&probe);
+        PLOG("  [eh] throw %s (object 0x%x)\n", tn ? tn : "?", (unsigned)a[1]);
+    }
     /* Hand it to the plug-in's own handlers. A C++ throw arrives here as
      * 0xE06D7363 with the object and its ThrowInfo in the parameters, and the
      * __CxxFrameHandler that catches it never returns -- so anything below this
@@ -881,6 +909,68 @@ static MS void st_GetSystemTimeAsFileTime(uint64_t *ft)
     /* FILETIME: 100 ns ticks since 1601-01-01 */
     if (ft) *ft = (uint64_t)t.tv_sec * 10000000ULL + t.tv_nsec / 100 + 116444736000000000ULL;
 }
+/* Thread and process CPU accounting. The Concurrency runtime measures how much
+ * work a virtual processor is getting through with GetThreadTimes, and a stub
+ * answering FALSE is a failure it does not carry on from. FILETIME is 100 ns
+ * ticks; for the two CPU figures the epoch does not enter into it, they are
+ * durations. */
+static uint64_t w32_ts_to_ft(const struct timespec *t)
+{ return (uint64_t)t->tv_sec * 10000000ULL + (uint64_t)t->tv_nsec / 100; }
+
+static uint64_t g_proc_start_ft;
+static MS int32_t st_GetThreadTimes(void *h, uint64_t *create, uint64_t *exit_,
+                                    uint64_t *kernel, uint64_t *user)
+{
+    struct timespec t;
+    (void)h;
+    if (!g_proc_start_ft) {
+        struct timespec r;
+        clock_gettime(CLOCK_REALTIME, &r);
+        g_proc_start_ft = w32_ts_to_ft(&r) + 116444736000000000ULL;
+    }
+    if (create) *create = g_proc_start_ft;
+    if (exit_)  *exit_  = 0;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t) != 0) { g_last_error = 5; return 0; }
+    if (user)   *user   = w32_ts_to_ft(&t);
+    if (kernel) *kernel = 0;
+    return 1;
+}
+static MS int32_t st_GetProcessTimes(void *h, uint64_t *create, uint64_t *exit_,
+                                     uint64_t *kernel, uint64_t *user)
+{
+    struct timespec t;
+    (void)h;
+    if (!g_proc_start_ft) {
+        struct timespec r;
+        clock_gettime(CLOCK_REALTIME, &r);
+        g_proc_start_ft = w32_ts_to_ft(&r) + 116444736000000000ULL;
+    }
+    if (create) *create = g_proc_start_ft;
+    if (exit_)  *exit_  = 0;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t) != 0) { g_last_error = 5; return 0; }
+    if (user)   *user   = w32_ts_to_ft(&t);
+    if (kernel) *kernel = 0;
+    return 1;
+}
+static MS int32_t st_GetSystemTimes(uint64_t *idle, uint64_t *kernel, uint64_t *user)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    if (idle)   *idle   = w32_ts_to_ft(&t);
+    if (kernel) *kernel = 0;
+    if (user)   *user   = w32_ts_to_ft(&t);
+    return 1;
+}
+static MS int32_t st_QueryProcessCycleTime(void *h, uint64_t *cycles)
+{
+    struct timespec t;
+    (void)h;
+    if (!cycles) { g_last_error = 87; return 0; }
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    *cycles = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+    return 1;
+}
+
 static MS uint32_t st_GetTickCount(void)
 { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
   return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000); }
@@ -891,7 +981,83 @@ static MS uint64_t st_GetTickCount64(void)
 /* --------------------------------------------------------- module / loader */
 
 static MS void *st_GetModuleHandleA(const char *n) { (void)n; return g_image_base; }
-static MS void *st_GetModuleHandleW(const void *n) { (void)n; return g_image_base; }
+/* The Windows Runtime apartment calls, which live in combase.dll.
+ *
+ * msvcr120's Concurrency runtime resolves RoInitialize and RoUninitialize and
+ * throws scheduler_resource_allocation_error if either is missing -- it does
+ * not treat them as optional, even in a plain desktop process. Reporting the
+ * apartment as already initialised is what a desktop process sees anyway:
+ * S_FALSE, not an error. */
+/* Event tracing. Nothing here records anything, but every one of these has to
+ * exist: the MSVC CRT resolves RegisterTraceGuidsW through GetProcAddress,
+ * stores the result XOR'd with a cookie of its own, and then calls it back
+ * having compared the slot against EncodePointer(NULL) -- a comparison that
+ * cannot match, because the two encodings are unrelated. On Windows that is
+ * harmless, since advapi32 always has the function; here a NULL decoded to a
+ * call through address zero, which is where the 32-bit NI plug-ins landed once
+ * their scheduler started. Answering ERROR_SUCCESS and doing nothing is what a
+ * process with no tracing session sees. */
+static MS uint32_t st_RegisterTraceGuidsW(void *req, void *ctx, const void *guid,
+                                          uint32_t count, void *reg,
+                                          const uint16_t *mofpath,
+                                          const uint16_t *mofres, uint64_t *handle)
+{
+    (void)req; (void)ctx; (void)guid; (void)count; (void)reg;
+    (void)mofpath; (void)mofres;
+    if (handle) *handle = 1;                   /* a handle, not a session */
+    return 0;                                  /* ERROR_SUCCESS */
+}
+static MS uint32_t st_RegisterTraceGuidsA(void *req, void *ctx, const void *guid,
+                                          uint32_t count, void *reg,
+                                          const char *mofpath, const char *mofres,
+                                          uint64_t *handle)
+{
+    (void)mofpath; (void)mofres;
+    return st_RegisterTraceGuidsW(req, ctx, guid, count, reg, NULL, NULL, handle);
+}
+static MS uint32_t st_UnregisterTraceGuids(uint64_t handle) { (void)handle; return 0; }
+static MS uint64_t st_GetTraceLoggerHandle(void *buf) { (void)buf; return 0; }
+static MS uint8_t  st_GetTraceEnableLevel(uint64_t h) { (void)h; return 0; }
+static MS uint32_t st_GetTraceEnableFlags(uint64_t h) { (void)h; return 0; }
+static MS uint32_t st_TraceEvent(uint64_t h, void *ev) { (void)h; (void)ev; return 0; }
+static MS uint32_t st_EventRegister(const void *id, void *cb, void *ctx, uint64_t *h)
+{ (void)id; (void)cb; (void)ctx; if (h) *h = 1; return 0; }
+static MS uint32_t st_EventUnregister(uint64_t h) { (void)h; return 0; }
+static MS uint32_t st_EventWrite(uint64_t h, const void *desc, uint32_t n, void *d)
+{ (void)h; (void)desc; (void)n; (void)d; return 0; }
+static MS uint32_t st_EventWriteTransfer(uint64_t h, const void *desc, const void *a,
+                                         const void *b, uint32_t n, void *d)
+{ (void)h;(void)desc;(void)a;(void)b;(void)n;(void)d; return 0; }
+static MS int32_t st_EventEnabled(uint64_t h, const void *desc)
+{ (void)h; (void)desc; return 0; }
+static MS int32_t st_EventProviderEnabled(uint64_t h, uint8_t lvl, uint64_t kw)
+{ (void)h; (void)lvl; (void)kw; return 0; }
+static MS uint32_t st_EventSetInformation(uint64_t h, uint32_t cls, void *info, uint32_t n)
+{ (void)h;(void)cls;(void)info;(void)n; return 0; }
+static MS uint32_t st_EventActivityIdControl(uint32_t code, void *guid)
+{ (void)code; (void)guid; return 0; }
+
+static MS int32_t st_RoInitialize(uint32_t type)
+{ (void)type; return 1; }                      /* S_FALSE: already initialised */
+static MS void st_RoUninitialize(void) { }
+static MS int32_t st_RoGetActivationFactory(void *cls, const void *iid, void **out)
+{ (void)cls; (void)iid; if (out) *out = NULL; return (int32_t)0x80004001; }  /* E_NOTIMPL */
+static MS int32_t st_RoActivateInstance(void *cls, void **out)
+{ (void)cls; if (out) *out = NULL; return (int32_t)0x80004001; }
+
+/* A module handle for a name this host knows, rather than the plug-in's own
+ * base for every question asked. GetProcAddress searches the whole table by
+ * name regardless, so this only sharpens which handle a caller gets back. */
+static void *w32_lib_handle(const char *name);            /* below */
+static MS void *st_GetModuleHandleW(const void *n)
+{
+    char b[256];
+    void *h;
+    if (!n) return g_image_base;
+    w2c((const uint16_t *)n, b, sizeof b);
+    h = w32_lib_handle(b);
+    return h ? h : g_image_base;
+}
 static MS int32_t st_GetModuleHandleExW(uint32_t f, const void *n, void **out)
 { (void)f;(void)n; if (out) *out = g_image_base; return 1; }
 /* The A form was missing while the W form was here, so a plug-in that asked
@@ -973,9 +1139,42 @@ static const char *const g_sysdlls[] = {
     "kernel32.dll", "user32.dll", "gdi32.dll", "ole32.dll",
     "advapi32.dll", "shell32.dll", "shlwapi.dll", "winmm.dll",
     "comctl32.dll", "msvcrt.dll", "version.dll", "oleaut32.dll",
+    "combase.dll",
 };
 #define NSYSDLL   ((int)(sizeof g_sysdlls / sizeof *g_sysdlls))
 #define H_DLL(i)  ((void *)(uintptr_t)(0x5044u << 16 | (unsigned)(i)))   /* 'PD' */
+
+/* DLLs that are part of any stock Windows install but that this host implements
+ * nothing for.
+ *
+ * LoadLibrary has to succeed for these. msvcr120's Concurrency runtime opens
+ * combase.dll with LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32) and, if it
+ * comes back NULL, throws scheduler_resource_allocation_error out of its own
+ * initialisation -- which is where all four 32-bit NI plug-ins stopped, with an
+ * exception whose text says nothing about a missing DLL. On Windows the file is
+ * always there, so answering "no such library" is the wrong answer to give.
+ *
+ * GetProcAddress against one of these still returns NULL for anything not
+ * implemented, which is exactly what a caller probing for an optional export
+ * expects to see. The graphics DLLs are deliberately absent: a plug-in that
+ * finds d3d11 present takes its Direct3D path, and the fallback it takes today
+ * is the one this host actually draws. */
+static const char *const g_stockdlls[] = {
+    "ntdll", "kernelbase", "sechost", "rpcrt4", "crypt32", "bcrypt",
+    "ncrypt", "wintrust", "secur32", "psapi", "imm32", "uxtheme", "dwmapi",
+    "powrprof", "setupapi", "iphlpapi", "mpr", "netapi32", "userenv", "usp10",
+    "msimg32", "dbghelp", "propsys", "oleacc", "avrt", "winhttp", "wininet",
+    "urlmon", "winspool", "cfgmgr32", "kernel.appcore", "shcore", "profapi",
+};
+#define NSTOCKDLL  ((int)(sizeof g_stockdlls / sizeof *g_stockdlls))
+#define H_STOCK(i) ((void *)(uintptr_t)(0x5350u << 16 | (unsigned)(i)))  /* 'SP' */
+
+static int w32_stock_index(void *h)
+{
+    uintptr_t v = (uintptr_t)h;
+    if ((v >> 16) != 0x5350u) return -1;
+    return (int)(v & 0xFFFF) < NSTOCKDLL ? (int)(v & 0xFFFF) : -1;
+}
 
 static int w32_dll_index(void *h)
 {
@@ -1014,6 +1213,8 @@ static void *w32_lib_handle(const char *name)
         cur[strlen(cur) - 4] = 0;                               /* drop ".dll" */
         if (!strcmp(b, cur)) return H_DLL(d);
     }
+    for (d = 0; d < NSTOCKDLL; d++)
+        if (!strcmp(b, g_stockdlls[d])) return H_STOCK(d);
     return NULL;
 }
 
@@ -1101,7 +1302,8 @@ static MS void *st_GetProcAddress(void *h, const char *n)
      * module really does define these, and a same-named stub would shadow the
      * genuine one. A miss falls through rather than returning -- the handle may
      * simply not be one of ours, and the name search below still has to run. */
-    if (n && h && h != H_DWRITE && w32_dll_index(h) < 0 && g_real_sym) {
+    if (n && h && h != H_DWRITE && w32_dll_index(h) < 0 &&
+        w32_stock_index(h) < 0 && g_real_sym) {
         void *fn = g_real_sym(h, n);
         if (fn) { PLOG("  [win] GetProcAddress(\"%s\") -> real\n", n); return fn; }
     }
@@ -1122,8 +1324,26 @@ static MS int32_t st_DisableThreadLibraryCalls(void *h) { (void)h; return 1; }
 static MS const char *st_GetCommandLineA(void) { return "peload.exe"; }
 static MS const uint16_t *st_GetCommandLineW(void)
 { static const uint16_t w[] = { 'p','e','l','o','a','d','.','e','x','e',0 }; return w; }
+#define W32_ENV_MAX 64
+static const char *w32_env_block(void);
 static MS void *st_GetEnvironmentStringsW(void)
-{ static const uint16_t e[] = { 0, 0 }; return (void *)e; }
+{
+    static uint16_t block[W32_ENV_MAX * 600];
+    static int built;
+    if (!built) {
+        const char *a = w32_env_block();
+        size_t i = 0;
+        for (;;) {
+            size_t n = strlen(a + i);
+            size_t k;
+            for (k = 0; k <= n; k++) block[i + k] = (uint16_t)(unsigned char)a[i + k];
+            i += n + 1;
+            if (!a[i]) { block[i] = 0; break; }
+        }
+        built = 1;
+    }
+    return block;
+}
 static MS int32_t st_FreeEnvironmentStringsW(void *p) { (void)p; return 1; }
 static MS void st_GetStartupInfoW(void *si)
 { if (si) { memset(si, 0, sizeof(W_STARTUPINFO));
@@ -1394,7 +1614,7 @@ static void make_parents_in_root(const char *path)
 /* One table for every kernel object, because Windows HANDLEs are opaque and
  * CloseHandle/WaitForSingleObject must work on any of them. Handles are table
  * indices biased away from 0 and from the -1/-2 pseudo-handles above. */
-typedef enum { H_FREE = 0, H_FILE, H_EVENT, H_MUTEX, H_SEM, H_THREAD } htype;
+typedef enum { H_FREE = 0, H_FILE, H_EVENT, H_MUTEX, H_SEM, H_THREAD, H_MAP } htype;
 typedef struct {
     htype           type;
     int             fd;
@@ -1403,6 +1623,11 @@ typedef struct {
     int             signaled, manual, count;
     pthread_t       th;
     void           *start, *param;
+    uint64_t        map_size;          /* H_MAP: the section's size */
+    int             map_prot;          /* H_MAP: the mmap protection */
+    int             map_own_fd;        /* H_MAP: we made the backing file */
+    int             borrowed;          /* H_FILE: the CRT owns this fd, not us */
+    char            map_name[64];      /* H_MAP: the section's name, if any */
 } hobj;
 
 #define H_BIAS 0x100
@@ -1566,7 +1791,8 @@ static MS int32_t st_CloseHandle(void *h)
     intptr_t i = (intptr_t)h - H_BIAS;
     hobj *o = h_get(h, H_FREE);
     if (!o) return 1;
-    if (o->type == H_FILE && o->fd >= 0) close(o->fd);
+    if (o->type == H_FILE && o->fd >= 0 && !o->borrowed) close(o->fd);
+    if (o->type == H_MAP && o->map_own_fd && o->fd >= 0) close(o->fd);
     pthread_mutex_lock(&g_hlock);
     g_hobj[i] = NULL;
     pthread_mutex_unlock(&g_hlock);
@@ -1593,6 +1819,254 @@ static MS uint32_t st_GetFileSize(void *h, uint32_t *hi)
     if (hi) *hi = (uint32_t)(s.st_size >> 32);
     return (uint32_t)s.st_size;
 }
+/* _get_osfhandle bridges the CRT's file descriptors to Win32 HANDLEs, and it
+ * is not a nicety: Kontakt opens its database with the CRT, asks for the
+ * handle, and maps the file. A stub answering zero sent CreateFileMapping down
+ * the anonymous path instead, so the "database" it went on to parse was a
+ * zeroed page -- and the length prefix at the front of it, being all zeros,
+ * never terminated. The handle is borrowed, exactly as on Windows: closing it
+ * is the caller's bug, not ours, so CloseHandle leaves the descriptor alone. */
+static MSCRT intptr_t st__get_osfhandle(int fd)
+{
+    hobj *o;
+    void *h;
+    int i;
+    if (fd < 0) return -1;
+    for (i = 1; i < H_MAX; i++) {
+        o = g_hobj[i];
+        if (o && o->type == H_FILE && o->fd == fd)
+            return (intptr_t)(i + H_BIAS);
+    }
+    if (!(h = h_new(H_FILE))) return -1;
+    o = h_get(h, H_FILE);
+    o->fd = fd;
+    o->borrowed = 1;
+    return (intptr_t)h;
+}
+static MSCRT int st__open_osfhandle(intptr_t h, int flags)
+{
+    hobj *o = h_get((void *)h, H_FILE);
+    (void)flags;
+    return o ? o->fd : -1;
+}
+
+static MS int32_t st_CloseHandle(void *h);
+
+/* ------------------------------------------------------ file mapping ------
+ *
+ * Every binary in the corpus imports CreateFileMapping and MapViewOfFile, and
+ * a stub answering NULL is not a small thing: mapping a file is how a plug-in
+ * reads its sample bank, its wavetables or its preset library without copying
+ * them, and the fallback path -- when there is one -- reads the whole file into
+ * the heap instead. It is mmap either way, so this is the one place where doing
+ * it properly is less work than pretending.
+ *
+ * A mapping with no file behind it (hFile == INVALID_HANDLE_VALUE) is anonymous
+ * memory, which is how Windows programs share a block within a process; those
+ * get a name so OpenFileMapping can find them again. */
+enum {
+    W_PAGE_NOACCESS = 0x01, W_PAGE_READONLY = 0x02, W_PAGE_READWRITE = 0x04,
+    W_PAGE_WRITECOPY = 0x08, W_PAGE_EXECUTE_READ = 0x20,
+    W_PAGE_EXECUTE_READWRITE = 0x40
+};
+enum {
+    W_FILE_MAP_COPY = 1, W_FILE_MAP_WRITE = 2, W_FILE_MAP_READ = 4,
+    W_FILE_MAP_EXECUTE = 0x20
+};
+
+typedef struct { void *base; size_t len; } w32_view;
+#define W32_VIEW_MAX 256
+static w32_view g_views[W32_VIEW_MAX];
+static pthread_mutex_t g_view_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void w32_view_note(void *base, size_t len)
+{
+    int i;
+    pthread_mutex_lock(&g_view_lock);
+    for (i = 0; i < W32_VIEW_MAX; i++)
+        if (!g_views[i].base) { g_views[i].base = base; g_views[i].len = len; break; }
+    pthread_mutex_unlock(&g_view_lock);
+}
+static size_t w32_view_take(void *base)
+{
+    size_t n = 0;
+    int i;
+    pthread_mutex_lock(&g_view_lock);
+    for (i = 0; i < W32_VIEW_MAX; i++)
+        if (g_views[i].base == base) { n = g_views[i].len; g_views[i].base = NULL; break; }
+    pthread_mutex_unlock(&g_view_lock);
+    return n;
+}
+
+static int w32_prot_of(uint32_t page)
+{
+    switch (page & 0xFF) {
+    case W_PAGE_NOACCESS:              return PROT_NONE;
+    case W_PAGE_READONLY:              return PROT_READ;
+    case W_PAGE_WRITECOPY:             return PROT_READ | PROT_WRITE;
+    case W_PAGE_EXECUTE_READ:          return PROT_READ | PROT_EXEC;
+    case W_PAGE_EXECUTE_READWRITE:     return PROT_READ | PROT_WRITE | PROT_EXEC;
+    default:                           return PROT_READ | PROT_WRITE;
+    }
+}
+
+static void *w32_create_mapping(void *hfile, uint32_t page, uint32_t hi, uint32_t lo,
+                                const char *name)
+{
+    hobj *f = h_get(hfile, H_FILE);
+    uint64_t size = ((uint64_t)hi << 32) | lo;
+    void *h;
+    hobj *m;
+    int i;
+
+    /* A name already in use is that same section, which is the point of names. */
+    if (name && *name)
+        for (i = 1; i < H_MAX; i++) {
+            hobj *o = g_hobj[i];
+            if (o && o->type == H_MAP && !strcmp(o->map_name, name)) {
+                g_last_error = 183;                 /* ERROR_ALREADY_EXISTS */
+                return (void *)(intptr_t)(i + H_BIAS);
+            }
+        }
+    if (!f && hfile != (void *)(intptr_t)-1 && hfile != NULL) {
+        g_last_error = 6;
+        return NULL;
+    }
+    if (f && !size) {
+        struct stat st;
+        if (fstat(f->fd, &st) == 0) size = (uint64_t)st.st_size;
+    }
+    if (!size) { g_last_error = 87; return NULL; }
+    if (f && (page & 0xFF) != W_PAGE_READONLY) {
+        struct stat st;                              /* grow to the asked-for size */
+        if (fstat(f->fd, &st) == 0 && (uint64_t)st.st_size < size)
+            if (ftruncate(f->fd, (off_t)size) != 0) { g_last_error = 5; return NULL; }
+    }
+    if (!(h = h_new(H_MAP))) { g_last_error = 8; return NULL; }
+    m = h_get(h, H_MAP);
+    m->fd = f ? f->fd : -1;
+    if (!f) {
+        /* A section with no file behind it is still *shared*: two views of one
+         * section see the same bytes, which is the whole point of naming them.
+         * MAP_ANONYMOUS gives every view its own zeroed pages instead, and a
+         * plug-in that writes a structure through one view and reads it back
+         * through another gets zeros -- which is a null pointer as soon as the
+         * structure holds one. A memfd is anonymous memory that mmap can share. */
+        int fd = memfd_create(name && *name ? name : "peload-section", MFD_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, (off_t)size) != 0) {
+            if (fd >= 0) close(fd);
+            st_CloseHandle(h);
+            g_last_error = 8;
+            return NULL;
+        }
+        m->fd = fd;
+        m->map_own_fd = 1;
+    }
+    m->map_size = size;
+    m->map_prot = w32_prot_of(page);
+    if (name && *name) snprintf(m->map_name, sizeof m->map_name, "%s", name);
+    /* A fresh section reports no error at all, and that is load-bearing: the
+     * caller distinguishes "I created this, so I must fill it in" from "it was
+     * already there, so it already holds something" by asking GetLastError for
+     * ERROR_ALREADY_EXISTS. Leaving whatever the last call happened to set had
+     * Kontakt read an uninitialised section as though another process had
+     * written it, and walk a 7-bit length prefix off the end of the page. */
+    g_last_error = 0;
+    return h;
+}
+static MS void *st_CreateFileMappingA(void *hfile, void *sa, uint32_t page,
+                                      uint32_t hi, uint32_t lo, const char *name)
+{
+    void *h;
+    (void)sa;
+    h = w32_create_mapping(hfile, page, hi, lo, name);
+    PLOG("  [win] CreateFileMappingA(%s, %u bytes) -> %p\n",
+         name ? name : "(unnamed)", (unsigned)(((uint64_t)hi << 32) | lo), h);
+    return h;
+}
+static MS void *st_CreateFileMappingW(void *hfile, void *sa, uint32_t page,
+                                      uint32_t hi, uint32_t lo, const uint16_t *name)
+{
+    char b[64];
+    if (name) w2c(name, b, sizeof b); else b[0] = 0;
+    return st_CreateFileMappingA(hfile, sa, page, hi, lo, name ? b : NULL);
+}
+static MS void *st_OpenFileMappingA(uint32_t access, int32_t inherit, const char *name)
+{
+    int i;
+    (void)access; (void)inherit;
+    if (!name) { g_last_error = 87; return NULL; }
+    for (i = 1; i < H_MAX; i++) {
+        hobj *o = g_hobj[i];
+        if (o && o->type == H_MAP && !strcmp(o->map_name, name))
+            return (void *)(intptr_t)(i + H_BIAS);
+    }
+    g_last_error = 2;                                /* ERROR_FILE_NOT_FOUND */
+    return NULL;
+}
+static MS void *st_OpenFileMappingW(uint32_t access, int32_t inherit, const uint16_t *name)
+{ char b[64]; w2c(name, b, sizeof b); return st_OpenFileMappingA(access, inherit, b); }
+
+static MS void *st_MapViewOfFileEx(void *hmap, uint32_t access, uint32_t hi,
+                                   uint32_t lo, size_t bytes, void *want)
+{
+    hobj *m = h_get(hmap, H_MAP);
+    uint64_t off = ((uint64_t)hi << 32) | lo;
+    int prot = 0, flags;
+    void *p;
+
+    if (!m) { g_last_error = 6; return NULL; }
+    if (access & (W_FILE_MAP_READ | W_FILE_MAP_COPY)) prot |= PROT_READ;
+    if (access & (W_FILE_MAP_WRITE | W_FILE_MAP_COPY)) prot |= PROT_READ | PROT_WRITE;
+    if (access & W_FILE_MAP_EXECUTE) prot |= PROT_EXEC;
+    if (!prot) prot = m->map_prot;
+    if (!bytes) bytes = (size_t)(m->map_size - off);
+    /* FILE_MAP_COPY is copy-on-write: the file must not see the writes. */
+    flags = (access & W_FILE_MAP_COPY) ? MAP_PRIVATE : MAP_SHARED;
+    p = mmap(want, bytes, prot, flags, m->fd, (off_t)off);
+    PLOG("  [win] MapViewOfFile(fd=%d off=%llu bytes=%zu prot=%d) -> %p\n",
+         m->fd, (unsigned long long)off, bytes, prot, p == MAP_FAILED ? NULL : p);
+    if (p == MAP_FAILED) { g_last_error = 8; return NULL; }
+    w32_view_note(p, bytes);
+    return p;
+}
+static MS void *st_MapViewOfFile(void *hmap, uint32_t access, uint32_t hi,
+                                 uint32_t lo, size_t bytes)
+{ return st_MapViewOfFileEx(hmap, access, hi, lo, bytes, NULL); }
+static MS int32_t st_UnmapViewOfFile(void *base)
+{
+    size_t n = w32_view_take(base);
+    if (!n) { g_last_error = 487; return 0; }        /* ERROR_INVALID_ADDRESS */
+    return munmap(base, n) == 0;
+}
+static MS int32_t st_FlushViewOfFile(void *base, size_t bytes)
+{
+    if (!bytes) bytes = 4096;
+    return msync(base, bytes, MS_SYNC) == 0;
+}
+
+/* The 64-bit file positions, which every modern CRT uses in place of the
+ * DWORD-and-a-pointer pair. */
+static MS int32_t st_GetFileSizeEx(void *h, int64_t *size)
+{
+    hobj *o = h_get(h, H_FILE);
+    struct stat st;
+    if (!o || !size || fstat(o->fd, &st)) { g_last_error = 6; return 0; }
+    *size = (int64_t)st.st_size;
+    return 1;
+}
+static MS int32_t st_SetFilePointerEx(void *h, int64_t off, int64_t *newpos,
+                                      uint32_t whence)
+{
+    hobj *o = h_get(h, H_FILE);
+    off_t r;
+    if (!o) { g_last_error = 6; return 0; }
+    r = lseek(o->fd, (off_t)off, whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET);
+    if (r == (off_t)-1) { g_last_error = 87; return 0; }
+    if (newpos) *newpos = (int64_t)r;
+    return 1;
+}
+
 static MS int32_t st_FlushFileBuffers(void *h)
 { hobj *o = h_get(h, H_FILE); return o ? fsync(o->fd) == 0 : 1; }
 static MS uint32_t st_GetFileType(void *h) { (void)h; return 1; /* FILE_TYPE_DISK */ }
@@ -1804,6 +2278,307 @@ static MS void *st_CreateThread(void *sa, size_t stack, void *start, void *param
     if (tid) *tid = (uint32_t)(uintptr_t)o->th;
     return h;
 }
+/* The thread-pool wait registration.
+ *
+ * A stub answering zero is "registration failed", and the Concurrency runtime
+ * turns that straight into scheduler_resource_allocation_error -- the last of
+ * the four things standing between the 32-bit NI plug-ins and a working
+ * scheduler. What it asks for is genuinely simple: wait on the object, then
+ * call back on some other thread. A thread each is not how Windows does it,
+ * but it is the same contract, and the callback runs where the caller expects
+ * it to -- not on the thread that registered it. */
+typedef struct {
+    void    *obj;                 /* the handle waited on */
+    void    *cb, *ctx;            /* WAITORTIMERCALLBACK and its parameter */
+    uint32_t ms, flags;
+    volatile int stop, running;
+    pthread_t th;
+} w32_wait;
+
+#define W32_WT_EXECUTEONLYONCE 0x00000008u
+
+static void *w32_wait_thread(void *ud)
+{
+    w32_wait *w = ud;
+    teb_install();
+    while (!w->stop) {
+        uint32_t r = st_WaitForSingleObject(w->obj, w->ms);
+        if (w->stop) break;
+        if (r == 0xFFFFFFFFu) break;                      /* WAIT_FAILED */
+        if (w->cb) {
+            void (MS *cb)(void *, uint8_t) = (void (MS *)(void *, uint8_t))w->cb;
+            cb(w->ctx, (uint8_t)(r == 0x102));            /* TimerOrWaitFired */
+        }
+        if (w->flags & W32_WT_EXECUTEONLYONCE) break;
+    }
+    w->running = 0;
+    return NULL;
+}
+static MS int32_t st_RegisterWaitForSingleObject(void **out, void *obj, void *cb,
+                                                 void *ctx, uint32_t ms, uint32_t flags)
+{
+    w32_wait *w;
+    if (!out) { g_last_error = 87; return 0; }
+    if (!(w = calloc(1, sizeof *w))) { g_last_error = 8; return 0; }
+    w->obj = obj; w->cb = cb; w->ctx = ctx; w->ms = ms; w->flags = flags;
+    w->running = 1;
+    if (pthread_create(&w->th, NULL, w32_wait_thread, w) != 0) {
+        free(w);
+        g_last_error = 8;
+        PLOG("  [win] RegisterWaitForSingleObject: thread creation failed\n");
+        return 0;
+    }
+    *out = w;
+    PLOG("  [win] RegisterWaitForSingleObject(obj=%p ms=%u flags=0x%x) -> %p\n",
+         obj, ms, flags, (void *)w);
+    return 1;
+}
+/* The Ex form returns the wait handle itself rather than writing it out. */
+static MS void *st_RegisterWaitForSingleObjectEx(void *obj, void *cb, void *ctx,
+                                                 uint32_t ms, uint32_t flags)
+{
+    void *h = NULL;
+    return st_RegisterWaitForSingleObject(&h, obj, cb, ctx, ms, flags) ? h : NULL;
+}
+static MS int32_t st_UnregisterWait(void *h)
+{
+    w32_wait *w = h;
+    if (!w) { g_last_error = 6; return 0; }
+    w->stop = 1;
+    st_SetEvent(w->obj);                       /* wake it so it can notice */
+    pthread_join(w->th, NULL);
+    free(w);
+    return 1;
+}
+static MS int32_t st_UnregisterWaitEx(void *h, void *ev)
+{ (void)ev; return st_UnregisterWait(h); }
+
+/* ------------------------------------------------------- the thread pool ---
+ *
+ * The Vista thread-pool API, which msvcr120's Concurrency runtime resolves by
+ * name and then insists on: CreateThreadpoolTimer answering NULL is the last
+ * thing between the four 32-bit NI plug-ins and a scheduler, and it reports the
+ * failure as scheduler_resource_allocation_error rather than falling back to
+ * the older timer-queue calls it also knows about.
+ *
+ * One thread per object rather than a shared pool. That is not how Windows
+ * spends its threads, but the contract callers depend on is the one kept here:
+ * the callback runs on some other thread, Set arms it, Close waits for it to
+ * stop, and WaitFor... blocks until any callback in flight has finished. */
+typedef void (MS *w32_tp_timer_cb)(void *inst, void *ctx, void *timer);
+typedef void (MS *w32_tp_wait_cb)(void *inst, void *ctx, void *wait, uint32_t result);
+typedef void (MS *w32_tp_work_cb)(void *inst, void *ctx, void *work);
+
+typedef struct {
+    int              kind;             /* 0 timer, 1 wait, 2 work */
+    void            *cb, *ctx;
+    pthread_t        th;
+    pthread_mutex_t  m;
+    pthread_cond_t   c;
+    int              armed, stop, started, in_callback;
+    int64_t          due_ms;           /* timer: first fire, relative */
+    uint32_t         period_ms;        /* timer: 0 for one-shot */
+    void            *wait_obj;         /* wait: the handle */
+    int64_t          wait_ms;          /* wait: timeout, -1 for infinite */
+} w32_tp;
+
+static void w32_tp_sleep_ms(int64_t ms)
+{
+    struct timespec t;
+    if (ms <= 0) return;
+    t.tv_sec = (time_t)(ms / 1000);
+    t.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&t, NULL);
+}
+static void *w32_tp_thread(void *ud)
+{
+    w32_tp *t = ud;
+    teb_install();
+    pthread_mutex_lock(&t->m);
+    for (;;) {
+        while (!t->armed && !t->stop)
+            pthread_cond_wait(&t->c, &t->m);
+        if (t->stop) break;
+        if (t->kind == 0) {                       /* timer */
+            int64_t due = t->due_ms;
+            uint32_t period = t->period_ms;
+            pthread_mutex_unlock(&t->m);
+            w32_tp_sleep_ms(due);
+            pthread_mutex_lock(&t->m);
+            if (t->stop || !t->armed) continue;
+            t->in_callback = 1;
+            pthread_mutex_unlock(&t->m);
+            ((w32_tp_timer_cb)t->cb)(NULL, t->ctx, t);
+            pthread_mutex_lock(&t->m);
+            t->in_callback = 0;
+            pthread_cond_broadcast(&t->c);
+            if (period) t->due_ms = period; else t->armed = 0;
+        } else if (t->kind == 1) {                /* wait */
+            void *obj = t->wait_obj;
+            uint32_t ms = t->wait_ms < 0 ? 0xFFFFFFFFu : (uint32_t)t->wait_ms;
+            uint32_t r;
+            pthread_mutex_unlock(&t->m);
+            r = st_WaitForSingleObject(obj, ms);
+            pthread_mutex_lock(&t->m);
+            if (t->stop || !t->armed) continue;
+            t->armed = 0;                          /* a wait fires once */
+            t->in_callback = 1;
+            pthread_mutex_unlock(&t->m);
+            ((w32_tp_wait_cb)t->cb)(NULL, t->ctx, t, r);
+            pthread_mutex_lock(&t->m);
+            t->in_callback = 0;
+            pthread_cond_broadcast(&t->c);
+        } else {                                   /* work */
+            t->armed = 0;
+            t->in_callback = 1;
+            pthread_mutex_unlock(&t->m);
+            ((w32_tp_work_cb)t->cb)(NULL, t->ctx, t);
+            pthread_mutex_lock(&t->m);
+            t->in_callback = 0;
+            pthread_cond_broadcast(&t->c);
+        }
+    }
+    pthread_mutex_unlock(&t->m);
+    return NULL;
+}
+static void *w32_tp_new(int kind, void *cb, void *ctx)
+{
+    w32_tp *t;
+    if (!cb) { g_last_error = 87; return NULL; }
+    if (!(t = calloc(1, sizeof *t))) { g_last_error = 8; return NULL; }
+    t->kind = kind; t->cb = cb; t->ctx = ctx;
+    pthread_mutex_init(&t->m, NULL);
+    pthread_cond_init(&t->c, NULL);
+    if (pthread_create(&t->th, NULL, w32_tp_thread, t) != 0) {
+        pthread_mutex_destroy(&t->m);
+        pthread_cond_destroy(&t->c);
+        free(t);
+        g_last_error = 8;
+        return NULL;
+    }
+    t->started = 1;
+    return t;
+}
+static void w32_tp_close(void *h)
+{
+    w32_tp *t = h;
+    if (!t) return;
+    pthread_mutex_lock(&t->m);
+    t->stop = 1;
+    t->armed = 0;
+    pthread_cond_broadcast(&t->c);
+    pthread_mutex_unlock(&t->m);
+    if (t->kind == 1 && t->wait_obj) st_SetEvent(t->wait_obj);   /* break the wait */
+    if (t->started) pthread_join(t->th, NULL);
+    pthread_mutex_destroy(&t->m);
+    pthread_cond_destroy(&t->c);
+    free(t);
+}
+static void w32_tp_flush(void *h, int32_t cancel)
+{
+    w32_tp *t = h;
+    if (!t) return;
+    pthread_mutex_lock(&t->m);
+    if (cancel) t->armed = 0;
+    while (t->in_callback) pthread_cond_wait(&t->c, &t->m);
+    pthread_mutex_unlock(&t->m);
+}
+
+static MS void *st_CreateThreadpoolTimer(void *cb, void *ctx, void *env)
+{ (void)env; return w32_tp_new(0, cb, ctx); }
+static MS void st_SetThreadpoolTimer(void *h, const int64_t *due, uint32_t period,
+                                     uint32_t window)
+{
+    w32_tp *t = h;
+    (void)window;
+    if (!t) return;
+    pthread_mutex_lock(&t->m);
+    if (!due) {
+        t->armed = 0;                              /* NULL cancels it */
+    } else {
+        /* A negative FILETIME is a delay in 100 ns units; a positive one is an
+         * absolute time, which for a timer that has just been set is now. */
+        t->due_ms = (*due < 0) ? (-*due) / 10000 : 0;
+        t->period_ms = period;
+        t->armed = 1;
+    }
+    pthread_cond_broadcast(&t->c);
+    pthread_mutex_unlock(&t->m);
+}
+static MS void st_WaitForThreadpoolTimerCallbacks(void *h, int32_t cancel)
+{ w32_tp_flush(h, cancel); }
+static MS void st_CloseThreadpoolTimer(void *h) { w32_tp_close(h); }
+
+static MS void *st_CreateThreadpoolWait(void *cb, void *ctx, void *env)
+{ (void)env; return w32_tp_new(1, cb, ctx); }
+static MS void st_SetThreadpoolWait(void *h, void *obj, const int64_t *timeout)
+{
+    w32_tp *t = h;
+    if (!t) return;
+    pthread_mutex_lock(&t->m);
+    if (!obj) {
+        t->armed = 0;
+    } else {
+        t->wait_obj = obj;
+        t->wait_ms = timeout ? ((*timeout < 0) ? (-*timeout) / 10000 : 0) : -1;
+        t->armed = 1;
+    }
+    pthread_cond_broadcast(&t->c);
+    pthread_mutex_unlock(&t->m);
+}
+static MS void st_WaitForThreadpoolWaitCallbacks(void *h, int32_t cancel)
+{ w32_tp_flush(h, cancel); }
+static MS void st_CloseThreadpoolWait(void *h) { w32_tp_close(h); }
+
+static MS void *st_CreateThreadpoolWork(void *cb, void *ctx, void *env)
+{ (void)env; return w32_tp_new(2, cb, ctx); }
+static MS void st_SubmitThreadpoolWork(void *h)
+{
+    w32_tp *t = h;
+    if (!t) return;
+    pthread_mutex_lock(&t->m);
+    t->armed = 1;
+    pthread_cond_broadcast(&t->c);
+    pthread_mutex_unlock(&t->m);
+}
+static MS void st_WaitForThreadpoolWorkCallbacks(void *h, int32_t cancel)
+{ w32_tp_flush(h, cancel); }
+static MS void st_CloseThreadpoolWork(void *h) { w32_tp_close(h); }
+
+/* A full barrier across every thread. __sync_synchronize is the local half of
+ * it; the cross-thread half is what the kernel call does on Windows, and there
+ * is no portable equivalent -- but every caller uses this to publish writes it
+ * has already made, which the barrier does cover. */
+static MS void st_FlushProcessWriteBuffers(void) { __sync_synchronize(); }
+
+/* The stack guarantee is a guard-page reservation for handling stack overflow;
+ * with no structured overflow handling to run, reporting success is truthful
+ * about what the caller can then rely on. */
+static MS int32_t st_SetThreadStackGuarantee(uint32_t *bytes)
+{ if (bytes) *bytes = 0; return 1; }
+
+/* QueueUserWorkItem: run it on a thread of its own and let it go. */
+typedef struct { void *fn, *ctx; } w32_workitem;
+static void *w32_work_thread(void *ud)
+{
+    w32_workitem it = *(w32_workitem *)ud;
+    free(ud);
+    teb_install();
+    if (it.fn) ((uint32_t (MS *)(void *))it.fn)(it.ctx);
+    return NULL;
+}
+static MS int32_t st_QueueUserWorkItem(void *fn, void *ctx, uint32_t flags)
+{
+    pthread_t t;
+    w32_workitem *it;
+    (void)flags;
+    if (!(it = malloc(sizeof *it))) { g_last_error = 8; return 0; }
+    it->fn = fn; it->ctx = ctx;
+    if (pthread_create(&t, NULL, w32_work_thread, it) != 0) { free(it); g_last_error = 8; return 0; }
+    pthread_detach(t);
+    return 1;
+}
+
 static MS void st_ExitThread(uint32_t code) { (void)code; pthread_exit(NULL); }
 static MS int32_t st_GetExitCodeThread(void *h, uint32_t *code)
 { (void)h; if (code) *code = 0; return 1; }
@@ -2350,6 +3125,108 @@ static MS uint32_t st_GetFullPathNameW(const uint16_t *nm, uint32_t len,
     }
     return need;
 }
+
+/* The "Ex" locale calls take a locale *name* rather than an LCID. This host has
+ * one locale, so the name is not consulted -- but answering zero meant the CRT
+ * believed the call had failed, which is a different thing from "the C locale
+ * says the same". */
+static MS int32_t st_LCMapStringEx(const uint16_t *loc, uint32_t f,
+                                   const uint16_t *in, int32_t inlen,
+                                   uint16_t *out, int32_t outlen,
+                                   void *ver, void *reserved, intptr_t sort)
+{
+    (void)loc; (void)ver; (void)reserved; (void)sort;
+    return st_LCMapStringW(0x0409, f, in, inlen, out, outlen);
+}
+static MS int32_t st_CompareStringEx(const uint16_t *loc, uint32_t f,
+                                     const uint16_t *a, int32_t na,
+                                     const uint16_t *b, int32_t nb,
+                                     void *ver, void *reserved, intptr_t sort)
+{
+    (void)loc; (void)ver; (void)reserved; (void)sort;
+    return st_CompareStringW(0x0409, f, a, na, b, nb);
+}
+static MS int32_t st_GetLocaleInfoEx(const uint16_t *loc, uint32_t t,
+                                     uint16_t *out, int32_t n)
+{ (void)loc; return st_GetLocaleInfoW(0x0409, t, out, n); }
+
+static MS uint32_t st_GetSystemDirectoryW(uint16_t *buf, uint32_t n)
+{
+    char a[512];
+    uint32_t need = st_GetSystemDirectoryA(a, sizeof a);
+    uint32_t i;
+    if (!need) return 0;
+    if (!buf || n <= need) return need + 1;
+    for (i = 0; i < need; i++) buf[i] = (uint16_t)(unsigned char)a[i];
+    buf[need] = 0;
+    return need;
+}
+
+/* Dates and times, formatted the way the C locale would. A plug-in stamping a
+ * preset with the time got an empty string and wrote a file with no date in it. */
+static MS int32_t st_GetDateFormatA(uint32_t lcid, uint32_t flags, const void *st,
+                                    const char *fmt, char *out, int32_t n)
+{
+    time_t now = time(NULL);
+    struct tm tmv;
+    char b[128];
+    (void)lcid; (void)st; (void)fmt;
+    localtime_r(&now, &tmv);
+    strftime(b, sizeof b, (flags & 0x1) ? "%d/%m/%Y" : "%d %B %Y", &tmv);
+    if (!out || n <= (int32_t)strlen(b)) return (int32_t)strlen(b) + 1;
+    memcpy(out, b, strlen(b) + 1);
+    return (int32_t)strlen(b) + 1;
+}
+static MS int32_t st_GetDateFormatW(uint32_t lcid, uint32_t flags, const void *st,
+                                    const uint16_t *fmt, uint16_t *out, int32_t n)
+{
+    char b[128];
+    int32_t need, i;
+    (void)fmt;
+    need = st_GetDateFormatA(lcid, flags, st, NULL, b, (int32_t)sizeof b);
+    if (!out || n < need) return need;
+    for (i = 0; b[i]; i++) out[i] = (uint16_t)(unsigned char)b[i];
+    out[i] = 0;
+    return need;
+}
+static MS int32_t st_GetTimeFormatA(uint32_t lcid, uint32_t flags, const void *st,
+                                    const char *fmt, char *out, int32_t n)
+{
+    time_t now = time(NULL);
+    struct tm tmv;
+    char b[128];
+    (void)lcid; (void)st; (void)fmt; (void)flags;
+    localtime_r(&now, &tmv);
+    strftime(b, sizeof b, "%H:%M:%S", &tmv);
+    if (!out || n <= (int32_t)strlen(b)) return (int32_t)strlen(b) + 1;
+    memcpy(out, b, strlen(b) + 1);
+    return (int32_t)strlen(b) + 1;
+}
+static MS int32_t st_GetTimeFormatW(uint32_t lcid, uint32_t flags, const void *st,
+                                    const uint16_t *fmt, uint16_t *out, int32_t n)
+{
+    char b[128];
+    int32_t need, i;
+    (void)fmt;
+    need = st_GetTimeFormatA(lcid, flags, st, NULL, b, (int32_t)sizeof b);
+    if (!out || n < need) return need;
+    for (i = 0; b[i]; i++) out[i] = (uint16_t)(unsigned char)b[i];
+    out[i] = 0;
+    return need;
+}
+
+/* Nothing is connected to a pipe here, and "no data waiting" is the truthful
+ * answer -- distinct from the stub's "the call failed", which a reader loop
+ * treats as a broken pipe. */
+static MS int32_t st_PeekNamedPipe(void *h, void *buf, uint32_t n, uint32_t *read_,
+                                   uint32_t *avail, uint32_t *left)
+{
+    (void)h; (void)buf; (void)n;
+    if (read_) *read_ = 0;
+    if (avail) *avail = 0;
+    if (left)  *left  = 0;
+    return 1;
+}
 static MS uint32_t st_GetCurrentDirectoryW(uint32_t n, uint16_t *buf)
 { char c[512]; uint32_t i = 0; if (!getcwd(c, sizeof c)) return 0;
   for (; c[i] && i + 1 < n; i++) buf[i] = (uint8_t)c[i]; if (n) buf[i] = 0; return i; }
@@ -2781,7 +3658,287 @@ static MSCRT long   st_strtol(const char *s, char **e, int b) { return strtol(s,
 static MSCRT double st_strtod(const char *s, char **e)        { return strtod(s, e); }
 static MSCRT int    st_rand(void)                  { return rand(); }
 static MSCRT void   st_srand(unsigned s)           { srand(s); }
-static MSCRT char  *st_getenv(const char *n)       { (void)n; return NULL; }
+/* ------------------------------------------------------------ environment --
+ *
+ * getenv and _wgetenv used to answer NULL for everything, and NULL is not a
+ * neutral answer. NI Massive asserts and calls ExitProcess(1) when
+ * _wgetenv(L"CommonProgramFiles(x86)") comes back empty, because on Windows
+ * that variable is always set -- the plug-in never loads and there is nothing
+ * in the log to say why.
+ *
+ * The values are the same ~/.peload prefix the shell folders use, so a path
+ * built from %APPDATA% and one from SHGetFolderPath land in the same place, and
+ * the directories are created as they are handed out so that opening one works.
+ * The host's own environment is deliberately not exposed: a plug-in reading
+ * PATH or HOME would get Linux paths where it expects Windows ones. Anything a
+ * plug-in sets for itself is kept and takes precedence. */
+
+static const char *w32_guest_dir(const char *leaf, char *buf, size_t n)
+{
+    const char *home = getenv("HOME");
+    char t[512];
+    size_t i;
+    if (!home || !*home) home = "/tmp";
+    if (leaf && *leaf) snprintf(buf, n, "%s/.peload/%s", home, leaf);
+    else               snprintf(buf, n, "%s/.peload", home);
+    snprintf(t, sizeof t, "%s", buf);
+    for (i = 1; t[i]; i++)
+        if (t[i] == '/') { t[i] = 0; mkdir(t, 0755); t[i] = '/'; }
+    mkdir(t, 0755);
+    return buf;
+}
+
+typedef struct {
+    char     name[64];
+    char     value[512];
+    uint16_t wide[512];
+    int      wide_ok;
+} w32_envvar;
+static w32_envvar g_env[W32_ENV_MAX];
+static int g_nenv;
+static pthread_mutex_t g_env_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void w32_env_put(const char *name, const char *value)
+{
+    int i;
+    for (i = 0; i < g_nenv; i++)
+        if (!strcasecmp(g_env[i].name, name)) break;
+    if (i == g_nenv) {
+        if (g_nenv >= W32_ENV_MAX) return;
+        snprintf(g_env[i].name, sizeof g_env[i].name, "%s", name);
+        g_nenv++;
+    }
+    snprintf(g_env[i].value, sizeof g_env[i].value, "%s", value ? value : "");
+    g_env[i].wide_ok = 0;
+}
+static void w32_env_dir(const char *name, const char *leaf)
+{
+    char buf[512];
+    w32_env_put(name, w32_guest_dir(leaf, buf, sizeof buf));
+}
+
+static void w32_env_build(void)
+{
+    char win[512], buf[600];
+    const char *user = getenv("USER");
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+
+    w32_env_dir("ProgramFiles",            "Program Files");
+    w32_env_dir("ProgramW6432",            "Program Files");
+    w32_env_dir("ProgramFiles(x86)",       "Program Files (x86)");
+    w32_env_dir("CommonProgramFiles",      "Program Files/Common Files");
+    w32_env_dir("CommonProgramW6432",      "Program Files/Common Files");
+    w32_env_dir("CommonProgramFiles(x86)", "Program Files (x86)/Common Files");
+    w32_env_dir("ProgramData",             "ProgramData");
+    w32_env_dir("ALLUSERSPROFILE",         "ProgramData");
+    w32_env_dir("APPDATA",                 "AppData/Roaming");
+    w32_env_dir("LOCALAPPDATA",            "AppData/Local");
+    w32_env_dir("USERPROFILE",             "");
+    w32_env_dir("PUBLIC",                  "Public");
+    w32_env_dir("TEMP",                    "Temp");
+    w32_env_dir("TMP",                     "Temp");
+    w32_guest_dir("Windows", win, sizeof win);
+    w32_env_put("SystemRoot", win);
+    w32_env_put("windir", win);
+    snprintf(buf, sizeof buf, "%s/system32", win);
+    w32_env_put("PATH", buf);
+    snprintf(buf, sizeof buf, "%s/system32/cmd.exe", win);
+    w32_env_put("ComSpec", buf);
+    w32_env_put("SystemDrive", "C:");
+    w32_env_put("HOMEDRIVE",   "C:");
+    w32_env_put("HOMEPATH",    "\\");
+    w32_env_put("OS",          "Windows_NT");
+    w32_env_put("PATHEXT",     ".COM;.EXE;.BAT;.CMD");
+    w32_env_put("PROCESSOR_ARCHITECTURE", sizeof(void *) == 8 ? "AMD64" : "x86");
+    snprintf(buf, sizeof buf, "%ld", ncpu > 0 ? ncpu : 1);
+    w32_env_put("NUMBER_OF_PROCESSORS", buf);
+    if (gethostname(buf, sizeof buf) != 0) snprintf(buf, sizeof buf, "PELOAD");
+    buf[sizeof buf - 1] = 0;
+    { char *d = strchr(buf, '.'); if (d) *d = 0; }
+    w32_env_put("COMPUTERNAME", buf);
+    w32_env_put("USERDOMAIN",   buf);
+    w32_env_put("USERNAME", (user && *user) ? user : "user");
+}
+
+static const char *w32_env_find(const char *name)
+{
+    static int built;
+    const char *r = NULL;
+    int i;
+    if (!name || !*name) return NULL;
+    pthread_mutex_lock(&g_env_lock);
+    if (!built) { built = 1; w32_env_build(); }
+    for (i = 0; i < g_nenv; i++)
+        if (!strcasecmp(g_env[i].name, name)) { r = g_env[i].value; break; }
+    pthread_mutex_unlock(&g_env_lock);
+    return r;
+}
+static const uint16_t *w32_env_find_w(const char *name)
+{
+    const uint16_t *r = NULL;
+    int i;
+    if (!w32_env_find(name)) return NULL;             /* also builds the table */
+    pthread_mutex_lock(&g_env_lock);
+    for (i = 0; i < g_nenv; i++)
+        if (!strcasecmp(g_env[i].name, name)) {
+            if (!g_env[i].wide_ok) {
+                size_t k;
+                for (k = 0; g_env[i].value[k] && k < 511; k++)
+                    g_env[i].wide[k] = (uint16_t)(unsigned char)g_env[i].value[k];
+                g_env[i].wide[k] = 0;
+                g_env[i].wide_ok = 1;
+            }
+            r = g_env[i].wide;
+            break;
+        }
+    pthread_mutex_unlock(&g_env_lock);
+    return r;
+}
+static void w32_env_store(const char *name, const char *value)
+{
+    if (!name || !*name) return;
+    w32_env_find("OS");                                /* make sure it is built */
+    pthread_mutex_lock(&g_env_lock);
+    w32_env_put(name, value);
+    pthread_mutex_unlock(&g_env_lock);
+}
+
+static MS uint32_t st_GetEnvironmentVariableA(const char *name, char *buf, uint32_t n)
+{
+    const char *v = w32_env_find(name);
+    uint32_t need;
+    if (!v) { g_last_error = 203; return 0; }          /* ERROR_ENVVAR_NOT_FOUND */
+    need = (uint32_t)strlen(v);
+    if (!buf || n <= need) return need + 1;
+    memcpy(buf, v, need + 1);
+    return need;
+}
+static MS uint32_t st_GetEnvironmentVariableW(const uint16_t *name, uint16_t *buf, uint32_t n)
+{
+    char nb[128];
+    const uint16_t *v;
+    uint32_t need = 0;
+    w2c(name, nb, sizeof nb);
+    v = w32_env_find_w(nb);
+    if (!v) { g_last_error = 203; return 0; }
+    while (v[need]) need++;
+    if (!buf || n <= need) return need + 1;
+    memcpy(buf, v, (need + 1) * sizeof *v);
+    return need;
+}
+static MS int32_t st_SetEnvironmentVariableA(const char *name, const char *value)
+{ w32_env_store(name, value); return 1; }
+static MS int32_t st_SetEnvironmentVariableW(const uint16_t *name, const uint16_t *value)
+{
+    char nb[128], vb[512];
+    w2c(name, nb, sizeof nb);
+    if (value) w2c(value, vb, sizeof vb); else vb[0] = 0;
+    w32_env_store(nb, value ? vb : "");
+    return 1;
+}
+
+/* %NAME% substitution, which is how a plug-in written for Windows spells a
+ * path in a configuration file. An unknown name is left as it stands, which is
+ * what Windows does. */
+static MS uint32_t st_ExpandEnvironmentStringsA(const char *src, char *dst, uint32_t n)
+{
+    char out[2048];
+    size_t o = 0;
+    const char *p = src;
+    if (!src) return 0;
+    while (*p && o < sizeof out - 1) {
+        const char *e;
+        if (*p == '%' && (e = strchr(p + 1, '%')) != NULL) {
+            char nb[128];
+            size_t len = (size_t)(e - p - 1);
+            const char *v;
+            if (len < sizeof nb) {
+                memcpy(nb, p + 1, len);
+                nb[len] = 0;
+                if ((v = w32_env_find(nb)) != NULL) {
+                    o += (size_t)snprintf(out + o, sizeof out - o, "%s", v);
+                    p = e + 1;
+                    continue;
+                }
+            }
+        }
+        out[o++] = *p++;
+    }
+    out[o] = 0;
+    if (!dst || n <= o) return (uint32_t)o + 1;
+    memcpy(dst, out, o + 1);
+    return (uint32_t)o + 1;
+}
+static MS uint32_t st_ExpandEnvironmentStringsW(const uint16_t *src, uint16_t *dst, uint32_t n)
+{
+    char sb[2048], ob[2048];
+    uint32_t need;
+    size_t i;
+    if (!src) return 0;
+    w2c(src, sb, sizeof sb);
+    st_ExpandEnvironmentStringsA(sb, ob, sizeof ob);
+    need = (uint32_t)strlen(ob);
+    if (!dst || n <= need) return need + 1;
+    for (i = 0; i < need; i++) dst[i] = (uint16_t)(unsigned char)ob[i];
+    dst[need] = 0;
+    return need + 1;
+}
+
+/* The environment as one block of NAME=VALUE strings, double-NUL terminated. */
+static const char *w32_env_block(void)
+{
+    static char block[W32_ENV_MAX * 600];
+    static int built;
+    size_t o = 0;
+    int i;
+    if (built) return block;
+    w32_env_find("OS");
+    pthread_mutex_lock(&g_env_lock);
+    for (i = 0; i < g_nenv && o < sizeof block - 2; i++)
+        o += (size_t)snprintf(block + o, sizeof block - o - 1, "%s=%s",
+                              g_env[i].name, g_env[i].value) + 1;
+    block[o] = 0;
+    built = 1;
+    pthread_mutex_unlock(&g_env_lock);
+    return block;
+}
+static MS void *st_GetEnvironmentStringsA(void) { return (void *)w32_env_block(); }
+static MS int32_t st_FreeEnvironmentStringsA(void *p) { (void)p; return 1; }
+
+static MSCRT int st__putenv(const char *s)
+{
+    char nb[128];
+    const char *eq;
+    if (!s || !(eq = strchr(s, '='))) return -1;
+    if ((size_t)(eq - s) >= sizeof nb) return -1;
+    memcpy(nb, s, (size_t)(eq - s));
+    nb[eq - s] = 0;
+    w32_env_store(nb, eq + 1);
+    return 0;
+}
+static MSCRT int st_getenv_s(size_t *need, char *buf, size_t n, const char *name)
+{
+    const char *v = w32_env_find(name);
+    if (need) *need = v ? strlen(v) + 1 : 0;
+    if (!v) { if (buf && n) buf[0] = 0; return 0; }
+    if (!buf || n < strlen(v) + 1) return 34;          /* ERANGE */
+    memcpy(buf, v, strlen(v) + 1);
+    return 0;
+}
+static MSCRT int st__dupenv_s(char **out, size_t *len, const char *name)
+{
+    const char *v = w32_env_find(name);
+    if (!out) return 22;                               /* EINVAL */
+    *out = NULL;
+    if (len) *len = 0;
+    if (!v) return 0;
+    if (!(*out = (char *)w32_strdup_guest(v))) return 12;   /* ENOMEM */
+    if (len) *len = strlen(v) + 1;
+    return 0;
+}
+
+static MSCRT char  *st_getenv(const char *n)
+{ return (char *)w32_env_find(n); }
 static MSCRT char  *st_strerror(int e)             { return strerror(e); }
 /* CLOCKS_PER_SEC is 1000 on Windows and 1000000 here, so the raw value would
  * be a thousand times too large to any caller dividing by the Windows one. */
@@ -2789,6 +3946,285 @@ static MSCRT long   st_clock(void)
 { return (long)(clock() / (CLOCKS_PER_SEC / 1000)); }
 
 /* ------------------------------------------------------------ the table */
+
+/* ------------------------------------------------- dialogs and the shell ---
+ *
+ * These are the last of the imports every binary in the corpus asks for. A stub
+ * answering zero reads as "the user pressed Cancel", which is harmless but also
+ * means File > Open never opens anything. zenity is a real chooser and it is
+ * what a desktop Linux box has; with no display, or with zenity absent, the
+ * answer falls back to Cancel, which is the same thing a plug-in sees when
+ * someone changes their mind. */
+#include <sys/wait.h>
+static int w32_run_capture(char *const argv[], char *out, size_t n)
+{
+    int fds[2];
+    pid_t pid;
+    ssize_t got = 0;
+    int status = -1;
+
+    if (out && n) out[0] = 0;
+    if (pipe(fds) != 0) return -1;
+    if ((pid = fork()) < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        dup2(fds[1], 1);
+        close(fds[0]);
+        close(fds[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(fds[1]);
+    if (out && n > 1) {
+        got = read(fds[0], out, n - 1);
+        if (got < 0) got = 0;
+        out[got] = 0;
+        while (got > 0 && (out[got - 1] == '\n' || out[got - 1] == '\r'))
+            out[--got] = 0;
+    }
+    close(fds[0]);
+    waitpid(pid, &status, 0);
+    return (status == 0) ? 0 : -1;
+}
+static int w32_have_display(void)
+{
+    const char *a = getenv("DISPLAY"), *b = getenv("WAYLAND_DISPLAY");
+    return (a && *a) || (b && *b);
+}
+
+typedef struct {
+    uint32_t    lStructSize;
+    void       *hwndOwner;
+    void       *hInstance;
+    const void *lpstrFilter;
+    void       *lpstrCustomFilter;
+    uint32_t    nMaxCustFilter;
+    uint32_t    nFilterIndex;
+    void       *lpstrFile;
+    uint32_t    nMaxFile;
+    void       *lpstrFileTitle;
+    uint32_t    nMaxFileTitle;
+    const void *lpstrInitialDir;
+    const void *lpstrTitle;
+    uint32_t    Flags;
+    uint16_t    nFileOffset, nFileExtension;
+    const void *lpstrDefExt;
+    intptr_t    lCustData;
+    void       *lpfnHook;
+    const void *lpTemplateName;
+} W_OPENFILENAME;
+
+static int w32_file_dialog(W_OPENFILENAME *o, int save, int wide)
+{
+    char picked[1024];
+    char *argv[6];
+    int n = 0;
+
+    if (!o || !o->lpstrFile || !w32_have_display()) return 0;
+    argv[n++] = (char *)"zenity";
+    argv[n++] = (char *)"--file-selection";
+    if (save) { argv[n++] = (char *)"--save"; argv[n++] = (char *)"--confirm-overwrite"; }
+    argv[n] = NULL;
+    if (w32_run_capture(argv, picked, sizeof picked) != 0 || !picked[0]) return 0;
+    if (wide) {
+        uint16_t *w = (uint16_t *)o->lpstrFile;
+        uint32_t i, max = o->nMaxFile ? o->nMaxFile : 260;
+        for (i = 0; picked[i] && i + 1 < max; i++) w[i] = (uint16_t)(unsigned char)picked[i];
+        w[i] = 0;
+    } else {
+        snprintf((char *)o->lpstrFile, o->nMaxFile ? o->nMaxFile : 260, "%s", picked);
+    }
+    return 1;
+}
+static MS int32_t st_GetOpenFileNameW(W_OPENFILENAME *o) { return w32_file_dialog(o, 0, 1); }
+static MS int32_t st_GetSaveFileNameW(W_OPENFILENAME *o) { return w32_file_dialog(o, 1, 1); }
+static MS int32_t st_GetOpenFileNameA(W_OPENFILENAME *o) { return w32_file_dialog(o, 0, 0); }
+static MS int32_t st_GetSaveFileNameA(W_OPENFILENAME *o) { return w32_file_dialog(o, 1, 0); }
+
+/* The folder picker comes in two halves: one returns an opaque item list, the
+ * other turns it into a path. The path itself is the only thing either end
+ * actually holds, so that is what the "item list" is. */
+static MS void *st_SHBrowseForFolderW(void *bi)
+{
+    char picked[1024], *dup;
+    char *argv[] = { (char *)"zenity", (char *)"--file-selection",
+                     (char *)"--directory", NULL };
+    (void)bi;
+    if (!w32_have_display()) return NULL;
+    if (w32_run_capture(argv, picked, sizeof picked) != 0 || !picked[0]) return NULL;
+    if (!(dup = malloc(strlen(picked) + 1))) return NULL;
+    strcpy(dup, picked);
+    return dup;
+}
+static MS void *st_SHBrowseForFolderA(void *bi) { return st_SHBrowseForFolderW(bi); }
+static MS int32_t st_SHGetPathFromIDListW(void *idl, uint16_t *out)
+{
+    const char *p = idl;
+    size_t i;
+    if (!p || !out) return 0;
+    for (i = 0; p[i] && i < 259; i++) out[i] = (uint16_t)(unsigned char)p[i];
+    out[i] = 0;
+    return 1;
+}
+static MS int32_t st_SHGetPathFromIDListA(void *idl, char *out)
+{
+    if (!idl || !out) return 0;
+    snprintf(out, 260, "%s", (const char *)idl);
+    return 1;
+}
+
+/* CHOOSECOLOR: the picked value goes back through rgbResult, which sits after
+ * the four pointer-or-DWORD fields at the head of the structure. */
+typedef struct {
+    uint32_t lStructSize;
+    void    *hwndOwner;
+    void    *hInstance;
+    uint32_t rgbResult;
+    uint32_t *lpCustColors;
+    uint32_t Flags;
+    intptr_t lCustData;
+    void    *lpfnHook;
+    const void *lpTemplateName;
+} W_CHOOSECOLOR;
+
+static MS int32_t st_ChooseColorW(W_CHOOSECOLOR *cc)
+{
+    char picked[128];
+    unsigned r = 0, g = 0, b = 0;
+    char *argv[] = { (char *)"zenity", (char *)"--color-selection", NULL };
+    if (!cc || !w32_have_display()) return 0;
+    if (w32_run_capture(argv, picked, sizeof picked) != 0) return 0;
+    if (sscanf(picked, "rgb(%u,%u,%u)", &r, &g, &b) != 3 &&
+        sscanf(picked, "#%2x%2x%2x", &r, &g, &b) != 3)
+        return 0;
+    cc->rgbResult = (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16);
+    return 1;
+}
+static MS int32_t st_ChooseColorA(W_CHOOSECOLOR *cc) { return st_ChooseColorW(cc); }
+
+/* ShellExecute opens a document or a link with whatever the desktop uses for
+ * it. Only the verbs that mean "open this" are honoured; "print" and the rest
+ * report that no association was found, which is a documented answer. */
+static MS void *st_ShellExecuteA(void *hwnd, const char *verb, const char *file,
+                                 const char *params, const char *dir, int32_t show)
+{
+    pid_t pid;
+    (void)hwnd; (void)params; (void)dir; (void)show;
+    if (!file || !*file) return (void *)(intptr_t)2;         /* ERROR_FILE_NOT_FOUND */
+    if (verb && *verb && strcasecmp(verb, "open") && strcasecmp(verb, "explore"))
+        return (void *)(intptr_t)31;                         /* SE_ERR_NOASSOC */
+    PLOG("  [win] ShellExecute(\"%s\")\n", file);
+    /* Only when someone is actually looking. A plug-in that opens its manual or
+     * a "buy the full version" page during start-up would otherwise spray
+     * browser windows across an unattended corpus run, and a headless machine
+     * has nothing for xdg-open to hand the document to anyway. */
+    if (!w32_have_display()) return (void *)(intptr_t)42;
+    if ((pid = fork()) == 0) {
+        char *argv[3];
+        argv[0] = (char *)"xdg-open";
+        argv[1] = (char *)file;
+        argv[2] = NULL;
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    if (pid < 0) return (void *)(intptr_t)8;                 /* out of memory */
+    return (void *)(intptr_t)42;                             /* > 32 means success */
+}
+static MS void *st_ShellExecuteW(void *hwnd, const uint16_t *verb, const uint16_t *file,
+                                 const uint16_t *params, const uint16_t *dir, int32_t show)
+{
+    char v[64], f[1024];
+    if (verb) w2c(verb, v, sizeof v); else v[0] = 0;
+    if (file) w2c(file, f, sizeof f); else f[0] = 0;
+    (void)params; (void)dir;
+    return st_ShellExecuteA(hwnd, verb ? v : NULL, file ? f : NULL, NULL, NULL, show);
+}
+
+/* ------------------------------------------------------------- wininet ----
+ *
+ * Answered as a machine with no network, deliberately and consistently. A
+ * plug-in reaching for the internet is checking for updates or calling home,
+ * and a host has no business doing either on its behalf; what it does have a
+ * duty to do is give a coherent answer, because the stub's zeros are not one --
+ * a NULL handle from InternetOpen followed by a "success" from InternetReadFile
+ * is a state no caller has a path for. Offline is a state every one of them
+ * handles, because it happens on real machines. */
+#define H_INET ((void *)(uintptr_t)0x494E4554u)              /* 'INET' */
+
+static MS void *st_InternetOpenA(const char *agent, uint32_t access,
+                                 const char *proxy, const char *bypass, uint32_t f)
+{ (void)agent;(void)access;(void)proxy;(void)bypass;(void)f; return H_INET; }
+static MS void *st_InternetOpenW(const uint16_t *agent, uint32_t access,
+                                 const uint16_t *proxy, const uint16_t *bypass, uint32_t f)
+{ (void)agent;(void)access;(void)proxy;(void)bypass;(void)f; return H_INET; }
+static MS int32_t st_InternetGetConnectedState(uint32_t *flags, uint32_t reserved)
+{
+    (void)reserved;
+    if (flags) *flags = 0;
+    g_last_error = 2250;                                     /* ERROR_NOT_CONNECTED */
+    return 0;
+}
+static MS void *st_InternetConnectA(void *h, const char *host, uint16_t port,
+                                    const char *user, const char *pass,
+                                    uint32_t svc, uint32_t f, uintptr_t ctx)
+{
+    (void)h;(void)host;(void)port;(void)user;(void)pass;(void)svc;(void)f;(void)ctx;
+    g_last_error = 12029;                                    /* ERROR_INTERNET_CANNOT_CONNECT */
+    return NULL;
+}
+static MS void *st_InternetConnectW(void *h, const uint16_t *host, uint16_t port,
+                                    const uint16_t *user, const uint16_t *pass,
+                                    uint32_t svc, uint32_t f, uintptr_t ctx)
+{
+    (void)host; (void)user; (void)pass;
+    return st_InternetConnectA(h, NULL, port, NULL, NULL, svc, f, ctx);
+}
+static MS void *st_InternetOpenUrlA(void *h, const char *url, const char *hdrs,
+                                    uint32_t hlen, uint32_t f, uintptr_t ctx)
+{
+    (void)h;(void)url;(void)hdrs;(void)hlen;(void)f;(void)ctx;
+    g_last_error = 12029;
+    return NULL;
+}
+static MS void *st_HttpOpenRequestA(void *conn, const char *verb, const char *obj,
+                                    const char *ver, const char *ref,
+                                    const char **accept, uint32_t f, uintptr_t ctx)
+{
+    (void)conn;(void)verb;(void)obj;(void)ver;(void)ref;(void)accept;(void)f;(void)ctx;
+    g_last_error = 12029;
+    return NULL;
+}
+static MS int32_t st_HttpSendRequestA(void *req, const char *hdrs, uint32_t hlen,
+                                      void *opt, uint32_t olen)
+{ (void)req;(void)hdrs;(void)hlen;(void)opt;(void)olen; g_last_error = 12029; return 0; }
+static MS int32_t st_HttpSendRequestW(void *req, const uint16_t *hdrs, uint32_t hlen,
+                                      void *opt, uint32_t olen)
+{ (void)req;(void)hdrs;(void)hlen;(void)opt;(void)olen; g_last_error = 12029; return 0; }
+static MS int32_t st_HttpQueryInfoA(void *req, uint32_t level, void *buf,
+                                    uint32_t *len, uint32_t *idx)
+{ (void)req;(void)level;(void)buf;(void)idx; if (len) *len = 0; g_last_error = 12150; return 0; }
+static MS int32_t st_InternetReadFile(void *h, void *buf, uint32_t n, uint32_t *got)
+{
+    (void)h; (void)buf; (void)n;
+    if (got) *got = 0;                                       /* zero read is EOF */
+    return 1;
+}
+static MS int32_t st_InternetQueryDataAvailable(void *h, uint32_t *avail,
+                                                uint32_t f, uintptr_t ctx)
+{ (void)h;(void)f;(void)ctx; if (avail) *avail = 0; return 1; }
+static MS int32_t st_InternetSetOptionA(void *h, uint32_t opt, void *buf, uint32_t n)
+{ (void)h;(void)opt;(void)buf;(void)n; return 1; }
+static MS int32_t st_InternetCloseHandle(void *h) { (void)h; return 1; }
+
+/* Console reads see end-of-file: there is no console attached. */
+static MS int32_t st_ReadConsoleW(void *h, void *buf, uint32_t n, uint32_t *got, void *r)
+{ (void)h;(void)buf;(void)n;(void)r; if (got) *got = 0; return 1; }
+static MS int32_t st_WriteConsoleA(void *h, const void *b, uint32_t n, uint32_t *w, void *r)
+{
+    (void)h; (void)r;
+    if (b && n) fwrite(b, 1, n, stderr);
+    if (w) *w = n;
+    return 1;
+}
 
 #define S(dll, name) { dll, #name, (void *)st_##name }
 /* C++ operator new/delete have no identifier spelling, so they are entered by
@@ -3163,6 +4599,236 @@ static long w32_ncpu(void)
 {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? n : 1;
+}
+
+/* The processor topology, which the Concurrency runtime's ResourceManager
+ * builds its scheduler out of before main ever runs.
+ *
+ * A stub answering zero here does not mean "one processor": it means the call
+ * failed, and ConcRT's answer to a failed topology query is to throw
+ * Concurrency::scheduler_resource_allocation_error out of a static
+ * initialiser. That is where all four 32-bit NI plug-ins stopped, with nothing
+ * in the log but an exception nobody caught. */
+static uintptr_t w32_cpu_mask(void)
+{
+    long n = w32_ncpu();
+    if (n >= (long)(sizeof(uintptr_t) * 8)) return ~(uintptr_t)0;
+    return ((uintptr_t)1 << n) - 1;
+}
+static MS int32_t st_GetProcessAffinityMask(void *h, uintptr_t *proc, uintptr_t *sys)
+{
+    (void)h;
+    if (!proc || !sys) { g_last_error = 87; return 0; }
+    *proc = *sys = w32_cpu_mask();
+    return 1;
+}
+static MS int32_t st_SetProcessAffinityMask(void *h, uintptr_t mask)
+{ (void)h; (void)mask; return 1; }
+/* Returns the *previous* mask, and zero means failure. */
+static MS uintptr_t st_SetThreadAffinityMask(void *h, uintptr_t mask)
+{ (void)h; (void)mask; return w32_cpu_mask(); }
+static MS int32_t st_SetThreadIdealProcessor(void *h, uint32_t n)
+{ (void)h; (void)n; return 0; }
+static MS uint32_t st_GetActiveProcessorCount(uint16_t group)
+{ (void)group; return (uint32_t)w32_ncpu(); }
+static MS uint16_t st_GetActiveProcessorGroupCount(void) { return 1; }
+static MS uint32_t st_GetMaximumProcessorCount(uint16_t group)
+{ (void)group; return (uint32_t)w32_ncpu(); }
+static MS uint16_t st_GetMaximumProcessorGroupCount(void) { return 1; }
+static MS int32_t st_GetNumaHighestNodeNumber(uint32_t *n)
+{ if (!n) { g_last_error = 87; return 0; } *n = 0; return 1; }
+static MS int32_t st_GetNumaNodeProcessorMask(uint8_t node, uint64_t *mask)
+{
+    if (!mask) { g_last_error = 87; return 0; }
+    *mask = node ? 0 : (uint64_t)w32_cpu_mask();
+    return 1;
+}
+static MS uint32_t st_GetCurrentProcessorNumber(void)
+{
+#ifdef _GNU_SOURCE
+    int c = sched_getcpu();
+    return c < 0 ? 0 : (uint32_t)c;
+#else
+    return 0;
+#endif
+}
+
+/* The processor-group API, which is where the Concurrency runtime actually
+ * stopped. ConcRT resolves SetThreadGroupAffinity and GetThreadGroupAffinity
+ * through GetProcAddress and, finding neither, throws
+ * scheduler_resource_allocation_error rather than falling back -- so answering
+ * NULL for them is not the harmless "this is an older Windows" it looks like.
+ * One group holding every processor is the truthful answer for any machine
+ * with 64 or fewer cores, which is the only shape KAFFINITY can describe. */
+enum { W_RelationProcessorPackage = 3, W_RelationGroup = 4, W_RelationAll = 0xFFFF };
+
+typedef struct { uintptr_t Mask; uint16_t Group; uint16_t Reserved[3]; } W_GROUP_AFFINITY;
+
+typedef struct {
+    uint8_t  Flags, EfficiencyClass, Reserved[20];
+    uint16_t GroupCount;
+    W_GROUP_AFFINITY GroupMask[1];
+} W_PROC_REL;
+typedef struct {
+    uint32_t NodeNumber;
+    uint8_t  Reserved[20];
+    W_GROUP_AFFINITY GroupMask;
+} W_NUMA_REL;
+typedef struct {
+    uint8_t   MaximumProcessorCount, ActiveProcessorCount, Reserved[38];
+    uintptr_t ActiveProcessorMask;
+} W_GROUP_INFO;
+typedef struct {
+    uint16_t MaximumGroupCount, ActiveGroupCount;
+    uint8_t  Reserved[20];
+    W_GROUP_INFO GroupInfo[1];
+} W_GROUP_REL;
+typedef struct {
+    uint32_t Relationship, Size;
+    union { W_PROC_REL Processor; W_NUMA_REL NumaNode; W_GROUP_REL Group; } u;
+} W_SLPIEX;
+
+static void w32_group_affinity(W_GROUP_AFFINITY *g)
+{
+    memset(g, 0, sizeof *g);
+    g->Mask = w32_cpu_mask();
+    g->Group = 0;
+}
+
+/* Entries are variable length and packed nose to tail, each carrying its own
+ * Size; the caller walks them by that field, so it has to be right. */
+static uint32_t w32_slpiex_emit(uint32_t rel, uint8_t *out, uint32_t room, uint32_t *used)
+{
+    long n = w32_ncpu(), i;
+    uint32_t total = 0;
+    int want_core = (rel == W_RelationProcessorCore || rel == W_RelationAll);
+    int want_numa = (rel == W_RelationNumaNode || rel == W_RelationAll);
+    int want_pkg  = (rel == W_RelationProcessorPackage || rel == W_RelationAll);
+    int want_grp  = (rel == W_RelationGroup || rel == W_RelationAll);
+
+    if (n > 64) n = 64;
+#define W32_EMIT(kind, sz)                                                     \
+    do {                                                                       \
+        uint32_t need = (uint32_t)(offsetof(W_SLPIEX, u) + (sz));              \
+        need = (need + 7u) & ~7u;                                              \
+        if (out && total + need <= room) {                                     \
+            W_SLPIEX *e = (W_SLPIEX *)(out + total);                           \
+            memset(e, 0, need);                                                \
+            e->Relationship = (kind);                                          \
+            e->Size = need;                                                    \
+            cur = e;                                                           \
+        } else cur = NULL;                                                     \
+        total += need;                                                         \
+    } while (0)
+
+    {
+        W_SLPIEX *cur;
+        if (want_core)
+            for (i = 0; i < n; i++) {
+                W32_EMIT(W_RelationProcessorCore, sizeof(W_PROC_REL));
+                if (cur) {
+                    cur->u.Processor.Flags = 0;          /* no SMT sibling */
+                    cur->u.Processor.GroupCount = 1;
+                    cur->u.Processor.GroupMask[0].Mask = (uintptr_t)1 << i;
+                }
+            }
+        if (want_numa) {
+            W32_EMIT(W_RelationNumaNode, sizeof(W_NUMA_REL));
+            if (cur) w32_group_affinity(&cur->u.NumaNode.GroupMask);
+        }
+        if (want_pkg) {
+            W32_EMIT(W_RelationProcessorPackage, sizeof(W_PROC_REL));
+            if (cur) {
+                cur->u.Processor.GroupCount = 1;
+                w32_group_affinity(&cur->u.Processor.GroupMask[0]);
+            }
+        }
+        if (want_grp) {
+            W32_EMIT(W_RelationGroup, sizeof(W_GROUP_REL));
+            if (cur) {
+                cur->u.Group.MaximumGroupCount = 1;
+                cur->u.Group.ActiveGroupCount  = 1;
+                cur->u.Group.GroupInfo[0].MaximumProcessorCount = (uint8_t)n;
+                cur->u.Group.GroupInfo[0].ActiveProcessorCount  = (uint8_t)n;
+                cur->u.Group.GroupInfo[0].ActiveProcessorMask   = w32_cpu_mask();
+            }
+        }
+    }
+#undef W32_EMIT
+    if (used) *used = total;
+    return total;
+}
+
+static MS int32_t st_GetLogicalProcessorInformationEx(uint32_t rel, void *buf, uint32_t *len)
+{
+    uint32_t need;
+    if (!len) { g_last_error = 87; return 0; }
+    need = w32_slpiex_emit(rel, NULL, 0, NULL);
+    if (!need) { g_last_error = 87; return 0; }
+    if (!buf || *len < need) {
+        *len = need;
+        g_last_error = 122;                      /* ERROR_INSUFFICIENT_BUFFER */
+        return 0;
+    }
+    w32_slpiex_emit(rel, (uint8_t *)buf, *len, len);
+    return 1;
+}
+static MS int32_t st_GetThreadGroupAffinity(void *h, W_GROUP_AFFINITY *g)
+{
+    (void)h;
+    if (!g) { g_last_error = 87; return 0; }
+    w32_group_affinity(g);
+    return 1;
+}
+static MS int32_t st_SetThreadGroupAffinity(void *h, const W_GROUP_AFFINITY *g,
+                                            W_GROUP_AFFINITY *prev)
+{
+    (void)h; (void)g;
+    if (prev) w32_group_affinity(prev);
+    return 1;
+}
+static MS int32_t st_GetNumaNodeProcessorMaskEx(uint16_t node, W_GROUP_AFFINITY *g)
+{
+    if (!g) { g_last_error = 87; return 0; }
+    w32_group_affinity(g);
+    if (node) { g->Mask = 0; return 0; }
+    return 1;
+}
+static MS int32_t st_GetThreadIdealProcessorEx(void *h, void *p)
+{
+    (void)h;
+    if (!p) { g_last_error = 87; return 0; }
+    memset(p, 0, 4);                             /* PROCESSOR_NUMBER */
+    return 1;
+}
+static MS int32_t st_SetThreadIdealProcessorEx(void *h, void *p, void *prev)
+{ (void)h; (void)p; if (prev) memset(prev, 0, 4); return 1; }
+
+/* PROCESSOR_NUMBER: group, number, reserved. */
+static MS void st_GetCurrentProcessorNumberEx(void *p)
+{
+    if (!p) return;
+    memset(p, 0, 4);
+    ((uint8_t *)p)[2] = (uint8_t)st_GetCurrentProcessorNumber();
+}
+static MS int32_t st_GetNumaProximityNodeEx(uint32_t prox, uint16_t *node)
+{ (void)prox; if (!node) { g_last_error = 87; return 0; } *node = 0; return 1; }
+static MS int32_t st_GetNumaAvailableMemoryNodeEx(uint16_t node, uint64_t *bytes)
+{
+    if (!bytes) { g_last_error = 87; return 0; }
+    *bytes = node ? 0 : (uint64_t)sysconf(_SC_AVPHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE);
+    return node ? 0 : 1;
+}
+static MS int32_t st_GetNumaNodeNumberFromHandle(void *h, uint16_t *node)
+{ (void)h; if (!node) { g_last_error = 87; return 0; } *node = 0; return 1; }
+static MS int32_t st_QueryThreadCycleTime(void *h, uint64_t *cycles)
+{
+    struct timespec t;
+    (void)h;
+    if (!cycles) { g_last_error = 87; return 0; }
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    *cycles = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+    return 1;
 }
 
 static MS int32_t st_GetLogicalProcessorInformation(void *buf, uint32_t *len)
@@ -3565,11 +5231,21 @@ MS void peload_cxx_throw_c(void *object, const ms_throwinfo *ti, cxx_throw_state
 }
 #define st__CxxThrowException peload_cxx_throw
 #else
+/* On i386 a C++ throw is an ordinary Windows exception, and this host already
+ * dispatches those: RaiseException walks the fs:[0] chain and hands the record
+ * to each __CxxFrameHandler in turn. So _CxxThrowException is what MSVC's own
+ * is -- the three parameters that make an exception record a C++ one -- rather
+ * than the abort that used to stand here, which took down every i386 plug-in
+ * that opened an editor and threw inside it. */
 static MS void st__CxxThrowException(void *object, const void *throwinfo)
 {
-    (void)object; (void)throwinfo;
-    fprintf(stderr, "[win] a C++ exception was thrown and dispatch is not "
-                    "implemented on this architecture\n");
+    uintptr_t a[3];
+    a[0] = 0x19930520u;                       /* EH_MAGIC_NUMBER1 */
+    a[1] = (uintptr_t)object;
+    a[2] = (uintptr_t)throwinfo;
+    st_RaiseException(0xE06D7363u, 1 /* EXCEPTION_NONCONTINUABLE */, 3, a);
+    /* A C++ throw that nobody catches does not come back. */
+    fprintf(stderr, "[win] C++ throw returned from dispatch -- nothing caught it\n");
     fflush(stderr);
     abort();
 }
@@ -4465,9 +6141,9 @@ static MSCRT int st__set_doserrno(uint32_t v) { g_crt_doserrno = v; return 0; }
  * destructor and what(), in the order the compiler emitted the calls against. */
 typedef struct { void **vft; const char *what; int dofree; } cxx_exception;
 
-static MS const char *st_cxx_exc_what(cxx_exception *e)
+static MSTHIS const char *st_cxx_exc_what(cxx_exception *e)
 { return e && e->what ? e->what : "Unknown exception"; }
-static MS void *st_cxx_exc_del(cxx_exception *e, unsigned flags)
+static MSTHIS void *st_cxx_exc_del(cxx_exception *e, unsigned flags)
 {
     (void)flags;
     if (e && e->dofree && e->what) { free((void *)e->what); e->what = NULL; }
@@ -4475,12 +6151,12 @@ static MS void *st_cxx_exc_del(cxx_exception *e, unsigned flags)
 }
 static void *g_cxx_exc_vft[2] = { (void *)st_cxx_exc_del, (void *)st_cxx_exc_what };
 
-static MS cxx_exception *st_cxx_exc_ctor(cxx_exception *e)
+static MSTHIS cxx_exception *st_cxx_exc_ctor(cxx_exception *e)
 { if (e) { e->vft = g_cxx_exc_vft; e->what = NULL; e->dofree = 0; } return e; }
 
 /* exception(char const * const &) -- the argument is a *reference* to a pointer,
  * so it arrives as a pointer to the string pointer, not the string. */
-static MS cxx_exception *st_cxx_exc_ctor_s(cxx_exception *e, const char *const *msg)
+static MSTHIS cxx_exception *st_cxx_exc_ctor_s(cxx_exception *e, const char *const *msg)
 {
     if (!e) return e;
     e->vft = g_cxx_exc_vft;
@@ -4488,9 +6164,9 @@ static MS cxx_exception *st_cxx_exc_ctor_s(cxx_exception *e, const char *const *
     e->dofree = 0;                        /* the caller's literal, not ours */
     return e;
 }
-static MS cxx_exception *st_cxx_exc_ctor_si(cxx_exception *e, const char *const *msg, int noalloc)
+static MSTHIS cxx_exception *st_cxx_exc_ctor_si(cxx_exception *e, const char *const *msg, int noalloc)
 { (void)noalloc; return st_cxx_exc_ctor_s(e, msg); }
-static MS cxx_exception *st_cxx_exc_copy(cxx_exception *e, const cxx_exception *o)
+static MSTHIS cxx_exception *st_cxx_exc_copy(cxx_exception *e, const cxx_exception *o)
 {
     if (!e) return e;
     e->vft = g_cxx_exc_vft;
@@ -4498,7 +6174,7 @@ static MS cxx_exception *st_cxx_exc_copy(cxx_exception *e, const cxx_exception *
     e->dofree = 0;                        /* share, so neither frees the other's */
     return e;
 }
-static MS void st_cxx_exc_dtor(cxx_exception *e)
+static MSTHIS void st_cxx_exc_dtor(cxx_exception *e)
 { if (e && e->dofree && e->what) { free((void *)e->what); e->what = NULL; } }
 
 /* ------------------------------------------------------- process token ----- */
@@ -5283,6 +6959,19 @@ static MS void *st_FindFirstFileA(const char *spec, W32_FIND_DATAA *out)
     if (h != (void *)(intptr_t)-1 && out) find_store_a(out, name, attrs, size, mt);
     return h;
 }
+
+/* FindFirstFileEx is what a modern CRT calls; the extra arguments select a
+ * cheaper info level and an optional filter, and neither changes which files
+ * come back for the "*" patterns plug-ins use. Answering NULL because of the
+ * spelling alone meant a plug-in enumerating its own preset directory found
+ * nothing there. fSearchOp is a hint on Windows as well -- documented as not
+ * always honoured -- so matching on the pattern is within the contract. */
+static MS void *st_FindFirstFileExW(const uint16_t *spec, int32_t level, void *out,
+                                    int32_t op, void *filter, uint32_t flags)
+{ (void)level; (void)op; (void)filter; (void)flags; return st_FindFirstFileW(spec, out); }
+static MS void *st_FindFirstFileExA(const char *spec, int32_t level, void *out,
+                                    int32_t op, void *filter, uint32_t flags)
+{ (void)level; (void)op; (void)filter; (void)flags; return st_FindFirstFileA(spec, out); }
 static MS int32_t st_FindNextFileW(void *h, W32_FIND_DATAW *out)
 {
     w32_find *f = find_get(h);
@@ -5328,18 +7017,40 @@ static MS int32_t st_FindClose(void *h)
 /* ------------------------------------------------------------ odds again --- */
 
 static MSCRT uint16_t *st__wgetenv(const uint16_t *name)
-{ (void)name; return NULL; }               /* as getenv already does */
+{
+    char nb[128];
+    if (!name) return NULL;
+    w2c(name, nb, sizeof nb);
+    return (uint16_t *)w32_env_find_w(nb);
+}
+static MSCRT int st__wdupenv_s(uint16_t **out, size_t *len, const uint16_t *name)
+{
+    char nb[128];
+    const uint16_t *v;
+    size_t n = 0;
+    if (!out) return 22;
+    *out = NULL;
+    if (len) *len = 0;
+    if (!name) return 0;
+    w2c(name, nb, sizeof nb);
+    if (!(v = w32_env_find_w(nb))) return 0;
+    while (v[n]) n++;
+    if (!(*out = (uint16_t *)w32_alloc((n + 1) * 2, 0))) return 12;
+    memcpy(*out, v, (n + 1) * 2);
+    if (len) *len = n + 1;
+    return 0;
+}
 
 /* type_info comparison is by name: MSVC guarantees one descriptor per type
  * within an image, but not across images, and the runtime compares the mangled
  * name for exactly that reason. Returning an uninitialised register here decides
  * type identity at random. */
 typedef struct { void *vft, *spare; char name[1]; } w32_type_info;
-static MSCRT int8_t st_type_info_eq(const w32_type_info *a, const w32_type_info *b)
+static MSTHIS int8_t st_type_info_eq(const w32_type_info *a, const w32_type_info *b)
 { return (int8_t)(a == b || (a && b && !strcmp(a->name, b->name))); }
-static MSCRT int8_t st_type_info_ne(const w32_type_info *a, const w32_type_info *b)
+static MSTHIS int8_t st_type_info_ne(const w32_type_info *a, const w32_type_info *b)
 { return (int8_t)!st_type_info_eq(a, b); }
-static MSCRT const char *st_type_info_name(const w32_type_info *t)
+static MSTHIS const char *st_type_info_name(const w32_type_info *t)
 { return t ? t->name : ""; }
 
 static MS int32_t st_RegDeleteValueA(void *k, const char *name)
@@ -7210,6 +8921,13 @@ static const winstub g_stubs[] = {
     /* printf family, narrow and wide */
     { "msvcrt.dll", "_setjmp", (void *)st__setjmp },
     { "msvcrt.dll", "_setjmpex", (void *)st__setjmpex },
+    /* _setjmp3 is what the MSVC compiler emits for setjmp() on i386, and it has
+     * to come from the same pair as longjmp: with the real CRT loaded, its
+     * _setjmp3 wrote the buffer and our longjmp found no magic in it and
+     * refused to jump -- which took NI Absynth and FM8 down. The extra
+     * arguments describe unwind state we do not keep, and the buffer is in the
+     * same place either way. */
+    { "msvcrt.dll", "_setjmp3", (void *)st__setjmp },
     { "msvcrt.dll", "longjmp", (void *)st_longjmp },
     { "msvcrt.dll", "_beginthreadex", (void *)st__beginthreadex },
     { "msvcrt.dll", "_endthreadex", (void *)st__endthreadex },
@@ -7460,6 +9178,71 @@ static const winstub g_stubs[] = {
      * later, and reached here through crt_alias. */
     { "msvcrt.dll", "__RTDynamicCast", (void *)st___RTDynamicCast },
     S("kernel32.dll", GetLogicalProcessorInformation),
+    S("kernel32.dll", GetProcessAffinityMask), S("kernel32.dll", SetProcessAffinityMask),
+    S("kernel32.dll", SetThreadAffinityMask), S("kernel32.dll", SetThreadIdealProcessor),
+    S("kernel32.dll", GetActiveProcessorCount), S("kernel32.dll", GetActiveProcessorGroupCount),
+    S("kernel32.dll", GetMaximumProcessorCount), S("kernel32.dll", GetMaximumProcessorGroupCount),
+    S("kernel32.dll", GetNumaHighestNodeNumber), S("kernel32.dll", GetNumaNodeProcessorMask),
+    S("kernel32.dll", GetCurrentProcessorNumber),
+    S("kernel32.dll", GetLogicalProcessorInformationEx),
+    S("kernel32.dll", GetThreadGroupAffinity), S("kernel32.dll", SetThreadGroupAffinity),
+    S("kernel32.dll", GetNumaNodeProcessorMaskEx),
+    S("kernel32.dll", GetThreadIdealProcessorEx), S("kernel32.dll", SetThreadIdealProcessorEx),
+    /* Dialogs, the shell and a network that is honestly not there. */
+    S("comdlg32.dll", GetOpenFileNameW), S("comdlg32.dll", GetSaveFileNameW),
+    S("comdlg32.dll", GetOpenFileNameA), S("comdlg32.dll", GetSaveFileNameA),
+    S("comdlg32.dll", ChooseColorW), S("comdlg32.dll", ChooseColorA),
+    S("shell32.dll", ShellExecuteA), S("shell32.dll", ShellExecuteW),
+    S("shell32.dll", SHBrowseForFolderW), S("shell32.dll", SHBrowseForFolderA),
+    S("shell32.dll", SHGetPathFromIDListW), S("shell32.dll", SHGetPathFromIDListA),
+    S("wininet.dll", InternetOpenA), S("wininet.dll", InternetOpenW),
+    S("wininet.dll", InternetConnectA), S("wininet.dll", InternetConnectW),
+    S("wininet.dll", InternetOpenUrlA), S("wininet.dll", InternetGetConnectedState),
+    S("wininet.dll", HttpOpenRequestA), S("wininet.dll", HttpSendRequestA),
+    S("wininet.dll", HttpSendRequestW), S("wininet.dll", HttpQueryInfoA),
+    S("wininet.dll", InternetReadFile), S("wininet.dll", InternetQueryDataAvailable),
+    S("wininet.dll", InternetSetOptionA), S("wininet.dll", InternetCloseHandle),
+    S("kernel32.dll", ReadConsoleW), S("kernel32.dll", WriteConsoleA),
+    S("kernel32.dll", FindFirstFileExA), S("kernel32.dll", FindFirstFileExW),
+    S("kernel32.dll", GetSystemDirectoryW),
+    S("kernel32.dll", LCMapStringEx), S("kernel32.dll", CompareStringEx),
+    S("kernel32.dll", GetLocaleInfoEx),
+    S("kernel32.dll", GetDateFormatA), S("kernel32.dll", GetDateFormatW),
+    S("kernel32.dll", GetTimeFormatA), S("kernel32.dll", GetTimeFormatW),
+    S("kernel32.dll", PeekNamedPipe),
+    /* File mapping and the 64-bit file positions -- see the block above them. */
+    S("msvcrt.dll", _get_osfhandle), S("msvcrt.dll", _open_osfhandle),
+    S("kernel32.dll", CreateFileMappingA), S("kernel32.dll", CreateFileMappingW),
+    S("kernel32.dll", OpenFileMappingA), S("kernel32.dll", OpenFileMappingW),
+    S("kernel32.dll", MapViewOfFile), S("kernel32.dll", MapViewOfFileEx),
+    S("kernel32.dll", UnmapViewOfFile), S("kernel32.dll", FlushViewOfFile),
+    S("kernel32.dll", GetFileSizeEx), S("kernel32.dll", SetFilePointerEx),
+    S("kernel32.dll", GetThreadTimes), S("kernel32.dll", GetProcessTimes),
+    S("kernel32.dll", GetSystemTimes), S("kernel32.dll", QueryProcessCycleTime),
+    S("kernel32.dll", CreateThreadpoolTimer), S("kernel32.dll", SetThreadpoolTimer),
+    S("kernel32.dll", WaitForThreadpoolTimerCallbacks), S("kernel32.dll", CloseThreadpoolTimer),
+    S("kernel32.dll", CreateThreadpoolWait), S("kernel32.dll", SetThreadpoolWait),
+    S("kernel32.dll", WaitForThreadpoolWaitCallbacks), S("kernel32.dll", CloseThreadpoolWait),
+    S("kernel32.dll", CreateThreadpoolWork), S("kernel32.dll", SubmitThreadpoolWork),
+    S("kernel32.dll", WaitForThreadpoolWorkCallbacks), S("kernel32.dll", CloseThreadpoolWork),
+    S("kernel32.dll", FlushProcessWriteBuffers), S("kernel32.dll", SetThreadStackGuarantee),
+    S("kernel32.dll", RegisterWaitForSingleObject),
+    S("kernel32.dll", RegisterWaitForSingleObjectEx),
+    S("kernel32.dll", UnregisterWait), S("kernel32.dll", UnregisterWaitEx),
+    S("kernel32.dll", QueueUserWorkItem),
+    S("advapi32.dll", RegisterTraceGuidsW), S("advapi32.dll", RegisterTraceGuidsA),
+    S("advapi32.dll", UnregisterTraceGuids), S("advapi32.dll", GetTraceLoggerHandle),
+    S("advapi32.dll", GetTraceEnableLevel), S("advapi32.dll", GetTraceEnableFlags),
+    S("advapi32.dll", TraceEvent),
+    S("advapi32.dll", EventRegister), S("advapi32.dll", EventUnregister),
+    S("advapi32.dll", EventWrite), S("advapi32.dll", EventWriteTransfer),
+    S("advapi32.dll", EventEnabled), S("advapi32.dll", EventProviderEnabled),
+    S("advapi32.dll", EventSetInformation), S("advapi32.dll", EventActivityIdControl),
+    S("combase.dll", RoInitialize), S("combase.dll", RoUninitialize),
+    S("combase.dll", RoGetActivationFactory), S("combase.dll", RoActivateInstance),
+    S("kernel32.dll", GetCurrentProcessorNumberEx), S("kernel32.dll", QueryThreadCycleTime),
+    S("kernel32.dll", GetNumaProximityNodeEx), S("kernel32.dll", GetNumaAvailableMemoryNodeEx),
+    S("kernel32.dll", GetNumaNodeNumberFromHandle),
     { "powrprof.dll", "CallNtPowerInformation", (void *)st_CallNtPowerInformation },
     S("kernel32.dll", IsWow64Process),
     S("kernel32.dll", GetUserDefaultLangID), S("kernel32.dll", GetSystemDefaultLangID),
@@ -7565,6 +9348,8 @@ static const winstub g_stubs[] = {
     S("msvcrt.dll", atoi), S("msvcrt.dll", atof), S("msvcrt.dll", strtol),
     S("msvcrt.dll", strtod), S("msvcrt.dll", rand), S("msvcrt.dll", srand),
     S("msvcrt.dll", getenv), S("msvcrt.dll", strerror), S("msvcrt.dll", clock),
+    S("msvcrt.dll", _putenv), S("msvcrt.dll", getenv_s),
+    S("msvcrt.dll", _dupenv_s), S("msvcrt.dll", _wdupenv_s),
     /* Wine's debug entry points, imported by any Wine-built runtime DLL the
      * real-dependency loader maps in. */
     S("ntdll.dll", __wine_dbg_get_channel_flags),
@@ -7678,6 +9463,11 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", GetProcAddress), S("kernel32.dll", DisableThreadLibraryCalls),
     S("kernel32.dll", GetCommandLineA), S("kernel32.dll", GetCommandLineW),
     S("kernel32.dll", GetEnvironmentStringsW), S("kernel32.dll", FreeEnvironmentStringsW),
+    /* The environment a Windows plug-in expects to find -- see w32_env_build. */
+    S("kernel32.dll", GetEnvironmentStringsA), S("kernel32.dll", FreeEnvironmentStringsA),
+    S("kernel32.dll", GetEnvironmentVariableA), S("kernel32.dll", GetEnvironmentVariableW),
+    S("kernel32.dll", SetEnvironmentVariableA), S("kernel32.dll", SetEnvironmentVariableW),
+    S("kernel32.dll", ExpandEnvironmentStringsA), S("kernel32.dll", ExpandEnvironmentStringsW),
     S("kernel32.dll", GetStartupInfoW), S("kernel32.dll", GetStdHandle),
     S("kernel32.dll", GetStartupInfoA), S("kernel32.dll", GetSystemDirectoryA),
     S("kernel32.dll", GetWindowsDirectoryA), S("kernel32.dll", GetPrivateProfileStringA),

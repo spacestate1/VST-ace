@@ -36,24 +36,33 @@ obscurely. To turn it on:
 There is no equivalent in the `.rpm` yet; on Fedora, 32-bit plug-ins still want
 a build from source.
 
-The Microsoft C++ runtime is reimplemented rather than required. Every symbol
-the plug-in corpus imports from `msvcp120.dll` is provided natively, and the
-plug-ins that used to need it -- NI Absynth 5, FM8 and Kontakt 5 -- render
-byte-identical audio with no such DLL present. Nothing in the corpus needs
-`runtime/` or `runtime32/` any more.
+The Microsoft C++ runtime is reimplemented rather than required at 64-bit.
+Every symbol the plug-in corpus imports from `msvcp120.dll` is provided
+natively, and the plug-ins that used to need it -- NI Absynth 5, FM8, Kontakt 5
+and Massive -- render byte-identical audio with no such DLL present. The
+`runtime/` directory can stay empty.
 
-The two directories still ship, empty, as an escape hatch for a plug-in built
-against a runtime that is not yet covered -- `msvcp140.dll` is the known gap:
+`runtime32/` is a different matter: the reimplementation is 64-bit only, so the
+four 32-bit Native Instruments plug-ins still want Microsoft's `msvcp120.dll`
+and `msvcr120.dll` there. Everything else in the corpus loads at both widths
+with both directories empty.
 
-    /usr/lib/vst-ace/runtime/      x86-64 DLLs, for the 64-bit hosts
-    /usr/lib/vst-ace/runtime32/    i386 DLLs, for peload32
+    /usr/lib/vst-ace/runtime/      x86-64 DLLs -- nothing in the corpus needs these
+    /usr/lib/vst-ace/runtime32/    i386 DLLs -- msvcp120.dll and msvcr120.dll,
+                                   for the 32-bit NI plug-ins
 
-Anything dropped there is searched next to the installed binaries, so there is
-nothing to configure; `PELOAD_DLL_PATH` overrides the search if the DLLs live
-somewhere else. A real DLL is preferred over the built-in implementation
-wherever one is found. Wine's builds of the same DLLs are refused rather than
-loaded: they are compiled against Wine's own `ntdll` and fault inside their own
-startup.
+Both are searched next to the installed binaries, so there is nothing to
+configure; `PELOAD_DLL_PATH` overrides the search if the DLLs live somewhere
+else, and a real DLL is preferred over the built-in implementation wherever one
+is found. Wine's builds of the same DLLs are refused rather than loaded: they
+are compiled against Wine's own `ntdll` and fault inside their own startup.
+
+Some plug-ins also want their own factory content, which is a separate thing
+from a runtime and is not ours to ship. NI Massive is the one in the corpus:
+`tables.dat` from its installer goes in
+`~/.peload/Program Files (x86)/Common Files/Native Instruments/Massive/` for the
+64-bit build and `~/.peload/AppData/Roaming/Native Instruments/Massive/` for the
+32-bit one. Without it the plug-in loads nothing and says so in the log.
 
 An installed copy has no tree to find the plug-in corpus in. Both windows take
 the folders to search under **Settings > Plug-in Folders**, each filed under the

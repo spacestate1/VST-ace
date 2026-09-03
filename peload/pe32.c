@@ -138,9 +138,14 @@ static void teb_clear_all_slots(void) { }
 static int teb_install(void)
 {
     struct user_desc d;
-    teb32 *t = calloc(1, sizeof *t);
+    teb32 *t;
 
-    if (!t) return -1;
+    /* Once per thread. i386 has three GDT slots for thread-local bases and
+     * glibc has already taken one, so a second call on the same thread spends
+     * a slot it does not need and a third fails outright with ESRCH -- which is
+     * what "set_thread_area: No such process" is. */
+    if (g_teb) return 0;
+    if (!(t = calloc(1, sizeof *t))) return -1;
     if (posix_memalign((void **)&t->raw, 4096, TEB_SIZE)) { free(t); return -1; }
     memset(t->raw, 0, TEB_SIZE);
     *(uint32_t *)(t->raw + TEB_SELF_32)    = (uint32_t)(uintptr_t)t->raw;
@@ -173,14 +178,32 @@ static int teb_install(void)
     d.read_exec_only = 0;
     d.seg_not_present = 0;
     d.useable      = 1;
-    if (syscall(SYS_set_thread_area, &d) != 0) {
-        perror("set_thread_area");
-        free(t->raw); free(t);
-        return -1;
-    }
-    /* Load the returned selector into %fs. */
-    {
+    if (syscall(SYS_set_thread_area, &d) == 0) {
         unsigned short sel = (unsigned short)((d.entry_number << 3) | 3);
+        __asm__ volatile ("movw %0, %%fs" :: "r"(sel));
+    } else {
+        /* The GDT has three thread-local slots and glibc has one of them, so a
+         * process with enough threads runs out and set_thread_area answers
+         * ESRCH. The LDT has 8192 entries for the whole process, which is what
+         * Windows-on-i386 emulators use for exactly this reason: one selector
+         * per thread, allocated once and never reused, because two threads with
+         * the same selector would share a TEB. */
+        static int next_ldt = 1;
+        int idx = __atomic_fetch_add(&next_ldt, 1, __ATOMIC_SEQ_CST);
+        unsigned short sel;
+        if (idx >= 8192) {
+            fprintf(stderr, "peload: out of LDT selectors for thread-local storage\n");
+            free(t->raw); free(t);
+            return -1;
+        }
+        d.entry_number = idx;
+        if (syscall(SYS_modify_ldt, 1, &d, sizeof d) != 0) {
+            fprintf(stderr, "peload: no thread-local selector for this thread (%s)\n",
+                    strerror(errno));
+            free(t->raw); free(t);
+            return -1;
+        }
+        sel = (unsigned short)((idx << 3) | 7);          /* LDT, ring 3 */
         __asm__ volatile ("movw %0, %%fs" :: "r"(sel));
     }
     g_teb = t;
