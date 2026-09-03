@@ -269,6 +269,456 @@ static MS void *mp_Lockit_ctor(void *self, int32_t kind)
 static MS void *mp_Lockit_dtor(void *self)
 { pthread_mutex_unlock(&mp_lockit); return self; }
 
+/* ---- the containers' debug base ------------------------------------------
+ *
+ * Every MSVC container derives from _Container_base12, which in a debug build
+ * keeps a list of the iterators pointing into it. In a release build -- which
+ * is what a shipping plug-in is -- that list is never populated, and the whole
+ * family folds to almost nothing. Read out of msvcp120: the constructor is
+ * `and QWORD PTR [rcx],0` and a return, and the destructor, _Orphan_all and
+ * _Container_base0::_Swap_all are one shared `ret`, which the linker folded
+ * together because they are the same instruction.
+ *
+ * Three of the eight entry points the Native Instruments plug-ins actually
+ * reach are in here, and they are the easy three. */
+typedef struct { void *proxy; } mp_container_base;
+
+static MS void *mp_cb_ctor(mp_container_base *self)
+{ if (self) self->proxy = NULL; return self; }
+static MS void mp_cb_noop(void *self) { (void)self; }
+/* _Getpfirst: the proxy's iterator list, which is always empty here. */
+static MS void *mp_cb_getpfirst(mp_container_base *self)
+{ return (self && self->proxy) ? (char *)self->proxy + 8 : NULL; }
+static MS void mp_cb_swap(mp_container_base *a, mp_container_base *b)
+{ if (a && b) { void *t = a->proxy; a->proxy = b->proxy; b->proxy = t; } }
+
+/* ---- the iostream tier ---------------------------------------------------
+ *
+ * Enough of it to construct the objects a plug-in builds and to leave them in
+ * the state its own inlined code reads back. Not a working iostream: nothing
+ * here formats a number or moves a character. That is deliberate -- the three
+ * plug-ins that need this construct a stream and one manipulator between them,
+ * and never write through it.
+ *
+ * The layouts are msvcp120's, read with objdump:
+ *
+ *   basic_streambuf<char>   0x68 bytes. The get and put areas are held twice:
+ *                           the pointers themselves at +0x08/+0x10 (first),
+ *                           +0x28/+0x30 (next), +0x48/+0x4c (count), and
+ *                           *pointers to those* at +0x18/+0x20, +0x38/+0x40,
+ *                           +0x50/+0x58, which is how a derived streambuf
+ *                           shares them. The locale is at +0x60.
+ *
+ *   ios_base                +0x18 _Fmtfl, initialised to 0x201; +0x20 _Prec,
+ *                           to 6; +0x08, +0x14, +0x28, +0x30, +0x38, +0x40
+ *                           zeroed. basic_ios adds _Mystrbuf at +0x48 and
+ *                           _Tiestr at +0x50.
+ *
+ *   basic_iostream<char>    has virtual bases, so it is laid out through
+ *                           vbtables rather than by offset: a vbptr at +0x00
+ *                           whose table is {0, 32}, a second at +0x10 whose
+ *                           table is {0, 16}, and the basic_ios subobject at
+ *                           +0x20 -- which is where both of those point, 0+32
+ *                           and 0x10+16. The constructor writes both vbptrs,
+ *                           the vftable at the virtual base, zeroes the
+ *                           istream character count at +0x08, and calls
+ *                           basic_ios::init.
+ *
+ * Getting a vbtable wrong is not a subtle failure: the plug-in's own inlined
+ * member access computes the subobject address from it, so every read after
+ * that lands somewhere else entirely. They are reproduced exactly. */
+
+/* The vbtables, which must exist as data the object can point at. */
+static const int32_t mp_vbtable_iostream[2] = { 0, 32 };
+static const int32_t mp_vbtable_ostream[2]  = { 0, 16 };
+
+typedef struct {
+    void    *vftable;          /* +0x00 */
+    void    *pad08;            /* +0x08 */
+    int32_t  state;            /* +0x10  _Mystate */
+    int32_t  except;           /* +0x14  _Except  */
+    int32_t  fmtfl;            /* +0x18 */
+    int32_t  pad1c;
+    int64_t  prec;             /* +0x20 */
+    int64_t  wide;             /* +0x28 */
+    void    *pad30, *pad38, *pad40;
+    void    *strbuf;           /* +0x48  _Mystrbuf */
+    void    *tiestr;           /* +0x50  _Tiestr   */
+    int32_t  fillch;           /* +0x58 */
+    int32_t  pad5c;
+} mp_ios;
+
+static MS void *mp_ios_ctor(mp_ios *self);
+
+/* ios_base::_Init, with the constants the real one writes. */
+static void mp_ios_init_fields(mp_ios *b)
+{
+    if (!b) return;
+    b->pad08 = NULL;
+    b->except = 0;
+    b->fmtfl = 0x201;                     /* skipws | dec */
+    b->prec = 6;
+    b->wide = 0;
+    b->pad30 = b->pad38 = b->pad40 = NULL;
+    /* The real one asks the locale for a ctype and widens a space to find the
+     * fill character. It is a space either way, and going through a facet to
+     * discover that would mean building one. */
+    b->fillch = ' ';
+}
+
+static MS void *mp_basic_ios_ctor(mp_ios *self)
+{
+    /* The protected default constructor sets the vftable and nothing else --
+     * two instructions in the original. init() does the rest, later. */
+    if (self) self->vftable = mp_facet_vft;
+    return self;
+}
+
+static MS void *mp_basic_ios_init(mp_ios *self, void *sb, uint32_t isstd)
+{
+    (void)isstd;
+    if (!self) return self;
+    mp_ios_init_fields(self);
+    self->strbuf = sb;
+    self->tiestr = NULL;
+    /* clear(), which init calls last: good if there is a buffer, bad if not. */
+    self->state = sb ? 0 : 4;                     /* goodbit / badbit */
+    return self;
+}
+
+/* The ostream suffix -- flush if unitbuf is set, which it is not here -- and
+ * the streambuf lock, which guards a buffer nothing else touches. */
+static MS void mp_ostream_osfx(void *self) { (void)self; }
+static MS void mp_sb_lock(void *self)   { (void)self; }
+static MS void mp_sb_unlock(void *self) { (void)self; }
+
+/* Destructors for the three. Each object's storage belongs to whoever built
+ * it -- these are all embedded in a plug-in's own object -- so there is
+ * nothing here to release. */
+static MS void *mp_stream_dtor(void *self, uint32_t deleting)
+{ (void)deleting; return self; }
+
+/* basic_streambuf<char>, for real.
+ *
+ * The get and put areas are held the way MSVC holds them, which is not the way
+ * the standard describes them: a first pointer, a next pointer and a *count* of
+ * characters remaining -- there is no end pointer -- and then a second set of
+ * pointers *to* those three, which is what every accessor actually reads
+ * through. The indirection is how a derived streambuf can point the base at
+ * storage of its own, and a plug-in with its own streambuf does exactly that,
+ * so reading the direct fields instead would see stale values.
+ *
+ *   egptr() is gptr() + *_IGcount, not a stored pointer. */
+typedef struct {
+    char    *first, *pfirst;      /* +0x08, +0x10  _Gfirst, _Pfirst */
+    char   **ifirst, **ipfirst;   /* +0x18, +0x20  _IGfirst, _IPfirst */
+    char    *next, *pnext;        /* +0x28, +0x30  _Gnext, _Pnext */
+    char   **inext, **ipnext;     /* +0x38, +0x40  _IGnext, _IPnext */
+    int32_t  gcount, pcount;      /* +0x48, +0x4c  _Gcount, _Pcount */
+    int32_t *igcount, *ipcount;   /* +0x50, +0x58  _IGcount, _IPcount */
+    void    *locale;              /* +0x60 */
+} mp_streambuf_body;
+
+#define MP_SB(self) ((mp_streambuf_body *)((char *)(self) + 8))
+#define MP_EOF (-1)
+
+static char *mp_sb_gptr(void *sb)
+{ mp_streambuf_body *b = MP_SB(sb); return b->inext ? *b->inext : NULL; }
+static char *mp_sb_pptr(void *sb)
+{ mp_streambuf_body *b = MP_SB(sb); return b->ipnext ? *b->ipnext : NULL; }
+static int32_t mp_sb_gcount(void *sb)
+{ mp_streambuf_body *b = MP_SB(sb); return b->igcount ? *b->igcount : 0; }
+static int32_t mp_sb_pcount(void *sb)
+{ mp_streambuf_body *b = MP_SB(sb); return b->ipcount ? *b->ipcount : 0; }
+
+/* The virtual slots, in the order msvcp120's own vftable has them -- confirmed
+ * by which entries the linker folded together: _Unlock with _Lock, pbackfail
+ * and underflow with overflow, seekpos with seekoff, sync with showmanyc, and
+ * imbue with _Lock. Calling one of these on a plug-in's own streambuf has to
+ * land on its override, so the numbering is not negotiable. */
+enum {
+    MP_SB_DTOR = 0, MP_SB_LOCK, MP_SB_UNLOCK, MP_SB_OVERFLOW, MP_SB_PBACKFAIL,
+    MP_SB_SHOWMANYC, MP_SB_UNDERFLOW, MP_SB_UFLOW, MP_SB_XSGETN, MP_SB_XSPUTN,
+    MP_SB_SEEKOFF, MP_SB_SEEKPOS, MP_SB_SETBUF, MP_SB_SYNC, MP_SB_IMBUE,
+    MP_SB_NSLOTS
+};
+
+static void *mp_sb_slot(void *sb, int n)
+{
+    void **vft = sb ? *(void ***)sb : NULL;
+    return vft ? vft[n] : NULL;
+}
+
+/* setg and setp, which a derived streambuf calls to publish its buffer. Note
+ * that the count is what is stored, so setg's third argument -- the end -- is
+ * turned into one here rather than kept. */
+static MS void mp_sb_setg(void *self, char *gbeg, char *gnext, char *gend)
+{
+    mp_streambuf_body *b;
+    if (!self) return;
+    b = MP_SB(self);
+    if (b->ifirst)  *b->ifirst  = gbeg;
+    if (b->inext)   *b->inext   = gnext;
+    if (b->igcount) *b->igcount = (int32_t)(gend - gnext);
+}
+static MS void mp_sb_setp(void *self, char *pbeg, char *pend)
+{
+    mp_streambuf_body *b;
+    if (!self) return;
+    b = MP_SB(self);
+    if (b->ipfirst) *b->ipfirst = pbeg;
+    if (b->ipnext)  *b->ipnext  = pbeg;
+    if (b->ipcount) *b->ipcount = (int32_t)(pend - pbeg);
+}
+static MS char *mp_sb_eback(void *self)
+{ mp_streambuf_body *b = MP_SB(self); return b->ifirst ? *b->ifirst : NULL; }
+static MS char *mp_sb_gptr_pub(void *self)  { return mp_sb_gptr(self); }
+static MS char *mp_sb_pptr_pub(void *self)  { return mp_sb_pptr(self); }
+static MS char *mp_sb_egptr(void *self)
+{ char *g = mp_sb_gptr(self); return g ? g + mp_sb_gcount(self) : NULL; }
+static MS char *mp_sb_epptr(void *self)
+{ char *p = mp_sb_pptr(self); return p ? p + mp_sb_pcount(self) : NULL; }
+static MS void mp_sb_gbump(void *self, int32_t n)
+{
+    mp_streambuf_body *b = MP_SB(self);
+    if (b->inext)   *b->inext   += n;
+    if (b->igcount) *b->igcount -= n;
+}
+static MS void mp_sb_pbump(void *self, int32_t n)
+{
+    mp_streambuf_body *b = MP_SB(self);
+    if (b->ipnext)  *b->ipnext  += n;
+    if (b->ipcount) *b->ipcount -= n;
+}
+
+/* The default virtuals. A base streambuf has no buffer of its own, so the ones
+ * that would move a character report failure -- which is what the real ones do
+ * and what a derived class overrides. */
+static MS int32_t mp_sb_v_overflow(void *self, int32_t c)  { (void)self;(void)c; return MP_EOF; }
+static MS int32_t mp_sb_v_underflow(void *self)            { (void)self; return MP_EOF; }
+static MS int32_t mp_sb_v_pbackfail(void *self, int32_t c) { (void)self;(void)c; return MP_EOF; }
+static MS int64_t mp_sb_v_showmanyc(void *self)            { (void)self; return 0; }
+static MS int32_t mp_sb_v_sync(void *self)                 { (void)self; return 0; }
+static MS void   *mp_sb_v_setbuf(void *self, char *p, int64_t n)
+{ (void)p; (void)n; return self; }
+static MS void    mp_sb_v_imbue(void *self, const void *loc) { (void)self;(void)loc; }
+static MS int64_t mp_sb_v_seekoff(void *self, int64_t off, int32_t way, int32_t which)
+{ (void)self;(void)off;(void)way;(void)which; return -1; }
+
+/* uflow: take the character under the get pointer and advance. The default
+ * fetches through underflow, which a base streambuf cannot do. */
+static MS int32_t mp_sb_v_uflow(void *self)
+{
+    int32_t (MS *underflow)(void *) = (int32_t (MS *)(void *))mp_sb_slot(self, MP_SB_UNDERFLOW);
+    int32_t c;
+    if (!underflow) return MP_EOF;
+    c = underflow(self);
+    if (c != MP_EOF) mp_sb_gbump(self, 1);
+    return c;
+}
+
+static MS int64_t mp_sb_v_xsgetn(void *self, char *out, int64_t n)
+{
+    int64_t done = 0;
+    while (done < n) {
+        int32_t avail = mp_sb_gcount(self);
+        if (avail > 0) {
+            int64_t take = (n - done) < avail ? (n - done) : avail;
+            memcpy(out + done, mp_sb_gptr(self), (size_t)take);
+            mp_sb_gbump(self, (int32_t)take);
+            done += take;
+        } else {
+            int32_t (MS *uflow)(void *) =
+                (int32_t (MS *)(void *))mp_sb_slot(self, MP_SB_UFLOW);
+            int32_t c = uflow ? uflow(self) : MP_EOF;
+            if (c == MP_EOF) break;
+            out[done++] = (char)c;
+        }
+    }
+    return done;
+}
+
+static MS int64_t mp_sb_v_xsputn(void *self, const char *in, int64_t n)
+{
+    int64_t done = 0;
+    while (done < n) {
+        int32_t room = mp_sb_pcount(self);
+        if (room > 0) {
+            int64_t put = (n - done) < room ? (n - done) : room;
+            memcpy(mp_sb_pptr(self), in + done, (size_t)put);
+            mp_sb_pbump(self, (int32_t)put);
+            done += put;
+        } else {
+            int32_t (MS *overflow)(void *, int32_t) =
+                (int32_t (MS *)(void *, int32_t))mp_sb_slot(self, MP_SB_OVERFLOW);
+            if (!overflow || overflow(self, (unsigned char)in[done]) == MP_EOF) break;
+            done++;
+        }
+    }
+    return done;
+}
+
+/* The public members, which dispatch to whichever override the object has. */
+static MS int64_t mp_sb_sputn(void *self, const char *in, int64_t n)
+{
+    int64_t (MS *xsputn)(void *, const char *, int64_t) =
+        (int64_t (MS *)(void *, const char *, int64_t))mp_sb_slot(self, MP_SB_XSPUTN);
+    return xsputn ? xsputn(self, in, n) : 0;
+}
+static MS int64_t mp_sb_sgetn(void *self, char *out, int64_t n)
+{
+    int64_t (MS *xsgetn)(void *, char *, int64_t) =
+        (int64_t (MS *)(void *, char *, int64_t))mp_sb_slot(self, MP_SB_XSGETN);
+    return xsgetn ? xsgetn(self, out, n) : 0;
+}
+static MS int32_t mp_sb_sbumpc(void *self)
+{
+    if (mp_sb_gcount(self) > 0) {
+        int32_t c = (unsigned char)*mp_sb_gptr(self);
+        mp_sb_gbump(self, 1);
+        return c;
+    }
+    { int32_t (MS *uflow)(void *) = (int32_t (MS *)(void *))mp_sb_slot(self, MP_SB_UFLOW);
+      return uflow ? uflow(self) : MP_EOF; }
+}
+static MS int32_t mp_sb_sgetc(void *self)
+{
+    if (mp_sb_gcount(self) > 0) return (unsigned char)*mp_sb_gptr(self);
+    { int32_t (MS *underflow)(void *) =
+        (int32_t (MS *)(void *))mp_sb_slot(self, MP_SB_UNDERFLOW);
+      return underflow ? underflow(self) : MP_EOF; }
+}
+static MS int32_t mp_sb_snextc(void *self)
+{ return mp_sb_sbumpc(self) == MP_EOF ? MP_EOF : mp_sb_sgetc(self); }
+static MS int32_t mp_sb_sputc(void *self, int32_t c)
+{
+    if (mp_sb_pcount(self) > 0) {
+        *mp_sb_pptr(self) = (char)c;
+        mp_sb_pbump(self, 1);
+        return c;
+    }
+    { int32_t (MS *overflow)(void *, int32_t) =
+        (int32_t (MS *)(void *, int32_t))mp_sb_slot(self, MP_SB_OVERFLOW);
+      return overflow ? overflow(self, c) : MP_EOF; }
+}
+static MS int32_t mp_sb_pubsync(void *self)
+{
+    int32_t (MS *sync)(void *) = (int32_t (MS *)(void *))mp_sb_slot(self, MP_SB_SYNC);
+    return sync ? sync(self) : 0;
+}
+static MS void *mp_sb_getloc(void *self, void *out)
+{
+    mp_streambuf_body *b = self ? MP_SB(self) : NULL;
+    if (out) *(void **)out = b ? b->locale : NULL;
+    return out;
+}
+
+static void *mp_streambuf_vft[MP_SB_NSLOTS] = {
+    (void *)mp_stream_dtor, (void *)mp_sb_lock, (void *)mp_sb_unlock,
+    (void *)mp_sb_v_overflow, (void *)mp_sb_v_pbackfail,
+    (void *)mp_sb_v_showmanyc, (void *)mp_sb_v_underflow, (void *)mp_sb_v_uflow,
+    (void *)mp_sb_v_xsgetn, (void *)mp_sb_v_xsputn,
+    (void *)mp_sb_v_seekoff, (void *)mp_sb_v_seekoff,
+    (void *)mp_sb_v_setbuf, (void *)mp_sb_v_sync, (void *)mp_sb_v_imbue
+};
+
+static MS void *mp_streambuf_ctor(void *self)
+{
+    char *p = (char *)self;
+    mp_streambuf_body *b;
+
+    if (!self) return self;
+    *(void **)p = mp_streambuf_vft;                /* +0x00 vftable */
+    b = (mp_streambuf_body *)(p + 8);
+    b->first = b->pfirst = b->next = b->pnext = NULL;
+    b->gcount = b->pcount = 0;
+    b->ifirst  = &b->first;   b->ipfirst = &b->pfirst;
+    b->inext   = &b->next;    b->ipnext  = &b->pnext;
+    b->igcount = &b->gcount;  b->ipcount = &b->pcount;
+    b->locale  = mp_locale_Init(1);
+    return self;
+}
+
+/* basic_iostream<char>::basic_iostream(basic_streambuf *). The third argument
+ * is the flag MSVC passes to the constructor of a class with virtual bases,
+ * saying whether this is the most derived object and therefore whether the
+ * virtual base is this constructor's to set up. */
+static MS void *mp_iostream_ctor(void *self, void *sb, uint32_t most_derived)
+{
+    char *p = (char *)self;
+    mp_ios *ios;
+
+    if (!self) return self;
+    if (most_derived) {
+        *(const void **)(p + 0x00) = mp_vbtable_iostream;
+        *(const void **)(p + 0x10) = mp_vbtable_ostream;
+    }
+    /* Both vbtables put the virtual base at +0x20; taking it from the table
+     * rather than assuming keeps this right if a caller laid it out for a
+     * different derived class. */
+    {
+        const int32_t *vb = *(const int32_t **)(p + 0x00);
+        int32_t off = vb ? vb[1] : 32;
+        ios = (mp_ios *)(p + off);
+        *(int32_t *)(p + off - 4) = 0;
+    }
+    *(void **)(p + 0x08) = NULL;                   /* the istream count */
+    mp_basic_ios_ctor(ios);
+    mp_basic_ios_init(ios, sb, 0);
+    return self;
+}
+
+/* ostream << manipulator. The manipulator takes and returns an ios_base&, and
+ * the operator hands it the stream's ios_base subobject and returns the stream.
+ * endl and flush are what arrive here; with nothing buffered there is nothing
+ * for either to do beyond what the manipulator itself does. */
+static MS void *mp_ostream_manip(void *self, void *(MS *fn)(void *))
+{
+    if (self && fn) {
+        const int32_t *vb = *(const int32_t **)self;
+        int32_t off = vb ? vb[1] : 32;
+        fn((char *)self + off);
+    }
+    return self;
+}
+
+/* What a stream does once it has been built.
+ *
+ * Not an implementation of iostreams: no character moves through any of these.
+ * The point is that a caller's loop ends. A plug-in reading from a stream this
+ * host did not fill will loop until it is told the stream is exhausted, so an
+ * extraction that quietly does nothing turns a crash into a hang -- which is
+ * the worse of the two for a host scanning a folder. Reporting eof and fail is
+ * both true and terminating: the stream really has nothing in it.
+ *
+ * eofbit is 1, failbit 2, badbit 4. */
+static MS void *mp_istream_extract(void *self, void *out)
+{
+    (void)out;
+    if (self) {
+        const int32_t *vb = *(const int32_t **)self;
+        int32_t off = vb ? vb[1] : 32;
+        mp_ios *b = (mp_ios *)((char *)self + off);
+        b->state |= 1 | 2;                         /* eofbit | failbit */
+    }
+    return self;
+}
+
+static MS void mp_ios_setstate(mp_ios *self, int32_t st, uint32_t reraise)
+{ (void)reraise; if (self) self->state |= st; }
+static MS int32_t mp_ios_rdstate(mp_ios *self) { return self ? self->state : 4; }
+static MS void mp_ios_clear(mp_ios *self, int32_t st, uint32_t reraise)
+{ (void)reraise; if (self) self->state = st; }
+
+/* std::chrono's tick source inside the C++ library, in 100ns units. Zero here
+ * is the same lie _Query_perf_counter would be: a clock that never advances. */
+static MS int64_t mp_Xtime_get_ticks(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return (int64_t)t.tv_sec * 10000000ll + t.tv_nsec / 100;
+}
+
 /* ---- the pieces with no layout ------------------------------------------ */
 
 /* MSVC's mutex and condition objects are storage the plug-in embeds, sized by

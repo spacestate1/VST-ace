@@ -3480,6 +3480,177 @@ void pehost_render_io(pehost *h, const float *src, float *inter, int frames)
 /* VST2 editor flag and rect come from the dispatcher. */
 #define EFF_HAS_EDITOR 1
 
+/* ---- msvcp: ours against Microsoft's -----------------------------------
+ *
+ * msvcp_shim.h reimplements part of the MSVC C++ library from layouts read out
+ * of the real DLL. Reading a disassembly correctly and writing the same bytes
+ * are different claims, and the second one is the one that matters: a plug-in
+ * embeds these objects in its own and reaches into them with offsets its
+ * compiler baked in, so a field in the wrong place is a wrong answer rather
+ * than a failure.
+ *
+ * So: run both, on identical memory, and compare. Where the two differ only
+ * because a pointer points into its own object -- which basic_streambuf is
+ * full of -- the offset is compared instead of the address. A vftable or a
+ * locale pointer differs by construction and is reported as such rather than
+ * counted as a mismatch.
+ *
+ * Needs a real msvcp120.dll to compare against; says so and stops if there is
+ * none. */
+#define MPT_MAX 0x100
+
+static const char *mpt_word_kind(const uint8_t *obj, size_t objlen, uint64_t v,
+                                 int64_t *rel)
+{
+    uintptr_t base = (uintptr_t)obj;
+    if (!v) return "null";
+    if ((uintptr_t)v >= base && (uintptr_t)v < base + objlen) {
+        *rel = (int64_t)((uintptr_t)v - base);
+        return "self";
+    }
+    return "extern";
+}
+
+static int mpt_compare(const char *what, const uint8_t *a, const uint8_t *b,
+                       size_t len)
+{
+    size_t i;
+    int bad = 0, ext = 0;
+
+    for (i = 0; i + 8 <= len; i += 8) {
+        uint64_t va, vb;
+        int64_t ra = -1, rb = -1;
+        const char *ka, *kb;
+        memcpy(&va, a + i, 8);
+        memcpy(&vb, b + i, 8);
+        ka = mpt_word_kind(a, len, va, &ra);
+        kb = mpt_word_kind(b, len, vb, &rb);
+        if (!strcmp(ka, "self") && !strcmp(kb, "self")) {
+            if (ra != rb) {
+                fprintf(stderr, "    +0x%02zx  self+0x%llx vs self+0x%llx  MISMATCH\n",
+                        i, (unsigned long long)ra, (unsigned long long)rb);
+                bad++;
+            }
+            continue;
+        }
+        if (!strcmp(ka, "extern") && !strcmp(kb, "extern")) { ext++; continue; }
+        if (va != vb) {
+            fprintf(stderr, "    +0x%02zx  %016llx (%s) vs %016llx (%s)  MISMATCH\n",
+                    i, (unsigned long long)va, ka, (unsigned long long)vb, kb);
+            bad++;
+        }
+    }
+    fprintf(stderr, "  %-34s %s", what, bad ? "DIFFERS" : "same");
+    if (ext) fprintf(stderr, " (%d pointer%s out of the object, not compared)",
+                     ext, ext == 1 ? "" : "s");
+    fprintf(stderr, "\n");
+    return bad;
+}
+
+int pehost_msvcp_selftest(void)
+{
+    pe_module *rm = real_module("msvcp120.dll");
+    uint8_t mine[MPT_MAX], theirs[MPT_MAX];
+    int bad = 0, ran = 0;
+
+    if (!rm) {
+        fprintf(stderr, "msvcp selftest: no real msvcp120.dll to compare against.\n"
+                        "Put one in runtime/ or name its directory in "
+                        "PELOAD_DLL_PATH.\n");
+        return 2;
+    }
+    fprintf(stderr, "msvcp selftest: ours against Microsoft's msvcp120\n");
+
+#define MPT_BOTH(sym, len, call)                                              \
+    do {                                                                      \
+        void *r = pe_module_export(rm, (sym));                                \
+        void *o = winstub_lookup("msvcp120.dll", (sym));                      \
+        if (!r || !o) {                                                       \
+            fprintf(stderr, "  %-34s skipped (%s)\n", (sym),                  \
+                    !r ? "not in the DLL" : "not implemented here");          \
+            break;                                                            \
+        }                                                                     \
+        memset(mine, 0xA5, sizeof mine);                                      \
+        memset(theirs, 0xA5, sizeof theirs);                                  \
+        { void *self = theirs; call(r); }                                     \
+        { void *self = mine;   call(o); }                                     \
+        ran++;                                                                \
+        bad += mpt_compare((sym), theirs, mine, (len));                       \
+    } while (0)
+
+    /* _Container_base12: one pointer, zeroed. */
+#define CALL_CB(fn) ((void *(MS *)(void *))(fn))(self)
+    MPT_BOTH("??0_Container_base12@std@@QEAA@XZ", 8, CALL_CB);
+
+    /* basic_streambuf<char>: 0x68 bytes, six of them pointers into itself. */
+#define CALL_SB(fn) ((void *(MS *)(void *))(fn))(self)
+    MPT_BOTH("??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAA@XZ", 0x68, CALL_SB);
+
+    /* basic_ios<char>: the protected constructor, which sets a vftable. */
+#define CALL_IOS(fn) ((void *(MS *)(void *))(fn))(self)
+    MPT_BOTH("??0?$basic_ios@DU?$char_traits@D@std@@@std@@IEAA@XZ", 8, CALL_IOS);
+
+#undef MPT_BOTH
+
+    /* Constructing the same object is half the claim. The other half is that
+     * it behaves the same afterwards, so: publish a get and a put area through
+     * setg and setp, write through sputn, and compare the object, what came out
+     * and what each said it wrote. */
+    {
+        void *ctor_r = pe_module_export(rm, "??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAA@XZ");
+        void *ctor_o = winstub_lookup("msvcp120.dll", "??0?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAA@XZ");
+        void *setg_r = pe_module_export(rm, "?setg@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD00@Z");
+        void *setg_o = winstub_lookup("msvcp120.dll", "?setg@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD00@Z");
+        void *setp_r = pe_module_export(rm, "?setp@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD0@Z");
+        void *setp_o = winstub_lookup("msvcp120.dll", "?setp@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEAAXPEAD0@Z");
+        void *sputn_r = pe_module_export(rm, "?sputn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAA_JPEBD_J@Z");
+        void *sputn_o = winstub_lookup("msvcp120.dll", "?sputn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QEAA_JPEBD_J@Z");
+
+        if (ctor_r && ctor_o && setg_r && setg_o && setp_r && setp_o &&
+            sputn_r && sputn_o) {
+            char gr[16], go[16], pr[16], po[16];
+            int64_t nr, no;
+
+            memset(mine, 0xA5, sizeof mine); memset(theirs, 0xA5, sizeof theirs);
+            memcpy(gr, "GETAREA-", 8); memcpy(go, "GETAREA-", 8);
+            memset(pr, '.', sizeof pr); memset(po, '.', sizeof po);
+
+            ((void *(MS *)(void *))ctor_r)(theirs);
+            ((void *(MS *)(void *))ctor_o)(mine);
+            ((void (MS *)(void *, char *, char *, char *))setg_r)(theirs, gr, gr, gr + 8);
+            ((void (MS *)(void *, char *, char *, char *))setg_o)(mine,   go, go, go + 8);
+            ((void (MS *)(void *, char *, char *))setp_r)(theirs, pr, pr + 8);
+            ((void (MS *)(void *, char *, char *))setp_o)(mine,   po, po + 8);
+            nr = ((int64_t (MS *)(void *, const char *, int64_t))sputn_r)(theirs, "hello", 5);
+            no = ((int64_t (MS *)(void *, const char *, int64_t))sputn_o)(mine,   "hello", 5);
+
+            ran++;
+            bad += mpt_compare("setg + setp + sputn (object)", theirs, mine, 0x68);
+            if (nr != no) {
+                fprintf(stderr, "    sputn returned %lld vs %lld  MISMATCH\n",
+                        (long long)nr, (long long)no);
+                bad++;
+            } else {
+                fprintf(stderr, "  %-34s same (%lld character%s)\n",
+                        "sputn return", (long long)nr, nr == 1 ? "" : "s");
+            }
+            if (memcmp(pr, po, sizeof pr)) {
+                fprintf(stderr, "    put area differs: '%.8s' vs '%.8s'  MISMATCH\n", pr, po);
+                bad++;
+            } else {
+                fprintf(stderr, "  %-34s same ('%.5s')\n", "put area contents", pr);
+            }
+        } else {
+            fprintf(stderr, "  %-34s skipped (an entry point is missing)\n",
+                    "setg + setp + sputn");
+        }
+    }
+
+    fprintf(stderr, "msvcp selftest: %d compared, %d field%s differ\n",
+            ran, bad, bad == 1 ? "" : "s");
+    return bad ? 1 : 0;
+}
+
 int pehost_editor_kind(pehost *h)
 {
     /* A Classic editor draws into a GWorld -- guest memory -- so what comes

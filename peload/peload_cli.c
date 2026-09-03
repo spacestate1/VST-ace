@@ -34,6 +34,7 @@ typedef struct {
     const char *path;             /* the plugin, or a bank that names one */
     const char *wav;              /* --render */
     const char *shot;             /* --editor */
+    int         selftest;         /* --msvcp-selftest */
     const char *patch_in;         /* --patch, or a .json given positionally */
     const char *patch_out;        /* --save-patch */
     const char *pick;             /* --pick */
@@ -203,6 +204,7 @@ static int parse_args(int argc, char **argv, opts *o)
         else if (!strcmp(argv[i], "--program") && i + 1 < argc)  o->prog  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--params"))                   o->dump  = 1;
         else if (!strcmp(argv[i], "--editor") && i + 1 < argc)   o->shot  = argv[++i];
+        else if (!strcmp(argv[i], "--msvcp-selftest"))           o->selftest = 1;
         else if (!strcmp(argv[i], "--drag") && i + 1 < argc) {
             if (sscanf(argv[++i], "%d,%d,%d,%d", &o->drag[0], &o->drag[1],
                        &o->drag[2], &o->drag[3]) != 4) {
@@ -661,6 +663,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "load failed: %s\n", pehost_last_error());
         return 1;
     }
+
+    /* Compare msvcp_shim.h against a real msvcp120.dll. Done with a plug-in
+     * loaded rather than on its own: the C runtime a side-loaded DLL starts up
+     * against is the one the host has already built, and a comparison run in
+     * some other state would not be comparing what a plug-in sees. */
+    if (o.selftest) { int r = pehost_msvcp_selftest(); pehost_close(h); return r; }
 
     describe(h, &o);
     if (bank && apply_patch(h, bank, patch_ix, o.block)) { pehost_close(h); return 1; }

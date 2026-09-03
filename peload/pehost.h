@@ -261,6 +261,9 @@ void  pehost_render_io(pehost *h, const float *in, float *out, int frames);
  *   PIXELS -- the plugin renders into a buffer we own (Windows VST2 and VST3) */
 enum { PEHOST_EDITOR_NONE = 0, PEHOST_EDITOR_X11, PEHOST_EDITOR_PIXELS };
 int  pehost_editor_kind(pehost *h);
+/* Compare msvcp_shim.h's implementations against a real msvcp120.dll, field by
+ * field. Returns 0 if they agree, 1 if they differ, 2 if there is no DLL. */
+int  pehost_msvcp_selftest(void);
 
 /* Open a PIXELS editor. Pump it from a UI timer, then read the pixels with
  * pehost_editor_pixels(). Returns 0 on success. */
