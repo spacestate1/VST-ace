@@ -1828,6 +1828,7 @@ static MS void st_CoUninitialize(void) { }
 #include "win32host.h"
 #include "win32gui.h"
 #include "dwrite_shim.h"
+#include "gdiplus_shim.h"
 #endif
 
 /* ------------------------------------------------------------- registry */
@@ -4892,29 +4893,6 @@ static MS void *st_FindWindowW(const uint16_t *cls, const uint16_t *name)
 static MS void *st_FindWindowExW(void *p, void *c, const uint16_t *cls, const uint16_t *nm)
 { (void)p;(void)c;(void)cls;(void)nm; return NULL; }
 
-/* GDI+ startup, answering honestly.
- *
- * There is no GDI+ here -- a plug-in that draws with it needs ninety-odd
- * entry points, paths and text and image transforms among them, and none of
- * them exist. The danger is that GDI+ spells success as 0, which is exactly
- * what the generic stub returns, so a plug-in was told GDI+ had started and
- * then spun waiting for a subsystem that was never going to answer. Clicking
- * the editor tab hung the plug-in and, with it, the audio.
- *
- * GenericError instead. A caller that checks the status takes its own failure
- * path -- usually falling back to another renderer, or declining to build an
- * editor at all -- which is a far better outcome than a hang, and an honest
- * description of the situation. */
-static MS int32_t st_GdiplusStartup(void *token, const void *input, void *output)
-{
-    (void)input; (void)output;
-    if (token) *(uintptr_t *)token = 0;
-    fprintf(stderr, "[win] GdiplusStartup: GDI+ is not implemented here, "
-                    "reporting failure rather than letting the caller wait "
-                    "for it\n");
-    return 1;                                  /* Gdiplus::GenericError */
-}
-static MS void st_GdiplusShutdown(uintptr_t token) { (void)token; }
 
 /* GetDeviceCaps.
  *
@@ -6257,6 +6235,41 @@ static const winstub g_stubs[] = {
     { "ole32.dll", "CoCreateInstance", (void *)st_CoCreateInstance },
 #endif
     S("gdiplus.dll", GdiplusStartup), S("gdiplus.dll", GdiplusShutdown),
+#ifndef PELOAD_NO_GUI_LAYER
+    /* GDI+. The whole surface this corpus imports -- see gdiplus_shim.h. */
+    S("gdiplus.dll", GdiplusStartup), S("gdiplus.dll", GdiplusShutdown), S("gdiplus.dll", GdipCreatePath),
+    S("gdiplus.dll", GdipClonePath), S("gdiplus.dll", GdipDeletePath), S("gdiplus.dll", GdipMeasureString),
+    S("gdiplus.dll", GdipDrawString), S("gdiplus.dll", GdipGetFontHeightGivenDPI), S("gdiplus.dll", GdipGetFontSize),
+    S("gdiplus.dll", GdipGetFontStyle), S("gdiplus.dll", GdipGetFamily), S("gdiplus.dll", GdipDeleteFont),
+    S("gdiplus.dll", GdipCreateFont), S("gdiplus.dll", GdipGetLineSpacing), S("gdiplus.dll", GdipGetCellDescent),
+    S("gdiplus.dll", GdipGetCellAscent), S("gdiplus.dll", GdipGetEmHeight), S("gdiplus.dll", GdipGetGenericFontFamilySansSerif),
+    S("gdiplus.dll", GdipDeleteFontFamily), S("gdiplus.dll", GdipCreateFontFamilyFromName), S("gdiplus.dll", GdipSetClipRect),
+    S("gdiplus.dll", GdipDrawImageRectRectI), S("gdiplus.dll", GdipFillPath), S("gdiplus.dll", GdipFillEllipse),
+    S("gdiplus.dll", GdipFillPolygon), S("gdiplus.dll", GdipFillRectangle), S("gdiplus.dll", GdipDrawPath),
+    S("gdiplus.dll", GdipDrawPolygon), S("gdiplus.dll", GdipDrawEllipse), S("gdiplus.dll", GdipDrawRectangle),
+    S("gdiplus.dll", GdipDrawLine), S("gdiplus.dll", GdipGetDpiY), S("gdiplus.dll", GdipSetPageUnit),
+    S("gdiplus.dll", GdipGetWorldTransform), S("gdiplus.dll", GdipTranslateWorldTransform), S("gdiplus.dll", GdipSetWorldTransform),
+    S("gdiplus.dll", GdipSetInterpolationMode), S("gdiplus.dll", GdipSetTextRenderingHint), S("gdiplus.dll", GdipSetPixelOffsetMode),
+    S("gdiplus.dll", GdipSetSmoothingMode), S("gdiplus.dll", GdipDeleteGraphics), S("gdiplus.dll", GdipCreateFromHWND),
+    S("gdiplus.dll", GdipCreateFromHDC), S("gdiplus.dll", GdipSetImageAttributesColorMatrix), S("gdiplus.dll", GdipDisposeImageAttributes),
+    S("gdiplus.dll", GdipCreateImageAttributes), S("gdiplus.dll", GdipBitmapUnlockBits), S("gdiplus.dll", GdipBitmapLockBits),
+    S("gdiplus.dll", GdipCreateBitmapFromResource), S("gdiplus.dll", GdipCreateHBITMAPFromBitmap), S("gdiplus.dll", GdipCreateBitmapFromScan0),
+    S("gdiplus.dll", GdipCreateBitmapFromStreamICM), S("gdiplus.dll", GdipGetImageHeight), S("gdiplus.dll", GdipGetImageWidth),
+    S("gdiplus.dll", GdipGetImageGraphicsContext), S("gdiplus.dll", GdipDisposeImage), S("gdiplus.dll", GdipCloneImage),
+    S("gdiplus.dll", GdipSetPenDashArray), S("gdiplus.dll", GdipSetPenDashOffset), S("gdiplus.dll", GdipSetPenDashStyle),
+    S("gdiplus.dll", GdipSetPenColor), S("gdiplus.dll", GdipSetPenLineJoin), S("gdiplus.dll", GdipSetPenLineCap197819),
+    S("gdiplus.dll", GdipSetPenWidth), S("gdiplus.dll", GdipDeletePen), S("gdiplus.dll", GdipCreatePen1),
+    S("gdiplus.dll", GdipGetPathGradientPointCount), S("gdiplus.dll", GdipSetPathGradientCenterPoint), S("gdiplus.dll", GdipSetPathGradientSurroundColorsWithCount),
+    S("gdiplus.dll", GdipSetPathGradientCenterColor), S("gdiplus.dll", GdipCreatePathGradientFromPath), S("gdiplus.dll", GdipSetLinePresetBlend),
+    S("gdiplus.dll", GdipCreateLineBrush), S("gdiplus.dll", GdipSetSolidFillColor), S("gdiplus.dll", GdipCreateSolidFill),
+    S("gdiplus.dll", GdipDeleteBrush), S("gdiplus.dll", GdipCloneBrush), S("gdiplus.dll", GdipSetMatrixElements),
+    S("gdiplus.dll", GdipDeleteMatrix), S("gdiplus.dll", GdipCreateMatrix2), S("gdiplus.dll", GdipCreateMatrix),
+    S("gdiplus.dll", GdipIsVisiblePathPoint), S("gdiplus.dll", GdipFree), S("gdiplus.dll", GdipAlloc),
+    S("gdiplus.dll", GdipGetPathWorldBounds), S("gdiplus.dll", GdipTransformPath), S("gdiplus.dll", GdipStartPathFigure),
+    S("gdiplus.dll", GdipClosePathFigure), S("gdiplus.dll", GdipGetPathLastPoint), S("gdiplus.dll", GdipAddPathLine),
+    S("gdiplus.dll", GdipAddPathArc), S("gdiplus.dll", GdipAddPathBezier), S("gdiplus.dll", GdipAddPathRectangle),
+    S("gdiplus.dll", GdipAddPathEllipse), S("gdiplus.dll", GdipAddPathString), S("gdiplus.dll", GdipSetPathFillMode),
+#endif
     S("gdi32.dll", GetDeviceCaps),
     S("gdi32.dll", SetDIBitsToDevice), S("gdi32.dll", GetClipBox),
     S("gdi32.dll", GdiFlush),

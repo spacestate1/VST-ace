@@ -409,17 +409,13 @@ static uint64_t stub_failure_value(const char *dll, const char *sym)
             if (!strcasecmp(g_failvals[i].dll, "msvcrt.dll") &&
                 !strcmp(g_failvals[i].sym, sym))
                 return g_failvals[i].val;
-    /* GDI+ spells success as 0, which is what a stub returns by default -- so
-     * every unimplemented GDI+ call was reporting that it had worked. A
-     * plug-in drawing its interface that way is told each step succeeded,
-     * takes the handle it was never given, and faults on it much later.
-     *
-     * GenericError instead, for the whole library at once: there are ninety-six
-     * entry points in this corpus alone and none of them are implemented, so
-     * the rule is the library rather than the function. A caller that checks
-     * takes its own failure path, which is the outcome that leaves the plug-in
-     * running. */
-    if (!strncasecmp(dll, "gdiplus", 7)) return 1;         /* Gdiplus::GenericError */
+    /* Direct3D and Direct2D. Same trap as GDI+ in reverse: an HRESULT of 0 is
+     * S_OK, so an unimplemented D3D11CreateDevice was reporting that it had
+     * made a device and leaving the pointer null. E_FAIL instead -- there is no
+     * GPU API here and there never will be one by accident. */
+    if (!strncasecmp(dll, "d3d", 3) || !strncasecmp(dll, "d2d", 3) ||
+        !strncasecmp(dll, "dxgi", 4))
+        return 0x80004005ull;                              /* E_FAIL */
 
     if (ntdll_status_call(dll, sym)) return FV_STATUS;
     return 0;
@@ -888,12 +884,14 @@ static void *pehost_dll_symbol(void *module, const char *name)
     return NULL;
 }
 
-/* Set when the loaded image imports GDI+. There are ninety-six entry points
- * in it across this corpus and none are implemented, so an editor drawn that
- * way cannot come up -- and finding that out by opening it costs the whole
- * plug-in, audio included, because the drawing code does not check the status
- * it is handed and faults on a handle it never received. */
-static int g_image_wants_gdiplus;
+/* Set when the loaded image imports Direct3D or Direct2D.
+ *
+ * GDI+ is implemented here now, but a GPU API is not, and a plug-in that opens
+ * its editor by making a D3D11 device does not check whether it got one -- it
+ * calls straight through the null pointer. Finding that out by opening the
+ * editor costs the whole plug-in, audio included, so the editor is declined
+ * instead. */
+static int g_image_wants_d3d;
 
 /* Names the C++ runtime a plug-in needed and could not have, for the caller to
  * report. Empty when nothing was missing. */
@@ -910,10 +908,10 @@ static int resolve_imports(image *im)
     if (!d.VirtualAddress) return 0;
     for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
         const char *dll = rva(im, desc->Name);
-        /* Noted while the names are already in hand: a plug-in that draws with
-         * GDI+ cannot have a working editor here, and the editor path checks
-         * this rather than finding out by dying. */
-        if (!strncasecmp(dll, "gdiplus", 7)) g_image_wants_gdiplus = 1;
+        /* Noted while the names are already in hand, and checked by the editor
+         * path rather than found out by dying. */
+        if (!strncasecmp(dll, "d3d", 3) || !strncasecmp(dll, "d2d", 3))
+            g_image_wants_d3d = 1;
         uint64_t *lookup = rva(im, desc->OriginalFirstThunk ? desc->OriginalFirstThunk
                                                             : desc->FirstThunk);
         uint64_t *iat = rva(im, desc->FirstThunk);
@@ -3493,17 +3491,18 @@ int pehost_editor_kind(pehost *h)
 {
     /* Refused before it is attempted. Saying "no editor" costs a window the
      * plug-in could not have drawn anyway; opening it costs the plug-in. */
-    if (h && g_image_wants_gdiplus) {
+    if (h && g_image_wants_d3d) {
         static int said;
         if (!said) {
             said = 1;
-            fprintf(stderr, "editor: this plug-in draws with GDI+, which is not "
-                            "implemented here -- reporting no editor rather than "
-                            "opening one that would take the plug-in down with "
-                            "it. Audio is unaffected.\n");
+            fprintf(stderr, "editor: this plug-in builds its editor on Direct3D, "
+                            "which is not implemented here -- reporting no editor "
+                            "rather than opening one that would take the plug-in "
+                            "down with it. Audio is unaffected.\n");
         }
         return PEHOST_EDITOR_NONE;
     }
+
 
     /* A Classic editor draws into a GWorld -- guest memory -- so what comes
      * back is pixels, the same as a Windows editor. */
