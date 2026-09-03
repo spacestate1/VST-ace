@@ -548,6 +548,11 @@ static MS void *st_GetModuleHandleA(const char *n) { (void)n; return g_image_bas
 static MS void *st_GetModuleHandleW(const void *n) { (void)n; return g_image_base; }
 static MS int32_t st_GetModuleHandleExW(uint32_t f, const void *n, void **out)
 { (void)f;(void)n; if (out) *out = g_image_base; return 1; }
+/* The A form was missing while the W form was here, so a plug-in that asked
+ * for its own module handle this way got the generic stub's zero -- and read
+ * that as "I am not loaded", which is not a state its code has a path for. */
+static MS int32_t st_GetModuleHandleExA(uint32_t f, const char *n, void **out)
+{ (void)f;(void)n; if (out) *out = g_image_base; return 1; }
 static MS uint32_t st_GetModuleFileNameA(void *h, char *buf, uint32_t sz)
 { (void)h; return (uint32_t)snprintf(buf, sz, "C:\\peload\\plugin.dll"); }
 static MS uint32_t st_GetModuleFileNameW(void *h, uint16_t *buf, uint32_t sz)
@@ -3252,6 +3257,472 @@ static MSCRT int st_vsnprintf_s(char *b, size_t n, size_t cnt, const char *f, MS
 static MSCRT int st__vsnprintf_l(char *b, size_t n, const char *f, void *loc, MSVA_LIST a)
 { (void)loc; return (int)w32_vfmt(b, n, f, 0, a); }
 
+/* --------------------------------------------- the rest of the 2015 CRT --- */
+
+/* What a 2015-built plug-in reaches for that nothing here had needed yet. Each
+ * one was found by watching which stubs an actual load and render touched, so
+ * the list is what the corpus asks for rather than a guess at the API.
+ *
+ * Windows `long` is 32 bits, which is why strtoul and atol return fixed-width
+ * types here rather than the host's long. */
+static MSCRT uint32_t st_strtoul(const char *s, char **e, int b)
+{ return (uint32_t)strtoul(s, e, b); }
+static MSCRT uint64_t st__strtoui64(const char *s, char **e, int b)
+{ return (uint64_t)strtoull(s, e, b); }
+static MSCRT int64_t st__strtoi64(const char *s, char **e, int b)
+{ return (int64_t)strtoll(s, e, b); }
+static MSCRT int32_t st_atol(const char *s)   { return (int32_t)atol(s); }
+static MSCRT int64_t st__atoi64(const char *s){ return (int64_t)strtoll(s, NULL, 10); }
+
+/* The wide ctype family. ASCII-only, as the narrow ones beside it already are. */
+#define W32_ISW(name, expr) \
+    static MSCRT int st_##name(uint32_t c) { return (c) < 128 ? (expr) : 0; }
+W32_ISW(iswspace,  isspace((int)c))
+W32_ISW(iswalpha,  isalpha((int)c))
+W32_ISW(iswdigit,  isdigit((int)c))
+W32_ISW(iswalnum,  isalnum((int)c))
+W32_ISW(iswupper,  isupper((int)c))
+W32_ISW(iswlower,  islower((int)c))
+W32_ISW(iswpunct,  ispunct((int)c))
+W32_ISW(iswxdigit, isxdigit((int)c))
+W32_ISW(iswcntrl,  iscntrl((int)c))
+W32_ISW(iswprint,  isprint((int)c))
+static MSCRT uint32_t st_towlower(uint32_t c)
+{ return c < 128 ? (uint32_t)tolower((int)c) : c; }
+static MSCRT uint32_t st_towupper(uint32_t c)
+{ return c < 128 ? (uint32_t)toupper((int)c) : c; }
+
+/* The bounds-checked string copies. They return an errno_t, 0 for success, and
+ * truncate rather than overrun -- which is the whole reason a caller picked the
+ * _s form. */
+static MSCRT int st_strcpy_s(char *d, size_t n, const char *src)
+{
+    size_t i = 0;
+    if (!d || !n) return 22;                                   /* EINVAL */
+    if (!src) { d[0] = 0; return 22; }
+    while (src[i] && i + 1 < n) { d[i] = src[i]; i++; }
+    d[i] = 0;
+    return src[i] ? 34 : 0;                                    /* ERANGE */
+}
+static MSCRT int st_wcscpy_s(uint16_t *d, size_t n, const uint16_t *src)
+{
+    size_t i = 0;
+    if (!d || !n) return 22;
+    if (!src) { d[0] = 0; return 22; }
+    while (src[i] && i + 1 < n) { d[i] = src[i]; i++; }
+    d[i] = 0;
+    return src[i] ? 34 : 0;
+}
+static MSCRT int st_wcsncpy_s(uint16_t *d, size_t n, const uint16_t *src, size_t cnt)
+{
+    size_t i = 0;
+    if (!d || !n) return 22;
+    if (!src) { d[0] = 0; return 22; }
+    while (src[i] && i < cnt && i + 1 < n) { d[i] = src[i]; i++; }
+    d[i] = 0;
+    return 0;
+}
+static MSCRT int st_wcscat_s(uint16_t *d, size_t n, const uint16_t *src)
+{
+    size_t i = 0;
+    if (!d || !n || !src) return 22;
+    while (i < n && d[i]) i++;
+    return st_wcscpy_s(d + i, n - i, src);
+}
+
+/* _wsplitpath_s and _splitpath_s. Only the pieces a path actually has are
+ * written; the rest are emptied, which is what a caller reading only `ext`
+ * depends on. */
+static MSCRT int st__wsplitpath_s(const uint16_t *path,
+                                  uint16_t *drv, size_t dn, uint16_t *dir, size_t dirn,
+                                  uint16_t *nam, size_t nn, uint16_t *ext, size_t en)
+{
+    size_t len = st_wcslen(path), slash = (size_t)-1, dot = (size_t)-1, i;
+    if (drv && dn) drv[0] = 0;
+    if (dir && dirn) dir[0] = 0;
+    if (nam && nn) nam[0] = 0;
+    if (ext && en) ext[0] = 0;
+    if (!path) return 22;
+    for (i = 0; i < len; i++) {
+        if (path[i] == '/' || path[i] == '\\') { slash = i; dot = (size_t)-1; }
+        else if (path[i] == '.') dot = i;
+    }
+    if (dir && dirn && slash != (size_t)-1) {
+        size_t n = slash + 1 < dirn ? slash + 1 : dirn - 1;
+        for (i = 0; i < n; i++) dir[i] = path[i];
+        dir[n] = 0;
+    }
+    {
+        size_t b = (slash == (size_t)-1) ? 0 : slash + 1;
+        size_t e = (dot == (size_t)-1 || dot < b) ? len : dot;
+        if (nam && nn) {
+            size_t n = (e - b) < nn - 1 ? (e - b) : nn - 1;
+            for (i = 0; i < n; i++) nam[i] = path[b + i];
+            nam[n] = 0;
+        }
+        if (ext && en && dot != (size_t)-1 && dot >= b) {
+            size_t n = (len - dot) < en - 1 ? (len - dot) : en - 1;
+            for (i = 0; i < n; i++) ext[i] = path[dot + i];
+            ext[n] = 0;
+        }
+    }
+    return 0;
+}
+
+/* Floating-point classification. _fdtest reports what a float is, and the
+ * caller branches on it -- a stub answering 0 says "zero" about every value. */
+static MSCRT int st__fdtest(float *px)
+{
+    float v = px ? *px : 0.0f;
+    if (v != v) return 2;                       /* _NANCODE  */
+    if (v > 3.4028234663852886e+38f || v < -3.4028234663852886e+38f) return 1; /* _INFCODE */
+    if (v == 0.0f) return 0;
+    return -1;                                  /* _FINITE */
+}
+static MSCRT int st__dtest(double *px)
+{
+    double v = px ? *px : 0.0;
+    if (v != v) return 2;
+    if (v > 1.7976931348623157e+308 || v < -1.7976931348623157e+308) return 1;
+    if (v == 0.0) return 0;
+    return -1;
+}
+
+/* The standard streams, and the one printf that writes to them. Only this
+ * host's own stubs ever see these FILE pointers, so handing back the real ones
+ * is self-consistent -- and it means a plug-in's diagnostics reach the terminal
+ * instead of vanishing. */
+static MSCRT void *st___acrt_iob_func(uint32_t which)
+{ return which == 0 ? (void *)stdin : which == 1 ? (void *)stdout : (void *)stderr; }
+static MSCRT int st___stdio_common_vfprintf(uint64_t opt, void *f, const char *fmt,
+                                            void *loc, MSVA_LIST a)
+{
+    char b[2048];
+    size_t n;
+    (void)opt; (void)loc;
+    n = w32_vfmt(b, sizeof b, fmt, 0, a);
+    fwrite(b, 1, n, f ? (FILE *)f : stderr);
+    return (int)n;
+}
+
+/* atexit bookkeeping. Reporting success without recording anything means a
+ * module's static destructors do not run at exit -- which costs nothing in a
+ * host that unloads plug-ins by dropping the mapping, and beats failing the
+ * registration, which the CRT treats as a fatal startup error. */
+static MSCRT int st__initialize_onexit_table(void *t)   { (void)t; return 0; }
+static MSCRT int st__register_onexit_function(void *t, void *f)
+{ (void)t; (void)f; return 0; }
+static MSCRT int st__execute_onexit_table(void *t)      { (void)t; return 0; }
+static MSCRT int st___uncaught_exceptions(void)         { return 0; }
+/* The CRT brackets a locale read with these. Nothing here changes the locale
+ * under a plug-in, so the lock has nothing to protect -- but it must return
+ * rather than fall to a stub, because the unlock is what the caller balances. */
+static MSCRT void st__lock_locales(void)   { }
+static MSCRT void st__unlock_locales(void) { }
+static MS int32_t st___vcrt_InitializeCriticalSectionEx(void *cs, uint32_t spin, uint32_t fl)
+{ (void)fl; return st_InitializeCriticalSectionAndSpinCount(cs, spin); }
+
+/* The locale's day and month names, in the CRT's own packed form: a separator
+ * character, then abbreviated and full names alternating. <locale>'s time facet
+ * indexes straight into this, so a null would fault rather than degrade.
+ *
+ * The buffer is malloc'd because the caller frees it -- that is the contract,
+ * not a detail. Returning a literal here cost a "free(): invalid pointer" abort
+ * the moment a locale was destroyed, which is a worse failure than the missing
+ * stub had been. The plug-in's free is this host's free, so one strdup matches
+ * the other side exactly. */
+static MSCRT char *st__Getdays(void)
+{ return strdup(":Sun:Sunday:Mon:Monday:Tue:Tuesday:Wed:Wednesday:Thu:Thursday"
+                ":Fri:Friday:Sat:Saturday"); }
+static MSCRT char *st__Getmonths(void)
+{ return strdup(":Jan:January:Feb:February:Mar:March:Apr:April:May:May:Jun:June"
+                ":Jul:July:Aug:August:Sep:September:Oct:October:Nov:November"
+                ":Dec:December"); }
+
+/* ------------------------------------------------------------ the scanf family --- */
+
+/* sscanf, written out rather than delegated.
+ *
+ * The host's own vsscanf cannot be handed this argument list: on x86-64 the
+ * guest passes Microsoft's va_list and the host's expects System V's, so every
+ * pointer would be read from the wrong register or stack slot. That is the same
+ * reason w32_vfmt exists instead of a call to vsnprintf.
+ *
+ * It was worth writing because a stub is silently destructive here. A plug-in
+ * parsing its own patch data reads integers with this; a stub assigns nothing
+ * and returns 0, so every value it believed it had parsed keeps whatever was in
+ * the variable, and the failure surfaces much later as a lookup that finds
+ * nothing. That is exactly how it turned up -- a SynthEdit VST3 read its module
+ * graph out of XML, every module id came back unset, and the registry lookup
+ * returned null to a call site with no null check.
+ *
+ * Windows `long` is 32 bits at both widths while the host's is 64 at one of
+ * them, so %ld must store four bytes here and not eight. Storing eight would
+ * scribble on whatever the guest put next to the variable -- silent, and not
+ * obviously this function's fault afterwards. */
+
+#define W32_SCANBUF 512
+
+/* One conversion's worth of input, copied out so the host's parsers can have a
+ * NUL-terminated string with the field width already applied. */
+static size_t w32_scan_span(const char *s, size_t width, const char *accept,
+                            char *buf, size_t cap)
+{
+    size_t n = 0;
+    while (s[n] && n < width && n + 1 < cap && strchr(accept, s[n]) != NULL) n++;
+    memcpy(buf, s, n);
+    buf[n] = 0;
+    return n;
+}
+
+static void w32_scan_put_int(MSVA_LIST *ap, int lmod, long long v)
+{
+    void *q = MSVA_ARG(*ap, void *);
+    if (!q) return;
+    switch (lmod) {
+    case 2:  *(int8_t  *)q = (int8_t)v;  break;   /* hh */
+    case 1:  *(int16_t *)q = (int16_t)v; break;   /* h  */
+    case 4:  *(int64_t *)q = v;          break;   /* ll, I64, j, z, t */
+    /* l, and the default. Windows long is 32-bit, so both store four bytes. */
+    default: *(int32_t *)q = (int32_t)v; break;
+    }
+}
+
+static void w32_scan_put_dbl(MSVA_LIST *ap, int lmod, double v)
+{
+    void *q = MSVA_ARG(*ap, void *);
+    if (!q) return;
+    if (lmod >= 3) *(double *)q = v;              /* l, L: double */
+    else           *(float  *)q = (float)v;       /* bare %f is a float* */
+}
+
+/* Write a scanned string out at the caller's character width. */
+static void w32_scan_put_str(MSVA_LIST *ap, int wide, const char *v, size_t n,
+                             int terminate)
+{
+    void *q = MSVA_ARG(*ap, void *);
+    size_t i;
+    if (!q) return;
+    if (wide) {
+        uint16_t *w = (uint16_t *)q;
+        for (i = 0; i < n; i++) w[i] = (uint8_t)v[i];
+        if (terminate) w[n] = 0;
+    } else {
+        memcpy(q, v, n);
+        if (terminate) ((char *)q)[n] = 0;
+    }
+}
+
+static const char W32_DIGITS[]  = "0123456789";
+static const char W32_HEXDIG[]  = "0123456789abcdefABCDEF";
+
+static int w32_scan_core(const char *in, const char *fmt, int wide_str, MSVA_LIST ap)
+{
+    const char *s = in, *p = fmt;
+    char buf[W32_SCANBUF];
+    int assigned = 0;
+
+    while (*p) {
+        if (isspace((unsigned char)*p)) {
+            while (isspace((unsigned char)*s)) s++;
+            p++;
+            continue;
+        }
+        if (*p != '%') {
+            if (*s != *p) return assigned;
+            s++; p++;
+            continue;
+        }
+        p++;
+        if (*p == '%') {
+            while (isspace((unsigned char)*s)) s++;
+            if (*s != '%') return assigned;
+            s++; p++;
+            continue;
+        }
+        {
+            int suppress = 0, lmod = 0, base = 10;
+            size_t width = (size_t)-1, n;
+            char conv;
+
+            if (*p == '*') { suppress = 1; p++; }
+            if (isdigit((unsigned char)*p)) {
+                width = 0;
+                while (isdigit((unsigned char)*p)) width = width * 10 + (size_t)(*p++ - '0');
+            }
+            if (*p == 'h')      { p++; lmod = 1; if (*p == 'h') { p++; lmod = 2; } }
+            else if (*p == 'l') { p++; lmod = 3; if (*p == 'l') { p++; lmod = 4; } }
+            else if (*p == 'L') { p++; lmod = 3; }
+            else if (*p == 'j' || *p == 'z' || *p == 't') { p++; lmod = 4; }
+            else if (*p == 'I') {                          /* MSVC's I64 / I32 */
+                if (p[1] == '6' && p[2] == '4')      { p += 3; lmod = 4; }
+                else if (p[1] == '3' && p[2] == '2') { p += 3; lmod = 0; }
+                else                                 { p += 1; lmod = 4; }
+            }
+            conv = *p++;
+            if (!conv) break;
+
+            /* Every conversion but these three skips leading whitespace. */
+            if (conv != 'c' && conv != 'n' && conv != '[')
+                while (isspace((unsigned char)*s)) s++;
+
+            switch (conv) {
+            case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'p': {
+                const char *acc = W32_DIGITS;
+                char *end = NULL;
+                long long v;
+                size_t off = 0;
+                if (conv == 'o') { acc = "01234567"; base = 8; }
+                else if (conv == 'x' || conv == 'X' || conv == 'p') { acc = W32_HEXDIG; base = 16; }
+                else if (conv == 'i') { acc = W32_HEXDIG; base = 0; }
+                /* A sign is part of the field, and not in the accept set. */
+                if ((*s == '-' || *s == '+') && width) { buf[0] = *s++; off = 1; }
+                if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+                    if (off + 2 < sizeof buf) { buf[off] = s[0]; buf[off+1] = s[1]; }
+                    s += 2; off += 2;
+                }
+                n = w32_scan_span(s, width == (size_t)-1 ? width : width - off,
+                                  acc, buf + off, sizeof buf - off);
+                if (!n && !off) return assigned;
+                s += n;
+                v = (long long)strtoull(buf, &end, base);
+                if (!suppress) { w32_scan_put_int(&ap, lmod, v); assigned++; }
+                break;
+            }
+            case 'f': case 'e': case 'E': case 'g': case 'G': case 'a': {
+                char *end = NULL;
+                double v;
+                n = w32_scan_span(s, width, "0123456789+-.eEpxXaAbBcCdDfF",
+                                  buf, sizeof buf);
+                if (!n) return assigned;
+                v = strtod(buf, &end);
+                if (end == buf) return assigned;
+                s += (size_t)(end - buf);        /* only what strtod consumed */
+                if (!suppress) { w32_scan_put_dbl(&ap, lmod, v); assigned++; }
+                break;
+            }
+            case 's': {
+                const char *b = s;
+                n = 0;
+                while (s[n] && !isspace((unsigned char)s[n]) && n < width) n++;
+                if (!n) return assigned;
+                s += n;
+                /* %s in a wide scan writes wchar_t unless %hs said otherwise. */
+                if (!suppress) {
+                    w32_scan_put_str(&ap, wide_str ? (lmod != 1) : (lmod >= 3), b, n, 1);
+                    assigned++;
+                }
+                break;
+            }
+            case 'c': {
+                const char *b = s;
+                size_t want = (width == (size_t)-1) ? 1 : width;
+                for (n = 0; n < want && s[n]; n++) { }
+                if (n < want) return assigned;
+                s += n;
+                if (!suppress) {
+                    w32_scan_put_str(&ap, wide_str ? (lmod != 1) : (lmod >= 3), b, n, 0);
+                    assigned++;
+                }
+                break;
+            }
+            case '[': {
+                char set[128];
+                size_t sn = 0;
+                int negate = 0;
+                const char *b;
+                if (*p == '^') { negate = 1; p++; }
+                if (*p == ']') { set[sn++] = *p++; }
+                while (*p && *p != ']' && sn + 1 < sizeof set) set[sn++] = *p++;
+                set[sn] = 0;
+                if (*p == ']') p++;
+                b = s; n = 0;
+                while (s[n] && n < width) {
+                    int in_set = strchr(set, s[n]) != NULL;
+                    if (negate ? in_set : !in_set) break;
+                    n++;
+                }
+                if (!n) return assigned;
+                s += n;
+                if (!suppress) {
+                    w32_scan_put_str(&ap, wide_str ? (lmod != 1) : (lmod >= 3), b, n, 1);
+                    assigned++;
+                }
+                break;
+            }
+            case 'n':
+                if (!suppress) w32_scan_put_int(&ap, lmod, (long long)(s - in));
+                break;               /* %n is not an assignment for the count */
+            default:
+                return assigned;
+            }
+        }
+    }
+    return assigned;
+}
+
+/* The input may be handed over with an explicit length rather than a
+ * terminator, so bound it before the scanner sees it. */
+static int w32_vsscanf(const char *in, size_t len, const char *fmt, MSVA_LIST ap)
+{
+    char tmp[4096];
+    if (!in || !fmt) return -1;
+    if (len != (size_t)-1 && len < sizeof tmp && strnlen(in, len) == len) {
+        memcpy(tmp, in, len);
+        tmp[len] = 0;
+        in = tmp;
+    }
+    return w32_scan_core(in, fmt, 0, ap);
+}
+
+/* Wide input and format, narrowed the same way w32_vfmtw narrows its output --
+ * everything this host handles is Latin-1 already. String results still go back
+ * out as wchar_t, which is what wide_str selects. */
+static int w32_vswscanf(const uint16_t *in, const uint16_t *fmt, MSVA_LIST ap)
+{
+    char ni[4096], nf[1024];
+    size_t i;
+    if (!in || !fmt) return -1;
+    for (i = 0; i + 1 < sizeof ni && in[i]; i++)  ni[i] = (char)(in[i] < 0x100 ? in[i] : '?');
+    ni[i] = 0;
+    for (i = 0; i + 1 < sizeof nf && fmt[i]; i++) nf[i] = (char)(fmt[i] < 0x100 ? fmt[i] : '?');
+    nf[i] = 0;
+    return w32_scan_core(ni, nf, 1, ap);
+}
+
+static MSCRT int st_sscanf(const char *b, const char *f, ...)
+{ MSVA_LIST a; int r; MSVA_START(a, f); r = w32_vsscanf(b, (size_t)-1, f, a); MSVA_END(a); return r; }
+static MSCRT int st_sscanf_s(const char *b, const char *f, ...)
+{ MSVA_LIST a; int r; MSVA_START(a, f); r = w32_vsscanf(b, (size_t)-1, f, a); MSVA_END(a); return r; }
+static MSCRT int st_swscanf(const uint16_t *b, const uint16_t *f, ...)
+{ MSVA_LIST a; int r; MSVA_START(a, f); r = w32_vswscanf(b, f, a); MSVA_END(a); return r; }
+static MSCRT int st_swscanf_s(const uint16_t *b, const uint16_t *f, ...)
+{ MSVA_LIST a; int r; MSVA_START(a, f); r = w32_vswscanf(b, f, a); MSVA_END(a); return r; }
+static MSCRT int st_vsscanf(const char *b, const char *f, MSVA_LIST a)
+{ return w32_vsscanf(b, (size_t)-1, f, a); }
+
+/* The 2015 CRT funnels every scanf and sprintf through one of these, with the
+ * options word carrying what used to be the difference between the _s and
+ * plain forms. The buffer size is honoured either way here, so the options are
+ * not consulted. */
+static MSCRT int st___stdio_common_vsscanf(uint64_t opt, const char *b, size_t n,
+                                           const char *f, void *loc, MSVA_LIST a)
+{ (void)opt; (void)loc; return w32_vsscanf(b, n, f, a); }
+static MSCRT int st___stdio_common_vswscanf(uint64_t opt, const uint16_t *b, size_t n,
+                                            const uint16_t *f, void *loc, MSVA_LIST a)
+{ (void)opt; (void)n; (void)loc; return w32_vswscanf(b, f, a); }
+static MSCRT int st___stdio_common_vsprintf(uint64_t opt, char *b, size_t n,
+                                            const char *f, void *loc, MSVA_LIST a)
+{ (void)opt; (void)loc; return (int)w32_vfmt(b, b ? n : 0, f, 0, a); }
+/* _vsnprintf_s carries a count *as well as* the buffer size, so it takes one
+ * more argument than the call above. Sharing an implementation between them
+ * shifts every argument past the buffer -- the format pointer arrives holding a
+ * length, and the first %s dereferences it. */
+static MSCRT int st___stdio_common_vsnprintf_s(uint64_t opt, char *b, size_t n,
+                                               size_t cnt, const char *f,
+                                               void *loc, MSVA_LIST a)
+{ (void)opt; (void)cnt; (void)loc; return (int)w32_vfmt(b, b ? n : 0, f, 0, a); }
+
 /* Wide entry points: format narrow, then widen. */
 static size_t w32_vfmtw(uint16_t *b, size_t n, const uint16_t *wf, MSVA_LIST a)
 {
@@ -3281,6 +3752,10 @@ static MSCRT int st__vswprintf_c(uint16_t *b, size_t n, const uint16_t *f, MSVA_
 static MSCRT int st__vsnwprintf_l(uint16_t *b, size_t n, const uint16_t *f,
                                   void *loc, MSVA_LIST a)
 { (void)loc; return (int)w32_vfmtw(b, n, f, a); }
+/* The 2015 CRT's wide sprintf core, the partner of __stdio_common_vsprintf. */
+static MSCRT int st___stdio_common_vswprintf(uint64_t opt, uint16_t *b, size_t n,
+                                             const uint16_t *f, void *loc, MSVA_LIST a)
+{ (void)opt; (void)loc; return (int)w32_vfmtw(b, b ? n : 0, f, a); }
 
 /* wsprintf and wvsprintf, user32's own formatters. The two halves do not share
  * a calling convention, which is the whole reason they are spelled differently
@@ -5562,6 +6037,47 @@ static const winstub g_stubs[] = {
     { "msvcrt.dll", "_snprintf", (void *)st__snprintf },
     { "msvcrt.dll", "_snprintf_s", (void *)st__snprintf_s },
     { "msvcrt.dll", "vsprintf",  (void *)st_vsprintf },
+    /* scanf. Absent entirely until now -- and a stub for it assigns nothing
+     * while reporting success, so a caller keeps whatever was in the variable.
+     * The __stdio_common_* forms are how anything built with 2015 or later
+     * reaches both scanf and sprintf. */
+    { "msvcrt.dll", "strtoul", (void *)st_strtoul },
+    { "msvcrt.dll", "_strtoui64", (void *)st__strtoui64 },
+    { "msvcrt.dll", "_strtoi64", (void *)st__strtoi64 },
+    { "msvcrt.dll", "strtoull", (void *)st__strtoui64 },
+    { "msvcrt.dll", "strtoll", (void *)st__strtoi64 },
+    { "msvcrt.dll", "atol", (void *)st_atol },
+    { "msvcrt.dll", "_atoi64", (void *)st__atoi64 },
+    S("msvcrt.dll", iswspace), S("msvcrt.dll", iswalpha), S("msvcrt.dll", iswdigit),
+    S("msvcrt.dll", iswalnum), S("msvcrt.dll", iswupper), S("msvcrt.dll", iswlower),
+    S("msvcrt.dll", iswpunct), S("msvcrt.dll", iswxdigit), S("msvcrt.dll", iswcntrl),
+    S("msvcrt.dll", iswprint), S("msvcrt.dll", towlower), S("msvcrt.dll", towupper),
+    S("msvcrt.dll", strcpy_s), S("msvcrt.dll", wcscpy_s), S("msvcrt.dll", wcsncpy_s),
+    S("msvcrt.dll", wcscat_s), S("msvcrt.dll", _wsplitpath_s),
+    S("msvcrt.dll", _fdtest), S("msvcrt.dll", _dtest),
+    { "msvcrt.dll", "__acrt_iob_func", (void *)st___acrt_iob_func },
+    { "msvcrt.dll", "__stdio_common_vfprintf", (void *)st___stdio_common_vfprintf },
+    { "msvcrt.dll", "__stdio_common_vsnprintf_s", (void *)st___stdio_common_vsnprintf_s },
+    { "msvcrt.dll", "_initialize_onexit_table", (void *)st__initialize_onexit_table },
+    { "msvcrt.dll", "_register_onexit_function", (void *)st__register_onexit_function },
+    { "msvcrt.dll", "_execute_onexit_table", (void *)st__execute_onexit_table },
+    { "msvcrt.dll", "__uncaught_exceptions", (void *)st___uncaught_exceptions },
+    { "msvcrt.dll", "__vcrt_InitializeCriticalSectionEx", (void *)st___vcrt_InitializeCriticalSectionEx },
+    { "msvcrt.dll", "_lock_locales", (void *)st__lock_locales },
+    { "msvcrt.dll", "_unlock_locales", (void *)st__unlock_locales },
+    { "msvcrt.dll", "_Getdays", (void *)st__Getdays },
+    { "msvcrt.dll", "_Getmonths", (void *)st__Getmonths },
+    { "msvcrt.dll", "sscanf",   (void *)st_sscanf },
+    { "msvcrt.dll", "sscanf_s", (void *)st_sscanf_s },
+    { "msvcrt.dll", "swscanf",  (void *)st_swscanf },
+    { "msvcrt.dll", "swscanf_s",(void *)st_swscanf_s },
+    { "msvcrt.dll", "vsscanf",  (void *)st_vsscanf },
+    { "msvcrt.dll", "__stdio_common_vsscanf",   (void *)st___stdio_common_vsscanf },
+    { "msvcrt.dll", "__stdio_common_vswscanf",  (void *)st___stdio_common_vswscanf },
+    { "msvcrt.dll", "__stdio_common_vsprintf",  (void *)st___stdio_common_vsprintf },
+    { "msvcrt.dll", "__stdio_common_vsprintf_s",(void *)st___stdio_common_vsprintf },
+    { "msvcrt.dll", "__stdio_common_vswprintf", (void *)st___stdio_common_vswprintf },
+    { "msvcrt.dll", "__stdio_common_vswprintf_s",(void *)st___stdio_common_vswprintf },
     { "msvcrt.dll", "_vsnprintf", (void *)st__vsnprintf },
     { "msvcrt.dll", "vsnprintf", (void *)st__vsnprintf },
     { "msvcrt.dll", "vsnprintf_s", (void *)st_vsnprintf_s },
@@ -5793,7 +6309,7 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", GetTickCount), S("kernel32.dll", GetTickCount64),
     /* module / loader */
     S("kernel32.dll", GetModuleHandleA), S("kernel32.dll", GetModuleHandleW),
-    S("kernel32.dll", GetModuleHandleExW),
+    S("kernel32.dll", GetModuleHandleExW), S("kernel32.dll", GetModuleHandleExA),
     S("kernel32.dll", GetModuleFileNameA), S("kernel32.dll", GetModuleFileNameW),
     S("kernel32.dll", LoadLibraryA), S("kernel32.dll", LoadLibraryW),
     S("kernel32.dll", LoadLibraryExW), S("kernel32.dll", FreeLibrary),
