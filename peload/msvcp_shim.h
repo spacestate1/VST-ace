@@ -182,7 +182,29 @@ static MS size_t mp_id_value(size_t *self)
 
 /* ---- _Locimp ------------------------------------------------------------- */
 
-static pthread_mutex_t mp_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Recursive, and that is not a preference.
+ *
+ * _Lockit is a scoped lock the C++ library takes around locale work, and that
+ * work nests: building a locale takes it, adding a facet takes it again. A
+ * plain mutex deadlocks the second time, on one thread, with no CPU burned --
+ * which presents as a plug-in that loads and then simply stops, and looks
+ * nothing like a locking bug until you notice the process is in futex_wait
+ * with a single thread. The same goes for the locale lock below it. */
+static pthread_mutex_t mp_lock;
+static pthread_mutex_t mp_lockit;
+static pthread_once_t  mp_lock_once = PTHREAD_ONCE_INIT;
+
+static void mp_locks_init(void)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&mp_lock, &a);
+    pthread_mutex_init(&mp_lockit, &a);
+    pthread_mutexattr_destroy(&a);
+}
+static void mp_locks(void) { pthread_once(&mp_lock_once, mp_locks_init); }
+
 static mp_locimp *mp_classic;
 
 static mp_locimp *mp_locimp_new(void)
@@ -219,6 +241,7 @@ static MS void *mp_New_Locimp_copy(const mp_locimp *from)
 static MS void mp_Locimp_Addfac(mp_locimp *imp, mp_facet *pf, size_t id)
 {
     if (!imp || !pf) return;
+    mp_locks();
     pthread_mutex_lock(&mp_lock);
     if (imp->facetcount <= id) {
         size_t want = id + 1 < 40 ? 40 : id + 1;
@@ -246,6 +269,7 @@ static MS void mp_Locimp_Addfac(mp_locimp *imp, mp_facet *pf, size_t id)
 /* locale::_Init(bool): build the classic locale once and hand it back. */
 static MS void *mp_locale_Init(uint32_t addref)
 {
+    mp_locks();
     pthread_mutex_lock(&mp_lock);
     if (!mp_classic) {
         mp_classic = mp_locimp_new();
@@ -259,13 +283,11 @@ static MS void *mp_Getgloballocale(void) { return mp_locale_Init(0); }
 
 /* ---- _Lockit ------------------------------------------------------------- */
 
-/* One recursive mutex for every kind. _Lockit's argument selects between the
- * locale, iostream and debug locks; sharing one is coarser than the original
- * and cannot deadlock differently, because the original nests the same way. */
-static pthread_mutex_t mp_lockit = PTHREAD_MUTEX_INITIALIZER;
-
+/* One lock for every kind. _Lockit's argument selects between the locale,
+ * iostream and debug locks; sharing one is coarser than the original and safe
+ * only because it is recursive -- see mp_locks_init. */
 static MS void *mp_Lockit_ctor(void *self, int32_t kind)
-{ (void)kind; pthread_mutex_lock(&mp_lockit); return self; }
+{ (void)kind; mp_locks(); pthread_mutex_lock(&mp_lockit); return self; }
 static MS void *mp_Lockit_dtor(void *self)
 { pthread_mutex_unlock(&mp_lockit); return self; }
 
@@ -613,6 +635,68 @@ static MS void *mp_sb_getloc(void *self, void *out)
     return out;
 }
 
+/* The pointer-stepping accessors a derived streambuf uses to walk its own
+ * buffer. _Gninc returns the current get pointer and then advances; _Gnpreinc
+ * advances first and then returns; _Gndec steps back. They differ only in when
+ * the step happens, and a plug-in reading a character through the wrong one is
+ * off by one for the rest of the stream. */
+static MS char *mp_sb_pbase(void *self)
+{ mp_streambuf_body *b = MP_SB(self); return b->ipfirst ? *b->ipfirst : NULL; }
+static MS char *mp_sb_gninc(void *self)
+{ char *g = mp_sb_gptr(self); mp_sb_gbump(self, 1); return g; }
+static MS char *mp_sb_gnpreinc(void *self)
+{ mp_sb_gbump(self, 1); return mp_sb_gptr(self); }
+static MS char *mp_sb_gndec(void *self)
+{ mp_sb_gbump(self, -1); return mp_sb_gptr(self); }
+static MS char *mp_sb_pninc(void *self)
+{ char *p = mp_sb_pptr(self); mp_sb_pbump(self, 1); return p; }
+
+/* The rest of the public members. in_avail answers from the get area without
+ * touching the buffer, and sungetc steps back into it. */
+static MS int64_t mp_sb_in_avail(void *self)
+{
+    int32_t n = mp_sb_gcount(self);
+    if (n > 0) return n;
+    { int64_t (MS *showmanyc)(void *) =
+        (int64_t (MS *)(void *))mp_sb_slot(self, MP_SB_SHOWMANYC);
+      return showmanyc ? showmanyc(self) : 0; }
+}
+static MS int32_t mp_sb_sungetc(void *self)
+{
+    mp_streambuf_body *b = MP_SB(self);
+    char *g = mp_sb_gptr(self), *first = b->ifirst ? *b->ifirst : NULL;
+    if (g && first && g > first) { mp_sb_gbump(self, -1); return (unsigned char)*mp_sb_gptr(self); }
+    { int32_t (MS *pbackfail)(void *, int32_t) =
+        (int32_t (MS *)(void *, int32_t))mp_sb_slot(self, MP_SB_PBACKFAIL);
+      return pbackfail ? pbackfail(self, MP_EOF) : MP_EOF; }
+}
+static MS void *mp_sb_pubsetbuf(void *self, char *b, int64_t n)
+{
+    void *(MS *setbuf)(void *, char *, int64_t) =
+        (void *(MS *)(void *, char *, int64_t))mp_sb_slot(self, MP_SB_SETBUF);
+    return setbuf ? setbuf(self, b, n) : self;
+}
+static MS void *mp_sb_pubimbue(void *self, void *out, const void *loc)
+{
+    void (MS *imbue)(void *, const void *) =
+        (void (MS *)(void *, const void *))mp_sb_slot(self, MP_SB_IMBUE);
+    mp_streambuf_body *b = self ? MP_SB(self) : NULL;
+    if (out) *(void **)out = b ? b->locale : NULL;   /* the previous one */
+    if (imbue) imbue(self, loc);
+    return out;
+}
+static MS void *mp_sb_pubseekoff(void *self, void *out, int64_t off,
+                                 int32_t way, int32_t which)
+{
+    int64_t (MS *seekoff)(void *, int64_t, int32_t, int32_t) =
+        (int64_t (MS *)(void *, int64_t, int32_t, int32_t))mp_sb_slot(self, MP_SB_SEEKOFF);
+    int64_t r = seekoff ? seekoff(self, off, way, which) : -1;
+    /* fpos<int> is returned through a hidden pointer: the offset, then the
+     * state and the file position, which a memory stream does not have. */
+    if (out) { memset(out, 0, 24); *(int64_t *)out = r; }
+    return out;
+}
+
 static void *mp_streambuf_vft[MP_SB_NSLOTS] = {
     (void *)mp_stream_dtor, (void *)mp_sb_lock, (void *)mp_sb_unlock,
     (void *)mp_sb_v_overflow, (void *)mp_sb_v_pbackfail,
@@ -717,6 +801,252 @@ static MS int64_t mp_Xtime_get_ticks(void)
     struct timespec t;
     clock_gettime(CLOCK_REALTIME, &t);
     return (int64_t)t.tv_sec * 10000000ll + t.tv_nsec / 100;
+}
+
+/* ---- basic_streambuf<wchar_t> --------------------------------------------
+ *
+ * The same object as the narrow one -- the fields are pointers and counts
+ * either way -- but the pointers step in two-byte elements, so gbump and pbump
+ * cannot be shared. Windows' wchar_t is 16 bits. */
+static MS void *mp_wstreambuf_ctor(void *self)
+{
+    char *p = (char *)self;
+    mp_streambuf_body *b;
+
+    if (!self) return self;
+    *(void **)p = mp_streambuf_vft;
+    b = MP_SB(p);
+    b->first = b->pfirst = b->next = b->pnext = NULL;
+    b->gcount = b->pcount = 0;
+    b->ifirst  = &b->first;   b->ipfirst = &b->pfirst;
+    b->inext   = &b->next;    b->ipnext  = &b->pnext;
+    b->igcount = &b->gcount;  b->ipcount = &b->pcount;
+    b->locale  = mp_locale_Init(1);
+    return self;
+}
+static MS void mp_wsb_setg(void *self, uint16_t *gbeg, uint16_t *gnext, uint16_t *gend)
+{
+    mp_streambuf_body *b;
+    if (!self) return;
+    b = MP_SB(self);
+    if (b->ifirst)  *b->ifirst  = (char *)gbeg;
+    if (b->inext)   *b->inext   = (char *)gnext;
+    if (b->igcount) *b->igcount = (int32_t)(gend - gnext);
+}
+static MS void mp_wsb_setp(void *self, uint16_t *pbeg, uint16_t *pend)
+{
+    mp_streambuf_body *b;
+    if (!self) return;
+    b = MP_SB(self);
+    if (b->ipfirst) *b->ipfirst = (char *)pbeg;
+    if (b->ipnext)  *b->ipnext  = (char *)pbeg;
+    if (b->ipcount) *b->ipcount = (int32_t)(pend - pbeg);
+}
+
+/* ---- ctype<wchar_t> ------------------------------------------------------
+ *
+ * The facet a wide stream asks the locale for, and the first one msvcp builds
+ * for itself rather than leaving to the plug-in's inlined use_facet -- which is
+ * why the locale shim's empty facet vector is not enough here.
+ *
+ * 96 bytes, from the allocation its _Getcat makes, and fifteen virtuals in the
+ * order its vftable has them: destructor, _Incref, _Decref, then each of is,
+ * scan_is, scan_not, tolower, toupper, widen and narrow with the range form
+ * before the single-character one. _Getcat returns 2, which is the ctype
+ * category.
+ *
+ * The classifications are the C locale's, which is the locale this host has. */
+#define MP_CT_UPPER 0x01
+#define MP_CT_LOWER 0x02
+#define MP_CT_DIGIT 0x04
+#define MP_CT_SPACE 0x08
+#define MP_CT_PUNCT 0x10
+#define MP_CT_CNTRL 0x20
+#define MP_CT_BLANK 0x40
+#define MP_CT_HEX   0x80
+#define MP_CT_ALPHA 0x103
+
+static int16_t mp_ctype_mask(uint32_t c)
+{
+    int16_t m = 0;
+    if (c > 0xFF) return (int16_t)(iswalpha((wint_t)c) ? MP_CT_ALPHA : 0);
+    if (isupper((int)c)) m |= MP_CT_UPPER;
+    if (islower((int)c)) m |= MP_CT_LOWER;
+    if (isdigit((int)c)) m |= MP_CT_DIGIT;
+    if (isspace((int)c)) m |= MP_CT_SPACE;
+    if (ispunct((int)c)) m |= MP_CT_PUNCT;
+    if (iscntrl((int)c)) m |= MP_CT_CNTRL;
+    if (c == ' ' || c == '\t') m |= MP_CT_BLANK;
+    if (isxdigit((int)c)) m |= MP_CT_HEX;
+    if (isalpha((int)c)) m |= MP_CT_ALPHA;
+    return m;
+}
+
+static MS int32_t mp_ctw_is_ch(void *self, int16_t mask, uint16_t ch)
+{ (void)self; return (mp_ctype_mask(ch) & mask) != 0; }
+static MS const uint16_t *mp_ctw_is_range(void *self, const uint16_t *first,
+                                          const uint16_t *last, int16_t *out)
+{
+    (void)self;
+    while (first != last) *out++ = mp_ctype_mask(*first++);
+    return last;
+}
+static MS const uint16_t *mp_ctw_scan_is(void *self, int16_t mask,
+                                         const uint16_t *first, const uint16_t *last)
+{
+    (void)self;
+    while (first != last && !(mp_ctype_mask(*first) & mask)) first++;
+    return first;
+}
+static MS const uint16_t *mp_ctw_scan_not(void *self, int16_t mask,
+                                          const uint16_t *first, const uint16_t *last)
+{
+    (void)self;
+    while (first != last && (mp_ctype_mask(*first) & mask)) first++;
+    return first;
+}
+static MS uint16_t mp_ctw_tolower_ch(void *self, uint16_t c)
+{ (void)self; return (uint16_t)towlower((wint_t)c); }
+static MS const uint16_t *mp_ctw_tolower_range(void *self, uint16_t *first,
+                                               const uint16_t *last)
+{
+    (void)self;
+    while (first != (uint16_t *)last) { *first = (uint16_t)towlower((wint_t)*first); first++; }
+    return last;
+}
+static MS uint16_t mp_ctw_toupper_ch(void *self, uint16_t c)
+{ (void)self; return (uint16_t)towupper((wint_t)c); }
+static MS const uint16_t *mp_ctw_toupper_range(void *self, uint16_t *first,
+                                               const uint16_t *last)
+{
+    (void)self;
+    while (first != (uint16_t *)last) { *first = (uint16_t)towupper((wint_t)*first); first++; }
+    return last;
+}
+static MS uint16_t mp_ctw_widen_ch(void *self, char c)
+{ (void)self; return (uint16_t)(unsigned char)c; }
+static MS const char *mp_ctw_widen_range(void *self, const char *first,
+                                         const char *last, uint16_t *out)
+{
+    (void)self;
+    while (first != last) *out++ = (uint16_t)(unsigned char)*first++;
+    return last;
+}
+static MS char mp_ctw_narrow_ch(void *self, uint16_t c, char dflt)
+{ (void)self; return c < 0x100 ? (char)c : dflt; }
+static MS const uint16_t *mp_ctw_narrow_range(void *self, const uint16_t *first,
+                                              const uint16_t *last, char dflt, char *out)
+{
+    (void)self;
+    while (first != last) { *out++ = *first < 0x100 ? (char)*first : dflt; first++; }
+    return last;
+}
+
+static void *mp_ctypew_vft[15] = {
+    (void *)mp_facet_dtor, (void *)mp_facet_Incref, (void *)mp_facet_Decref,
+    (void *)mp_ctw_is_range,      (void *)mp_ctw_is_ch,
+    (void *)mp_ctw_scan_is,       (void *)mp_ctw_scan_not,
+    (void *)mp_ctw_tolower_range, (void *)mp_ctw_tolower_ch,
+    (void *)mp_ctw_toupper_range, (void *)mp_ctw_toupper_ch,
+    (void *)mp_ctw_widen_range,   (void *)mp_ctw_widen_ch,
+    (void *)mp_ctw_narrow_range,  (void *)mp_ctw_narrow_ch
+};
+
+/* The public members. Each is a one-line dispatch to its virtual, and each has
+ * to go through the vftable rather than call our implementation directly: a
+ * plug-in may have installed a ctype of its own, and the public member is how
+ * its override gets reached. */
+enum {
+    MP_CT_DTOR = 0, MP_CT_INCREF, MP_CT_DECREF,
+    MP_CT_IS_RANGE, MP_CT_IS_CH, MP_CT_SCAN_IS, MP_CT_SCAN_NOT,
+    MP_CT_TOLOWER_RANGE, MP_CT_TOLOWER_CH, MP_CT_TOUPPER_RANGE, MP_CT_TOUPPER_CH,
+    MP_CT_WIDEN_RANGE, MP_CT_WIDEN_CH, MP_CT_NARROW_RANGE, MP_CT_NARROW_CH
+};
+static void *mp_ct_slot(void *self, int n)
+{ void **v = self ? *(void ***)self : NULL; return v ? v[n] : NULL; }
+
+static MS uint16_t mp_ctw_widen(void *self, char c)
+{
+    uint16_t (MS *f)(void *, char) =
+        (uint16_t (MS *)(void *, char))mp_ct_slot(self, MP_CT_WIDEN_CH);
+    return f ? f(self, c) : (uint16_t)(unsigned char)c;
+}
+static MS const char *mp_ctw_widen_r(void *self, const char *a, const char *b, uint16_t *o)
+{
+    const char *(MS *f)(void *, const char *, const char *, uint16_t *) =
+        (const char *(MS *)(void *, const char *, const char *, uint16_t *))
+        mp_ct_slot(self, MP_CT_WIDEN_RANGE);
+    return f ? f(self, a, b, o) : b;
+}
+static MS char mp_ctw_narrow(void *self, uint16_t c, char d)
+{
+    char (MS *f)(void *, uint16_t, char) =
+        (char (MS *)(void *, uint16_t, char))mp_ct_slot(self, MP_CT_NARROW_CH);
+    return f ? f(self, c, d) : (c < 0x100 ? (char)c : d);
+}
+static MS const uint16_t *mp_ctw_narrow_r(void *self, const uint16_t *a,
+                                          const uint16_t *b, char d, char *o)
+{
+    const uint16_t *(MS *f)(void *, const uint16_t *, const uint16_t *, char, char *) =
+        (const uint16_t *(MS *)(void *, const uint16_t *, const uint16_t *, char, char *))
+        mp_ct_slot(self, MP_CT_NARROW_RANGE);
+    return f ? f(self, a, b, d, o) : b;
+}
+static MS int32_t mp_ctw_is(void *self, int16_t m, uint16_t c)
+{
+    int32_t (MS *f)(void *, int16_t, uint16_t) =
+        (int32_t (MS *)(void *, int16_t, uint16_t))mp_ct_slot(self, MP_CT_IS_CH);
+    return f ? f(self, m, c) : 0;
+}
+static MS const uint16_t *mp_ctw_is_r(void *self, const uint16_t *a,
+                                      const uint16_t *b, int16_t *o)
+{
+    const uint16_t *(MS *f)(void *, const uint16_t *, const uint16_t *, int16_t *) =
+        (const uint16_t *(MS *)(void *, const uint16_t *, const uint16_t *, int16_t *))
+        mp_ct_slot(self, MP_CT_IS_RANGE);
+    return f ? f(self, a, b, o) : b;
+}
+static MS uint16_t mp_ctw_tolower(void *self, uint16_t c)
+{
+    uint16_t (MS *f)(void *, uint16_t) =
+        (uint16_t (MS *)(void *, uint16_t))mp_ct_slot(self, MP_CT_TOLOWER_CH);
+    return f ? f(self, c) : c;
+}
+static MS uint16_t mp_ctw_toupper(void *self, uint16_t c)
+{
+    uint16_t (MS *f)(void *, uint16_t) =
+        (uint16_t (MS *)(void *, uint16_t))mp_ct_slot(self, MP_CT_TOUPPER_CH);
+    return f ? f(self, c) : c;
+}
+static MS const uint16_t *mp_ctw_scan_is_p(void *self, int16_t m,
+                                           const uint16_t *a, const uint16_t *b)
+{
+    const uint16_t *(MS *f)(void *, int16_t, const uint16_t *, const uint16_t *) =
+        (const uint16_t *(MS *)(void *, int16_t, const uint16_t *, const uint16_t *))
+        mp_ct_slot(self, MP_CT_SCAN_IS);
+    return f ? f(self, m, a, b) : b;
+}
+static MS const uint16_t *mp_ctw_scan_not_p(void *self, int16_t m,
+                                            const uint16_t *a, const uint16_t *b)
+{
+    const uint16_t *(MS *f)(void *, int16_t, const uint16_t *, const uint16_t *) =
+        (const uint16_t *(MS *)(void *, int16_t, const uint16_t *, const uint16_t *))
+        mp_ct_slot(self, MP_CT_SCAN_NOT);
+    return f ? f(self, m, a, b) : b;
+}
+
+/* ctype<wchar_t>::_Getcat(const facet **ppf, const locale *ploc): build the
+ * facet if the caller has not got one, and answer with the category it belongs
+ * to. Two is ctype's. */
+static MS size_t mp_ctypew_Getcat(const void **ppf, const void *ploc)
+{
+    (void)ploc;
+    if (ppf && !*ppf) {
+        mp_facet *f = (mp_facet *)w32_alloc(96, 1);   /* the size its own _Getcat allocates */
+        if (f) { f->vftable = mp_ctypew_vft; f->ref = 1; }
+        *ppf = f;
+    }
+    return 2;
 }
 
 /* ---- the pieces with no layout ------------------------------------------ */

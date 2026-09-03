@@ -426,6 +426,28 @@ static MS uint64_t missing_import(uint32_t idx)
         if (v) fprintf(stderr, " -> 0x%llx (failure)", (unsigned long long)v);
         fputc('\n', stderr);
     }
+    /* PELOAD_MSVCP_STRICT: stop at the first C++ library entry point
+     * msvcp_shim.h does not implement, and name it.
+     *
+     * This is for building that shim out, and it exists because the default is
+     * unhelpful there in a specific way: a stub answering 0 for "how many
+     * characters did you write" sends the caller round a loop that never ends,
+     * so the symbol that is missing never gets reported at all -- the run just
+     * stops responding. Stopping here turns each round of that work into one
+     * name instead of an afternoon. */
+    {
+        static int strict = -1;
+        if (strict < 0) {
+            const char *e = getenv("PELOAD_MSVCP_STRICT");
+            strict = e && *e != '0';
+        }
+        if (strict && !strncasecmp(g_imp[idx].dll, "msvcp", 5)) {
+            fprintf(stderr, "[msvcp] %s!%s is not implemented here\n",
+                    g_imp[idx].dll, g_imp[idx].sym);
+            fflush(stderr);
+            abort();
+        }
+    }
     return v;
 }
 
