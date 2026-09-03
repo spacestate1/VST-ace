@@ -408,7 +408,11 @@ static const IParamValueQueueVtbl g_pq_vt = {
 };
 
 /* IParameterChanges: the set of queues handed to process(). */
-#define MAX_PARAM_CHANGES 64
+/* One block can carry a change for every parameter. It was 64, and pc_add
+ * silently drops anything past the end -- so a plug-in with more parameters
+ * than that, handed a whole program at once, had most of them thrown away and
+ * rendered from a patch that was part old and part new. */
+#define MAX_PARAM_CHANGES 512
 typedef struct {
     const struct IParameterChangesVtbl *vt;
     ParamQueue q[MAX_PARAM_CHANGES];
@@ -527,6 +531,7 @@ typedef struct {
     const IComponentHandlerVtbl *vt;                 /* primary interface */
     struct { const IUnitHandlerVtbl        *vt; } unith;
     struct { const IComponentHandler2Vtbl  *vt; } ch2;
+    void *host;                                      /* the v3host this belongs to */
 } Handler;
 
 static V3CALL uint32_t uh_ref(void *s) { (void)s; return 1; }
@@ -566,9 +571,20 @@ static V3CALL tresult ch_qi(void *s, const TUID iid, void **o)
     *o = NULL; return V3_NOIFACE;
 }
 static V3CALL uint32_t ch_ref(void *s) { (void)s; return 1; }
+/* Defined once the host struct and its event queue exist, further down. */
+static void v3_perform_edit(void *handler, uint32_t id, double value);
+static void v3_refresh_params(void *handler);
+
 static V3CALL tresult  ch_edit(void *s, uint32_t id) { (void)s;(void)id; return V3_OK; }
-static V3CALL tresult  ch_perform(void *s, uint32_t id, double v) { (void)s;(void)id;(void)v; return V3_OK; }
-static V3CALL tresult  ch_restart(void *s, int32_t f) { (void)s;(void)f; return V3_OK; }
+static V3CALL tresult  ch_perform(void *s, uint32_t id, double v)
+{ v3_perform_edit(s, id, v); return V3_OK; }
+static V3CALL tresult  ch_restart(void *s, int32_t f)
+{
+    /* kParamValuesChanged: the controller has new values for everything, which
+     * is what a preset loaded from inside the editor looks like from here. */
+    if (f & (1 << 2)) v3_refresh_params(s);
+    return V3_OK;
+}
 static const IComponentHandlerVtbl g_ch_vt = {
     ch_qi, ch_ref, ch_ref, ch_edit, ch_perform, ch_edit, ch_restart
 };
@@ -952,6 +968,52 @@ static void qpush(v3host *h, unsigned char t, unsigned char a, unsigned char b,
     atomic_store_explicit(&h->head, hd + 1, memory_order_release);
 }
 
+/* The editor's own edits, on their way to the processor.
+ *
+ * In VST3 the editor belongs to the controller and the audio belongs to the
+ * processor, and the two do not talk to each other -- the host is the wire
+ * between them. performEdit was a no-op here, so turning a knob moved the
+ * controller's value and its picture and changed nothing anyone could hear.
+ * A plug-in that implements both interfaces on one object was unaffected, which
+ * is why this survived: most of the corpus is built that way.
+ *
+ * The value is queued for the processor exactly as a host-side change is. It is
+ * deliberately not written back to the controller, which already holds it: a
+ * controller that re-notified from setParamNormalized would drive this in a
+ * circle. The program-change parameter is left out for the same reason
+ * v3_set_param leaves it out. */
+static void v3_perform_edit(void *handler, uint32_t id, double value)
+{
+    Handler *hd = handler;
+    v3host  *h  = hd ? (v3host *)hd->host : NULL;
+    int i;
+
+    if (!h) return;
+    for (i = 0; i < h->nparams; i++)
+        if (h->pid[i] == id) break;
+    if (i >= h->nparams || i == h->prog_param) return;
+    qpush(h, Q_PARAM, (unsigned char)(i & 0xff), (unsigned char)(i >> 8), 0,
+          (float)value);
+}
+
+/* Every value again, read back from the controller. What a plug-in asks for
+ * when it has changed them all at once behind the host's back. */
+static void v3_refresh_params(void *handler)
+{
+    Handler *hd = handler;
+    v3host  *h  = hd ? (v3host *)hd->host : NULL;
+    int i;
+
+    if (!h || !h->ctrl) return;
+    for (i = 0; i < h->nparams; i++) {
+        double v;
+        if (i == h->prog_param) continue;
+        v = h->ctrl->vt->getParamNormalized(h->ctrl, h->pid[i]);
+        qpush(h, Q_PARAM, (unsigned char)(i & 0xff), (unsigned char)(i >> 8), 0,
+              (float)v);
+    }
+}
+
 /* A .vst3 bundle is a directory; the code lives under Contents/<arch>/. */
 /* A macOS .vst3 is a bundle whose binary sits in Contents/MacOS with no
  * extension at all, so the name cannot be the test. Recognise the layout, and
@@ -1092,6 +1154,7 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
     h->sr = samplerate;
     h->bs = blocksize;
     h->handler.vt = &g_ch_vt;
+    h->handler.host = h;
     h->handler.unith.vt = &g_uh_vt;
     h->handler.ch2.vt = &g_ch2_vt;
     h->hostapp.vt = &g_ha_vt;
