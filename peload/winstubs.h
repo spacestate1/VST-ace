@@ -2105,6 +2105,7 @@ static MS void st_CoUninitialize(void) { }
 #include "dwrite_shim.h"
 #include "gdiplus_shim.h"
 #include "d3d_shim.h"
+#include "msvcp_shim.h"
 #endif
 
 /* ------------------------------------------------------------- registry */
@@ -6397,6 +6398,80 @@ static const winstub g_stubs[] = {
     S("msvcrt.dll", realloc), S("msvcrt.dll", free),
     S("msvcrt.dll", _recalloc), S("msvcrt.dll", _msize),
     /* the CRT-internal allocator, same implementation */
+#if defined(__x86_64__)
+    /* The MSVC C++ library, natively -- see msvcp_shim.h for how each layout
+     * was derived. Registered under msvcrt.dll because crt_alias maps every
+     * msvcp/msvcr/vcruntime spelling onto it, so one set of entries answers
+     * msvcp120, msvcp140 and msvcp140_1 alike. These are the fallback: the
+     * import resolver still prefers a real msvcp wherever one is installed. */
+    { "msvcrt.dll", "_Mtx_init_in_situ",    (void *)mp_Mtx_init_in_situ },
+    { "msvcrt.dll", "_Mtx_destroy_in_situ", (void *)mp_Mtx_destroy_in_situ },
+    { "msvcrt.dll", "_Mtx_init",            (void *)mp_Mtx_init },
+    { "msvcrt.dll", "_Mtx_destroy",         (void *)mp_Mtx_destroy },
+    { "msvcrt.dll", "_Mtx_lock",            (void *)mp_Mtx_lock },
+    { "msvcrt.dll", "_Mtx_unlock",          (void *)mp_Mtx_unlock },
+    { "msvcrt.dll", "_Cnd_init_in_situ",    (void *)mp_Cnd_init_in_situ },
+    { "msvcrt.dll", "_Cnd_destroy_in_situ", (void *)mp_Cnd_destroy_in_situ },
+    { "msvcrt.dll", "_Cnd_init",            (void *)mp_Cnd_init },
+    { "msvcrt.dll", "_Cnd_destroy",         (void *)mp_Cnd_destroy },
+    { "msvcrt.dll", "_Cnd_wait",            (void *)mp_Cnd_wait },
+    { "msvcrt.dll", "_Cnd_signal",          (void *)mp_Cnd_signal },
+    { "msvcrt.dll", "_Cnd_broadcast",       (void *)mp_Cnd_broadcast },
+    { "msvcrt.dll", "_Cnd_do_broadcast_at_thread_exit",
+                                            (void *)mp_Cnd_do_broadcast_at_thread_exit },
+    { "msvcrt.dll", "_Thrd_id",             (void *)mp_Thrd_id },
+    { "msvcrt.dll", "_Query_perf_counter",  (void *)mp_Query_perf_counter },
+    { "msvcrt.dll", "_Query_perf_frequency",(void *)mp_Query_perf_frequency },
+    { "msvcrt.dll", "_Dtest",               (void *)mp_Dtest },
+    { "msvcrt.dll", "_Wcscoll",             (void *)mp_Wcscoll },
+    { "msvcrt.dll", "_Wcsxfrm",             (void *)mp_Wcsxfrm },
+    { "msvcrt.dll", "?_Init@locale@std@@CAPEAV_Locimp@12@_N@Z",
+                                            (void *)mp_locale_Init },
+    { "msvcrt.dll", "?_Getgloballocale@locale@std@@CAPEAV_Locimp@12@XZ",
+                                            (void *)mp_Getgloballocale },
+    { "msvcrt.dll", "?_New_Locimp@_Locimp@locale@std@@CAPEAV123@AEBV123@@Z",
+                                            (void *)mp_New_Locimp_copy },
+    { "msvcrt.dll", "?_New_Locimp@_Locimp@locale@std@@CAPEAV123@_N@Z",
+                                            (void *)mp_New_Locimp_b },
+    { "msvcrt.dll", "?_Locimp_Addfac@_Locimp@locale@std@@CAXPEAV123@PEAVfacet@23@_K@Z",
+                                            (void *)mp_Locimp_Addfac },
+    { "msvcrt.dll", "??Bid@locale@std@@QEAA_KXZ", (void *)mp_id_value },
+    { "msvcrt.dll", "??0_Lockit@std@@QEAA@H@Z",   (void *)mp_Lockit_ctor },
+    { "msvcrt.dll", "??1_Lockit@std@@QEAA@XZ",    (void *)mp_Lockit_dtor },
+    { "msvcrt.dll", "??0facet@locale@std@@IEAA@_K@Z", (void *)mp_facet_ctor },
+    { "msvcrt.dll", "??1facet@locale@std@@MEAA@XZ",   (void *)mp_facet_dtor_plain },
+    { "msvcrt.dll", "?_Incref@facet@locale@std@@UEAAXXZ", (void *)mp_facet_Incref },
+    { "msvcrt.dll", "?_Decref@facet@locale@std@@UEAAPEAV_Facet_base@3@XZ",
+                                            (void *)mp_facet_Decref },
+    { "msvcrt.dll", "??0?$codecvt@_WDU_Mbstatet@@@std@@QEAA@_K@Z",
+                                            (void *)mp_codecvt_ctor },
+    { "msvcrt.dll", "??1?$codecvt@_WDU_Mbstatet@@@std@@MEAA@XZ",
+                                            (void *)mp_facet_dtor_plain },
+    { "msvcrt.dll", "?_Xbad_alloc@std@@YAXXZ",        (void *)mp_Xbad_alloc },
+    { "msvcrt.dll", "?_Xlength_error@std@@YAXPEBD@Z", (void *)mp_Xlength_error },
+    { "msvcrt.dll", "?_Xout_of_range@std@@YAXPEBD@Z", (void *)mp_Xout_of_range },
+    { "msvcrt.dll", "?_Xinvalid_argument@std@@YAXPEBD@Z",
+                                            (void *)mp_Xinvalid_argument },
+    { "msvcrt.dll", "?_Xbad_function_call@std@@YAXXZ",
+                                            (void *)mp_Xbad_function_call },
+    { "msvcrt.dll", "?_Xregex_error@std@@YAXW4error_type@regex_constants@1@@Z",
+                                            (void *)mp_Xregex_error },
+    { "msvcrt.dll", "?_Throw_C_error@std@@YAXH@Z",   (void *)mp_Throw_C_error },
+    { "msvcrt.dll", "?_Throw_Cpp_error@std@@YAXH@Z", (void *)mp_Throw_Cpp_error },
+    { "msvcrt.dll", "?uncaught_exception@std@@YA_NXZ",
+                                            (void *)mp_uncaught_exception },
+    { "msvcrt.dll", "?__ExceptionPtrCreate@@YAXPEAX@Z",
+                                            (void *)mp_ExceptionPtrCreate },
+    { "msvcrt.dll", "?__ExceptionPtrDestroy@@YAXPEAX@Z",
+                                            (void *)mp_ExceptionPtrDestroy },
+    { "msvcrt.dll", "?__ExceptionPtrCurrentException@@YAXPEAX@Z",
+                                            (void *)mp_ExceptionPtrCurrentException },
+    { "msvcrt.dll", "?__ExceptionPtrRethrow@@YAXPEBX@Z",
+                                            (void *)mp_ExceptionPtrRethrow },
+    /* A data export: the IAT slot holds the address, and the plug-in reads
+     * through it. */
+    { "msvcrt.dll", "?_BADOFF@std@@3_JB",   (void *)&mp_BADOFF },
+#endif
     { "msvcrt.dll", "_malloc_crt",   (void *)st_malloc },
     { "msvcrt.dll", "_calloc_crt",   (void *)st_calloc },
     { "msvcrt.dll", "_realloc_crt",  (void *)st_realloc },

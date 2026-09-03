@@ -794,8 +794,9 @@ static pe_module *real_module(const char *dll)
     g_real[i].tried = 1;
 
     if (!find_real_dll(dll, path, sizeof path)) {
-        fprintf(stderr, "peload: %s is needed but was not found. Put a copy "
-                        "beside the plugin, or name its directory in "
+        fprintf(stderr, "peload: no %s on this machine -- using the built-in "
+                        "implementation. For the real one, put a copy beside "
+                        "the plug-in or name its directory in "
                         "PELOAD_DLL_PATH.\n", dll);
         return NULL;
     }
@@ -914,17 +915,22 @@ static int resolve_imports(image *im)
             if (wants_real_image(dll) && !(*lookup & (1ull << 63))) {
                 pe_module *rm = real_module(dll);
                 if (rm) fn = pe_module_export(rm, sym);
-                /* A stub is a reasonable answer for one missing entry point and
-                 * a terrible one for a whole C++ library: the plug-in loads
-                 * with several hundred of them and faults the moment it calls
-                 * a constructor. Refusing here, with the name of what is
-                 * missing, is what the caller can act on -- and it is the
-                 * difference between one plug-in failing to open and the
-                 * session ending. */
-                else if (!g_missing_real[0])
-                    snprintf(g_missing_real, sizeof g_missing_real, "%s", dll);
             }
             if (!fn) fn = winstub_lookup(dll, sym);
+            /* Refusing the load here used to be right: with none of the C++
+             * library implemented, a plug-in resolved several hundred stubs and
+             * faulted on the first constructor, and naming the missing DLL was
+             * the only actionable thing to say.
+             *
+             * msvcp_shim.h implements the part of it a plug-in actually starts
+             * on -- locale, the facet base, _Lockit, the mutex and condition
+             * primitives -- so a machine with no Microsoft runtime is no longer
+             * automatically a failed load. What is left unimplemented is
+             * imported far more often than it is called: this plug-in imports
+             * 145 entry points from MSVCP140 and reaches six. Each of those is
+             * a tracking stub that names itself on first call, which is a
+             * better diagnostic than a refusal, because it reports what was
+             * wanted rather than what was absent. */
             if (fn) { resolved++; }
             else {
                 if (g_nimp < MAX_IMPORTS) {
