@@ -1608,11 +1608,20 @@ static IPlugView *view_of(v3host *h)
     h->view = (IPlugView *)h->ctrl->vt->createView(h->ctrl, "editor");
     if (h->view) {
         ViewRect r = { 0, 0, 0, 0 };
-        if (h->view->vt->getSize(h->view, &r) == V3_OK) {
+        tresult gs = h->view->vt->getSize(h->view, &r);
+        if (gs == V3_OK) {
             h->view_w = r.right - r.left;
             h->view_h = r.bottom - r.top;
         }
+        /* Which of the two went wrong is the whole question when an editor
+         * does not appear: a null view means the plug-in has no GUI to give,
+         * while a view that reports nothing means it built one and could not
+         * size it -- usually because whatever draws it did not load. */
+        VLOG("vst3: createView -> %p, getSize -> %d, %dx%d\n",
+             (void *)h->view, (int)gs, h->view_w, h->view_h);
         h->view->vt->setFrame(h->view, &h->frame);
+    } else {
+        VLOG("vst3: createView(\"editor\") -> NULL\n");
     }
     return h->view;
 }

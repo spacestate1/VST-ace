@@ -191,16 +191,285 @@ static dwprobe *dwp_new_fixed(const char *iface, void **vtbl)
 
 static dwprobe *g_dwrite_syscoll;
 
+/* Defined below, once the types they hand back exist. */
+typedef struct dw_collection dw_collection_fwd;
+static dwprobe *dw_make_font(struct dw_collection *c);
+
+/* The collection's methods, defined below once dw_collection exists. */
+static MS uint32_t dwc_GetFontFamilyCount(void *self);
+static MS int32_t  dwc_GetFontFamily(void *self, uint32_t idx, void **out);
+static MS int32_t  dwc_FindFamilyName(void *self, const uint16_t *name,
+                                      uint32_t *index, int32_t *exists);
+
 /* IDWriteFactory::GetSystemFontCollection(IDWriteFontCollection**, BOOL) */
 static MS int32_t dwf_GetSystemFontCollection(void *self, void **out, int32_t checkUpdates)
 {
     (void)self; (void)checkUpdates;
     PLOG("  [dwrite] IDWriteFactory::GetSystemFontCollection\n");
     if (!out) return DW_E_NOTIMPL;
-    if (!g_dwrite_syscoll) g_dwrite_syscoll = dwp_new("IDWriteFontCollection");
+    if (!g_dwrite_syscoll) {
+        g_dwrite_syscoll = dwp_new("IDWriteFontCollection");
+        /* The same methods the custom collection below gets. Without them the
+         * system collection was a bare probe: every call answered E_NOTIMPL,
+         * and a plug-in walking the system fonts to size its own text got a
+         * null family it then dereferenced. Skia never noticed because it
+         * registers a collection of its own and never asks for this one. */
+        if (g_dwrite_syscoll) {
+            dwp_set(g_dwrite_syscoll, 3, (void *)dwc_GetFontFamilyCount);
+            dwp_set(g_dwrite_syscoll, 4, (void *)dwc_GetFontFamily);
+            dwp_set(g_dwrite_syscoll, 5, (void *)dwc_FindFamilyName);
+        }
+    }
     if (!g_dwrite_syscoll) return DW_E_NOTIMPL;
     g_dwrite_syscoll->refs++;
     *out = g_dwrite_syscoll;
+    return DW_S_OK;
+}
+
+/* The FreeType face everything here measures with, opened on demand below. */
+static FT_Face dw_ftface(void);
+
+/* ---- text format and layout --------------------------------------------
+ *
+ * Skia never needed these: it lays text out itself and asks this shim only for
+ * font files and glyph rasters. A plug-in that draws its own interface with
+ * DirectWrite does the opposite -- it hands over a string and a font size and
+ * expects the layout back -- so the two entry points below exist for it.
+ *
+ * The layout is one line, measured with FreeType through the same face
+ * everything else here uses. That is honest for what it is asked to do: label
+ * text in a plug-in editor, where the question is "how wide is this string"
+ * and the answer decides whether the interface has a size at all. */
+typedef struct {
+    float    size;
+    uint16_t family[64];
+    uint16_t text[512];
+    uint32_t textlen;
+    float    maxw, maxh;
+} dw_format;
+
+static MS float dwtf_GetFontSize(void *self)
+{ dwprobe *o = self; dw_format *f = o ? o->ctx : NULL; return f ? f->size : 12.0f; }
+
+/* Every alignment and wrapping setter. A format that cannot be configured is
+ * refused by some callers, and none of these change a single line's extent. */
+static MS int32_t dwtf_SetAny(void *self, uint32_t v)
+{ (void)self; (void)v; return DW_S_OK; }
+
+/* DWRITE_TEXT_METRICS: left, top, width, widthIncludingTrailingWhitespace,
+ * height, layoutWidth, layoutHeight (floats), then maxBidiReorderingDepth and
+ * lineCount (UINT32). Twenty-eight bytes at both widths. */
+/* How wide and tall the string is, measured through the same FreeType face
+ * everything else here draws with. One line: these are editor labels. */
+static void dw_measure(dw_format *f, float *wOut, float *hOut)
+{
+    FT_Face face = dw_ftface();
+    float w = 0.0f, h = f ? f->size : 12.0f;
+    uint32_t i;
+
+    if (face && f) {
+        FT_Set_Pixel_Sizes(face, 0, (FT_UInt)(f->size > 0 ? f->size : 12.0f));
+        for (i = 0; i < f->textlen; i++) {
+            if (FT_Load_Char(face, (FT_ULong)f->text[i], FT_LOAD_DEFAULT) == 0)
+                w += (float)(face->glyph->advance.x >> 6);
+        }
+        h = (float)((face->size->metrics.ascender - face->size->metrics.descender) >> 6);
+    } else if (f) {
+        w = (float)f->textlen * f->size * 0.55f;      /* a plausible average */
+    }
+    if (wOut) *wOut = w;
+    if (hOut) *hOut = h;
+}
+
+/* IDWriteTextLayout::DetermineMinWidth(FLOAT*) -- the narrowest the layout can
+ * be without breaking a word. One line and no wrapping, so it is the width. */
+static MS int32_t dwtl_DetermineMinWidth(void *self, float *out)
+{
+    dwprobe *o = self;
+    if (!out) return DW_E_NOTIMPL;
+    dw_measure(o ? o->ctx : NULL, out, NULL);
+    return DW_S_OK;
+}
+static MS int32_t dwtl_SetMaxWidth(void *self, float v)
+{ dwprobe *o = self; dw_format *f = o ? o->ctx : NULL; if (f) f->maxw = v; return DW_S_OK; }
+static MS int32_t dwtl_SetMaxHeight(void *self, float v)
+{ dwprobe *o = self; dw_format *f = o ? o->ctx : NULL; if (f) f->maxh = v; return DW_S_OK; }
+static MS float dwtl_GetMaxWidth(void *self)
+{ dwprobe *o = self; dw_format *f = o ? o->ctx : NULL; return f ? f->maxw : 0.0f; }
+static MS float dwtl_GetMaxHeight(void *self)
+{ dwprobe *o = self; dw_format *f = o ? o->ctx : NULL; return f ? f->maxh : 0.0f; }
+
+/* DWRITE_OVERHANG_METRICS: how far the ink spills past the layout box. Nothing
+ * here overhangs, and zeroes say exactly that. */
+static MS int32_t dwtl_GetOverhangMetrics(void *self, void *out)
+{ (void)self; if (!out) return DW_E_NOTIMPL; memset(out, 0, 16); return DW_S_OK; }
+
+static MS int32_t dwtl_GetMetrics(void *self, void *out)
+{
+    dwprobe *o = self;
+    dw_format *f = o ? o->ctx : NULL;
+    float w, h;
+    uint8_t *m = out;
+
+    if (!out) return DW_E_NOTIMPL;
+    dw_measure(f, &w, &h);
+    memset(m, 0, 28);
+    *(float *)(m + 8)  = w;                            /* width */
+    *(float *)(m + 12) = w;                            /* + trailing whitespace */
+    *(float *)(m + 16) = h;                            /* height */
+    *(float *)(m + 20) = f ? f->maxw : w;              /* layoutWidth */
+    *(float *)(m + 24) = f ? f->maxh : h;              /* layoutHeight */
+    /* lineCount sits past those; one line, always. */
+    return DW_S_OK;
+}
+
+/* The format's own getters. A probe is particularly bad for the two that
+ * return a length rather than an HRESULT: E_NOTIMPL read as a UINT32 is
+ * 2147500033, and a caller allocating that many characters gives up. */
+static MS int32_t dwtf_GetFontCollection(void *self, void **out)
+{
+    (void)self;
+    if (!out) return DW_E_NOTIMPL;
+    if (!g_dwrite_syscoll) return DW_E_NOTIMPL;
+    g_dwrite_syscoll->refs++;
+    *out = g_dwrite_syscoll;
+    return DW_S_OK;
+}
+static MS uint32_t dwtf_GetFontFamilyNameLength(void *self)
+{
+    dwprobe *o = self; dw_format *f = o ? o->ctx : NULL;
+    uint32_t n = 0;
+    if (f) while (f->family[n]) n++;
+    return n;
+}
+static MS int32_t dwtf_GetFontFamilyName(void *self, uint16_t *buf, uint32_t size)
+{
+    dwprobe *o = self; dw_format *f = o ? o->ctx : NULL;
+    uint32_t i = 0;
+    if (!buf || !size) return DW_E_NOTIMPL;
+    if (f) for (; f->family[i] && i + 1 < size; i++) buf[i] = f->family[i];
+    buf[i] = 0;
+    return DW_S_OK;
+}
+static MS uint32_t dwtf_GetFontWeight(void *self)  { (void)self; return 400; }
+static MS uint32_t dwtf_GetFontStretch(void *self) { (void)self; return 5; }
+static MS uint32_t dwtf_GetFontStyle(void *self)   { (void)self; return 0; }
+static MS uint32_t dwtf_GetLocaleNameLength(void *self) { (void)self; return 5; }
+static MS int32_t dwtf_GetLocaleName(void *self, uint16_t *buf, uint32_t size)
+{
+    static const char *en = "en-us";
+    uint32_t i;
+    (void)self;
+    if (!buf || !size) return DW_E_NOTIMPL;
+    for (i = 0; en[i] && i + 1 < size; i++) buf[i] = (uint16_t)en[i];
+    buf[i] = 0;
+    return DW_S_OK;
+}
+
+static dwprobe *dw_make_format(dw_format *f, const char *what)
+{
+    dwprobe *o = dwp_new(what);
+    if (!o) return NULL;
+    o->ctx = f;
+    dwp_set(o, 3,  (void *)dwtf_SetAny);          /* SetTextAlignment      */
+    dwp_set(o, 4,  (void *)dwtf_SetAny);          /* SetParagraphAlignment */
+    dwp_set(o, 5,  (void *)dwtf_SetAny);          /* SetWordWrapping       */
+    dwp_set(o, 6,  (void *)dwtf_SetAny);          /* SetReadingDirection   */
+    dwp_set(o, 7,  (void *)dwtf_SetAny);          /* SetFlowDirection      */
+    dwp_set(o, 19, (void *)dwtf_GetFontCollection);
+    dwp_set(o, 20, (void *)dwtf_GetFontFamilyNameLength);
+    dwp_set(o, 21, (void *)dwtf_GetFontFamilyName);
+    dwp_set(o, 22, (void *)dwtf_GetFontWeight);
+    dwp_set(o, 23, (void *)dwtf_GetFontStretch);
+    dwp_set(o, 24, (void *)dwtf_GetFontStyle);
+    dwp_set(o, 25, (void *)dwtf_GetFontSize);
+    dwp_set(o, 26, (void *)dwtf_GetLocaleNameLength);
+    dwp_set(o, 27, (void *)dwtf_GetLocaleName);
+    return o;
+}
+
+/* IDWriteFactory::CreateTextFormat(family, collection, weight, style, stretch,
+ *                                  size, locale, IDWriteTextFormat**) */
+static MS int32_t dwf_CreateTextFormat(void *self, const uint16_t *family, void *coll,
+                                       uint32_t weight, uint32_t style, uint32_t stretch,
+                                       float size, const uint16_t *locale, void **out)
+{
+    dw_format *f;
+    uint32_t i;
+    (void)self; (void)coll; (void)weight; (void)style; (void)stretch; (void)locale;
+    PLOG("  [dwrite] IDWriteFactory::CreateTextFormat(size %.1f)\n", (double)size);
+    if (!out) return DW_E_NOTIMPL;
+    if (!(f = calloc(1, sizeof *f))) return DW_E_NOTIMPL;
+    f->size = size > 0 ? size : 12.0f;
+    for (i = 0; family && family[i] && i + 1 < 64; i++) f->family[i] = family[i];
+    *out = dw_make_format(f, "IDWriteTextFormat");
+    return *out ? DW_S_OK : DW_E_NOTIMPL;
+}
+
+/* IDWriteFactory::CreateTextLayout(string, len, format, maxW, maxH,
+ *                                  IDWriteTextLayout**) */
+static MS int32_t dwf_CreateTextLayout(void *self, const uint16_t *str, uint32_t len,
+                                       void *format, float maxw, float maxh, void **out)
+{
+    dwprobe *fo = format;
+    dw_format *src = fo ? fo->ctx : NULL, *f;
+    dwprobe *o;
+    uint32_t i;
+    (void)self;
+    PLOG("  [dwrite] IDWriteFactory::CreateTextLayout(%u chars)\n", len);
+    if (!out) return DW_E_NOTIMPL;
+    if (!(f = calloc(1, sizeof *f))) return DW_E_NOTIMPL;
+    if (src) *f = *src;
+    else f->size = 12.0f;
+    f->maxw = maxw; f->maxh = maxh;
+    for (i = 0; str && i < len && i + 1 < 512; i++) f->text[i] = str[i];
+    f->textlen = i;
+    if (!(o = dw_make_format(f, "IDWriteTextLayout"))) { free(f); return DW_E_NOTIMPL; }
+    dwp_set(o, 28, (void *)dwtl_SetMaxWidth);
+    dwp_set(o, 29, (void *)dwtl_SetMaxHeight);
+    dwp_set(o, 42, (void *)dwtl_GetMaxWidth);
+    dwp_set(o, 43, (void *)dwtl_GetMaxHeight);
+    dwp_set(o, 57, (void *)dwtl_GetMetrics);
+    dwp_set(o, 58, (void *)dwtl_GetOverhangMetrics);
+    dwp_set(o, 60, (void *)dwtl_DetermineMinWidth);
+    *out = o;
+    return DW_S_OK;
+}
+
+/* IDWriteGdiInterop, the bridge back to GDI's way of naming a font.
+ *
+ * A plug-in that grew up on GDI describes what it wants with a LOGFONT and
+ * asks DirectWrite to turn that into an IDWriteFont. There is one font here,
+ * so the conversion is a formality -- but returning nothing means the caller
+ * has no font at all, and it does not check. */
+static MS int32_t dwgi_CreateFontFromLOGFONT(void *self, const void *lf, void **out)
+{
+    dwprobe *o = self;
+    (void)lf;
+    PLOG("  [dwrite] IDWriteGdiInterop::CreateFontFromLOGFONT\n");
+    if (!out) return DW_E_NOTIMPL;
+    *out = dw_make_font(o ? o->ctx : NULL);
+    return *out ? DW_S_OK : DW_E_NOTIMPL;
+}
+static MS int32_t dwgi_ConvertFontToLOGFONT(void *self, void *font, void *lf, int32_t *isSystem)
+{
+    (void)self; (void)font; (void)lf;
+    PLOG("  [dwrite] IDWriteGdiInterop::ConvertFontToLOGFONT\n");
+    if (isSystem) *isSystem = 1;
+    return DW_S_OK;
+}
+
+/* IDWriteFactory::GetGdiInterop(IDWriteGdiInterop**) */
+static MS int32_t dwf_GetGdiInterop(void *self, void **out)
+{
+    dwprobe *g;
+    (void)self;
+    PLOG("  [dwrite] IDWriteFactory::GetGdiInterop\n");
+    if (!out) return DW_E_NOTIMPL;
+    if (!(g = dwp_new("IDWriteGdiInterop"))) return DW_E_NOTIMPL;
+    dwp_set(g, 3, (void *)dwgi_CreateFontFromLOGFONT);
+    dwp_set(g, 4, (void *)dwgi_ConvertFontToLOGFONT);
+    *out = g;
     return DW_S_OK;
 }
 
@@ -291,8 +560,6 @@ static MS int32_t dwf_CreateCustomFontFileReference(void *self, const void *key,
 typedef struct dw_collection dw_collection;
 
 /* Defined below, once the collection type is known. */
-static MS uint32_t dwc_GetFontFamilyCount(void *self);
-static MS int32_t  dwc_GetFontFamily(void *self, uint32_t idx, void **out);
 
 /* Skia also registers a collection loader and then asks us to build a custom
  * collection from it. Driving that loader's enumerator is how we get back the
@@ -384,6 +651,19 @@ static MS int32_t dwc_GetFontFamily(void *self, uint32_t idx, void **out)
     if (idx != 0) return DW_E_NOTIMPL;
     *out = dw_make_family(o->ctx);
     return *out ? DW_S_OK : DW_E_NOTIMPL;
+}
+
+/* IDWriteFontCollection::FindFamilyName(WCHAR const*, UINT32*, BOOL*) */
+static MS int32_t dwc_FindFamilyName(void *self, const uint16_t *name,
+                                     uint32_t *index, int32_t *exists)
+{
+    (void)self; (void)name;
+    /* One family, and it answers to every name. A plug-in asking for a font it
+     * cannot have is better served by the one available than by "no such
+     * font", which it typically treats as a reason to draw nothing. */
+    if (index)  *index = 0;
+    if (exists) *exists = 1;
+    return DW_S_OK;
 }
 
 /* IDWriteFontFamily::GetFontCount() -> UINT32 */
@@ -628,26 +908,190 @@ static dwprobe *dw_make_fontface(dw_collection *c)
     return f;
 }
 
+/* The one family name this shim can honestly claim: whatever FreeType actually
+ * opened. A plug-in asks for it to measure and to populate a font menu, so a
+ * wrong name is better than none but the real one is better still. */
+static const char *dw_family_name(void)
+{
+    FT_Face f = dw_ftface();
+    if (f && f->family_name && f->family_name[0]) return f->family_name;
+    return "Sans";
+}
+
+/* IDWriteLocalizedStrings, over a single string in a single locale.
+ *
+ * A plug-in reads a family name by asking the family for its names, finding
+ * the entry for its locale and copying the string out. Three calls, and every
+ * one of them was a probe. */
+static MS uint32_t dwls_GetCount(void *self) { (void)self; return 1; }
+static MS int32_t dwls_FindLocaleName(void *self, const uint16_t *locale,
+                                      uint32_t *index, int32_t *exists)
+{
+    (void)self; (void)locale;
+    /* Whatever locale is asked for is the one entry there is. Reporting "not
+     * found" would be answering a question the caller cannot act on -- it has
+     * nowhere else to look. */
+    if (index)  *index = 0;
+    if (exists) *exists = 1;
+    return DW_S_OK;
+}
+static MS int32_t dwls_GetStringLength(void *self, uint32_t idx, uint32_t *len)
+{
+    (void)self;
+    if (!len || idx) return DW_E_NOTIMPL;
+    *len = (uint32_t)strlen(dw_family_name());
+    return DW_S_OK;
+}
+static MS int32_t dwls_GetString(void *self, uint32_t idx, uint16_t *buf, uint32_t size)
+{
+    const char *n = dw_family_name();
+    uint32_t i;
+    (void)self;
+    if (!buf || !size || idx) return DW_E_NOTIMPL;
+    /* The size is in characters and includes the terminator, which is the part
+     * a caller sizing from GetStringLength+1 depends on. */
+    for (i = 0; n[i] && i + 1 < size; i++) buf[i] = (uint16_t)(unsigned char)n[i];
+    buf[i] = 0;
+    return DW_S_OK;
+}
+static MS int32_t dwls_GetLocaleNameLength(void *self, uint32_t idx, uint32_t *len)
+{ (void)self; if (!len || idx) return DW_E_NOTIMPL; *len = 5; return DW_S_OK; }
+static MS int32_t dwls_GetLocaleName(void *self, uint32_t idx, uint16_t *buf, uint32_t size)
+{
+    static const char *en = "en-us";
+    uint32_t i;
+    (void)self;
+    if (!buf || !size || idx) return DW_E_NOTIMPL;
+    for (i = 0; en[i] && i + 1 < size; i++) buf[i] = (uint16_t)en[i];
+    buf[i] = 0;
+    return DW_S_OK;
+}
+
+static dwprobe *dw_make_strings(void)
+{
+    dwprobe *s = dwp_new("IDWriteLocalizedStrings");
+    if (!s) return NULL;
+    dwp_set(s, 3, (void *)dwls_GetCount);
+    dwp_set(s, 4, (void *)dwls_FindLocaleName);
+    dwp_set(s, 5, (void *)dwls_GetLocaleNameLength);
+    dwp_set(s, 6, (void *)dwls_GetLocaleName);
+    dwp_set(s, 7, (void *)dwls_GetStringLength);
+    dwp_set(s, 8, (void *)dwls_GetString);
+    return s;
+}
+
+/* IDWriteFontFamily::GetFamilyNames(IDWriteLocalizedStrings**) */
+static MS int32_t dwfam_GetFamilyNames(void *self, void **out)
+{
+    (void)self;
+    if (!out) return DW_E_NOTIMPL;
+    *out = dw_make_strings();
+    return *out ? DW_S_OK : DW_E_NOTIMPL;
+}
+
+/* IDWriteFontFamily::GetFontCollection(IDWriteFontCollection**), inherited
+ * from IDWriteFontList. */
+static MS int32_t dwfam_GetFontCollection(void *self, void **out)
+{
+    (void)self;
+    if (!out) return DW_E_NOTIMPL;
+    if (!g_dwrite_syscoll) return DW_E_NOTIMPL;
+    g_dwrite_syscoll->refs++;
+    *out = g_dwrite_syscoll;
+    return DW_S_OK;
+}
+
 static dwprobe *dw_make_family(dw_collection *c)
 {
     dwprobe *f = dwp_new("IDWriteFontFamily");
     if (!f) return NULL;
     f->ctx = c;
+    dwp_set(f, 3, (void *)dwfam_GetFontCollection);
     dwp_set(f, 4, (void *)dwfam_GetFontCount);
     dwp_set(f, 5, (void *)dwfam_GetFont);
+    dwp_set(f, 6, (void *)dwfam_GetFamilyNames);
     dwp_set(f, 7, (void *)dwfam_GetFirstMatchingFont);
     return f;
 }
+/* The face name, as distinct from the family name: "Regular" is what a font
+ * with no style variants reports, and there is only the one here. */
+static MS int32_t dwls_GetStringRegular(void *self, uint32_t idx, uint16_t *buf, uint32_t size)
+{
+    static const char *n = "Regular";
+    uint32_t i;
+    (void)self;
+    if (!buf || !size || idx) return DW_E_NOTIMPL;
+    for (i = 0; n[i] && i + 1 < size; i++) buf[i] = (uint16_t)n[i];
+    buf[i] = 0;
+    return DW_S_OK;
+}
+static MS int32_t dwls_GetStringLengthRegular(void *self, uint32_t idx, uint32_t *len)
+{ (void)self; if (!len || idx) return DW_E_NOTIMPL; *len = 7; return DW_S_OK; }
+
+/* IDWriteFont::GetFaceNames(IDWriteLocalizedStrings**) */
+static MS int32_t dwfont_GetFaceNames(void *self, void **out)
+{
+    dwprobe *s;
+    (void)self;
+    if (!out) return DW_E_NOTIMPL;
+    if (!(s = dw_make_strings())) return DW_E_NOTIMPL;
+    dwp_set(s, 7, (void *)dwls_GetStringLengthRegular);
+    dwp_set(s, 8, (void *)dwls_GetStringRegular);
+    *out = s;
+    return DW_S_OK;
+}
+
+/* IDWriteFont::GetFontFamily(IDWriteFontFamily**) */
+static MS int32_t dwfont_GetFontFamily(void *self, void **out)
+{
+    dwprobe *o = self;
+    if (!out) return DW_E_NOTIMPL;
+    *out = dw_make_family(o ? o->ctx : NULL);
+    return *out ? DW_S_OK : DW_E_NOTIMPL;
+}
+
+/* IDWriteFont::GetInformationalStrings(id, IDWriteLocalizedStrings**, BOOL*) */
+static MS int32_t dwfont_GetInformationalStrings(void *self, uint32_t id,
+                                                 void **out, int32_t *exists)
+{
+    (void)self; (void)id;
+    /* Nothing to report, said properly: a caller reading *exists first will
+     * not then dereference the null it was handed. */
+    if (out)    *out = NULL;
+    if (exists) *exists = 0;
+    return DW_S_OK;
+}
+
+/* IDWriteFont::GetMetrics(DWRITE_FONT_METRICS*) -- the same numbers the font
+ * face reports, because it is the same face. */
+static MS void dwfont_GetMetrics(void *self, void *out)
+{ dwfa_GetMetrics(self, out); }
+
+/* IDWriteFont::HasCharacter(UINT32, BOOL*) */
+static MS int32_t dwfont_HasCharacter(void *self, uint32_t ch, int32_t *has)
+{
+    FT_Face f = dw_ftface();
+    (void)self;
+    if (!has) return DW_E_NOTIMPL;
+    *has = (f && FT_Get_Char_Index(f, (FT_ULong)ch)) ? 1 : 0;
+    return DW_S_OK;
+}
+
 static dwprobe *dw_make_font(dw_collection *c)
 {
     dwprobe *f = dwp_new("IDWriteFont");
     if (!f) return NULL;
     f->ctx = c;
+    dwp_set(f, 3,  (void *)dwfont_GetFontFamily);
     dwp_set(f, 4,  (void *)dwfont_GetWeight);
     dwp_set(f, 5,  (void *)dwfont_GetStretch);
     dwp_set(f, 6,  (void *)dwfont_GetStyle);
     dwp_set(f, 7,  (void *)dwfont_IsSymbolFont);
+    dwp_set(f, 8,  (void *)dwfont_GetFaceNames);
+    dwp_set(f, 9,  (void *)dwfont_GetInformationalStrings);
     dwp_set(f, 10, (void *)dwfont_GetSimulations);
+    dwp_set(f, 11, (void *)dwfont_GetMetrics);
+    dwp_set(f, 12, (void *)dwfont_HasCharacter);
     dwp_set(f, 13, (void *)dwfont_CreateFontFace);
     return f;
 }
@@ -873,6 +1317,9 @@ static MS int32_t st_DWriteCreateFactory(uint32_t type, const void *iid, void **
         if (g_dwrite_factory) {
             g_dwrite_factory->iid_known = IID_IDWriteFactory_b;
             dwp_set(g_dwrite_factory,  3, (void *)dwf_GetSystemFontCollection);
+            dwp_set(g_dwrite_factory, 17, (void *)dwf_GetGdiInterop);
+            dwp_set(g_dwrite_factory, 15, (void *)dwf_CreateTextFormat);
+            dwp_set(g_dwrite_factory, 18, (void *)dwf_CreateTextLayout);
             dwp_set(g_dwrite_factory,  8, (void *)dwf_CreateCustomFontFileReference);
             dwp_set(g_dwrite_factory, 13, (void *)dwf_RegisterFontFileLoader);
             dwp_set(g_dwrite_factory, 14, (void *)dwf_UnregisterFontFileLoader);

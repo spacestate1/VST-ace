@@ -4892,6 +4892,39 @@ static MS void *st_FindWindowW(const uint16_t *cls, const uint16_t *name)
 static MS void *st_FindWindowExW(void *p, void *c, const uint16_t *cls, const uint16_t *nm)
 { (void)p;(void)c;(void)cls;(void)nm; return NULL; }
 
+/* GetDeviceCaps.
+ *
+ * A stub answering 0 to everything is not neutral here. LOGPIXELSX is how a
+ * plug-in finds the display's DPI, and it scales its whole layout by
+ * dpi/96 -- so zero collapses the interface to nothing. That is exactly what
+ * happened: a SynthEdit VST3 built its view, asked for the DPI, computed a
+ * scale of zero and reported a 0x0 editor, which this host then declined to
+ * open because there was nothing to open.
+ *
+ * The values are an ordinary desktop's, and the ones that describe the screen
+ * come from the same place GetSystemMetrics answers from, so a plug-in that
+ * asks both ways gets one story. */
+static MS int32_t st_GetDeviceCaps(void *hdc, int32_t index)
+{
+    (void)hdc;
+    switch (index) {
+    case 2:   return 1;                          /* TECHNOLOGY: DT_RASDISPLAY */
+    case 4:   return 520;                        /* HORZSIZE, mm */
+    case 6:   return 320;                        /* VERTSIZE, mm */
+    case 8:   return st_GetSystemMetrics(0);     /* HORZRES */
+    case 10:  return st_GetSystemMetrics(1);     /* VERTRES */
+    case 12:  return 32;                         /* BITSPIXEL */
+    case 14:  return 1;                          /* PLANES */
+    case 24:  return -1;                         /* NUMCOLORS: more than 8bpp */
+    case 26:  return 0;                          /* RASTERCAPS */
+    case 88:                                     /* LOGPIXELSX */
+    case 90:  return 96;                         /* LOGPIXELSY */
+    case 104: return 1;                          /* SIZEPALETTE / COLORRES */
+    case 118: return 1;                          /* SHADEBLENDCAPS */
+    default:  return 0;
+    }
+}
+
 /* dwData is an LPARAM: pointer-sized, so intptr_t rather than int64_t. As an
  * int64_t this stub was a five-argument stdcall function at i386 -- it popped
  * 20 bytes where win32_arity.h says EnumDisplayMonitors takes 16, so a plugin
@@ -6156,6 +6189,14 @@ static const winstub g_stubs[] = {
     { "ws2_32.dll", "htons", (void *)st_htons_ },
     { "ws2_32.dll", "ntohl", (void *)st_ntohl_ },
     { "ws2_32.dll", "ntohs", (void *)st_ntohs_ },
+#ifndef PELOAD_NO_GUI_LAYER
+    /* DirectWrite. Skia finds this with LoadLibrary and GetProcAddress, which
+     * the handle above already served; a plug-in that imports it straight from
+     * DWrite.dll reached the generic stub instead, and that returns E_NOTIMPL
+     * without filling the factory out-parameter the caller then dereferences. */
+    { "dwrite.dll", "DWriteCreateFactory", (void *)st_DWriteCreateFactory },
+#endif
+    S("gdi32.dll", GetDeviceCaps),
     S("gdi32.dll", SetDIBitsToDevice), S("gdi32.dll", GetClipBox),
     S("gdi32.dll", GdiFlush),
     S("user32.dll", GetDialogBaseUnits), S("user32.dll", MapDialogRect),
