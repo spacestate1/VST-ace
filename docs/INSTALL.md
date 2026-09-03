@@ -36,22 +36,24 @@ obscurely. To turn it on:
 There is no equivalent in the `.rpm` yet; on Fedora, 32-bit plug-ins still want
 a build from source.
 
-A few plug-ins import a Microsoft C or C++ runtime that cannot be stubbed --
-iostreams and locale objects carry vtables and internal state -- and they load
-only with the genuine DLL present. It is not ours to redistribute, so the main
-package ships the place to put it -- both widths, empty, with a README beside
-them:
+The Microsoft C++ runtime is reimplemented rather than required. Every symbol
+the plug-in corpus imports from `msvcp120.dll` is provided natively, and the
+plug-ins that used to need it -- NI Absynth 5, FM8 and Kontakt 5 -- render
+byte-identical audio with no such DLL present. Nothing in the corpus needs
+`runtime/` or `runtime32/` any more.
+
+The two directories still ship, empty, as an escape hatch for a plug-in built
+against a runtime that is not yet covered -- `msvcp140.dll` is the known gap:
 
     /usr/lib/vst-ace/runtime/      x86-64 DLLs, for the 64-bit hosts
     /usr/lib/vst-ace/runtime32/    i386 DLLs, for peload32
 
-Drop `msvcp120.dll` from the Visual C++ 2013 redistributable into the first,
-and `msvcp120.dll` with `msvcr120.dll` beside it into the second. Both are
-searched next to the installed binaries, so there is nothing to configure;
-`PELOAD_DLL_PATH` overrides the search if they live somewhere else. Everything
-apart from those plug-ins works with both directories empty, which is how they
-ship. Wine's builds of the same DLLs are refused rather than loaded: they are
-compiled against Wine's own `ntdll` and fault inside their own startup.
+Anything dropped there is searched next to the installed binaries, so there is
+nothing to configure; `PELOAD_DLL_PATH` overrides the search if the DLLs live
+somewhere else. A real DLL is preferred over the built-in implementation
+wherever one is found. Wine's builds of the same DLLs are refused rather than
+loaded: they are compiled against Wine's own `ntdll` and fault inside their own
+startup.
 
 An installed copy has no tree to find the plug-in corpus in. Both windows take
 the folders to search under **Settings > Plug-in Folders**, each filed under the
