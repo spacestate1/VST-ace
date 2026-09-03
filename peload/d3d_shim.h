@@ -374,6 +374,19 @@ static MS void d2_SetTransform(void *self, const float *m)
  * stack, and it then draws relative to that. */
 static MS void d2_GetTransform(void *self, float *m)
 { (void)self; if (m) memcpy(m, g_d2_xf, sizeof g_d2_xf); }
+#define D2_CLIP_DEPTH 32
+typedef struct { int has; float x0, y0, x1, y1; } d2_clip;
+static d2_clip g_d2_clip[D2_CLIP_DEPTH];      /* [0] is "no clip"; the top is in force */
+static int     g_d2_clipn;
+
+/* A point through the transform in force, which is the space a clip rectangle
+ * arrives in. */
+static void d2_xf_point(float x, float y, float *ox, float *oy)
+{
+    *ox = g_d2_xf[0] * x + g_d2_xf[2] * y + g_d2_xf[4];
+    *oy = g_d2_xf[1] * x + g_d2_xf[3] * y + g_d2_xf[5];
+}
+
 /* A graphics object over the window surface, made fresh per call: the
  * rasteriser keeps no state worth caching and the transform lives on the
  * context. */
@@ -385,6 +398,15 @@ static gp_graphics *d2_gfx(dwprobe *ctx)
     g.tag = GPO_GRAPHICS;
     g.surf = s;
     memcpy(g.xf.m, g_d2_xf, sizeof g_d2_xf);
+    /* Rebuilt for every call, so the clip has to be applied here rather than
+     * left on the object -- see d2_PushAxisAlignedClip. */
+    if (g_d2_clip[g_d2_clipn].has) {
+        g.has_clip = 1;
+        g.cx0 = g_d2_clip[g_d2_clipn].x0;
+        g.cy0 = g_d2_clip[g_d2_clipn].y0;
+        g.cx1 = g_d2_clip[g_d2_clipn].x1;
+        g.cy1 = g_d2_clip[g_d2_clipn].y1;
+    }
     (void)ctx;
     return s ? &g : NULL;
 }
@@ -463,18 +485,35 @@ static MS int32_t d2_FillRectangle(void *self, const float *rc, void *brush)
     free(p.pt); free(p.ty);
     return D3D_OK;
 }
+/* Clear paints the clip region, not the whole target -- which matters for the
+ * same reason the clip itself does. */
 static MS int32_t d2_Clear(void *self, const float *color)
 {
     gp_graphics *g = d2_gfx(self);
-    int W, H;
+    int W, H, x, y, x0, y0, x1, y1;
     uint32_t *px = gp_pixels(g, &W, &H), c = d2_color(color);
-    int i;
     if (!px) return D3D_NOTIMPL;
-    for (i = 0; i < W * H; i++) px[i] = c | 0xFF000000u;
+    x0 = 0; y0 = 0; x1 = W; y1 = H;
+    if (g->has_clip) {
+        if (g->cx0 > (float)x0) x0 = (int)g->cx0;
+        if (g->cy0 > (float)y0) y0 = (int)g->cy0;
+        if (g->cx1 < (float)x1) x1 = (int)g->cx1;
+        if (g->cy1 < (float)y1) y1 = (int)g->cy1;
+    }
+    for (y = y0; y < y1; y++)
+        for (x = x0; x < x1; x++)
+            px[(size_t)y * W + x] = c | 0xFF000000u;
     return D3D_OK;
 }
 static MS void d2_BeginDraw(void *self)
-{ (void)self; PLOG("  [d2d] BeginDraw\n"); }
+{
+    (void)self;
+    /* The clip stack is balanced within one frame. Starting each frame with it
+     * empty means a plug-in that pushes without popping loses its clip at the
+     * frame boundary rather than clipping every later frame away to nothing. */
+    g_d2_clipn = 0;
+    PLOG("  [d2d] BeginDraw\n");
+}
 static MS int32_t d2_EndDraw(void *self, uint64_t *tag1, uint64_t *tag2)
 {
     (void)self;
@@ -729,19 +768,40 @@ static MS int32_t d2_DrawBitmap(void *self, void *bitmap, const float *dest,
 
 /* Clipping. A rectangle pushed here bounds every later call until it is popped;
  * the rasteriser takes one clip rectangle, so they nest by intersection. */
-#define D2_CLIP_DEPTH 16
-static W32RECT g_d2_clip[D2_CLIP_DEPTH];
-static int     g_d2_clipn;
-
+/* Clipping, and it is not decoration.
+ *
+ * A plug-in repainting one knob pushes that knob's rectangle, redraws its whole
+ * background bitmap under it, and then draws only the controls the rectangle
+ * touches -- everything else is still on the window from the last frame, which
+ * is how Windows works. Recording the rectangle and then ignoring it let that
+ * background bitmap cover the entire editor, so adjusting one knob wiped every
+ * other control off the panel and left the bare backdrop behind.
+ *
+ * Nested pushes intersect, and the stack remembers what was in force so a pop
+ * puts it back. */
 static MS int32_t d2_PushAxisAlignedClip(void *self, const float *rc, uint32_t mode)
 {
+    d2_clip c;
+    float x0, y0, x1, y1, t;
     (void)self; (void)mode;
-    if (g_d2_clipn >= D2_CLIP_DEPTH || !rc) return D3D_OK;
-    g_d2_clip[g_d2_clipn].left   = (int32_t)rc[0];
-    g_d2_clip[g_d2_clipn].top    = (int32_t)rc[1];
-    g_d2_clip[g_d2_clipn].right  = (int32_t)rc[2];
-    g_d2_clip[g_d2_clipn].bottom = (int32_t)rc[3];
+    if (g_d2_clipn >= D2_CLIP_DEPTH - 1 || !rc) return D3D_OK;
+    d2_xf_point(rc[0], rc[1], &x0, &y0);
+    d2_xf_point(rc[2], rc[3], &x1, &y1);
+    if (x1 < x0) { t = x0; x0 = x1; x1 = t; }
+    if (y1 < y0) { t = y0; y0 = y1; y1 = t; }
+    c = g_d2_clip[g_d2_clipn];
+    if (c.has) {                                   /* intersect with the outer one */
+        if (x0 < c.x0) x0 = c.x0;
+        if (y0 < c.y0) y0 = c.y0;
+        if (x1 > c.x1) x1 = c.x1;
+        if (y1 > c.y1) y1 = c.y1;
+    }
     g_d2_clipn++;
+    g_d2_clip[g_d2_clipn].has = 1;
+    g_d2_clip[g_d2_clipn].x0 = x0;
+    g_d2_clip[g_d2_clipn].y0 = y0;
+    g_d2_clip[g_d2_clipn].x1 = x1;
+    g_d2_clip[g_d2_clipn].y1 = y1;
     return D3D_OK;
 }
 static MS int32_t d2_PopAxisAlignedClip(void *self)
