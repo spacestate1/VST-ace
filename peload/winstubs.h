@@ -2959,6 +2959,136 @@ static MS void st__CxxThrowException(void *object, const void *throwinfo)
 }
 #endif
 
+/* ------------------------------------------------------------ dynamic_cast --- */
+
+/* __RTDynamicCast is what `dynamic_cast<T*>(p)` compiles to.
+ *
+ * A stub returning 0 is not a soft failure. The compiler emits a null check
+ * only where the source says the cast might fail; a cast the programmer knows
+ * cannot fail is used immediately, so a stub turns every one of them into a
+ * null dereference somewhere else entirely. That is exactly how it presented:
+ * a VST3 plug-in faulted reading address 0x3c8, which is `lea rcx,[rax+0x3c8]`
+ * on a NULL rax two instructions after the call, while the *next* block in the
+ * same function tested for null before using the same pointer.
+ *
+ * MSVC records the whole class hierarchy in the image, so this is a lookup
+ * rather than a guess. The object's vftable is preceded by a pointer to a
+ * CompleteObjectLocator, which names the type, says where this subobject sits
+ * inside the complete object, and points at a hierarchy descriptor listing
+ * every base. Walk the bases for one whose mangled name matches the target and
+ * the cast is that base's address; find none and the cast genuinely fails.
+ *
+ * Types are compared by mangled name rather than by TypeDescriptor address: a
+ * class defined in two images has two descriptors, and comparing addresses
+ * would refuse a cast that must succeed. Names are what MSVC's own runtime
+ * compares for the same reason. */
+
+typedef struct {
+    uint32_t signature;         /* 0: fields are pointers (i386). 1: RVAs (x64) */
+    uint32_t offset;            /* this vftable's offset within the complete object */
+    uint32_t cdOffset;
+    uint32_t pTypeDescriptor;
+    uint32_t pClassDescriptor;
+    uint32_t pSelf;             /* signature 1 only: this locator's own RVA */
+} ms_objlocator;
+
+typedef struct {
+    uint32_t signature, attributes, numBaseClasses, pBaseClassArray;
+} ms_hierarchy;
+
+/* RTTIBaseClassDescriptor, read by offset rather than as a struct: the array
+ * holds pointers to these, so only the field offsets matter and a trailing
+ * field this does not use cannot shift anything. */
+#define BCD_TYPEDESC 0
+#define BCD_MDISP    8
+#define BCD_PDISP    12
+#define BCD_VDISP    16
+
+/* The mangled name inside a TypeDescriptor: a vftable pointer, a spare word,
+ * then the name. Two pointer-widths in, at either width. */
+static const char *ms_td_name(const void *td)
+{ return td ? (const char *)td + 2 * sizeof(void *) : NULL; }
+
+static MS void *st___RTDynamicCast(void *inptr, int32_t VfDelta,
+                                   void *SrcType, void *TargetType,
+                                   int32_t isReference)
+{
+    const ms_objlocator *col;
+    const ms_hierarchy *h;
+    const uint8_t *base, *complete;
+    const uint32_t *arr;
+    const char *want;
+    uint32_t i;
+
+    (void)VfDelta; (void)SrcType;
+    if (!inptr || !TargetType) return NULL;
+
+    /* vftable[-1] is the locator. */
+    {
+        const void *const *vft = *(const void *const **)inptr;
+        if (!vft) return NULL;
+        col = (const ms_objlocator *)vft[-1];
+    }
+    if (!col) return NULL;
+
+    /* Where RVAs are measured from. The locator carries its own RVA precisely
+     * so a 64-bit image can recover its base from any object, which is what
+     * makes this work without knowing which module the object came from --
+     * and a plug-in's objects and its runtime's are not always the same one. */
+    if (col->signature == 1) {
+        base = (const uint8_t *)col - col->pSelf;
+    } else {
+        base = NULL;                              /* i386: fields are pointers */
+    }
+#define MS_RTTI_AT(x) (base ? base + (x) : (const uint8_t *)(uintptr_t)(x))
+
+    want = ms_td_name(TargetType);
+    if (!want) return NULL;
+
+    complete = (const uint8_t *)inptr - col->offset;
+
+    h = (const ms_hierarchy *)MS_RTTI_AT(col->pClassDescriptor);
+    if (!h || !h->numBaseClasses || h->numBaseClasses > 4096) return NULL;
+    arr = (const uint32_t *)MS_RTTI_AT(h->pBaseClassArray);
+    if (!arr) return NULL;
+
+    for (i = 0; i < h->numBaseClasses; i++) {
+        const uint8_t *bcd = MS_RTTI_AT(arr[i]);
+        const void *td;
+        int32_t mdisp, pdisp, vdisp;
+        const uint8_t *p;
+
+        if (!bcd) continue;
+        td = MS_RTTI_AT(*(const uint32_t *)(bcd + BCD_TYPEDESC));
+        if (!td || strcmp(ms_td_name(td), want) != 0) continue;
+
+        mdisp = *(const int32_t *)(bcd + BCD_MDISP);
+        pdisp = *(const int32_t *)(bcd + BCD_PDISP);
+        vdisp = *(const int32_t *)(bcd + BCD_VDISP);
+
+        p = complete + mdisp;
+        if (pdisp >= 0) {
+            /* A virtual base: step to the vbtable pointer, then to the entry
+             * in the table that says where the base actually landed. */
+            p += pdisp;
+            p += *(const int32_t *)(*(const uint8_t *const *)p + vdisp);
+        }
+        return (void *)(uintptr_t)p;
+    }
+#undef MS_RTTI_AT
+
+    /* A cast that legitimately fails. For a pointer cast that is a null return
+     * and the caller's business; for a reference cast MSVC throws std::bad_cast,
+     * which cannot be raised from here -- so say so rather than hand back a
+     * null the compiler never emitted a check for. */
+    if (isReference)
+        fprintf(stderr, "[win] dynamic_cast to %s failed on a reference; "
+                        "std::bad_cast cannot be thrown from here\n", want);
+    PLOG("  [win] dynamic_cast to %s -> no match among %u base(s)\n",
+         want, (unsigned)h->numBaseClasses);
+    return NULL;
+}
+
 /* ------------------------------------------------------- the printf family --- */
 
 /* Variadic stubs need the Microsoft convention's own va_list on x86-64: MS
@@ -5459,6 +5589,9 @@ static const winstub g_stubs[] = {
     S("user32.dll", RegisterDeviceNotificationW),
     S("user32.dll", UnregisterDeviceNotification),
     { "msvcrt.dll", "_CxxThrowException", (void *)st__CxxThrowException },
+    /* dynamic_cast. Imported from VCRUNTIME140 by anything built with 2015 or
+     * later, and reached here through crt_alias. */
+    { "msvcrt.dll", "__RTDynamicCast", (void *)st___RTDynamicCast },
     S("kernel32.dll", GetLogicalProcessorInformation),
     { "powrprof.dll", "CallNtPowerInformation", (void *)st_CallNtPowerInformation },
     S("kernel32.dll", IsWow64Process),
