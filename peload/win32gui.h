@@ -155,6 +155,7 @@ typedef struct {
     uint8_t  *dib;
     int       dib_bpp, dib_stride, dib_flip, dib_alias, dib_565;
     int       px_drawn;            /* GDI has written this bitmap */
+    int       mono;                /* 1 bit per pixel: a mask, not a picture */
     uint32_t  dib_pal[256];
     int       dib_pal_n;
     uint32_t  color;               /* brushes and pens */
@@ -482,6 +483,12 @@ static void w32_dib_push(w32_obj *o)
         }
     }
 }
+
+/* Declared here because BitBlt needs them before the drawing section defines
+ * them: the colour-order conversion, and the pattern the pattern rops use. */
+static uint32_t w32_cr(uint32_t colorref);
+static int      w32_brush_on(const w32_dc *d);
+static uint32_t w32_brush_rgb(const w32_dc *d);
 
 static w32_surf *w32_target_in_raw(w32_dc *d, w32_surf *tmp)
 {
@@ -1682,6 +1689,71 @@ static MS int32_t st_StretchDIBits(void *hdc, int32_t xd, int32_t yd, int32_t wd
     return hd;
 }
 
+/* Raster operations.
+ *
+ * BitBlt took a rop and discarded it, which is SRCCOPY for everything. That is
+ * right for the great majority of blits and wrong for the one pattern every
+ * GDI-era plug-in uses to draw a shape with transparency: the mask is blitted
+ * with SRCAND to punch a hole, then the artwork with SRCPAINT to fill it. Done
+ * as two SRCCOPYs, the second simply overwrites the first and whatever was
+ * underneath is gone.
+ *
+ * The ternary rop codes encode a whole truth table in their high byte; these
+ * are the fifteen with names, which is what callers actually pass. */
+#define W32_SRCCOPY     0x00CC0020u
+#define W32_SRCPAINT    0x00EE0086u
+#define W32_SRCAND      0x008800C6u
+#define W32_SRCINVERT   0x00660046u
+#define W32_SRCERASE    0x00440328u
+#define W32_NOTSRCCOPY  0x00330008u
+#define W32_NOTSRCERASE 0x001100A6u
+#define W32_MERGECOPY   0x00C000CAu
+#define W32_MERGEPAINT  0x00BB0226u
+#define W32_PATCOPY     0x00F00021u
+#define W32_PATPAINT    0x00FB0A09u
+#define W32_PATINVERT   0x005A0049u
+#define W32_DSTINVERT   0x00550009u
+#define W32_BLACKNESS   0x00000042u
+#define W32_WHITENESS   0x00FF0062u
+
+/* Whether the operation reads the source at all. The ones that do not must not
+ * be clipped away just because the source rectangle is off its bitmap. */
+static int w32_rop_needs_src(uint32_t rop)
+{
+    switch (rop) {
+    case W32_PATCOPY: case W32_PATINVERT: case W32_DSTINVERT:
+    case W32_BLACKNESS: case W32_WHITENESS:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
+static uint32_t w32_rop_apply(uint32_t rop, uint32_t s, uint32_t d, uint32_t p)
+{
+    switch (rop) {
+    case W32_SRCCOPY:     return s;
+    case W32_SRCPAINT:    return d | s;
+    case W32_SRCAND:      return d & s;
+    case W32_SRCINVERT:   return d ^ s;
+    case W32_SRCERASE:    return d & ~s;
+    case W32_NOTSRCCOPY:  return ~s;
+    case W32_NOTSRCERASE: return ~(d | s);
+    case W32_MERGECOPY:   return s & p;
+    case W32_MERGEPAINT:  return d | ~s;
+    case W32_PATCOPY:     return p;
+    case W32_PATPAINT:    return d | p | ~s;
+    case W32_PATINVERT:   return d ^ p;
+    case W32_DSTINVERT:   return ~d;
+    case W32_BLACKNESS:   return 0;
+    case W32_WHITENESS:   return 0x00FFFFFFu;
+    /* An unnamed ternary rop is rare enough that copying the source is a better
+     * answer than refusing to draw, and it is what this did for every rop
+     * until now. */
+    default:              return s;
+    }
+}
+
 static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t h,
                             void *src, int32_t sx, int32_t sy, uint32_t rop)
 {
@@ -1691,7 +1763,6 @@ static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t 
     int j, i;
 
     W.n_bitblt++;
-    (void)rop;
     if (!ds || !ds->px) return 0;
     if (!ss || !ss->px) return 0;
     /* Both DCs' viewport origins apply, each to its own coordinates.
@@ -1705,13 +1776,32 @@ static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t 
      * like a plug-in that stopped drawing after the first control. */
     x += dd->org_x;  y += dd->org_y;
     sx += sd->org_x; sy += sd->org_y;
-    for (j = 0; j < h; j++) {
-        int ty = y + j, fy = sy + j;
-        if (ty < 0 || ty >= ds->h || fy < 0 || fy >= ss->h) continue;
-        for (i = 0; i < w; i++) {
-            int tx = x + i, fx = sx + i;
-            if (tx < 0 || tx >= ds->w || fx < 0 || fx >= ss->w) continue;
-            ds->px[(size_t)ty * ds->w + tx] = ss->px[(size_t)fy * ss->w + fx];
+    {
+        /* A monochrome source is expanded through the destination DC's colours:
+         * a 0 bit takes the text colour and a 1 bit the background colour,
+         * which is how an application paints a shape in the colours the DC is
+         * set to rather than in black and white. */
+        int mono = sd->bitmap && W.obj[sd->bitmap].mono && !(dd->bitmap &&
+                   W.obj[dd->bitmap].mono);
+        uint32_t fg = w32_cr(dd->text_color), bg = w32_cr(dd->bk_color);
+        uint32_t pat = w32_brush_on(dd) ? w32_brush_rgb(dd) : 0;
+
+        for (j = 0; j < h; j++) {
+            int ty = y + j, fy = sy + j;
+            if (ty < 0 || ty >= ds->h) continue;
+            for (i = 0; i < w; i++) {
+                int tx = x + i, fx = sx + i;
+                uint32_t sv = 0, dv, out;
+                if (tx < 0 || tx >= ds->w) continue;
+                if (w32_rop_needs_src(rop)) {
+                    if (fy < 0 || fy >= ss->h || fx < 0 || fx >= ss->w) continue;
+                    sv = ss->px[(size_t)fy * ss->w + fx];
+                    if (mono) sv = sv ? bg : fg;
+                }
+                dv = ds->px[(size_t)ty * ds->w + tx];
+                out = w32_rop_apply(rop, sv, dv, pat);
+                ds->px[(size_t)ty * ds->w + tx] = out & 0x00FFFFFFu;
+            }
         }
     }
     w32_dib_out(dd, x, y, x + w, y + h);
@@ -1996,6 +2086,11 @@ static MS void *st_CreateBitmap(int32_t w, int32_t h, uint32_t planes,
     o = &W.obj[idx];
     PLOG("  [w32] CreateBitmap bmp#%d %dx%d %u planes %ubpp bits=%p\n",
          idx, w, h, planes, bpp, bits);
+    /* A one-bit bitmap is a mask. Windows does not blit it as pixels: a 0 bit
+     * takes the destination's text colour and a 1 bit its background colour,
+     * which is how an application paints a shape in whatever colour the DC is
+     * set to rather than in black and white. */
+    o->mono = (bpp == 1 && planes == 1);
     if (!src || planes != 1) return w32_h(W32_OBJ_BASE, idx);
 
     stride = ((uint32_t)w * bpp + 15) / 16 * 2;

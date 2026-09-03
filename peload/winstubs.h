@@ -2237,6 +2237,50 @@ static MS int32_t st_GetClassInfoA(void *inst, const char *name, void *out)
     }
 }
 
+/* The path questions a plug-in asks before it decides where its own data lives.
+ *
+ * All four were stubs answering zero, and a caller reads that as "there is no
+ * such volume", "this is not a root", "there is no directory" -- so it concludes
+ * it has nowhere to keep anything and stops looking. */
+static MS int32_t st_GetVolumeInformationA(const char *root, char *name, uint32_t namelen,
+                                           uint32_t *serial, uint32_t *maxcomp,
+                                           uint32_t *flags, char *fsname, uint32_t fslen)
+{
+    (void)root;
+    if (name && namelen) snprintf(name, namelen, "%s", "peload");
+    if (serial)  *serial = 0x50454C44u;
+    if (maxcomp) *maxcomp = 255;
+    if (flags)   *flags = 0;
+    if (fsname && fslen) snprintf(fsname, fslen, "%s", "NTFS");
+    return 1;
+}
+static MS int32_t st_CreateDirectoryA(const char *path, void *sa)
+{
+    char host[1024];
+    (void)sa;
+    if (!path) return 0;
+    snprintf(host, sizeof host, "%s", path);
+    path_norm_n(host, sizeof host);
+    if (mkdir(host, 0777) == 0) return 1;
+    g_last_error = (errno == EEXIST) ? 183 : 3;   /* ALREADY_EXISTS / PATH_NOT_FOUND */
+    return 0;
+}
+/* Nothing this host serves is a UNC path; a drive letter is its own root. */
+static MS int32_t st_PathIsUNCA(const char *p)
+{ return p && p[0] == '\\' && p[1] == '\\'; }
+static MS int32_t st_PathStripToRootA(char *p)
+{
+    if (!p) return 0;
+    if (p[0] && p[1] == ':') { p[2] = '\\'; p[3] = 0; return 1; }
+    if (p[0] == '\\' && p[1] == '\\') {            /* \\server\share */
+        char *q = strchr(p + 2, '\\');
+        if (q) q = strchr(q + 1, '\\');
+        if (q) *q = 0;
+        return 1;
+    }
+    return 0;
+}
+
 /* A halftone palette is meaningless at 32 bits per pixel, and a caller that
  * gets NULL for one concludes the display cannot be drawn on. */
 static MS void *st_CreateHalftonePalette(void *hdc)
@@ -7229,6 +7273,9 @@ static const winstub g_stubs[] = {
     S("gdi32.dll", GetTextMetricsA), S("gdi32.dll", GetTextMetricsW),
     S("gdi32.dll", GetTextExtentPointA),
     S("user32.dll", DrawTextA), S("user32.dll", DrawTextW),
+    S("kernel32.dll", GetVolumeInformationA),
+    S("kernel32.dll", CreateDirectoryA),
+    S("shlwapi.dll", PathIsUNCA), S("shlwapi.dll", PathStripToRootA),
     S("winmm.dll", timeGetTime), S("winmm.dll", timeBeginPeriod),
     S("winmm.dll", timeEndPeriod), S("user32.dll", GetClassInfoA),
     S("gdi32.dll", CreateHalftonePalette), S("gdi32.dll", SelectPalette),
