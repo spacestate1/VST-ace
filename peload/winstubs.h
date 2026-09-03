@@ -2676,6 +2676,38 @@ static MS int32_t st_QueueUserWorkItem(void *fn, void *ctx, uint32_t flags)
     return 1;
 }
 
+/* CreateProcess. There is no Windows here to start a process in, and this
+ * reports that plainly rather than pretending -- but it has to *exist*: a
+ * plug-in that resolves a table of kernel32 entry points at load time and
+ * refuses to initialise when one comes back NULL never gets as far as calling
+ * it. VSTSpeek is one, and it failed in DllMain with nothing else wrong. */
+static MS int32_t st_CreateProcessW(const uint16_t *app, uint16_t *cmd,
+                                    void *psa, void *tsa, int32_t inherit,
+                                    uint32_t flags, void *env, const uint16_t *dir,
+                                    void *si, void *pi)
+{
+    char a[512];
+    (void)psa; (void)tsa; (void)inherit; (void)flags; (void)env; (void)dir; (void)si;
+    if (app) w2c(app, a, sizeof a);
+    else if (cmd) w2c(cmd, a, sizeof a);
+    else a[0] = 0;
+    PLOG("  [win] CreateProcessW(\"%s\") -- no process can be started here\n", a);
+    if (pi) memset(pi, 0, 24);                 /* PROCESS_INFORMATION */
+    g_last_error = 50;                         /* ERROR_NOT_SUPPORTED */
+    return 0;
+}
+static MS int32_t st_CreateProcessA(const char *app, char *cmd, void *psa, void *tsa,
+                                    int32_t inherit, uint32_t flags, void *env,
+                                    const char *dir, void *si, void *pi)
+{
+    (void)psa; (void)tsa; (void)inherit; (void)flags; (void)env; (void)dir; (void)si;
+    PLOG("  [win] CreateProcessA(\"%s\") -- no process can be started here\n",
+         app ? app : (cmd ? cmd : ""));
+    if (pi) memset(pi, 0, 24);
+    g_last_error = 50;
+    return 0;
+}
+
 static MS void st_ExitThread(uint32_t code) { (void)code; pthread_exit(NULL); }
 static MS int32_t st_GetExitCodeThread(void *h, uint32_t *code)
 { (void)h; if (code) *code = 0; return 1; }
@@ -9314,6 +9346,7 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", MapViewOfFile), S("kernel32.dll", MapViewOfFileEx),
     S("kernel32.dll", UnmapViewOfFile), S("kernel32.dll", FlushViewOfFile),
     S("kernel32.dll", GetFileSizeEx), S("kernel32.dll", SetFilePointerEx),
+    S("kernel32.dll", CreateProcessA), S("kernel32.dll", CreateProcessW),
     S("kernel32.dll", GetThreadTimes), S("kernel32.dll", GetProcessTimes),
     S("kernel32.dll", GetSystemTimes), S("kernel32.dll", QueryProcessCycleTime),
     S("kernel32.dll", CreateThreadpoolTimer), S("kernel32.dll", SetThreadpoolTimer),

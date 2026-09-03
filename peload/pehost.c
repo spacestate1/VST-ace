@@ -564,9 +564,30 @@ static int map_image(image *im, const char *path)
     im->size = im->opt->SizeOfImage;
     if (im->size < im->opt->SizeOfHeaders || im->size > (1u << 31))
         BAD("implausible SizeOfImage");
-    im->base = mmap(NULL, im->size, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (im->base == MAP_FAILED) { im->base = NULL; perror("mmap image"); goto fail; }
+    /* Ask for the address the image was linked for before letting the kernel
+     * choose. A DLL whose relocation directory is empty can only run there, and
+     * this loader never asked -- it always passed NULL, so the delta was never
+     * zero and "no relocs and base busy" was reported for a base that had not
+     * been tried. MAP_FIXED_NOREPLACE refuses rather than displacing whatever
+     * is already mapped, which is the whole point: a wrong guess here would
+     * unmap something the host is still using. */
+    im->base = NULL;
+#ifdef MAP_FIXED_NOREPLACE
+    if (im->opt->ImageBase && !(im->opt->ImageBase & 0xFFFu)) {
+        void *want = (void *)(uintptr_t)im->opt->ImageBase;
+        void *got = mmap(want, im->size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (got != MAP_FAILED) {
+            if (got == want) im->base = got;
+            else munmap(got, im->size);   /* a kernel that ignored the flag */
+        }
+    }
+#endif
+    if (!im->base) {
+        im->base = mmap(NULL, im->size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (im->base == MAP_FAILED) { im->base = NULL; perror("mmap image"); goto fail; }
+    }
     /* Where it landed, because every question about a crash in guest code
      * starts here: an address minus this is an RVA, and an RVA is what a
      * disassembler and a Ghidra project can both be asked about. Finding it
@@ -631,7 +652,12 @@ static int apply_relocs(image *im)
     int n = 0;
 
     if (!delta) return 0;
-    if (!d.VirtualAddress) { fprintf(stderr, "no relocs and base busy\n"); return -1; }
+    if (!d.VirtualAddress) {
+        fprintf(stderr, "this image has no relocations and its linked base "
+                        "0x%llx was already taken, so it cannot be moved\n",
+                (unsigned long long)im->opt->ImageBase);
+        return -1;
+    }
     p = rva(im, d.VirtualAddress); end = p + d.Size;
     while (p < end) {
         RELOC_BLK *b = (RELOC_BLK *)p;
