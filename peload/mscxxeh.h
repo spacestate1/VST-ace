@@ -29,6 +29,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #if defined(__x86_64__)
 
@@ -459,4 +461,193 @@ static void ms_run_unwind(const uint8_t *base, const ms_funcinfo *fi,
 }
 
 #endif  /* __x86_64__ */
+
+#if defined(__i386__)
+
+/* MSVC C++ exceptions on i386: the fs:[0] registration chain.
+ *
+ * The x86-64 half above reads tables out of the image because that is where
+ * Windows puts them. i386 has none: a function that needs a handler pushes an
+ * EXCEPTION_REGISTRATION_RECORD -- {prev, handler} -- onto its own stack and
+ * links it at fs:[0], so the chain is built by the plug-in as it runs. Every
+ * MSVC __try prologue in the corpus does exactly this, and the peload32 TEB has
+ * had a real %fs segment with the -1 terminator since it was written. The chain
+ * was there all along; nothing walked it.
+ *
+ * That makes this half short, and the shortness is the point: the compiler's
+ * tables are read by the plug-in's own __CxxFrameHandler, which is guest code we
+ * simply call. We provide the two things it cannot provide itself -- somebody to
+ * walk the chain when an exception is raised, and RtlUnwind to run the
+ * termination handlers between the throw and the catch it picked.
+ *
+ * Control does not come back from a handler that catches. It calls RtlUnwind and
+ * then jumps straight to its catch block with its own frame pointer, which
+ * abandons every host frame between here and there -- the same thing longjmp
+ * does, and safe for the same reason: this path holds no lock and owns no
+ * allocation. */
+
+typedef struct ms_exc_rec32 {
+    uint32_t ExceptionCode;
+    uint32_t ExceptionFlags;
+    struct ms_exc_rec32 *ExceptionRecord;
+    void    *ExceptionAddress;
+    uint32_t NumberParameters;
+    uint32_t ExceptionInformation[15];
+} ms_exc_rec32;
+
+typedef struct ms_seh32 {
+    struct ms_seh32 *prev;
+    void            *handler;
+} ms_seh32;
+
+/* What a handler may answer. Anything other than the first two means the
+ * runtime has found a state we did not create and cannot repair. */
+enum { MS_DISP_CONTINUE = 0, MS_DISP_SEARCH = 1,
+       MS_DISP_NESTED = 2, MS_DISP_COLLIDED = 3 };
+
+enum { MS_EH_NONCONTINUABLE = 0x01, MS_EH_UNWINDING     = 0x02,
+       MS_EH_EXIT_UNWIND    = 0x04, MS_EH_STACK_INVALID = 0x08,
+       MS_EH_NESTED_CALL    = 0x10, MS_EH_TARGET_UNWIND = 0x20,
+       MS_EH_COLLIDED_UNWIND = 0x40 };
+
+/* The end of the chain is -1, not NULL: a __try prologue pushes the old fs:[0]
+ * unconditionally, and a zero there would read as a record at address 0. */
+#define MS_SEH_END ((ms_seh32 *)0xFFFFFFFFu)
+
+/* i386 CONTEXT is 716 bytes. A handler is handed one because the ABI says so;
+ * MSVC's reads it only on the paths the kernel uses to resume a thread, which a
+ * raise from in here cannot take. Zeroed at the right size is therefore correct,
+ * and a smaller buffer would not be -- the handler may write to it. */
+#define MS_CONTEXT32_SIZE 716
+
+typedef int (*ms_seh_handler32)(ms_exc_rec32 *, void *, void *, void *);
+
+static ms_seh32 *ms_seh_head(void)
+{ ms_seh32 *h; __asm__ volatile ("movl %%fs:0, %0" : "=r"(h)); return h; }
+
+static void ms_seh_set_head(ms_seh32 *f)
+{ __asm__ volatile ("movl %0, %%fs:0" :: "r"(f) : "memory"); }
+
+/* A frame has to be on the stack, aligned, and further from the top than the one
+ * that named it. Windows checks the same three things, and for the same reason:
+ * the chain is guest-writable memory, and a plug-in that overruns a buffer on
+ * the stack corrupts it. Walking a corrupt chain calls whatever the overrun
+ * left behind, so a raise that should report a bad throw instead jumps into
+ * data. Refusing to walk is the honest failure. */
+static int ms_seh_plausible(const ms_seh32 *f, const ms_seh32 *prev)
+{
+    if (!f || f == MS_SEH_END)   return 0;
+    if ((uintptr_t)f & 3)        return 0;
+    if (prev && f <= prev)       return 0;
+    return f->handler != NULL;
+}
+
+/* RtlUnwind: run every termination handler between here and `target_frame`,
+ * unlinking each as it goes.
+ *
+ * A handler is popped after it runs, not before -- one that raises again must
+ * not find the frame it is unwinding still linked, or the second raise walks
+ * into it and recurses. */
+static void ms_unwind32(void *target_frame, void *target_ip,
+                        ms_exc_rec32 *rec, void *retval)
+{
+    ms_exc_rec32 local;
+    uint8_t ctx[MS_CONTEXT32_SIZE];
+    ms_seh32 *target = target_frame ? (ms_seh32 *)target_frame : MS_SEH_END;
+    ms_seh32 *f, *last = NULL;
+    void *dispatch = NULL;
+    int guard = 0;
+
+    (void)target_ip; (void)retval;
+
+    if (!rec) {
+        memset(&local, 0, sizeof local);
+        local.ExceptionCode  = 0xC0000027u;      /* STATUS_UNWIND */
+        local.ExceptionFlags = MS_EH_NONCONTINUABLE;
+        rec = &local;
+    }
+    rec->ExceptionFlags |= MS_EH_UNWINDING;
+    if (target == MS_SEH_END) rec->ExceptionFlags |= MS_EH_EXIT_UNWIND;
+
+    memset(ctx, 0, sizeof ctx);
+    for (f = ms_seh_head(); f != target && ms_seh_plausible(f, last); ) {
+        ms_seh32 *next = f->prev;
+        if (++guard > 4096) break;
+        ((ms_seh_handler32)f->handler)(rec, f, ctx, &dispatch);
+        ms_seh_set_head(next);
+        last = f;
+        f = next;
+    }
+    if (f == target) ms_seh_set_head(target);
+}
+
+/* Deliver `rec` to the chain. Returns non-zero only when a handler asked for
+ * execution to continue -- a handler that catches never comes back at all. */
+/* The mangled name of a thrown C++ type, for the report when nothing catches it.
+ *
+ * A plug-in that throws during init and dies with a bare 0xE06D7363 tells you
+ * nothing; the type name usually names the subsystem that gave up. MSVC hangs
+ * the whole description off the second exception parameter, and on i386 every
+ * pointer in that structure is absolute -- the RVA form is x86-64's.
+ *
+ * Returns NULL rather than guessing when any link does not look like what it
+ * should: this runs on the failure path, where the data is by definition
+ * already suspect. */
+static const char *ms_throw_typename32(const ms_exc_rec32 *rec)
+{
+    typedef struct { uint32_t attrs, unwind, fwd, catchable; } throwinfo32;
+    typedef struct { uint32_t props, type, disp, size, copy; } catchable32;
+    const throwinfo32 *ti;
+    const uint32_t *arr;
+    const catchable32 *ct;
+    const char *name;
+
+    if (!rec || rec->ExceptionCode != 0xE06D7363u || rec->NumberParameters < 3)
+        return NULL;
+    ti = (const throwinfo32 *)(uintptr_t)rec->ExceptionInformation[2];
+    if (!ti || !ti->catchable) return NULL;
+    arr = (const uint32_t *)(uintptr_t)ti->catchable;
+    if (!arr[0] || arr[0] > 64) return NULL;       /* count of catchable types */
+    ct = (const catchable32 *)(uintptr_t)arr[1];   /* the most derived one */
+    if (!ct || !ct->type) return NULL;
+    /* TypeDescriptor: vftable, spare, then the mangled name inline. */
+    name = (const char *)(uintptr_t)ct->type + 8;
+    return (name[0] == '.' || name[0] == '?') ? name : NULL;
+}
+
+static int ms_eh_verbose(void)
+{ static int v = -1; if (v < 0) { const char *e = getenv("PELOAD_VERBOSE");
+                                  v = e && *e != '0'; } return v; }
+
+static int ms_dispatch32(ms_exc_rec32 *rec)
+{
+    uint8_t ctx[MS_CONTEXT32_SIZE];
+    ms_seh32 *f, *last = NULL;
+    void *dispatch = NULL;
+    int guard = 0;
+
+    if (ms_eh_verbose())
+        fprintf(stderr, "  [eh] raise 0x%08x, chain head %p\n",
+                rec->ExceptionCode, (void *)ms_seh_head());
+
+    memset(ctx, 0, sizeof ctx);
+    for (f = ms_seh_head(); ms_seh_plausible(f, last); last = f, f = f->prev) {
+        int d;
+        if (++guard > 4096) break;
+        d = ((ms_seh_handler32)f->handler)(rec, f, ctx, &dispatch);
+        if (ms_eh_verbose())
+            fprintf(stderr, "  [eh]   frame %p handler %p -> %d\n",
+                    (void *)f, f->handler, d);
+        if (d == MS_DISP_CONTINUE) return 1;
+        if (d != MS_DISP_SEARCH)   break;
+    }
+    {
+        const char *t = ms_throw_typename32(rec);
+        fprintf(stderr, "[eh] nothing caught 0x%08x after %d frame(s)%s%s\n",
+                rec->ExceptionCode, guard, t ? "; thrown type " : "", t ? t : "");
+    }
+    return 0;
+}
+
+#endif  /* __i386__ */
 #endif  /* PELOAD_MSCXXEH_H */

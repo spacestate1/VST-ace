@@ -192,6 +192,50 @@ static MS void *st_LocalAlloc(uint32_t f, size_t sz)
 { return (f & 0x40) ? calloc(1, sz ? sz : 1) : malloc(sz ? sz : 1); }
 static MS void *st_LocalFree(void *p) { free(p); return NULL; }
 
+/* The rest of the Local/Global family, which is not optional the moment a
+ * plug-in is old enough to use it.
+ *
+ * A stub returning NULL here is not a soft failure: NULL from an allocator is
+ * the caller's signal that the machine is out of memory, and a plug-in built on
+ * MFC turns that straight into `throw CMemoryException` -- which is how the
+ * first 32-bit plug-in tried here died, several subsystems away from the stub
+ * that lied to it. The allocation it was making was 32 bytes.
+ *
+ * A handle and its pointer are the same value throughout, which is what the
+ * Lock/Unlock pair above already assumes: the moveable-memory distinction the
+ * API is built around exists for a 16-bit segmented heap that this is not.
+ *
+ * Size is answered from the allocator rather than remembered. glibc knows the
+ * usable size of a block, which may exceed what was asked for -- and so may
+ * Windows', for the same reason, so a caller that trusts the answer is already
+ * required to cope with it. */
+static void *w32_heap_realloc(void *p, size_t sz, uint32_t flags)
+{
+    size_t was = p ? malloc_usable_size(p) : 0;
+    void *n;
+
+    if (!p) return (flags & 0x40) ? calloc(1, sz ? sz : 1) : malloc(sz ? sz : 1);
+    /* Windows frees on a zero size only for a moveable handle; reallocating to
+     * zero elsewhere would hand back a block the caller still means to use. */
+    if (!sz) sz = 1;
+    if (!(n = realloc(p, sz))) return NULL;
+    if ((flags & 0x40) && sz > was) memset((char *)n + was, 0, sz - was);
+    return n;
+}
+static MS void *st_LocalReAlloc(void *p, size_t sz, uint32_t f)
+{ return w32_heap_realloc(p, sz, f); }
+static MS void *st_GlobalReAlloc(void *p, size_t sz, uint32_t f)
+{ return w32_heap_realloc(p, sz, f); }
+static MS void *st_LocalLock(void *p) { return p; }
+static MS int32_t st_LocalUnlock(void *p) { (void)p; return 1; }
+static MS void *st_LocalHandle(void *p) { return p; }
+static MS void *st_GlobalHandle(void *p) { return p; }
+static MS size_t st_LocalSize(void *p) { return p ? malloc_usable_size(p) : 0; }
+static MS size_t st_GlobalSize(void *p) { return p ? malloc_usable_size(p) : 0; }
+/* LMEM_/GMEM_ flags of a live fixed block: not discarded, lock count zero. */
+static MS uint32_t st_LocalFlags(void *p) { (void)p; return 0; }
+static MS uint32_t st_GlobalFlags(void *p) { (void)p; return 0; }
+
 /* ------------------------------------------------------- critical sections */
 
 /* CRITICAL_SECTION is 40 bytes on x64; we only use the first 8 to hold a
@@ -436,9 +480,9 @@ static MS void st_ExitProcess(uint32_t c)
  *
  * The name is worth keeping: it goes to the host thread, so anything looking at
  * this process sees the names the plugin chose. */
-static MS void st_RaiseException(uint32_t code, uint32_t f, uint32_t n, const uint64_t *a)
+static MS void st_RaiseException(uint32_t code, uint32_t f, uint32_t n,
+                                 const uintptr_t *a)
 {
-    (void)f;
     if (code == 0x406D1388u && n >= 2 && a) {
         /* THREADNAME_INFO: type (always 0x1000), name, thread id, flags. */
         const char *name = (const char *)(uintptr_t)a[1];
@@ -450,12 +494,45 @@ static MS void st_RaiseException(uint32_t code, uint32_t f, uint32_t n, const ui
         }
         return;
     }
+#if defined(__i386__)
+    /* Hand it to the plug-in's own handlers. A C++ throw arrives here as
+     * 0xE06D7363 with the object and its ThrowInfo in the parameters, and the
+     * __CxxFrameHandler that catches it never returns -- so anything below this
+     * block is the unhandled case, which is the only one worth reporting. */
+    {
+        ms_exc_rec32 rec;
+        uint32_t i;
+
+        memset(&rec, 0, sizeof rec);
+        rec.ExceptionCode     = code;
+        rec.ExceptionFlags    = f;
+        rec.ExceptionAddress  = __builtin_return_address(0);
+        rec.NumberParameters  = n > 15 ? 15 : n;
+        for (i = 0; i < rec.NumberParameters && a; i++)
+            rec.ExceptionInformation[i] = (uint32_t)a[i];
+        if (ms_dispatch32(&rec)) return;      /* a handler resumed execution */
+    }
+    fprintf(stderr, "[win] RaiseException(0x%08x): no handler in the chain "
+                    "accepted it\n", code);
+#else
+    (void)f;
     fprintf(stderr, "[win] RaiseException(0x%08x): structured exception "
-                    "dispatch is not implemented, so this cannot be delivered "
-                    "to a handler\n", code);
+                    "dispatch is not implemented at this width, so this cannot "
+                    "be delivered to a handler\n", code);
+#endif
     fflush(stderr);
     abort();
 }
+
+#if defined(__i386__)
+/* The other half a catch needs: everything between the throw and the frame the
+ * handler chose has to have its __finally blocks and destructors run before
+ * control lands in the catch. MSVC's handler asks for that by calling this and
+ * expects it to come back, which a plain C function does -- it preserves the
+ * callee-saved registers its caller is relying on by construction. */
+static MS void st_RtlUnwind(void *target, void *target_ip, void *rec, void *ret)
+{ ms_unwind32(target, target_ip, (ms_exc_rec32 *)rec, ret); }
+#endif
 static MS void st_SetErrorMode(uint32_t m) { (void)m; }
 static MS uint32_t st_GetVersion(void) { return 0x0A00; }
 
@@ -6540,6 +6617,11 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", GlobalAlloc), S("kernel32.dll", GlobalFree),
     S("kernel32.dll", GlobalLock), S("kernel32.dll", GlobalUnlock),
     S("kernel32.dll", LocalAlloc), S("kernel32.dll", LocalFree),
+    S("kernel32.dll", LocalReAlloc), S("kernel32.dll", GlobalReAlloc),
+    S("kernel32.dll", LocalLock), S("kernel32.dll", LocalUnlock),
+    S("kernel32.dll", LocalHandle), S("kernel32.dll", GlobalHandle),
+    S("kernel32.dll", LocalSize), S("kernel32.dll", GlobalSize),
+    S("kernel32.dll", LocalFlags), S("kernel32.dll", GlobalFlags),
     /* sync */
     S("kernel32.dll", InitializeCriticalSection),
     S("kernel32.dll", InitializeCriticalSectionAndSpinCount),
@@ -6628,6 +6710,9 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", RtlCaptureContext), S("kernel32.dll", RtlLookupFunctionEntry),
     S("kernel32.dll", RtlVirtualUnwind), S("kernel32.dll", RtlPcToFileHeader),
     S("kernel32.dll", RtlUnwindEx), S("kernel32.dll", RtlAddFunctionTable),
+#if defined(__i386__)
+    S("kernel32.dll", RtlUnwind), S("ntdll.dll", RtlUnwind),
+#endif
     /* files */
     S("kernel32.dll", CreateFileA), S("kernel32.dll", ReadFile),
     S("kernel32.dll", WriteFile), S("kernel32.dll", CloseHandle),
@@ -6725,7 +6810,20 @@ static const winstub g_stubs[] = {
     /* gdi32 */
     S("gdi32.dll", StretchDIBits), S("gdi32.dll", BitBlt),
     S("gdi32.dll", CreateCompatibleDC), S("gdi32.dll", CreateCompatibleBitmap),
-    S("gdi32.dll", CreateBitmap), S("gdi32.dll", DeleteDC),
+    S("gdi32.dll", CreateBitmap), S("gdi32.dll", CreateDIBSection),
+    S("gdi32.dll", RectVisible), S("gdi32.dll", IntersectClipRect),
+    S("gdi32.dll", ExcludeClipRect), S("gdi32.dll", SetViewportOrgEx),
+    S("gdi32.dll", OffsetViewportOrgEx), S("gdi32.dll", GetViewportOrgEx),
+    S("gdi32.dll", SetWindowOrgEx), S("gdi32.dll", GetWindowOrgEx),
+    S("user32.dll", SetRect), S("user32.dll", SetRectEmpty),
+    S("user32.dll", CopyRect), S("user32.dll", OffsetRect),
+    S("user32.dll", InflateRect), S("user32.dll", IntersectRect),
+    S("user32.dll", UnionRect), S("user32.dll", SubtractRect),
+    S("user32.dll", EqualRect), S("user32.dll", IsRectEmpty),
+    S("user32.dll", PtInRect),
+    S("user32.dll", SetWindowsHookExA), S("user32.dll", SetWindowsHookExW),
+    S("user32.dll", UnhookWindowsHookEx), S("user32.dll", CallNextHookEx),
+    S("gdi32.dll", DeleteDC),
     S("gdi32.dll", SelectObject), S("gdi32.dll", DeleteObject),
     S("gdi32.dll", GetCurrentObject), S("gdi32.dll", GetObjectA), S("gdi32.dll", GetObjectW),
     S("gdi32.dll", CreateSolidBrush), S("gdi32.dll", CreateBrushIndirect),

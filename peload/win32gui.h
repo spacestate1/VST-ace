@@ -34,6 +34,8 @@
 
 #define W32_HWND_BASE 0x00110000u
 #define W32_HDC_BASE  0x00220000u
+#define W32_HOOK_BASE 0x00660000u
+#define W32_MAX_HOOK  16
 #define W32_OBJ_BASE  0x00330000u
 
 typedef struct { int32_t left, top, right, bottom; } W32RECT;
@@ -137,6 +139,16 @@ typedef struct {
     int       used, kind;
     int       w, h;
     uint32_t *px;                  /* bitmaps */
+    /* A DIB section additionally hands the plugin a pointer to its own pixels,
+     * in the layout it asked for. When that layout is one we can read directly
+     * -- 32 bits per pixel, top-down -- `dib` and `px` are the same allocation
+     * and there is nothing to keep in step. Otherwise `dib` is what the plugin
+     * writes and `px` is what we draw and blit, converted on demand. */
+    uint8_t  *dib;
+    int       dib_bpp, dib_stride, dib_flip, dib_alias, dib_565;
+    int       px_drawn;            /* GDI has written this bitmap */
+    uint32_t  dib_pal[256];
+    int       dib_pal_n;
     uint32_t  color;               /* brushes and pens */
     W32RECT   rc;                  /* regions */
     uint8_t   logfont[92];         /* LOGFONTW as handed to CreateFontIndirect */
@@ -156,6 +168,15 @@ typedef struct {
     int bitmap;                    /* selected bitmap object, 0 if none */
     int font;                      /* selected font object, 0 if none */
     int in_paint;
+    /* The viewport origin, which drawing is relative to. MFC moves it rather
+     * than offsetting its own coordinates -- OnPaint on a scrolled or inset
+     * view sets it once and then draws in its own space -- so ignoring it does
+     * not lose a translation, it puts every element in the wrong place. */
+    int32_t org_x, org_y;
+    /* The clip box, and whether one has been set. Tracked mainly so RectVisible
+     * can answer honestly: see st_RectVisible. */
+    W32RECT clip;
+    int     has_clip;
 } w32_dc;
 
 typedef struct { int used; int wnd; uintptr_t id; uint32_t ms; double next; void *proc; } w32_timer;
@@ -166,6 +187,7 @@ static struct {
     w32_obj   obj[W32_MAX_OBJ];
     w32_timer timer[W32_MAX_TIMER];
     struct { int used; char name[64]; void *proc; } cls[W32_MAX_CLS];
+    struct { int used, id; void *proc; } hook[W32_MAX_HOOK];
     W32MSG    q[W32_MSGQ];
     int       qhead, qtail;
     int       capture, focus;
@@ -321,7 +343,93 @@ void *w32_bitmap_from_dib(const uint8_t *dib, uint32_t len)
  * a single static here silently aliases: BitBlt resolves two DCs, and when both
  * had a bitmap selected the source and destination became the same struct -- the
  * blit copied a bitmap onto itself and the editor stayed black. */
-static w32_surf *w32_target_in(w32_dc *d, w32_surf *tmp)
+/* Keeping a DIB section and our own surface in step, in whichever direction the
+ * plugin is actually using it.
+ *
+ * Only the layouts we cannot alias need this at all -- 32bpp top-down is one
+ * buffer and always correct. For the rest there are two writers and they cannot
+ * both be authoritative:
+ *
+ *   - the plugin writes raw pixels into the pointer CreateDIBSection returned,
+ *     which is the entire reason that call exists. We must read them.
+ *   - the plugin draws into the same bitmap with GDI, through a memory DC.
+ *     Then our surface holds the drawing and the DIB buffer is stale.
+ *
+ * Syncing unconditionally on every access gets the second case exactly wrong:
+ * it copies the untouched DIB over the drawing, so each call erases the one
+ * before it and the editor comes out black with every call reporting success.
+ * That is what the first pass here did.
+ *
+ * So the direction follows the role. A blit source pulls, unless GDI has drawn
+ * into it -- in which case our surface is the newer of the two. A drawing target
+ * records that GDI has written it, and pushes back when the bitmap leaves its DC,
+ * which is when an application that means to read the bits goes to look. A
+ * plugin that interleaves both, drawing first and then writing raw pixels, would
+ * need a page-protection trick to detect; nothing here does it. */
+static void w32_dib_pull(w32_obj *o)
+{
+    int y, x;
+
+    if (!o || !o->dib || o->dib_alias || !o->px) return;
+    for (y = 0; y < o->h; y++) {
+        const uint8_t *src = o->dib +
+            (size_t)(o->dib_flip ? o->h - 1 - y : y) * o->dib_stride;
+        uint32_t *dst = o->px + (size_t)y * o->w;
+        for (x = 0; x < o->w; x++) {
+            switch (o->dib_bpp) {
+            case 32: memcpy(&dst[x], src + x * 4, 4); dst[x] &= 0x00ffffffu; break;
+            case 24: dst[x] = ((uint32_t)src[x * 3 + 2] << 16) |
+                              ((uint32_t)src[x * 3 + 1] << 8) | src[x * 3 + 0]; break;
+            case 16: { uint16_t v; memcpy(&v, src + x * 2, 2);
+                       dst[x] = o->dib_565
+                         ? (((uint32_t)(((v >> 11) & 0x1f) * 255 / 31) << 16) |
+                            ((uint32_t)(((v >>  5) & 0x3f) * 255 / 63) << 8)  |
+                             (uint32_t)((  v        & 0x1f) * 255 / 31))
+                         : (((uint32_t)(((v >> 10) & 0x1f) * 255 / 31) << 16) |
+                            ((uint32_t)(((v >>  5) & 0x1f) * 255 / 31) << 8)  |
+                             (uint32_t)((  v        & 0x1f) * 255 / 31)); break; }
+            case 8:  dst[x] = o->dib_pal[src[x]]; break;
+            case 4:  dst[x] = o->dib_pal[(x & 1) ? (src[x >> 1] & 0xf)
+                                                 : (src[x >> 1] >> 4)]; break;
+            case 1:  dst[x] = o->dib_pal[(src[x >> 3] >> (7 - (x & 7))) & 1]; break;
+            default: return;
+            }
+        }
+    }
+}
+
+/* The other direction: what GDI drew, in the layout the plugin asked for. */
+static void w32_dib_push(w32_obj *o)
+{
+    int y, x;
+
+    if (!o || !o->dib || o->dib_alias || !o->px || !o->px_drawn) return;
+    for (y = 0; y < o->h; y++) {
+        uint8_t *dst = o->dib +
+            (size_t)(o->dib_flip ? o->h - 1 - y : y) * o->dib_stride;
+        const uint32_t *src = o->px + (size_t)y * o->w;
+        for (x = 0; x < o->w; x++) {
+            switch (o->dib_bpp) {
+            case 32: { uint32_t v = src[x]; memcpy(dst + x * 4, &v, 4); break; }
+            case 24: dst[x * 3 + 0] = (uint8_t)(src[x]);
+                     dst[x * 3 + 1] = (uint8_t)(src[x] >> 8);
+                     dst[x * 3 + 2] = (uint8_t)(src[x] >> 16); break;
+            case 16: { uint32_t v = src[x];
+                       uint16_t p = o->dib_565
+                         ? (uint16_t)((((v >> 16) & 0xff) >> 3 << 11) |
+                                      (((v >> 8)  & 0xff) >> 2 << 5)  |
+                                       ((v        & 0xff) >> 3))
+                         : (uint16_t)((((v >> 16) & 0xff) >> 3 << 10) |
+                                      (((v >> 8)  & 0xff) >> 3 << 5)  |
+                                       ((v        & 0xff) >> 3));
+                       memcpy(dst + x * 2, &p, 2); break; }
+            default: return;            /* palettised: no reverse mapping */
+            }
+        }
+    }
+}
+
+static w32_surf *w32_target_in_raw(w32_dc *d, w32_surf *tmp)
 {
     if (!d) return NULL;
     if (d->bitmap) {
@@ -331,6 +439,25 @@ static w32_surf *w32_target_in(w32_dc *d, w32_surf *tmp)
     }
     if (d->wnd && W.wnd[d->wnd].used) return &W.wnd[d->wnd].surf;
     return NULL;
+}
+
+/* Where drawing through this DC lands. Records that GDI has written the bitmap,
+ * so a later blit from it does not pull the plugin's staler buffer over it. */
+static w32_surf *w32_target_in(w32_dc *d, w32_surf *tmp)
+{
+    if (d && d->bitmap) W.obj[d->bitmap].px_drawn = 1;
+    return w32_target_in_raw(d, tmp);
+}
+
+/* A blit source. Pulls the plugin's own pixels in when they are the newer of
+ * the two; see w32_dib_push for why that is conditional. */
+static w32_surf *w32_source_in(w32_dc *d, w32_surf *tmp)
+{
+    if (d && d->bitmap) {
+        w32_obj *o = &W.obj[d->bitmap];
+        if (!o->px_drawn) w32_dib_pull(o);
+    }
+    return w32_target_in_raw(d, tmp);
 }
 
 static void w32_surf_size(w32_surf *s, int w, int h)
@@ -355,6 +482,198 @@ static W_LRESULT w32_call(w32_wnd *w, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
     p = (w32_wndproc)w->wndproc;
     idx = (int)(w - W.wnd);
     return p(w32_h(W32_HWND_BASE, idx), msg, wp, lp);
+}
+
+/* ---- rectangles ---------------------------------------------------------- */
+
+/* USER32's rectangle arithmetic, none of which was here.
+ *
+ * These look too trivial to matter and are the opposite. They carry no state
+ * and touch no device, so a generic stub returns 0 and leaves the caller's
+ * RECT exactly as it was -- which does not read as failure to the caller,
+ * because these are the functions nobody checks. Layout code offsets a
+ * rectangle and gets it back unmoved, unions two and gets neither, then
+ * iterates until it fits. It never fits.
+ *
+ * That is what an endless SelectObject(font)/SelectObject(NULL) pair with a
+ * growing stack turned out to be: a text layout recursing on a rectangle that
+ * every pass left unchanged, until the stack ran out 72 frames deep.
+ *
+ * The empty-rectangle convention is the one detail worth stating: Windows calls
+ * a rectangle empty when right <= left or bottom <= top, and the return value of
+ * every function here reports whether the *result* is non-empty rather than
+ * whether the call worked. Callers branch on it. */
+static int w32_rect_empty(const W32RECT *r)
+{ return !r || r->right <= r->left || r->bottom <= r->top; }
+
+static MS int32_t st_SetRect(W32RECT *r, int32_t l, int32_t t, int32_t rt, int32_t b)
+{ if (!r) return 0; r->left = l; r->top = t; r->right = rt; r->bottom = b; return 1; }
+
+static MS int32_t st_SetRectEmpty(W32RECT *r)
+{ if (!r) return 0; r->left = r->top = r->right = r->bottom = 0; return 1; }
+
+static MS int32_t st_CopyRect(W32RECT *d, const W32RECT *s)
+{ if (!d || !s) return 0; *d = *s; return 1; }
+
+static MS int32_t st_OffsetRect(W32RECT *r, int32_t dx, int32_t dy)
+{
+    if (!r) return 0;
+    r->left += dx; r->right += dx; r->top += dy; r->bottom += dy;
+    return 1;
+}
+
+static MS int32_t st_InflateRect(W32RECT *r, int32_t dx, int32_t dy)
+{
+    if (!r) return 0;
+    r->left -= dx; r->right += dx; r->top -= dy; r->bottom += dy;
+    return 1;
+}
+
+static MS int32_t st_IntersectRect(W32RECT *d, const W32RECT *a, const W32RECT *b)
+{
+    if (!d || !a || !b) return 0;
+    d->left   = a->left   > b->left   ? a->left   : b->left;
+    d->top    = a->top    > b->top    ? a->top    : b->top;
+    d->right  = a->right  < b->right  ? a->right  : b->right;
+    d->bottom = a->bottom < b->bottom ? a->bottom : b->bottom;
+    if (w32_rect_empty(d)) { st_SetRectEmpty(d); return 0; }
+    return 1;
+}
+
+static MS int32_t st_UnionRect(W32RECT *d, const W32RECT *a, const W32RECT *b)
+{
+    int ae, be;
+    if (!d || !a || !b) return 0;
+    ae = w32_rect_empty(a); be = w32_rect_empty(b);
+    /* An empty rectangle contributes nothing rather than dragging the union out
+     * to include the origin, which is what taking the min of all four edges
+     * unconditionally would do. */
+    if (ae && be) { st_SetRectEmpty(d); return 0; }
+    if (ae) { *d = *b; return 1; }
+    if (be) { *d = *a; return 1; }
+    d->left   = a->left   < b->left   ? a->left   : b->left;
+    d->top    = a->top    < b->top    ? a->top    : b->top;
+    d->right  = a->right  > b->right  ? a->right  : b->right;
+    d->bottom = a->bottom > b->bottom ? a->bottom : b->bottom;
+    return 1;
+}
+
+/* a minus b, but only when the difference is still a rectangle: b has to span
+ * a completely in one axis and cut a whole edge off the other. Anything else
+ * leaves a unchanged, which is what Windows does -- the result of subtracting
+ * a hole from the middle of a rectangle is not a rectangle. */
+static MS int32_t st_SubtractRect(W32RECT *d, const W32RECT *a, const W32RECT *b)
+{
+    W32RECT ov;
+    if (!d || !a || !b) return 0;
+    *d = *a;
+    if (w32_rect_empty(a)) { st_SetRectEmpty(d); return 0; }
+    if (!st_IntersectRect(&ov, a, b)) return 1;          /* nothing to take */
+    if (ov.left <= a->left && ov.right >= a->right) {
+        if (ov.top <= a->top)          d->top    = ov.bottom;
+        else if (ov.bottom >= a->bottom) d->bottom = ov.top;
+    } else if (ov.top <= a->top && ov.bottom >= a->bottom) {
+        if (ov.left <= a->left)        d->left   = ov.right;
+        else if (ov.right >= a->right) d->right  = ov.left;
+    }
+    if (w32_rect_empty(d)) { st_SetRectEmpty(d); return 0; }
+    return 1;
+}
+
+static MS int32_t st_EqualRect(const W32RECT *a, const W32RECT *b)
+{
+    if (!a || !b) return 0;
+    return a->left == b->left && a->top == b->top &&
+           a->right == b->right && a->bottom == b->bottom;
+}
+
+static MS int32_t st_IsRectEmpty(const W32RECT *r) { return w32_rect_empty(r); }
+
+/* The point is passed by value: two longs, not a pointer. Windows treats the
+ * right and bottom edges as outside, so adjacent rectangles do not both claim
+ * the same pixel. */
+static MS int32_t st_PtInRect(const W32RECT *r, int32_t x, int32_t y)
+{
+    if (!r) return 0;
+    return x >= r->left && x < r->right && y >= r->top && y < r->bottom;
+}
+
+/* ---- hooks --------------------------------------------------------------- */
+
+/* SetWindowsHookEx, because MFC does not treat it as optional.
+ *
+ * AfxHookWindowCreate installs a WH_CBT filter before every CreateWindowEx and
+ * calls AfxThrowMemoryException() if it cannot -- so a stub returning NULL does
+ * not cost a hook, it costs the editor, by way of a C++ throw from inside window
+ * creation. That is what "effEditOpen failed" was.
+ *
+ * Installing it is only half. MFC uses the HCBT_CREATEWND that follows to attach
+ * its CWnd to the new HWND and subclass the window procedure; a hook that is
+ * registered and never called leaves every MFC window unattached, which fails
+ * later and further away. So the hook has to actually fire, which is why
+ * w32_create calls it below.
+ *
+ * WH_CBT is the only type dispatched. The others in the corpus -- keyboard and
+ * mouse filters -- would need a real input queue to be meaningful, and a plugin
+ * that installs one still gets a handle back and works without it. */
+#define W32_WH_CBT        5
+#define W32_HCBT_CREATEWND 3
+#define W32_HCBT_DESTROYWND 4
+
+typedef MS W_LRESULT (*w32_hookproc)(int32_t, W_WPARAM, W_LPARAM);
+
+/* The chain runs in install order, most recent first, which is what Windows
+ * does and what CallNextHookEx walks. */
+static int w32_hook_next(int after, int id)
+{
+    int i;
+    for (i = after - 1; i >= 1; i--)
+        if (W.hook[i].used && W.hook[i].id == id) return i;
+    return 0;
+}
+
+static W_LRESULT w32_hook_call(int id, int32_t code, W_WPARAM wp, W_LPARAM lp)
+{
+    int i = w32_hook_next(W32_MAX_HOOK, id);
+    if (!i) return 0;
+    return ((w32_hookproc)W.hook[i].proc)(code, wp, lp);
+}
+
+static MS void *st_SetWindowsHookExA(int32_t id, void *proc, void *mod, uint32_t tid)
+{
+    int i;
+    (void)mod; (void)tid;
+    if (!proc) return NULL;
+    for (i = 1; i < W32_MAX_HOOK; i++) {
+        if (W.hook[i].used) continue;
+        W.hook[i].used = 1; W.hook[i].id = id; W.hook[i].proc = proc;
+        PLOG("  [w32] SetWindowsHookEx id=%d proc=%p -> #%d\n", id, proc, i);
+        return w32_h(W32_HOOK_BASE, i);
+    }
+    return NULL;
+}
+static MS void *st_SetWindowsHookExW(int32_t id, void *proc, void *mod, uint32_t tid)
+{ return st_SetWindowsHookExA(id, proc, mod, tid); }
+
+static MS int32_t st_UnhookWindowsHookEx(void *h)
+{
+    int i = w32_i(W32_HOOK_BASE, h);
+    if (i <= 0 || i >= W32_MAX_HOOK || !W.hook[i].used) return 0;
+    memset(&W.hook[i], 0, sizeof W.hook[i]);
+    return 1;
+}
+
+/* A hook that declines passes the call along. Returning 0 without walking the
+ * rest of the chain would silently drop whatever the next filter does -- and
+ * MFC's own filter calls this on every code it does not handle. */
+static MS W_LRESULT st_CallNextHookEx(void *h, int32_t code, W_WPARAM wp, W_LPARAM lp)
+{
+    int i = w32_i(W32_HOOK_BASE, h), nxt;
+    if (i <= 0 || i >= W32_MAX_HOOK) i = W32_MAX_HOOK;
+    nxt = w32_hook_next(i, (i < W32_MAX_HOOK && W.hook[i].used) ? W.hook[i].id
+                                                                : W32_WH_CBT);
+    if (!nxt) return 0;
+    return ((w32_hookproc)W.hook[nxt].proc)(code, wp, lp);
 }
 
 /* ---- window management --------------------------------------------------- */
@@ -464,6 +783,14 @@ static void *w32_create(const char *cls, int x, int y, int w, int h, void *paren
             cs.x = x; cs.y = y;
             cs.style = (int32_t)style;
             cs.cls = cls;
+            /* Before WM_NCCREATE, as Windows does: MFC attaches its CWnd here
+             * and subclasses the window procedure, so anything sent earlier
+             * would go to the class procedure it is about to replace. */
+            {   struct { void *cs; void *insert_after; } cbt;
+                cbt.cs = &cs; cbt.insert_after = NULL;
+                w32_hook_call(W32_WH_CBT, W32_HCBT_CREATEWND,
+                              (W_WPARAM)(uintptr_t)hwnd, (W_LPARAM)&cbt);
+            }
             w32_call(&W.wnd[i], WM_NCCREATE, 0, (W_LPARAM)&cs);
             w32_call(&W.wnd[i], WM_CREATE,   0, (W_LPARAM)&cs);
         }
@@ -1018,6 +1345,114 @@ static MS int32_t st_GetClipBox(void *hdc, W32RECT *r)
     return t ? 2 /* SIMPLEREGION */ : 0;
 }
 
+/* ---- clipping and the viewport origin ------------------------------------ */
+
+/* Whether any of a rectangle would land inside the clip box.
+ *
+ * A renderer asks this before drawing each element so it can skip the ones that
+ * are off-screen, and it does not check for failure -- there is nothing to fail.
+ * So a stub returning 0 does not degrade anything: it says "none of your
+ * interface is visible", and a well-written plugin dutifully draws none of it.
+ * This host had no RectVisible, and that alone accounted for an MFC editor
+ * making zero drawing calls into a window it had correctly created and sized. */
+static MS int32_t st_RectVisible(void *hdc, const W32RECT *r)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp;
+    w32_surf *t;
+    W32RECT box, want;
+
+    if (!d || !r) return 0;
+    t = w32_target_in_raw(d, &ttmp);
+    if (!t) return 0;
+    box.left = 0; box.top = 0; box.right = t->w; box.bottom = t->h;
+    if (d->has_clip) {
+        if (d->clip.left   > box.left)   box.left   = d->clip.left;
+        if (d->clip.top    > box.top)    box.top    = d->clip.top;
+        if (d->clip.right  < box.right)  box.right  = d->clip.right;
+        if (d->clip.bottom < box.bottom) box.bottom = d->clip.bottom;
+    }
+    /* The caller's rectangle is in its own space, which the viewport origin
+     * translates out of. */
+    want = *r;
+    want.left += d->org_x; want.right  += d->org_x;
+    want.top  += d->org_y; want.bottom += d->org_y;
+    return !(want.right <= box.left || want.left >= box.right ||
+             want.bottom <= box.top || want.top  >= box.bottom);
+}
+
+#define W32_NULLREGION   1
+#define W32_SIMPLEREGION 2
+
+static MS int32_t st_IntersectClipRect(void *hdc, int32_t l, int32_t t,
+                                       int32_t r, int32_t b)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    l += d->org_x; r += d->org_x; t += d->org_y; b += d->org_y;
+    if (!d->has_clip) {
+        d->clip.left = l; d->clip.top = t; d->clip.right = r; d->clip.bottom = b;
+        d->has_clip = 1;
+    } else {
+        if (l > d->clip.left)   d->clip.left   = l;
+        if (t > d->clip.top)    d->clip.top    = t;
+        if (r < d->clip.right)  d->clip.right  = r;
+        if (b < d->clip.bottom) d->clip.bottom = b;
+    }
+    return w32_rect_empty(&d->clip) ? W32_NULLREGION : W32_SIMPLEREGION;
+}
+
+/* A rectangle taken *out* of the clip region cannot be expressed as one box, and
+ * a wrong box here is worse than none: narrowing the clip to the hole would stop
+ * everything else being drawn. Accepted and not applied, which costs at most
+ * some overdraw the next paint covers. */
+static MS int32_t st_ExcludeClipRect(void *hdc, int32_t l, int32_t t,
+                                     int32_t r, int32_t b)
+{ (void)l;(void)t;(void)r;(void)b; return w32_dcget(hdc) ? W32_SIMPLEREGION : 0; }
+
+static MS int32_t st_SetViewportOrgEx(void *hdc, int32_t x, int32_t y, W32POINT *old)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    if (old) { old->x = d->org_x; old->y = d->org_y; }
+    d->org_x = x; d->org_y = y;
+    return 1;
+}
+static MS int32_t st_OffsetViewportOrgEx(void *hdc, int32_t dx, int32_t dy, W32POINT *old)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    if (old) { old->x = d->org_x; old->y = d->org_y; }
+    d->org_x += dx; d->org_y += dy;
+    return 1;
+}
+static MS int32_t st_GetViewportOrgEx(void *hdc, W32POINT *p)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d || !p) return 0;
+    p->x = d->org_x; p->y = d->org_y;
+    return 1;
+}
+/* The window origin is the same translation with the opposite sign: it names the
+ * logical point that maps to the viewport origin. Only one of the two is used by
+ * anything here, but a plugin that sets this one and not the other still expects
+ * its drawing to move. */
+static MS int32_t st_SetWindowOrgEx(void *hdc, int32_t x, int32_t y, W32POINT *old)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    if (old) { old->x = -d->org_x; old->y = -d->org_y; }
+    d->org_x = -x; d->org_y = -y;
+    return 1;
+}
+static MS int32_t st_GetWindowOrgEx(void *hdc, W32POINT *p)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d || !p) return 0;
+    p->x = -d->org_x; p->y = -d->org_y;
+    return 1;
+}
+
 static MS int32_t st_GdiFlush(void) { return 1; }
 
 static MS int32_t st_StretchDIBits(void *hdc, int32_t xd, int32_t yd, int32_t wd, int32_t hd,
@@ -1078,7 +1513,7 @@ static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t 
 {
     w32_dc *dd = w32_dcget(dst), *sd = w32_dcget(src);
     w32_surf dtmp, stmp;
-    w32_surf *ds = w32_target_in(dd, &dtmp), *ss = w32_target_in(sd, &stmp);
+    w32_surf *ds = w32_target_in(dd, &dtmp), *ss = w32_source_in(sd, &stmp);
     int j, i;
 
     W.n_bitblt++;
@@ -1110,6 +1545,88 @@ static MS void *st_CreateCompatibleBitmap(void *hdc, int32_t w, int32_t h)
     PLOG("  [w32] CreateCompatibleBitmap %dx%d -> %p\n", w, h, r);
     return r;
 }
+/* The bitmap a plugin can draw into itself.
+ *
+ * This is how an application gets at pixels directly, and every GDI-era editor
+ * in this corpus reaches for it: make a DIB section, select it into a memory DC,
+ * draw both with GDI and by writing the returned pointer, then blit. Returning
+ * NULL is not a soft failure -- a caller reads it as out of memory, and one
+ * built on MFC turns that into `throw CMemoryException` a long way from here.
+ * That is exactly how the first 32-bit plugin tried against this host died.
+ *
+ * hSection is refused rather than half-honoured: mapping the caller's own file
+ * mapping would mean sharing pages we do not own, and a plugin that passes one
+ * is better told no than handed a private buffer it thinks is shared. Nothing
+ * in this corpus passes one. */
+static MS void *st_CreateDIBSection(void *hdc, const void *bmi, uint32_t usage,
+                                    void **bits, void *section, uint32_t offset)
+{
+    const uint8_t *h = (const uint8_t *)bmi;
+    uint32_t hdrsz, comp, clrused, stride;
+    int32_t w, ht;
+    uint16_t bpp;
+    int idx, flip = 1, alias, i;
+    w32_obj *o;
+
+    (void)hdc; (void)offset;
+    if (bits) *bits = NULL;
+    if (!bmi || section) return NULL;
+
+    memcpy(&hdrsz, h + 0, 4);
+    if (hdrsz < 40) return NULL;
+    memcpy(&w,   h + 4,  4);
+    memcpy(&ht,  h + 8,  4);
+    memcpy(&bpp, h + 14, 2);
+    memcpy(&comp, h + 16, 4);
+    memcpy(&clrused, h + 32, 4);
+    if (ht < 0) { ht = -ht; flip = 0; }
+    if (w <= 0 || ht <= 0 || w > 16384 || ht > 16384) return NULL;
+    if (comp != 0 && comp != 3) return NULL;            /* BI_RGB, BI_BITFIELDS */
+    if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)
+        return NULL;
+
+    stride = ((uint32_t)w * bpp + 31) / 32 * 4;
+    /* 32 bits per pixel top-down is byte-for-byte what we keep anyway, so the
+     * plugin writes into our own surface and no conversion ever runs. */
+    alias = (bpp == 32 && !flip && stride == (uint32_t)w * 4);
+
+    if (!(idx = w32_obj_new(OBJ_BITMAP, w, ht, 0))) return NULL;
+    o = &W.obj[idx];
+    o->dib_bpp = bpp; o->dib_stride = (int)stride; o->dib_flip = flip;
+    o->dib_alias = alias;
+
+    if (alias) {
+        o->dib = (uint8_t *)o->px;
+    } else if (!(o->dib = calloc((size_t)ht, stride))) {
+        free(o->px); memset(o, 0, sizeof *o); return NULL;
+    }
+
+    /* 16-bit has no default: BI_RGB means 5-5-5, and the 5-6-5 that hardware
+     * actually prefers arrives as BI_BITFIELDS with the masks spelled out. */
+    if (bpp == 16 && comp == 3) {
+        uint32_t rmask; memcpy(&rmask, h + hdrsz, 4);
+        o->dib_565 = (rmask == 0xF800u);
+    }
+    if (bpp <= 8) {
+        const uint8_t *pal = h + hdrsz;
+        int n = (int)(clrused ? clrused : (1u << bpp));
+        if (n > 256) n = 256;
+        o->dib_pal_n = n;
+        /* DIB_PAL_COLORS indexes the DC's palette rather than carrying colours.
+         * Nothing here keeps one, so those entries stay black -- which is what
+         * the call would produce against a default palette anyway. */
+        if (usage == 0)
+            for (i = 0; i < n; i++)
+                o->dib_pal[i] = ((uint32_t)pal[i * 4 + 2] << 16) |
+                                ((uint32_t)pal[i * 4 + 1] << 8) | pal[i * 4 + 0];
+    }
+
+    if (bits) *bits = o->dib;
+    PLOG("  [w32] CreateDIBSection %dx%d %ubpp %s%s -> bits %p\n", w, ht, bpp,
+         flip ? "bottom-up" : "top-down", alias ? " (aliased)" : "", (void *)o->dib);
+    return w32_h(W32_OBJ_BASE, idx);
+}
+
 static MS void *st_CreateBitmap(int32_t w, int32_t h, uint32_t planes, uint32_t bpp, const void *bits)
 { (void)planes;(void)bpp;(void)bits; return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_BITMAP, w, h, 0)); }
 
@@ -1122,6 +1639,10 @@ static MS void *st_SelectObject(void *hdc, void *obj)
     if (!d) return NULL;
     if (!o) return NULL;
     if (o->kind == OBJ_BITMAP) {
+        /* Whatever was selected before is finished being drawn into: give the
+         * plugin back what GDI put there, in its own layout. */
+        if (d && d->bitmap && d->bitmap != (int)(o - W.obj))
+            w32_dib_push(&W.obj[d->bitmap]);
         prev = d->bitmap ? w32_h(W32_OBJ_BASE, d->bitmap) : NULL;
         d->bitmap = (int)(o - W.obj);
         return prev;
@@ -1143,6 +1664,7 @@ static MS int32_t st_DeleteObject(void *obj)
 {
     w32_obj *o = w32_oget(obj);
     if (!o) return 1;
+    if (!o->dib_alias) free(o->dib);       /* aliased, px is the same block */
     free(o->px);
     memset(o, 0, sizeof *o);
     return 1;
@@ -1162,8 +1684,23 @@ static MS int32_t st_GetObjectA(void *obj, int32_t n, void *out)
     }
     if (o->kind == OBJ_BITMAP && n >= (int32_t)sizeof bm) {
         memset(&bm, 0, sizeof bm);
-        bm.type = 7; bm.w = o->w; bm.h = o->h;
-        bm.widthBytes = o->w * 4; bm.planes = 1; bm.bpp = 32; bm.bits = o->px;
+        bm.type = 7; bm.w = o->w; bm.h = o->h; bm.planes = 1;
+        /* A DIB section has to describe the layout the plugin asked for, not
+         * ours. Answering 32bpp at a stride of w*4 for a 24bpp bitmap sends the
+         * caller's own row arithmetic into the wrong bytes, and pointing bmBits
+         * at our internal surface rather than the buffer CreateDIBSection
+         * returned means whatever it writes there is overwritten the next time
+         * the DIB is read. */
+        if (o->dib) {
+            bm.widthBytes = o->dib_stride;
+            bm.bpp = (uint16_t)o->dib_bpp;
+            bm.bits = o->dib;
+        } else {
+            /* A device-dependent bitmap has no bits the caller may touch, and
+             * Windows says so with NULL. Handing ours over invites a write at
+             * whatever stride the caller assumes. */
+            bm.widthBytes = o->w * 4; bm.bpp = 32; bm.bits = NULL;
+        }
         memcpy(out, &bm, sizeof bm);
         return (int32_t)sizeof bm;
     }

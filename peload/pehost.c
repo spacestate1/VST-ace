@@ -663,7 +663,8 @@ static int g_nreal;
 /* The C++ library, in any of its vintages. The C runtimes (msvcr*, ucrtbase,
  * vcruntime) stay implemented here: they have no object layout to get wrong. */
 static int wants_real_image(const char *dll)
-{ return strncasecmp(dll, "msvcp", 5) == 0; }
+{ if (getenv("PELOAD_NO_REAL_MSVCP")) return 0;
+  return strncasecmp(dll, "msvcp", 5) == 0; }
 
 /* Try one directory, both as the import spelled the name and in lower case:
  * Windows does not distinguish them and the file on disk usually is lower case,
@@ -876,15 +877,6 @@ static void *pehost_dll_symbol(void *module, const char *name)
     return NULL;
 }
 
-/* Set when the loaded image imports Direct3D or Direct2D.
- *
- * GDI+ is implemented here now, but a GPU API is not, and a plug-in that opens
- * its editor by making a D3D11 device does not check whether it got one -- it
- * calls straight through the null pointer. Finding that out by opening the
- * editor costs the whole plug-in, audio included, so the editor is declined
- * instead. */
-static int g_image_wants_d3d;
-
 /* Names the C++ runtime a plug-in needed and could not have, for the caller to
  * report. Empty when nothing was missing. */
 static char g_missing_real[64];
@@ -900,10 +892,6 @@ static int resolve_imports(image *im)
     if (!d.VirtualAddress) return 0;
     for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
         const char *dll = rva(im, desc->Name);
-        /* Noted while the names are already in hand, and checked by the editor
-         * path rather than found out by dying. */
-        if (!strncasecmp(dll, "d3d", 3) || !strncasecmp(dll, "d2d", 3))
-            g_image_wants_d3d = 1;
         uint64_t *lookup = rva(im, desc->OriginalFirstThunk ? desc->OriginalFirstThunk
                                                             : desc->FirstThunk);
         uint64_t *iat = rva(im, desc->FirstThunk);
@@ -3481,8 +3469,6 @@ void pehost_render_io(pehost *h, const float *src, float *inter, int frames)
 
 int pehost_editor_kind(pehost *h)
 {
-
-
     /* A Classic editor draws into a GWorld -- guest memory -- so what comes
      * back is pixels, the same as a Windows editor. */
     if (h && h->cl) return (pefvst_flags(h->cl) & PV_FLAG_HAS_EDITOR)
