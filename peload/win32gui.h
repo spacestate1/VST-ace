@@ -136,6 +136,15 @@ typedef struct {
     int      visible;
     int      parent;               /* window index, 0 = none */
     char     cls[64];
+    /* Window text, and the little state a built-in control keeps. A plug-in
+     * whose editor is standard controls asks for these back through
+     * WM_GETTEXT, BM_GETCHECK and CB_GETCURSEL, and draws nothing sensible if
+     * they do not remember what it set. */
+    char     text[128];
+    int      ctl_check;            /* BM_SETCHECK, or the current selection */
+    char   (*items)[64];           /* combo box and list box contents */
+    int      nitems;
+    int      enabled;
     w32_surf surf;                 /* the client pixels the host displays */
     W32RECT  update;
     int      has_update;
@@ -864,6 +873,446 @@ static MS int32_t st_UnregisterClassA(const char *n, void *inst)
 static MS int32_t st_UnregisterClassW(const uint16_t *n, void *inst)
 { char b[64]; return st_UnregisterClassA(w32_cls_name(n, b, sizeof b, 1), inst); }
 
+/* Defined further down; the control classes draw through them. */
+static void *w32_dc_new(int wndidx);
+static void  w32_text_at(w32_dc *d, w32_surf *t, int x, int y,
+                         const char *s, int n, int opaque_rect_first,
+                         const W32RECT *bg);
+
+/* Wide to narrow for a window caption. winstubs.h has one of these, and it is
+ * defined after this header is included. */
+static void w2c_local(const uint16_t *w, char *out, size_t n)
+{
+    size_t i = 0;
+    if (!w) { if (n) out[0] = 0; return; }
+    for (; w[i] && i + 1 < n; i++) out[i] = w[i] < 256 ? (char)w[i] : '?';
+    out[i] = 0;
+}
+
+/* ---- the built-in window classes ----------------------------------------
+ *
+ * BUTTON, STATIC, EDIT, COMBOBOX, LISTBOX and SCROLLBAR are not registered by
+ * the application that uses them -- they come with the system, and a plug-in
+ * creates one by name and expects it to draw itself and answer its own
+ * messages. This host had none, so every such child was created with no window
+ * procedure at all: invisible, inert, and silent about it.
+ *
+ * It does not matter for a plug-in whose editor is one big skinned bitmap, and
+ * it is the whole editor for one built as a dialog -- which a great many from
+ * the COMCTL32 era are.
+ *
+ * These draw the classic look rather than a themed one. A themed control is a
+ * bitmap from a .msstyles file this host has no business shipping, and the
+ * classic look is what the same code drew before XP and what these plug-ins
+ * were designed against. */
+
+#define WM_SETTEXT       0x000C
+#define WM_GETTEXT       0x000D
+#define WM_GETTEXTLENGTH 0x000E
+#define WM_ENABLE        0x000A
+#define WM_SETFONT       0x0030
+#define WM_GETFONT       0x0031
+
+#define BM_GETCHECK 0x00F0
+#define BM_SETCHECK 0x00F1
+#define BM_GETSTATE 0x00F2
+#define BM_SETSTATE 0x00F3
+
+#define CB_ADDSTRING     0x0143
+#define CB_GETCOUNT      0x0146
+#define CB_GETCURSEL     0x0147
+#define CB_GETLBTEXT     0x0148
+#define CB_GETLBTEXTLEN  0x0149
+#define CB_INSERTSTRING  0x014A
+#define CB_RESETCONTENT  0x014B
+#define CB_SETCURSEL     0x014E
+
+#define LB_ADDSTRING     0x0180
+#define LB_RESETCONTENT  0x0184
+#define LB_SETCURSEL     0x0186
+#define LB_GETCURSEL     0x0188
+#define LB_GETTEXT       0x0189
+#define LB_GETCOUNT      0x018B
+
+/* Button styles live in the low four bits of the window style. */
+#define BS_TYPEMASK        0x0F
+#define BS_PUSHBUTTON      0
+#define BS_DEFPUSHBUTTON   1
+#define BS_CHECKBOX        2
+#define BS_AUTOCHECKBOX    3
+#define BS_RADIOBUTTON     4
+#define BS_3STATE          5
+#define BS_AUTO3STATE      6
+#define BS_GROUPBOX        7
+#define BS_AUTORADIOBUTTON 9
+
+/* The classic system colours, which is what these controls are drawn in. */
+#define CLR_FACE      0xC0C0C0u
+#define CLR_SHADOW    0x808080u
+#define CLR_DKSHADOW  0x000000u
+#define CLR_HILIGHT   0xFFFFFFu
+#define CLR_WINDOW    0xFFFFFFu
+#define CLR_TEXT      0x000000u
+#define CLR_GRAYTEXT  0x808080u
+
+static void ctl_fill(w32_surf *t, int l, int tp, int r, int b, uint32_t rgb)
+{
+    int y, x;
+    if (!t || !t->px) return;
+    for (y = tp; y < b; y++) {
+        if (y < 0 || y >= t->h) continue;
+        for (x = l; x < r; x++) {
+            if (x < 0 || x >= t->w) continue;
+            t->px[(size_t)y * t->w + x] = rgb;
+        }
+    }
+}
+
+/* The two-pixel bevel every classic control is drawn with: light above and
+ * left, dark below and right, reversed when the control is sunken or pressed. */
+static void ctl_bevel(w32_surf *t, int l, int tp, int r, int b, int sunken)
+{
+    uint32_t tl = sunken ? CLR_SHADOW : CLR_HILIGHT;
+    uint32_t br = sunken ? CLR_HILIGHT : CLR_SHADOW;
+    uint32_t tl2 = sunken ? CLR_DKSHADOW : CLR_FACE;
+    uint32_t br2 = sunken ? CLR_FACE : CLR_DKSHADOW;
+    ctl_fill(t, l, tp, r, tp + 1, tl);
+    ctl_fill(t, l, tp, l + 1, b, tl);
+    ctl_fill(t, l + 1, tp + 1, r - 1, tp + 2, tl2);
+    ctl_fill(t, l + 1, tp + 1, l + 2, b - 1, tl2);
+    ctl_fill(t, l, b - 1, r, b, br);
+    ctl_fill(t, r - 1, tp, r, b, br);
+    ctl_fill(t, l + 1, b - 2, r - 1, b - 1, br2);
+    ctl_fill(t, r - 2, tp + 1, r - 1, b - 1, br2);
+}
+
+/* Text through the same rasteriser everything else uses. A DC is borrowed for
+ * it because that is what carries the colour and the font. */
+static void ctl_text(int wi, int x, int y, const char *txt, uint32_t rgb)
+{
+    void *hdc;
+    w32_dc *d;
+    w32_surf ttmp, *t;
+
+    if (!txt || !*txt) return;
+    if (!(hdc = w32_dc_new(wi))) return;
+    d = w32_dcget(hdc);
+    if (d) {
+        d->text_color = ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF);
+        d->bk_mode = 1;                            /* TRANSPARENT */
+        t = w32_target_in_raw(d, &ttmp);
+        if (t) w32_text_at(d, t, x, y, txt, (int)strlen(txt), 0, NULL);
+        d->used = 0;
+    }
+}
+
+static int ctl_text_w(const char *txt)
+{
+    int w = 0, h = 0;
+    if (!txt || !*txt) return 0;
+    dw_text_measure(txt, (int)strlen(txt), 12, &w, &h, NULL);
+    return w;
+}
+
+static void ctl_paint_button(w32_wnd *w, int wi)
+{
+    w32_surf *t = &w->surf;
+    int type = w->style & BS_TYPEMASK;
+    int cw = w->w, ch = w->h;
+    uint32_t fg = w->enabled ? CLR_TEXT : CLR_GRAYTEXT;
+
+    if (type == BS_GROUPBOX) {
+        /* A frame with the caption sitting in a gap at the top left. */
+        int cap = ctl_text_w(w->text);
+        ctl_fill(t, 0, 0, cw, ch, CLR_FACE);
+        ctl_fill(t, 0, 6, cw, 7, CLR_SHADOW);
+        ctl_fill(t, 0, 6, 1, ch, CLR_SHADOW);
+        ctl_fill(t, 0, ch - 1, cw, ch, CLR_HILIGHT);
+        ctl_fill(t, cw - 1, 6, cw, ch, CLR_HILIGHT);
+        if (cap) { ctl_fill(t, 8, 0, 12 + cap, 14, CLR_FACE);
+                   ctl_text(wi, 10, 1, w->text, fg); }
+        return;
+    }
+    if (type == BS_CHECKBOX || type == BS_AUTOCHECKBOX ||
+        type == BS_RADIOBUTTON || type == BS_AUTORADIOBUTTON ||
+        type == BS_3STATE || type == BS_AUTO3STATE) {
+        int box = 13, top = (ch - box) / 2;
+        ctl_fill(t, 0, 0, cw, ch, CLR_FACE);
+        ctl_fill(t, 0, top, box, top + box, CLR_WINDOW);
+        ctl_bevel(t, 0, top, box, top + box, 1);
+        if (w->ctl_check) {
+            /* A tick, drawn as the two strokes it is made of. */
+            int i;
+            for (i = 0; i < 3; i++) ctl_fill(t, 3 + i, top + 5 + i, 4 + i, top + 8 + i, fg);
+            for (i = 0; i < 4; i++) ctl_fill(t, 6 + i, top + 7 - i, 7 + i, top + 10 - i, fg);
+        }
+        ctl_text(wi, box + 4, (ch - 14) / 2, w->text, fg);
+        return;
+    }
+    /* A push button: face, bevel, and the caption centred. */
+    ctl_fill(t, 0, 0, cw, ch, CLR_FACE);
+    ctl_bevel(t, 0, 0, cw, ch, w->ctl_check ? 1 : 0);
+    {
+        int tw = ctl_text_w(w->text);
+        ctl_text(wi, (cw - tw) / 2 + (w->ctl_check ? 1 : 0),
+                 (ch - 14) / 2 + (w->ctl_check ? 1 : 0), w->text, fg);
+    }
+}
+
+static void ctl_paint_static(w32_wnd *w, int wi)
+{
+    /* SS_ styles 0-2 are text alignments; the frame and rectangle styles are
+     * 4-7 and draw no text at all. */
+    int style = w->style & 0x1F;
+    w32_surf *t = &w->surf;
+
+    if (style >= 4 && style <= 7) {
+        ctl_fill(t, 0, 0, w->w, w->h,
+                 style == 4 ? CLR_DKSHADOW : style == 5 ? CLR_FACE : CLR_WINDOW);
+        return;
+    }
+    ctl_fill(t, 0, 0, w->w, w->h, CLR_FACE);
+    {
+        int tw = ctl_text_w(w->text), x = 0;
+        if (style == 1) x = (w->w - tw) / 2;        /* SS_CENTER */
+        else if (style == 2) x = w->w - tw;         /* SS_RIGHT  */
+        ctl_text(wi, x, (w->h - 14) / 2, w->text,
+                 w->enabled ? CLR_TEXT : CLR_GRAYTEXT);
+    }
+}
+
+static void ctl_paint_edit(w32_wnd *w, int wi)
+{
+    w32_surf *t = &w->surf;
+    ctl_fill(t, 0, 0, w->w, w->h, CLR_WINDOW);
+    ctl_bevel(t, 0, 0, w->w, w->h, 1);
+    ctl_text(wi, 3, (w->h - 14) / 2, w->text,
+             w->enabled ? CLR_TEXT : CLR_GRAYTEXT);
+}
+
+static void ctl_paint_combo(w32_wnd *w, int wi)
+{
+    w32_surf *t = &w->surf;
+    int bw = 16, bh = w->h < 21 ? w->h : 21;
+    const char *sel = (w->items && w->ctl_check >= 0 && w->ctl_check < w->nitems)
+                        ? w->items[w->ctl_check] : w->text;
+
+    ctl_fill(t, 0, 0, w->w, bh, CLR_WINDOW);
+    ctl_bevel(t, 0, 0, w->w, bh, 1);
+    /* The drop-down button, and the arrow on it. */
+    ctl_fill(t, w->w - bw, 2, w->w - 2, bh - 2, CLR_FACE);
+    ctl_bevel(t, w->w - bw, 2, w->w - 2, bh - 2, 0);
+    {
+        int cx = w->w - bw / 2 - 1, cy = bh / 2, i;
+        for (i = 0; i < 4; i++)
+            ctl_fill(t, cx - 3 + i, cy - 2 + i, cx + 4 - i, cy - 1 + i, CLR_TEXT);
+    }
+    ctl_text(wi, 3, (bh - 14) / 2, sel, w->enabled ? CLR_TEXT : CLR_GRAYTEXT);
+}
+
+static void ctl_paint_listbox(w32_wnd *w, int wi)
+{
+    w32_surf *t = &w->surf;
+    int i, y = 2;
+    ctl_fill(t, 0, 0, w->w, w->h, CLR_WINDOW);
+    ctl_bevel(t, 0, 0, w->w, w->h, 1);
+    for (i = 0; i < w->nitems && y + 14 < w->h; i++, y += 14) {
+        if (i == w->ctl_check) {
+            ctl_fill(t, 2, y, w->w - 2, y + 14, 0x000080u);   /* the selection */
+            ctl_text(wi, 4, y, w->items[i], CLR_HILIGHT);
+        } else {
+            ctl_text(wi, 4, y, w->items[i], CLR_TEXT);
+        }
+    }
+}
+
+static void ctl_paint_scrollbar(w32_wnd *w)
+{
+    w32_surf *t = &w->surf;
+    ctl_fill(t, 0, 0, w->w, w->h, 0xE0E0E0u);
+    ctl_bevel(t, 0, 0, w->w, w->h, 1);
+}
+
+/* Room for one more item, grown a few at a time. */
+static int ctl_items_room(w32_wnd *w)
+{
+    char (*p)[64];
+    if (w->items && (w->nitems % 16) != 0) return 1;
+    p = (char (*)[64])realloc(w->items, (size_t)(w->nitems + 16) * 64);
+    if (!p) return 0;
+    w->items = p;
+    return 1;
+}
+
+static W_LRESULT ctl_common(w32_wnd *w, int wi, uint32_t msg, W_WPARAM wp, W_LPARAM lp,
+                            int *handled)
+{
+    *handled = 1;
+    switch (msg) {
+    case WM_SETTEXT:
+        snprintf(w->text, sizeof w->text, "%s", lp ? (const char *)(uintptr_t)lp : "");
+        w->has_update = 1;
+        w->update.left = 0; w->update.top = 0;
+        w->update.right = w->w; w->update.bottom = w->h;
+        return 1;
+    case WM_GETTEXT: {
+        char *out = (char *)(uintptr_t)lp;
+        size_t n = (size_t)wp;
+        if (!out || !n) return 0;
+        snprintf(out, n, "%s", w->text);
+        return (W_LRESULT)strlen(out); }
+    case WM_GETTEXTLENGTH:
+        return (W_LRESULT)strlen(w->text);
+    case WM_ENABLE:
+        w->enabled = wp != 0;
+        w->has_update = 1;
+        return 0;
+    case WM_SETFONT:
+        w->has_update = 1;
+        return 0;
+    case WM_GETFONT:
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;                                  /* the paint covers it */
+    default:
+        *handled = 0;
+        return 0;
+    }
+}
+
+static MS W_LRESULT ctl_button_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    int wi = w ? (int)(w - W.wnd) : 0, handled;
+    W_LRESULT r;
+
+    if (!w) return 0;
+    r = ctl_common(w, wi, msg, wp, lp, &handled);
+    if (handled) return r;
+    switch (msg) {
+    case WM_PAINT:      ctl_paint_button(w, wi); w->has_update = 0; return 0;
+    case BM_GETCHECK:   return w->ctl_check;
+    case BM_SETCHECK:   w->ctl_check = (int)wp; w->has_update = 1; return 0;
+    case BM_GETSTATE:   return w->ctl_check;
+    case BM_SETSTATE:   w->ctl_check = (int)wp; w->has_update = 1; return 0;
+    default:            return 0;
+    }
+}
+
+static MS W_LRESULT ctl_static_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    int wi = w ? (int)(w - W.wnd) : 0, handled;
+    W_LRESULT r;
+    if (!w) return 0;
+    r = ctl_common(w, wi, msg, wp, lp, &handled);
+    if (handled) return r;
+    if (msg == WM_PAINT) { ctl_paint_static(w, wi); w->has_update = 0; }
+    return 0;
+}
+
+static MS W_LRESULT ctl_edit_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    int wi = w ? (int)(w - W.wnd) : 0, handled;
+    W_LRESULT r;
+    if (!w) return 0;
+    r = ctl_common(w, wi, msg, wp, lp, &handled);
+    if (handled) return r;
+    if (msg == WM_PAINT) { ctl_paint_edit(w, wi); w->has_update = 0; }
+    return 0;
+}
+
+static MS W_LRESULT ctl_combo_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    int wi = w ? (int)(w - W.wnd) : 0, handled;
+    W_LRESULT r;
+    const char *sz = (const char *)(uintptr_t)lp;
+
+    if (!w) return 0;
+    r = ctl_common(w, wi, msg, wp, lp, &handled);
+    if (handled) return r;
+    switch (msg) {
+    case WM_PAINT:   ctl_paint_combo(w, wi); w->has_update = 0; return 0;
+    case CB_ADDSTRING:
+        if (!sz || !ctl_items_room(w)) return -1;   /* CB_ERRSPACE */
+        snprintf(w->items[w->nitems], 64, "%s", sz);
+        return w->nitems++;
+    case CB_GETCOUNT:   return w->nitems;
+    case CB_GETCURSEL:  return w->nitems ? w->ctl_check : -1;
+    case CB_SETCURSEL:
+        if ((int)wp < -1 || (int)wp >= w->nitems) { w->ctl_check = -1; return -1; }
+        w->ctl_check = (int)wp; w->has_update = 1; return w->ctl_check;
+    case CB_GETLBTEXT: {
+        char *out = (char *)(uintptr_t)lp;
+        if (!out || (int)wp < 0 || (int)wp >= w->nitems) return -1;
+        strcpy(out, w->items[wp]);
+        return (W_LRESULT)strlen(out); }
+    case CB_GETLBTEXTLEN:
+        if ((int)wp < 0 || (int)wp >= w->nitems) return -1;
+        return (W_LRESULT)strlen(w->items[wp]);
+    case CB_RESETCONTENT:
+        w->nitems = 0; w->ctl_check = -1; w->has_update = 1; return 0;
+    default: return 0;
+    }
+}
+
+static MS W_LRESULT ctl_list_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    int wi = w ? (int)(w - W.wnd) : 0, handled;
+    W_LRESULT r;
+    const char *sz = (const char *)(uintptr_t)lp;
+
+    if (!w) return 0;
+    r = ctl_common(w, wi, msg, wp, lp, &handled);
+    if (handled) return r;
+    switch (msg) {
+    case WM_PAINT:  ctl_paint_listbox(w, wi); w->has_update = 0; return 0;
+    case LB_ADDSTRING:
+        if (!sz || !ctl_items_room(w)) return -1;
+        snprintf(w->items[w->nitems], 64, "%s", sz);
+        return w->nitems++;
+    case LB_GETCOUNT:  return w->nitems;
+    case LB_GETCURSEL: return w->nitems ? w->ctl_check : -1;
+    case LB_SETCURSEL: w->ctl_check = (int)wp; w->has_update = 1; return w->ctl_check;
+    case LB_GETTEXT: {
+        char *out = (char *)(uintptr_t)lp;
+        if (!out || (int)wp < 0 || (int)wp >= w->nitems) return -1;
+        strcpy(out, w->items[wp]);
+        return (W_LRESULT)strlen(out); }
+    case LB_RESETCONTENT:
+        w->nitems = 0; w->ctl_check = -1; w->has_update = 1; return 0;
+    default: return 0;
+    }
+}
+
+static MS W_LRESULT ctl_scroll_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    int wi = w ? (int)(w - W.wnd) : 0, handled;
+    W_LRESULT r;
+    if (!w) return 0;
+    r = ctl_common(w, wi, msg, wp, lp, &handled);
+    if (handled) return r;
+    if (msg == WM_PAINT) { ctl_paint_scrollbar(w); w->has_update = 0; }
+    return 0;
+}
+
+/* The system classes, matched case-insensitively as Windows does. */
+static void *w32_builtin_class(const char *cls)
+{
+    if (!cls) return NULL;
+    if (!strcasecmp(cls, "BUTTON"))    return (void *)ctl_button_proc;
+    if (!strcasecmp(cls, "STATIC"))    return (void *)ctl_static_proc;
+    if (!strcasecmp(cls, "EDIT"))      return (void *)ctl_edit_proc;
+    if (!strcasecmp(cls, "COMBOBOX"))  return (void *)ctl_combo_proc;
+    if (!strcasecmp(cls, "LISTBOX"))   return (void *)ctl_list_proc;
+    if (!strcasecmp(cls, "SCROLLBAR")) return (void *)ctl_scroll_proc;
+    return NULL;
+}
+
 /* The window procedure a class was registered with, or NULL if it was not.
  * GetClassInfo answers from this. */
 static void *w32_class_proc(const char *name)
@@ -875,8 +1324,8 @@ static void *w32_class_proc(const char *name)
     return NULL;
 }
 
-static void *w32_create(const char *cls, int x, int y, int w, int h, void *parent,
-                        void *param, uint32_t style, uint32_t exstyle)
+static void *w32_create(const char *cls, const char *name, int x, int y, int w, int h,
+                        void *parent, void *param, uint32_t style, uint32_t exstyle)
 {
     int i, ci = 0, pi;
     void *hwnd;
@@ -888,7 +1337,19 @@ static void *w32_create(const char *cls, int x, int y, int w, int h, void *paren
         if (W.wnd[i].used) continue;
         memset(&W.wnd[i], 0, sizeof W.wnd[i]);
         W.wnd[i].used = 1;
-        W.wnd[i].wndproc = ci ? W.cls[ci].proc : NULL;
+        /* A class the application registered, or one of the system's. A child
+         * created as BUTTON or EDIT gets no procedure at all otherwise, and
+         * cannot draw or answer for itself. */
+        W.wnd[i].wndproc = ci ? W.cls[ci].proc : w32_builtin_class(cls);
+        W.wnd[i].enabled = 1;
+        /* WS_VISIBLE. A control created without it is deliberately hidden, and
+         * a helper window a plug-in keeps off-screen must not be composited
+         * over the interface. */
+        W.wnd[i].visible = (style & 0x10000000u) != 0;
+        W.wnd[i].ctl_check = w32_builtin_class(cls) &&
+                             (!strcasecmp(cls, "COMBOBOX") ||
+                              !strcasecmp(cls, "LISTBOX")) ? -1 : 0;
+        if (name) snprintf(W.wnd[i].text, sizeof W.wnd[i].text, "%s", name);
         W.wnd[i].x = x; W.wnd[i].y = y;
         W.wnd[i].w = w > 0 ? w : 1;
         W.wnd[i].h = h > 0 ? h : 1;
@@ -946,18 +1407,20 @@ static MS void *st_CreateWindowExA(uint32_t ex, const char *cls, const char *nam
                                   void *parent, void *menu, void *inst, void *param)
 {
     char c[64];
-    (void)name; (void)menu; (void)inst;
-    return w32_create(w32_cls_name(cls, c, sizeof c, 0), x, y, w, h,
+    (void)menu; (void)inst;
+    return w32_create(w32_cls_name(cls, c, sizeof c, 0), name, x, y, w, h,
                       parent, param, style, ex);
 }
 static MS void *st_CreateWindowExW(uint32_t ex, const uint16_t *cls, const uint16_t *name,
                                   uint32_t style, int32_t x, int32_t y, int32_t w, int32_t h,
                                   void *parent, void *menu, void *inst, void *param)
 {
-    char c[64];
-    (void)name; (void)menu; (void)inst;
-    return w32_create(w32_cls_name(cls, c, sizeof c, 1), x, y, w, h,
-                      parent, param, style, ex);
+    char c[64], n[128];
+    (void)menu; (void)inst;
+    /* The caption arrives wide; the controls draw it narrow. */
+    if (name) w2c_local(name, n, sizeof n);
+    return w32_create(w32_cls_name(cls, c, sizeof c, 1), name ? n : NULL,
+                      x, y, w, h, parent, param, style, ex);
 }
 
 /* Whether a handle names a live window.
@@ -3395,7 +3858,7 @@ void *w32_create_host_window(int w, int h)
         c.lpfnWndProc = NULL;
         st_RegisterClassA(&c);
     }
-    hwnd = w32_create("peloadHostContainer", 0, 0, w, h, NULL, NULL, 0, 0);
+    hwnd = w32_create("peloadHostContainer", NULL, 0, 0, w, h, NULL, NULL, 0, 0);
     W.host = w32_i(W32_HWND_BASE, hwnd);
     W.display = 0;                    /* the plugin's window claims this next */
     return hwnd;
@@ -3434,7 +3897,10 @@ void w32_show_editor(void)
     int i;
     for (i = 1; i < W32_MAX_WND; i++) {
         if (!W.wnd[i].used) continue;
-        W.wnd[i].visible = 1;
+        /* Showing the editor shows the windows the plug-in built, not the ones
+         * it deliberately left hidden: a child without WS_VISIBLE keeps what
+         * ShowWindow last said about it. */
+        if (!W.wnd[i].parent) W.wnd[i].visible = 1;
         if (W.wnd[i].wndproc) {
             w32_call(&W.wnd[i], WM_SHOWWINDOW, 1, 0);
             w32_call(&W.wnd[i], WM_SIZE, 0,
@@ -3473,13 +3939,54 @@ void w32_stats(void)
             W.n_paint, W.n_beginpaint, W.n_getdc, W.n_stretch, W.n_bitblt, W.n_timerproc);
 }
 
+/* Child windows drawn over their parent, which is what a window manager would
+ * be doing. Composited into a buffer of our own rather than into the parent's
+ * surface: the parent keeps painting into that, and a child blitted onto it
+ * would still be there on the next frame with nothing to erase it.
+ *
+ * It matters for any plug-in whose editor is built from real controls rather
+ * than one skinned bitmap -- without it every BUTTON and EDIT paints itself
+ * correctly into a surface nobody ever looks at. */
+static w32_surf g_present;
+
+static void w32_composite_children(int parent, w32_surf *out, int ox, int oy)
+{
+    int i, guard = 0;
+
+    for (i = 1; i < W32_MAX_WND; i++) {
+        w32_wnd *c = &W.wnd[i];
+        int cx, cy, y, x;
+        if (!c->used || c->parent != parent || !c->visible || !c->surf.px) continue;
+        if (guard++ > W32_MAX_WND) break;
+        cx = ox + c->x; cy = oy + c->y;
+        for (y = 0; y < c->surf.h; y++) {
+            int ty = cy + y;
+            if (ty < 0 || ty >= out->h) continue;
+            for (x = 0; x < c->surf.w; x++) {
+                int tx = cx + x;
+                if (tx < 0 || tx >= out->w) continue;
+                out->px[(size_t)ty * out->w + tx] =
+                    c->surf.px[(size_t)y * c->surf.w + x];
+            }
+        }
+        w32_composite_children(i, out, cx, cy);
+    }
+}
+
 int w32_editor_pixels(const unsigned int **px, int *w, int *h)
 {
     int i = W.display ? W.display : W.host;
+    w32_surf *s;
+
     if (!i || !W.wnd[i].used || !W.wnd[i].surf.px) return 0;
-    if (px) *px = W.wnd[i].surf.px;
-    if (w)  *w  = W.wnd[i].surf.w;
-    if (h)  *h  = W.wnd[i].surf.h;
+    s = &W.wnd[i].surf;
+    w32_surf_size(&g_present, s->w, s->h);
+    if (!g_present.px) return 0;
+    memcpy(g_present.px, s->px, (size_t)s->w * s->h * 4);
+    w32_composite_children(i, &g_present, 0, 0);
+    if (px) *px = g_present.px;
+    if (w)  *w  = g_present.w;
+    if (h)  *h  = g_present.h;
     return 1;
 }
 
