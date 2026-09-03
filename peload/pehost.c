@@ -491,6 +491,10 @@ static int map_image(image *im, const char *path)
             snprintf(g_image_dir, sizeof g_image_dir, "%.*s",
                      (int)(slash - path), path);
     }
+    /* And the file itself, so GetModuleFileName can answer with where the
+     * plug-in really is rather than a placeholder -- which is how a plug-in
+     * that loads its own data from beside itself finds it. */
+    winstubs_set_image_path(path);
 
     im->base = NULL;
     im->size = 0;
@@ -799,10 +803,13 @@ static pe_module *real_module(const char *dll)
          * runs from inside the plugin's own import resolution. Leaving the
          * runtime in place made the plugin's resources unreachable. */
         void *pbase, *prsrc;
+        char ppath[1024];
         int rc;
         winstubs_primary_save(&pbase, &prsrc);
+        winstubs_image_path_save(ppath, sizeof ppath);
         rc = pe_module_load(path, &g_real[i].m, err, sizeof err);
         winstubs_primary_restore(pbase, prsrc);
+        winstubs_image_path_restore(ppath);
         if (rc != 0) {
             fprintf(stderr, "peload: %s at %s would not load: %s\n", dll, path, err);
             return NULL;

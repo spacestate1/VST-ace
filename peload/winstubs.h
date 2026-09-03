@@ -553,11 +553,47 @@ static MS int32_t st_GetModuleHandleExW(uint32_t f, const void *n, void **out)
  * that as "I am not loaded", which is not a state its code has a path for. */
 static MS int32_t st_GetModuleHandleExA(uint32_t f, const char *n, void **out)
 { (void)f;(void)n; if (out) *out = g_image_base; return 1; }
+/* The plug-in's own file, spelled the way a Windows program expects it.
+ *
+ * This used to answer with a fixed "C:\\peload\\plugin.dll" no matter what was
+ * loaded. That is enough for a plug-in that only wants *a* name, and wrong for
+ * the very common one that takes the directory out of it and loads its own data
+ * from beside itself -- the fixed answer normalises to /peload/, which holds
+ * nothing. A SynthEdit plug-in asks for its .sem modules that way and got seven
+ * nulls in a row, then threw because its module registry was empty.
+ *
+ * The real path goes back instead, with the separators flipped and a drive
+ * letter in front, so a guest splitting it on a backslash finds the right
+ * pieces and path_norm_n turns whatever it rebuilds back into the host path it
+ * came from. */
+static char g_image_path_win[1024];
+
+static void winstubs_set_image_path(const char *host_path)
+{
+    size_t i;
+    if (!host_path || !*host_path) { g_image_path_win[0] = 0; return; }
+    snprintf(g_image_path_win, sizeof g_image_path_win, "C:%s%s",
+             host_path[0] == '/' ? "" : "/", host_path);
+    for (i = 0; g_image_path_win[i]; i++)
+        if (g_image_path_win[i] == '/') g_image_path_win[i] = '\\';
+}
+
+/* Saved across a side-load: pe_module_load installs whatever it loads as the
+ * primary image, and a runtime DLL fetched from runtime/ must not become the
+ * answer to "where am I". */
+static void winstubs_image_path_save(char *out, size_t n)
+{ snprintf(out, n, "%s", g_image_path_win); }
+static void winstubs_image_path_restore(const char *p)
+{ snprintf(g_image_path_win, sizeof g_image_path_win, "%s", p ? p : ""); }
+
+static const char *winstubs_image_path(void)
+{ return g_image_path_win[0] ? g_image_path_win : "C:\\peload\\plugin.dll"; }
+
 static MS uint32_t st_GetModuleFileNameA(void *h, char *buf, uint32_t sz)
-{ (void)h; return (uint32_t)snprintf(buf, sz, "C:\\peload\\plugin.dll"); }
+{ (void)h; return (uint32_t)snprintf(buf, sz, "%s", winstubs_image_path()); }
 static MS uint32_t st_GetModuleFileNameW(void *h, uint16_t *buf, uint32_t sz)
 {
-    static const char *s = "C:\\peload\\plugin.dll";
+    const char *s = winstubs_image_path();
     uint32_t i;
     (void)h;
     for (i = 0; s[i] && i + 1 < sz; i++) buf[i] = (uint16_t)s[i];

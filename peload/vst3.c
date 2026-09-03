@@ -852,6 +852,7 @@ struct v3host {
     IMidiMapping    *midimap;      /* NULL when the plug-in offers none */
     unsigned         in_mask;      /* input channels fed; 0 = all */
     int              ctrl_is_comp;  /* single-component plugin: same object */
+    int              process_complained;  /* the one process() error, said once */
 
     Handler   handler;
     HostApp   hostapp;
@@ -1002,6 +1003,15 @@ static int alloc_bufs(v3host *h, int frames)
 }
 
 /* Channel-count -> VST3 SpeakerArrangement bitmask for the common layouts. */
+/* How many channels a speaker arrangement names -- the inverse of
+ * arrangement_for, for reading back what a plug-in chose for itself. */
+static int channels_in_arrangement(uint64_t a)
+{
+    int n = 0;
+    while (a) { n += (int)(a & 1); a >>= 1; }
+    return n;
+}
+
 static uint64_t arrangement_for(int ch)
 {
     switch (ch) {
@@ -1212,6 +1222,32 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
             tresult r = h->proc->vt->setBusArrangements(h->proc,
                         h->nInBus ? inArr : NULL, h->nInBus, outArr, h->nOutBus);
             VLOG("vst3: setBusArrangements -> %d\n", (int)r);
+            /* kResultFalse means the plug-in declined and kept an arrangement
+             * of its own. The SDK is explicit that the host then has to ask
+             * what that arrangement is and follow it -- carrying on with the
+             * one that was refused leaves the buffers shaped for a layout the
+             * plug-in is not writing to, which reads downstream as silence
+             * rather than as an error. */
+            if (r != V3_OK) {
+                for (b = 0; b < h->nOutBus; b++) {
+                    uint64_t a = 0;
+                    if (h->proc->vt->getBusArrangement(h->proc, BD_OUTPUT, b, &a) == V3_OK) {
+                        int ch = channels_in_arrangement(a);
+                        if (ch > 0 && ch <= MAXCH) h->outCh[b] = ch;
+                    }
+                }
+                for (b = 0; b < h->nInBus; b++) {
+                    uint64_t a = 0;
+                    if (h->proc->vt->getBusArrangement(h->proc, BD_INPUT, b, &a) == V3_OK) {
+                        int ch = channels_in_arrangement(a);
+                        if (ch > 0 && ch <= MAXCH) h->inCh[b] = ch;
+                    }
+                }
+                h->nin  = h->nInBus ? h->inCh[0] : 0;
+                h->nout = h->outCh[0];
+                VLOG("vst3: kept the plug-in's own arrangement: in %d out %d\n",
+                     h->nin, h->nout);
+            }
         }
         for (b = 0; b < h->nInBus; b++)
             h->comp->vt->activateBus(h->comp, MT_AUDIO, BD_INPUT, b, 1);
@@ -1242,6 +1278,14 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
         tresult act = h->comp->vt->setActive(h->comp, 1);
         tresult pro = h->proc->vt->setProcessing(h->proc, 1);
         VLOG("vst3: setActive -> %d, setProcessing -> %d\n", (int)act, (int)pro);
+        /* A refusal here is worth locating, not just reporting: it is the one
+         * failure that produces silence with process() still answering OK.
+         * The address is given as an offset into the image so it can be looked
+         * up in a disassembler without knowing where this run happened to map. */
+        if (pro != V3_OK && h->pe.base)
+            VLOG("vst3: setProcessing is at image+0x%lx\n",
+                 (unsigned long)((uint8_t *)h->proc->vt->setProcessing
+                                 - (uint8_t *)h->pe.base));
     }
 
     /* Validate the controller vtable before trusting counts from it: if slot 0
@@ -1762,7 +1806,16 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
     pd.inputEvents  = events.n ? (void *)&events : NULL;
     pd.outputEvents = (void *)&outevents;
 
-    h->proc->vt->process(h->proc, &pd);
+    {
+        tresult pr = h->proc->vt->process(h->proc, &pd);
+        /* Once, and only when it is not success: a per-block message would
+         * bury the log, and a plug-in that refuses to process is the one thing
+         * that explains silence with no other symptom. */
+        if (pr != V3_OK && !h->process_complained) {
+            h->process_complained = 1;
+            VLOG("vst3: process -> %d (0x%08x)\n", (int)pr, (unsigned)pr);
+        }
+    }
 
     for (i = 0; i < frames; i++) {
         out[2 * i]     = h->outbuf[0][0][i];

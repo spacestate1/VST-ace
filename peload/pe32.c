@@ -977,6 +977,12 @@ int main(int argc, char **argv)
         if (serve_fd >= 0) serve_report_fail(serve_fd, "cannot map plug-in image");
         return 1;
     }
+    /* Only here, and not in the runtime side-load above: GetModuleFileName has
+     * to keep answering with the plug-in even after a runtime DLL is mapped
+     * beside it. A plug-in that loads its own data from its own directory --
+     * SynthEdit reads its .sem modules that way -- has no other way to find
+     * out where it is. */
+    winstubs_set_image_path(path);
     if (apply_relocs(&im) < 0) {
         if (serve_fd >= 0) serve_report_fail(serve_fd, "relocation failed");
         return 1;
