@@ -117,6 +117,14 @@ typedef struct {
 #define GWL_EXSTYLE   (-20)
 #define GWLP_USERDATA (-21)
 
+/* Glyphs for the GDI text calls, from the same face. Declared with plain types
+ * so FreeType's headers stay on that side of the wall. */
+static int  dw_text_measure(const char *s, int n, int em_px,
+                            int *w, int *h, int *ascent);
+static int  dw_text_draw(uint32_t *px, int pw, int ph, int x, int baseline,
+                         const char *s, int n, int em_px, uint32_t rgb,
+                         const int32_t *clip4);
+
 typedef struct { int w, h; uint32_t *px; } w32_surf;
 
 typedef struct {
@@ -177,6 +185,16 @@ typedef struct {
      * can answer honestly: see st_RectVisible. */
     W32RECT clip;
     int     has_clip;
+    /* The rest of the drawing state. This layer was written for plug-ins that
+     * rasterise their own interface and blit it, so none of it was here: an
+     * editor that draws with GDI selects a pen and a brush, sets a text colour
+     * and expects them to be remembered. */
+    int      pen, brush;           /* selected objects, 0 = stock */
+    uint32_t text_color, bk_color;
+    int      bk_mode;              /* 1 TRANSPARENT, 2 OPAQUE */
+    uint32_t text_align;
+    int32_t  cur_x, cur_y;         /* current position, for LineTo */
+    int      inited;
 } w32_dc;
 
 typedef struct { int used; int wnd; uintptr_t id; uint32_t ms; double next; void *proc; } w32_timer;
@@ -214,22 +232,58 @@ static void w32_pump_input(void)
 
 /* ---- handle helpers ------------------------------------------------------ */
 
-static void *w32_h(uint32_t base, int idx) { return (void *)(uintptr_t)(base + (uint32_t)idx); }
+/* Handles are an index in a fixed window per object type, spaced sixteen apart.
+ *
+ * The spacing is not decoration. A consumer hashes a handle to find its own
+ * wrapper for it, and MFC's CHandleMap -- which every MFC-era editor goes
+ * through on each SelectObject -- hashes with `key >> 4`. Consecutive handles
+ * differ only in the bits that shift discards, so every object this host handed
+ * out landed in one bucket. Real Windows handles vary in the bits above the
+ * bottom nibble; matching that costs four bits of index space and nothing else. */
+#define W32_H_SHIFT  4
+#define W32_H_WINDOW 0x20000u
+
+static void *w32_h(uint32_t base, int idx)
+{ return (void *)(uintptr_t)(base + ((uint32_t)idx << W32_H_SHIFT)); }
 static int   w32_i(uint32_t base, const void *h)
 {
     uintptr_t v = (uintptr_t)h;
-    if (v < base || v >= base + 0x10000) return 0;
-    return (int)(v - base);
+    if (v < base || v >= base + W32_H_WINDOW) return 0;
+    v -= base;
+    /* A value inside the window that is not on a boundary is not one of ours. */
+    if (v & ((1u << W32_H_SHIFT) - 1)) return 0;
+    return (int)(v >> W32_H_SHIFT);
 }
 static w32_wnd *w32_wget(const void *h)
 {
     int i = w32_i(W32_HWND_BASE, h);
     return (i > 0 && i < W32_MAX_WND && W.wnd[i].used) ? &W.wnd[i] : NULL;
 }
+/* Defined below; a DC needs its stock objects the first time it is looked up. */
+static MS void *st_GetStockObject(int32_t i);
+
 static w32_dc *w32_dcget(const void *h)
 {
     int i = w32_i(W32_HDC_BASE, h);
-    return (i > 0 && i < W32_MAX_DC && W.dc[i].used) ? &W.dc[i] : NULL;
+    w32_dc *d = (i > 0 && i < W32_MAX_DC && W.dc[i].used) ? &W.dc[i] : NULL;
+    /* Windows hands out a DC with black text on a white opaque background, and
+     * a plug-in that never sets them is entitled to those. A zeroed struct
+     * means white-on-black with a transparent background instead, which draws
+     * invisible text and is a hard bug to see. */
+    if (d && !d->inited) {
+        d->inited = 1;
+        d->text_color = 0x000000u;
+        d->bk_color   = 0xFFFFFFu;
+        d->bk_mode    = 2;                       /* OPAQUE */
+        /* Windows has a stock pen, brush and font selected from the start, so
+         * SelectObject always has a previous object to return. Answering NULL
+         * instead hands a caller that wraps the result -- MFC does, on every
+         * SelectObject -- a null where a handle belongs. */
+        d->pen   = w32_i(W32_OBJ_BASE, st_GetStockObject(7));   /* BLACK_PEN */
+        d->brush = w32_i(W32_OBJ_BASE, st_GetStockObject(0));   /* WHITE_BRUSH */
+        d->font  = w32_i(W32_OBJ_BASE, st_GetStockObject(13));  /* SYSTEM_FONT */
+    }
+    return d;
 }
 static w32_obj *w32_oget(const void *h)
 {
@@ -1652,7 +1706,17 @@ static MS void *st_SelectObject(void *hdc, void *obj)
         d->font = (int)(o - W.obj);
         return prev;
     }
-    return obj;                                  /* brushes/pens/fonts: accepted */
+    if (o->kind == OBJ_PEN) {
+        prev = d->pen ? w32_h(W32_OBJ_BASE, d->pen) : NULL;
+        d->pen = (int)(o - W.obj);
+        return prev;
+    }
+    if (o->kind == OBJ_BRUSH) {
+        prev = d->brush ? w32_h(W32_OBJ_BASE, d->brush) : NULL;
+        d->brush = (int)(o - W.obj);
+        return prev;
+    }
+    return obj;
 }
 static MS void *st_GetCurrentObject(void *hdc, uint32_t type)
 {
@@ -1713,16 +1777,101 @@ static MS int32_t st_GetObjectW(void *o, int32_t n, void *out) { return st_GetOb
 
 static MS void *st_CreateSolidBrush(uint32_t c)
 { return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_BRUSH, 0, 0, c)); }
+/* LOGBRUSH { UINT lbStyle; COLORREF lbColor; ULONG_PTR lbHatch; } -- the colour
+ * is the second word at both widths. Discarding it made every brush black,
+ * which on a black background is indistinguishable from not drawing. */
 static MS void *st_CreateBrushIndirect(const void *lb)
-{ (void)lb; return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_BRUSH, 0, 0, 0)); }
+{
+    uint32_t style = 0, c = 0;
+    if (lb) { memcpy(&style, lb, 4); memcpy(&c, (const char *)lb + 4, 4); }
+    /* BS_NULL/BS_HOLLOW draws nothing; carried as a pen/brush of its own so the
+     * primitives below can tell "fill with black" from "do not fill". */
+    return w32_h(W32_OBJ_BASE,
+                 w32_obj_new(OBJ_BRUSH, style == 1 ? -1 : 0, 0, c));
+}
+/* LOGPEN { UINT lopnStyle; POINT lopnWidth; COLORREF lopnColor; } */
 static MS void *st_CreatePenIndirect(const void *lp)
-{ (void)lp; return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_PEN, 0, 0, 0)); }
+{
+    uint32_t style = 0, c = 0; int32_t wx = 1;
+    if (lp) {
+        memcpy(&style, lp, 4);
+        memcpy(&wx, (const char *)lp + 4, 4);
+        memcpy(&c, (const char *)lp + 12, 4);
+    }
+    return w32_h(W32_OBJ_BASE,
+                 w32_obj_new(OBJ_PEN, style == 5 ? -1 : (wx > 0 ? wx : 1), 0, c));
+}
+/* CreatePen(style, width, colour). PS_NULL is style 5 and draws nothing. */
+static MS void *st_CreatePen(int32_t style, int32_t width, uint32_t c)
+{
+    return w32_h(W32_OBJ_BASE,
+                 w32_obj_new(OBJ_PEN, style == 5 ? -1 : (width > 0 ? width : 1), 0, c));
+}
+/* Keep the LOGFONT the caller described, widened to the W layout so there is
+ * one shape to read it back from.
+ *
+ * Neither form stored anything before, which is invisible while nothing draws
+ * text and wrong the moment something does: lfHeight is the size, so every
+ * string came out at the same default no matter what the plug-in asked for, and
+ * lfFaceName is how it recognises the font it installed from memory.
+ *
+ * LOGFONTA is 28 numeric bytes then char lfFaceName[32]; LOGFONTW is the same
+ * 28 then WCHAR[32]. Only the name differs. */
+static void *w32_font_from_logfont(const void *lf, int wide)
+{
+    int idx = w32_obj_new(OBJ_FONT, 0, 0, 0);
+    w32_obj *o;
+
+    if (!idx) return NULL;
+    o = &W.obj[idx];
+    if (lf) {
+        memcpy(o->logfont, lf, 28);
+        if (wide) {
+            memcpy(o->logfont + 28, (const char *)lf + 28, 64);
+        } else {
+            const char *nm = (const char *)lf + 28;
+            uint16_t *w = (uint16_t *)(o->logfont + 28);
+            int i;
+            for (i = 0; i < 31 && nm[i]; i++) w[i] = (uint8_t)nm[i];
+            w[i] = 0;
+        }
+        o->logfont_len = 92;
+    }
+    return w32_h(W32_OBJ_BASE, idx);
+}
 static MS void *st_CreateFontIndirectA(const void *lf)
 {
-    PLOG("  [font] CreateFontIndirectA\n"); (void)lf; return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_FONT, 0, 0, 0)); }
+    int32_t h = 0;
+    if (lf) memcpy(&h, lf, 4);
+    PLOG("  [font] CreateFontIndirectA height=%d\n", (int)h);
+    return w32_font_from_logfont(lf, 0);
+}
 static MS void *st_CreateFontIndirectW(const void *lf)
 {
-    PLOG("  [font] CreateFontIndirectW\n"); (void)lf; return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_FONT, 0, 0, 0)); }
+    int32_t h = 0;
+    if (lf) memcpy(&h, lf, 4);
+    PLOG("  [font] CreateFontIndirectW height=%d\n", (int)h);
+    return w32_font_from_logfont(lf, 1);
+}
+/* CreateFont's fourteen arguments are a LOGFONT spelled out, so it becomes one. */
+static MS void *st_CreateFontA(int32_t h, int32_t w, int32_t esc, int32_t orient,
+                               int32_t weight, uint32_t italic, uint32_t underline,
+                               uint32_t strike, uint32_t charset, uint32_t outprec,
+                               uint32_t clipprec, uint32_t quality, uint32_t pitch,
+                               const char *face)
+{
+    uint8_t lf[60];
+    memset(lf, 0, sizeof lf);
+    memcpy(lf + 0, &h, 4); memcpy(lf + 4, &w, 4);
+    memcpy(lf + 8, &esc, 4); memcpy(lf + 12, &orient, 4);
+    memcpy(lf + 16, &weight, 4);
+    lf[20] = (uint8_t)italic; lf[21] = (uint8_t)underline;
+    lf[22] = (uint8_t)strike; lf[23] = (uint8_t)charset;
+    lf[24] = (uint8_t)outprec; lf[25] = (uint8_t)clipprec;
+    lf[26] = (uint8_t)quality; lf[27] = (uint8_t)pitch;
+    if (face) snprintf((char *)lf + 28, 32, "%s", face);
+    return w32_font_from_logfont(lf, 0);
+}
 static MS void *st_CreateRectRgn(int32_t l, int32_t t, int32_t r, int32_t b)
 {
     int i = w32_obj_new(OBJ_RGN, 0, 0, 0);
@@ -1749,24 +1898,262 @@ static MS uint32_t st_GetRegionData(void *rgn, uint32_t n, void *d)
     (void)rgn; (void)n; (void)d;
     return 0;
 }
+/* The stock objects, each of the kind it is actually named after.
+ *
+ * This returned a brush for every index, which was harmless while SelectObject
+ * ignored pens and brushes and is not now: selecting BLACK_PEN set the DC's
+ * brush, so a plug-in outlining a shape filled it instead. The colours matter
+ * for the same reason -- LTGRAY_BRUSH is the face of nearly every dialog
+ * control drawn in this corpus, and black is not a shade of grey. */
 static MS void *st_GetStockObject(int32_t i)
 {
-    /* A handful of fixed objects; identity is all that is checked. */
     static int cache[24];
     int k = (i >= 0 && i < 24) ? i : 0;
-    if (!cache[k]) cache[k] = w32_obj_new(OBJ_BRUSH, 0, 0, k == 0 ? 0xFFFFFF : 0);
+
+    if (!cache[k]) {
+        switch (k) {
+        case 0:  cache[k] = w32_obj_new(OBJ_BRUSH, 0, 0, 0xFFFFFFu); break;
+        case 1:  cache[k] = w32_obj_new(OBJ_BRUSH, 0, 0, 0xC0C0C0u); break;
+        case 2:  cache[k] = w32_obj_new(OBJ_BRUSH, 0, 0, 0x808080u); break;
+        case 3:  cache[k] = w32_obj_new(OBJ_BRUSH, 0, 0, 0x404040u); break;
+        case 4:  cache[k] = w32_obj_new(OBJ_BRUSH, 0, 0, 0x000000u); break;
+        case 5:  cache[k] = w32_obj_new(OBJ_BRUSH, -1, 0, 0); break;   /* NULL_BRUSH */
+        case 6:  cache[k] = w32_obj_new(OBJ_PEN, 1, 0, 0xFFFFFFu); break;
+        case 7:  cache[k] = w32_obj_new(OBJ_PEN, 1, 0, 0x000000u); break;
+        case 8:  cache[k] = w32_obj_new(OBJ_PEN, -1, 0, 0); break;      /* NULL_PEN */
+        case 18: cache[k] = w32_obj_new(OBJ_BRUSH, 0, 0, 0xFFFFFFu); break; /* DC_BRUSH */
+        case 19: cache[k] = w32_obj_new(OBJ_PEN, 1, 0, 0x000000u); break;   /* DC_PEN */
+        default: cache[k] = w32_obj_new(OBJ_FONT, 0, 0, 0); break;      /* the fonts */
+        }
+    }
     return w32_h(W32_OBJ_BASE, cache[k]);
 }
-static MS uint32_t st_SetBkColor(void *dc, uint32_t c) { (void)dc; return c; }
-static MS int32_t st_SetBkMode(void *dc, int32_t m) { (void)dc; return m; }
-static MS uint32_t st_SetTextColor(void *dc, uint32_t c) { (void)dc; return c; }
+
+static MS uint32_t st_SetBkColor(void *hdc, uint32_t c)
+{
+    w32_dc *d = w32_dcget(hdc);
+    uint32_t was;
+    if (!d) return 0xFFFFFFFFu;
+    was = d->bk_color; d->bk_color = c;
+    return was;
+}
+static MS uint32_t st_GetBkColor(void *hdc)
+{ w32_dc *d = w32_dcget(hdc); return d ? d->bk_color : 0xFFFFFFFFu; }
+static MS int32_t st_SetBkMode(void *hdc, int32_t m)
+{
+    w32_dc *d = w32_dcget(hdc);
+    int was;
+    if (!d) return 0;
+    was = d->bk_mode; d->bk_mode = m;
+    return was;
+}
+static MS int32_t st_GetBkMode(void *hdc)
+{ w32_dc *d = w32_dcget(hdc); return d ? d->bk_mode : 0; }
+/* ---- GDI drawing --------------------------------------------------------- */
+
+/* COLORREF is 0x00BBGGRR -- red in the low byte -- and the surfaces here are
+ * 0x00RRGGBB. Writing one into the other swaps red and blue, which is subtle
+ * enough to survive review and obvious the moment anything draws a colour that
+ * is not grey. FillRect did exactly that before this. */
+static uint32_t w32_cr(uint32_t colorref)
+{
+    return ((colorref & 0xFFu) << 16) | (colorref & 0xFF00u) |
+           ((colorref >> 16) & 0xFFu);
+}
+
+/* Whether a pen or brush draws at all. Width -1 is how PS_NULL and BS_NULL are
+ * carried; both mean "skip this part of the shape" rather than "use black". */
+static int w32_pen_on(const w32_dc *d)
+{ return !d->pen || W.obj[d->pen].w >= 0; }
+static int w32_brush_on(const w32_dc *d)
+{ return !d->brush || W.obj[d->brush].w >= 0; }
+static uint32_t w32_pen_rgb(const w32_dc *d)
+{ return w32_cr(d->pen ? W.obj[d->pen].color : 0); }
+static uint32_t w32_brush_rgb(const w32_dc *d)
+{ return w32_cr(d->brush ? W.obj[d->brush].color : 0xFFFFFFu); }
+
+/* One pixel, in device space, honouring the clip box. Every primitive below
+ * goes through here so the clip is applied in exactly one place. */
+static void w32_plot(w32_surf *t, const w32_dc *d, int x, int y, uint32_t rgb)
+{
+    if (!t || !t->px || x < 0 || y < 0 || x >= t->w || y >= t->h) return;
+    if (d->has_clip &&
+        (x < d->clip.left || x >= d->clip.right ||
+         y < d->clip.top  || y >= d->clip.bottom)) return;
+    t->px[(size_t)y * t->w + x] = rgb;
+}
+
+static void w32_fill_span(w32_surf *t, const w32_dc *d, int x0, int x1, int y,
+                          uint32_t rgb)
+{ for (; x0 < x1; x0++) w32_plot(t, d, x0, y, rgb); }
+
+/* Bresenham, with a square nib for a wide pen. Windows draws a line from the
+ * current position up to but not including the end point; the end point is
+ * where the next LineTo starts. */
+static void w32_line(w32_surf *t, const w32_dc *d, int x0, int y0, int x1, int y1,
+                     uint32_t rgb, int width)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = (dx > dy ? dx : -dy) / 2, e2;
+    int half = width > 1 ? width / 2 : 0;
+
+    for (;;) {
+        if (half) {
+            int i, j;
+            for (j = -half; j <= half; j++)
+                for (i = -half; i <= half; i++)
+                    w32_plot(t, d, x0 + i, y0 + j, rgb);
+        } else {
+            w32_plot(t, d, x0, y0, rgb);
+        }
+        if (x0 == x1 && y0 == y1) break;
+        e2 = err;
+        if (e2 > -dx) { err -= dy; x0 += sx; }
+        if (e2 <  dy) { err += dx; y0 += sy; }
+    }
+}
+
+static MS uint32_t st_SetTextColor(void *hdc, uint32_t c)
+{
+    w32_dc *d = w32_dcget(hdc);
+    uint32_t was;
+    if (!d) return 0xFFFFFFFFu;                  /* CLR_INVALID */
+    was = d->text_color; d->text_color = c;
+    return was;
+}
+static MS uint32_t st_GetTextColor(void *hdc)
+{ w32_dc *d = w32_dcget(hdc); return d ? d->text_color : 0xFFFFFFFFu; }
 static MS uint32_t st_SetDCBrushColor(void *dc, uint32_t c) { (void)dc; return c; }
 static MS int32_t st_SetROP2(void *dc, int32_t m) { (void)dc; return m; }
-static MS int32_t st_MoveToEx(void *dc, int32_t x, int32_t y, W32POINT *p)
-{ (void)dc;(void)x;(void)y; if (p) { p->x = 0; p->y = 0; } return 1; }
-static MS int32_t st_LineTo(void *dc, int32_t x, int32_t y) { (void)dc;(void)x;(void)y; return 1; }
-static MS int32_t st_Ellipse(void *dc, int32_t a, int32_t b, int32_t c, int32_t d)
-{ (void)dc;(void)a;(void)b;(void)c;(void)d; return 1; }
+
+static MS int32_t st_MoveToEx(void *hdc, int32_t x, int32_t y, W32POINT *p)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    if (p) { p->x = d->cur_x - d->org_x; p->y = d->cur_y - d->org_y; }
+    d->cur_x = x + d->org_x; d->cur_y = y + d->org_y;
+    return 1;
+}
+static MS int32_t st_LineTo(void *hdc, int32_t x, int32_t y)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    if (!d) return 0;
+    t = w32_target_in(d, &ttmp);
+    x += d->org_x; y += d->org_y;
+    if (t && w32_pen_on(d))
+        w32_line(t, d, d->cur_x, d->cur_y, x, y, w32_pen_rgb(d),
+                 d->pen ? W.obj[d->pen].w : 1);
+    d->cur_x = x; d->cur_y = y;
+    return 1;
+}
+static MS int32_t st_Rectangle(void *hdc, int32_t l, int32_t tp, int32_t r, int32_t b)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    int y;
+    if (!d || !(t = w32_target_in(d, &ttmp))) return 0;
+    l += d->org_x; r += d->org_x; tp += d->org_y; b += d->org_y;
+    /* Windows fills the interior with the brush and outlines it with the pen,
+     * and the right and bottom edges are outside the filled area. */
+    if (w32_brush_on(d)) {
+        uint32_t f = w32_brush_rgb(d);
+        for (y = tp + 1; y < b - 1; y++) w32_fill_span(t, d, l + 1, r - 1, y, f);
+    }
+    if (w32_pen_on(d)) {
+        uint32_t c = w32_pen_rgb(d);
+        int wd = d->pen ? W.obj[d->pen].w : 1;
+        w32_line(t, d, l, tp, r - 1, tp, c, wd);
+        w32_line(t, d, r - 1, tp, r - 1, b - 1, c, wd);
+        w32_line(t, d, r - 1, b - 1, l, b - 1, c, wd);
+        w32_line(t, d, l, b - 1, l, tp, c, wd);
+    }
+    return 1;
+}
+/* Midpoint ellipse: four symmetric arcs, filled by spanning between the two
+ * horizontal extremes at each y so the brush and the outline agree. */
+static MS int32_t st_Ellipse(void *hdc, int32_t l, int32_t tp, int32_t r, int32_t b)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    double cx, cy, rx, ry;
+    int y;
+    if (!d || !(t = w32_target_in(d, &ttmp))) return 0;
+    l += d->org_x; r += d->org_x; tp += d->org_y; b += d->org_y;
+    rx = (r - l) / 2.0; ry = (b - tp) / 2.0;
+    if (rx <= 0 || ry <= 0) return 1;
+    cx = l + rx; cy = tp + ry;
+    for (y = tp; y < b; y++) {
+        double dy = ((double)y + 0.5 - cy) / ry;
+        double q = 1.0 - dy * dy, hw;
+        int x0, x1;
+        if (q <= 0) continue;
+        hw = rx * sqrt(q);
+        x0 = (int)(cx - hw + 0.5); x1 = (int)(cx + hw + 0.5);
+        if (w32_brush_on(d)) w32_fill_span(t, d, x0, x1, y, w32_brush_rgb(d));
+        if (w32_pen_on(d)) {
+            uint32_t c = w32_pen_rgb(d);
+            w32_plot(t, d, x0, y, c);
+            w32_plot(t, d, x1 - 1, y, c);
+        }
+    }
+    return 1;
+}
+/* PatBlt with PATCOPY is how MFC's FillSolidRect paints, so it is a rectangle
+ * fill with the brush rather than a pattern operation. BLACKNESS and WHITENESS
+ * ignore the brush, which is the whole point of them. */
+static MS int32_t st_PatBlt(void *hdc, int32_t x, int32_t y, int32_t w, int32_t h,
+                            uint32_t rop)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    uint32_t c;
+    int j;
+    if (!d || !(t = w32_target_in(d, &ttmp))) return 0;
+    x += d->org_x; y += d->org_y;
+    if (rop == 0x00000042u) c = 0x000000u;             /* BLACKNESS */
+    else if (rop == 0x00FF0062u) c = 0xFFFFFFu;        /* WHITENESS */
+    else if (w32_brush_on(d)) c = w32_brush_rgb(d);
+    else return 1;
+    for (j = y; j < y + h; j++) w32_fill_span(t, d, x, x + w, j, c);
+    return 1;
+}
+static MS uint32_t st_SetPixel(void *hdc, int32_t x, int32_t y, uint32_t c)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    if (!d || !(t = w32_target_in(d, &ttmp))) return 0xFFFFFFFFu;
+    w32_plot(t, d, x + d->org_x, y + d->org_y, w32_cr(c));
+    return c;
+}
+static MS int32_t st_SetPixelV(void *hdc, int32_t x, int32_t y, uint32_t c)
+{ return st_SetPixel(hdc, x, y, c) != 0xFFFFFFFFu; }
+static MS uint32_t st_GetPixel(void *hdc, int32_t x, int32_t y)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    uint32_t v;
+    if (!d || !(t = w32_source_in(d, &ttmp)) || !t->px) return 0xFFFFFFFFu;
+    x += d->org_x; y += d->org_y;
+    if (x < 0 || y < 0 || x >= t->w || y >= t->h) return 0xFFFFFFFFu;
+    v = t->px[(size_t)y * t->w + x];
+    return w32_cr(v);                            /* back to COLORREF order */
+}
+static MS int32_t st_Polyline(void *hdc, const W32POINT *pts, int32_t n)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    int i;
+    if (!d || !pts || n < 2 || !(t = w32_target_in(d, &ttmp))) return 0;
+    if (!w32_pen_on(d)) return 1;
+    for (i = 0; i + 1 < n; i++)
+        w32_line(t, d, pts[i].x + d->org_x, pts[i].y + d->org_y,
+                 pts[i + 1].x + d->org_x, pts[i + 1].y + d->org_y,
+                 w32_pen_rgb(d), d->pen ? W.obj[d->pen].w : 1);
+    return 1;
+}
 static MS int32_t st_DPtoLP(void *dc, W32POINT *p, int32_t n) { (void)dc;(void)p;(void)n; return 1; }
 static MS int32_t st_FillRect(void *hdc, const W32RECT *r, void *brush)
 {
@@ -1774,20 +2161,231 @@ static MS int32_t st_FillRect(void *hdc, const W32RECT *r, void *brush)
     w32_surf ttmp;
     w32_surf *t = w32_target_in(d, &ttmp);
     w32_obj *b = w32_oget(brush);
-    uint32_t c = b ? b->color : 0;
-    int y, x;
-    if (!t || !t->px || !r) return 0;
-    for (y = r->top; y < r->bottom; y++) {
-        if (y < 0 || y >= t->h) continue;
-        for (x = r->left; x < r->right; x++) {
-            if (x < 0 || x >= t->w) continue;
-            t->px[(size_t)y * t->w + x] = c;
-        }
-    }
+    uint32_t c;
+    int y;
+    if (!t || !t->px || !r || !d) return 0;
+    if (b && b->w < 0) return 1;                 /* BS_NULL fills nothing */
+    c = w32_cr(b ? b->color : 0xFFFFFFu);
+    for (y = r->top + d->org_y; y < r->bottom + d->org_y; y++)
+        w32_fill_span(t, d, r->left + d->org_x, r->right + d->org_x, y, c);
     return 1;
 }
-static MS int32_t st_DrawTextA(void *dc, const char *s, int32_t n, W32RECT *r, uint32_t f)
-{ (void)dc;(void)s;(void)n;(void)r;(void)f; return 0; }
+/* ---- GDI text ------------------------------------------------------------ */
+
+/* The pixel height of the selected font. LOGFONT's lfHeight is the character
+ * cell height, negative when the caller means the character height itself --
+ * the sign is a unit, not a direction, and a plug-in that asks for -11 wants
+ * eleven pixels rather than a font measured upside down. */
+static int w32_font_px(const w32_dc *d)
+{
+    int32_t h = 0;
+    if (d && d->font && W.obj[d->font].used && W.obj[d->font].logfont_len >= 4)
+        memcpy(&h, W.obj[d->font].logfont, 4);
+    if (h < 0) h = -h;
+    if (h < 4 || h > 400) h = 12;       /* the system font, near enough */
+    return (int)h;
+}
+
+/* TA_* alignment. The default is the top-left corner with the y coordinate
+ * naming the top of the cell; TA_BASELINE means it names the baseline instead,
+ * which is what a caller that has measured its own text uses. */
+#define W32_TA_RIGHT    2
+#define W32_TA_CENTER   6
+#define W32_TA_BOTTOM   8
+#define W32_TA_BASELINE 24
+
+static void w32_text_at(w32_dc *d, w32_surf *t, int x, int y,
+                        const char *s, int n, int opaque_rect_first,
+                        const W32RECT *bg)
+{
+    int tw = 0, th = 0, asc = 0, em = w32_font_px(d);
+    int32_t clip[4];
+    const int32_t *pclip = NULL;
+
+    if (!t || !t->px || !s || n <= 0) return;
+    dw_text_measure(s, n, em, &tw, &th, &asc);
+
+    switch (d->text_align & 6) {
+    case W32_TA_RIGHT:  x -= tw;     break;
+    case W32_TA_CENTER: x -= tw / 2; break;
+    default: break;
+    }
+    if (d->text_align & W32_TA_BASELINE) y -= asc;   /* y named the baseline */
+    else if (d->text_align & W32_TA_BOTTOM) y -= th;
+
+    /* OPAQUE mode paints the cell behind the glyphs; a plug-in relies on it to
+     * erase what it drew last time rather than clearing first. */
+    if ((opaque_rect_first || d->bk_mode == 2) && th > 0) {
+        W32RECT r;
+        int j;
+        if (bg) r = *bg;
+        else { r.left = x; r.top = y; r.right = x + tw; r.bottom = y + th; }
+        for (j = r.top; j < r.bottom; j++)
+            w32_fill_span(t, d, r.left, r.right, j, w32_cr(d->bk_color));
+    }
+    if (d->has_clip) {
+        clip[0] = d->clip.left; clip[1] = d->clip.top;
+        clip[2] = d->clip.right; clip[3] = d->clip.bottom;
+        pclip = clip;
+    }
+    dw_text_draw(t->px, t->w, t->h, x, y + asc, s, n, em,
+                 w32_cr(d->text_color), pclip);
+}
+
+static int w32_strn(const char *s, int32_t n)
+{ return n < 0 ? (s ? (int)strlen(s) : 0) : (int)n; }
+
+static MS int32_t st_TextOutA(void *hdc, int32_t x, int32_t y,
+                              const char *s, int32_t n)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    if (!d || !(t = w32_target_in(d, &ttmp))) return 0;
+    w32_text_at(d, t, x + d->org_x, y + d->org_y, s, w32_strn(s, n), 0, NULL);
+    return 1;
+}
+/* Wide text, narrowed. The corpus labels its controls in Latin-1; a character
+ * outside it becomes '?' rather than silently truncating the string. */
+static MS int32_t st_TextOutW(void *hdc, int32_t x, int32_t y,
+                              const uint16_t *ws, int32_t n)
+{
+    char buf[512];
+    int i, len = 0;
+    if (!ws) return 0;
+    if (n < 0) { for (n = 0; ws[n]; n++) {} }
+    for (i = 0; i < n && len + 1 < (int)sizeof buf; i++)
+        buf[len++] = ws[i] < 256 ? (char)ws[i] : '?';
+    buf[len] = 0;
+    return st_TextOutA(hdc, x, y, buf, len);
+}
+
+#define W32_ETO_OPAQUE 2
+
+static MS int32_t st_ExtTextOutA(void *hdc, int32_t x, int32_t y, uint32_t opts,
+                                 const W32RECT *rc, const char *s, uint32_t n,
+                                 const int32_t *dx)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    W32RECT bg;
+    (void)dx;                                    /* per-character spacing */
+    if (!d || !(t = w32_target_in(d, &ttmp))) return 0;
+    if (rc) {
+        bg = *rc;
+        bg.left += d->org_x; bg.right  += d->org_x;
+        bg.top  += d->org_y; bg.bottom += d->org_y;
+    }
+    w32_text_at(d, t, x + d->org_x, y + d->org_y, s, (int)n,
+                (opts & W32_ETO_OPAQUE) != 0, (rc && (opts & W32_ETO_OPAQUE)) ? &bg : NULL);
+    return 1;
+}
+static MS int32_t st_ExtTextOutW(void *hdc, int32_t x, int32_t y, uint32_t opts,
+                                 const W32RECT *rc, const uint16_t *ws, uint32_t n,
+                                 const int32_t *dx)
+{
+    char buf[512];
+    uint32_t i;
+    int len = 0;
+    if (!ws) return 0;
+    for (i = 0; i < n && len + 1 < (int)sizeof buf; i++)
+        buf[len++] = ws[i] < 256 ? (char)ws[i] : '?';
+    return st_ExtTextOutA(hdc, x, y, opts, rc, buf, (uint32_t)len, dx);
+}
+
+static MS uint32_t st_SetTextAlign(void *hdc, uint32_t a)
+{
+    w32_dc *d = w32_dcget(hdc);
+    uint32_t was;
+    if (!d) return 0xFFFFFFFFu;
+    was = d->text_align; d->text_align = a;
+    return was;
+}
+static MS uint32_t st_GetTextAlign(void *hdc)
+{ w32_dc *d = w32_dcget(hdc); return d ? d->text_align : 0xFFFFFFFFu; }
+
+#define W32_DT_CENTER    0x1
+#define W32_DT_RIGHT     0x2
+#define W32_DT_VCENTER   0x4
+#define W32_DT_BOTTOM    0x8
+#define W32_DT_SINGLELINE 0x20
+#define W32_DT_CALCRECT  0x400
+
+/* Single-line DrawText, which is what a control label is. Multi-line wrapping
+ * is not attempted: reporting the single-line height for a block that would
+ * wrap is a wrong layout, where drawing nothing is no layout at all, and every
+ * caller in this corpus passes DT_SINGLELINE. */
+static MS int32_t st_DrawTextA(void *hdc, const char *s, int32_t n, W32RECT *r,
+                               uint32_t f)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    int len = w32_strn(s, n), tw = 0, th = 0, asc = 0, x, y;
+    int em;
+
+    if (!d || !r) return 0;
+    em = w32_font_px(d);
+    dw_text_measure(s, len, em, &tw, &th, &asc);
+    if (f & W32_DT_CALCRECT) {                   /* measure only */
+        r->right = r->left + tw;
+        r->bottom = r->top + th;
+        return th;
+    }
+    if (!(t = w32_target_in(d, &ttmp))) return 0;
+    x = r->left + d->org_x;
+    y = r->top + d->org_y;
+    if (f & W32_DT_CENTER)     x += ((r->right - r->left) - tw) / 2;
+    else if (f & W32_DT_RIGHT) x += (r->right - r->left) - tw;
+    if (f & W32_DT_VCENTER)    y += ((r->bottom - r->top) - th) / 2;
+    else if (f & W32_DT_BOTTOM) y += (r->bottom - r->top) - th;
+    {   /* alignment is applied here, not by the TA_ state */
+        uint32_t save = d->text_align;
+        d->text_align = 0;
+        w32_text_at(d, t, x, y, s, len, 0, NULL);
+        d->text_align = save;
+    }
+    return th;
+}
+static MS int32_t st_DrawTextW(void *hdc, const uint16_t *ws, int32_t n,
+                               W32RECT *r, uint32_t f)
+{
+    char buf[512];
+    int i, len = 0;
+    if (!ws) return 0;
+    if (n < 0) { for (n = 0; ws[n]; n++) {} }
+    for (i = 0; i < n && len + 1 < (int)sizeof buf; i++)
+        buf[len++] = ws[i] < 256 ? (char)ws[i] : '?';
+    buf[len] = 0;
+    return st_DrawTextA(hdc, buf, len, r, f);
+}
+
+/* TEXTMETRIC, which layout code divides by. tmHeight and tmAveCharWidth are the
+ * two fields anything here reads; a zeroed structure is a divide by zero. */
+static MS int32_t st_GetTextMetricsA(void *hdc, void *out)
+{
+    w32_dc *d = w32_dcget(hdc);
+    struct { int32_t height, ascent, descent, intleading, extleading,
+                     aveCharWidth, maxCharWidth, weight, overhang,
+                     digitizedAspectX, digitizedAspectY;
+             uint8_t first, last, def, brk, italic, underlined, struckOut,
+                     pitchAndFamily, charSet; } tm;
+    int w = 0, h = 0, asc = 0, em;
+
+    if (!out) return 0;
+    em = w32_font_px(d);
+    dw_text_measure("nnnnnnnnnn", 10, em, &w, &h, &asc);
+    memset(&tm, 0, sizeof tm);
+    tm.height = h ? h : em;
+    tm.ascent = asc ? asc : em;
+    tm.descent = tm.height - tm.ascent;
+    tm.aveCharWidth = w ? w / 10 : em / 2;
+    tm.maxCharWidth = tm.aveCharWidth * 2;
+    tm.weight = 400;
+    tm.first = 32; tm.last = 255; tm.def = '?'; tm.brk = ' ';
+    memcpy(out, &tm, sizeof tm);
+    return 1;
+}
+static MS int32_t st_GetTextMetricsW(void *hdc, void *out)
+{ return st_GetTextMetricsA(hdc, out); }
 
 /* The plugin registers its embedded TTF here. Keeping the bytes lets GetFontData
  * serve them, and parsing the family name out of the font lets
@@ -1984,14 +2582,24 @@ static MS int32_t st_EnumFontFamiliesExW(void *dc, void *lf, void *proc, intptr_
 
     return ((enumfontproc)proc)(elf, ntm, 0x0004 /* TRUETYPE_FONTTYPE */, p);
 }
-static MS int32_t st_GetTextExtentPoint32A(void *dc, const char *s, int32_t n, W32POINT *sz)
+static MS int32_t st_GetTextExtentPoint32A(void *hdc, const char *s, int32_t n,
+                                          W32POINT *sz)
 {
-    (void)dc;
-    /* A rough advance keeps layout code from dividing by zero. */
-    if (sz) { sz->x = n > 0 ? n * 7 : 0; sz->y = 14; }
-    (void)s;
+    w32_dc *d = w32_dcget(hdc);
+    int w = 0, h = 0;
+    if (!sz) return 0;
+    /* Measured with the selected font rather than guessed at seven pixels a
+     * character. Layout that centres a label or sizes a control to its text was
+     * being handed a width unrelated to what would be drawn. */
+    if (!dw_text_measure(s, w32_strn(s, n), w32_font_px(d), &w, &h, NULL)) {
+        w = n > 0 ? n * 7 : 0; h = 14;           /* no face: keep it non-zero */
+    }
+    sz->x = w; sz->y = h;
     return 1;
 }
+static MS int32_t st_GetTextExtentPointA(void *hdc, const char *s, int32_t n,
+                                         W32POINT *sz)
+{ return st_GetTextExtentPoint32A(hdc, s, n, sz); }
 static MS int32_t st_GetTextFaceA(void *dc, int32_t n, char *buf)
 {
     const char *f = w32_dc_family(dc);

@@ -1442,6 +1442,85 @@ static dwprobe *dw_make_font(dw_collection *c)
     return f;
 }
 
+/* ---- GDI text -----------------------------------------------------------
+ *
+ * TextOut and its relatives, served from the same FreeType face DirectWrite
+ * measures with. This exists because the GDI text calls in win32gui.h were
+ * no-ops: the Win32 layer was written for plug-ins that rasterise their own
+ * interface and blit it, and a plug-in from the GDI era draws its text by
+ * asking GDI to. Both kinds are in the corpus.
+ *
+ * Byte strings only, mapped through the face's Unicode cmap. That is right for
+ * ASCII and for the Latin-1 range every plug-in here labels its controls in;
+ * a genuine multi-byte code page would need the code page. */
+static int dw_text_measure(const char *s, int n, int em_px,
+                           int *w, int *h, int *ascent)
+{
+    FT_Face f = dw_ftface();
+    int i, adv = 0;
+
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (ascent) *ascent = 0;
+    if (!f || em_px <= 0) return 0;
+    FT_Set_Pixel_Sizes(f, 0, (FT_UInt)em_px);
+    for (i = 0; i < n && s; i++) {
+        FT_UInt gi = FT_Get_Char_Index(f, (FT_ULong)(unsigned char)s[i]);
+        if (FT_Load_Glyph(f, gi, FT_LOAD_DEFAULT)) continue;
+        adv += (int)(f->glyph->advance.x >> 6);
+    }
+    if (w) *w = adv;
+    if (h) *h = (int)((f->size->metrics.ascender - f->size->metrics.descender) >> 6);
+    if (ascent) *ascent = (int)(f->size->metrics.ascender >> 6);
+    return 1;
+}
+
+/* Draw at a baseline, blended by glyph coverage. `clip4` is left, top, right,
+ * bottom in device space, or NULL. */
+static int dw_text_draw(uint32_t *px, int pw, int ph, int x, int baseline,
+                        const char *s, int n, int em_px, uint32_t rgb,
+                        const int32_t *clip4)
+{
+    FT_Face f = dw_ftface();
+    int i, pen = x;
+
+    if (!f || !px || em_px <= 0 || !s) return 0;
+    FT_Set_Pixel_Sizes(f, 0, (FT_UInt)em_px);
+    for (i = 0; i < n; i++) {
+        FT_UInt gi = FT_Get_Char_Index(f, (FT_ULong)(unsigned char)s[i]);
+        int row, col, gx, gy;
+
+        if (FT_Load_Glyph(f, gi, FT_LOAD_DEFAULT)) continue;
+        if (FT_Render_Glyph(f->glyph, FT_RENDER_MODE_NORMAL)) {
+            pen += (int)(f->glyph->advance.x >> 6);
+            continue;
+        }
+        gx = pen + f->glyph->bitmap_left;
+        gy = baseline - f->glyph->bitmap_top;
+        for (row = 0; row < (int)f->glyph->bitmap.rows; row++) {
+            int ty = gy + row;
+            if (ty < 0 || ty >= ph) continue;
+            if (clip4 && (ty < clip4[1] || ty >= clip4[3])) continue;
+            for (col = 0; col < (int)f->glyph->bitmap.width; col++) {
+                int tx = gx + col;
+                uint32_t dst, r, g, b;
+                uint8_t a;
+                if (tx < 0 || tx >= pw) continue;
+                if (clip4 && (tx < clip4[0] || tx >= clip4[2])) continue;
+                a = f->glyph->bitmap.buffer[row * f->glyph->bitmap.pitch + col];
+                if (!a) continue;
+                dst = px[(size_t)ty * pw + tx];
+                r = (((rgb >> 16) & 0xFF) * a + ((dst >> 16) & 0xFF) * (255 - a)) / 255;
+                g = (((rgb >>  8) & 0xFF) * a + ((dst >>  8) & 0xFF) * (255 - a)) / 255;
+                b = ((  rgb        & 0xFF) * a + ( dst        & 0xFF) * (255 - a)) / 255;
+                px[(size_t)ty * pw + tx] = (r << 16) | (g << 8) | b;
+            }
+        }
+        pen += (int)(f->glyph->advance.x >> 6);
+    }
+    return 1;
+}
+
 /* ---- glyph rasterisation ------------------------------------------------
  *
  * Skia asks DirectWrite to turn a glyph run into an alpha texture. FreeType

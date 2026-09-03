@@ -139,20 +139,229 @@ static void w2c(const uint16_t *w, char *out, size_t n);
 
 /* ------------------------------------------------------------ heap / memory */
 
+/* ---- the allocator every plug-in-facing malloc goes through -------------
+ *
+ * A plug-in frees things. Sometimes it frees something it never got from us, or
+ * frees it twice, and until now that reached glibc's free() directly: a wild
+ * pointer took the host down, and a plausible-but-wrong one quietly corrupted
+ * the heap. The second is much worse. It cost a long chase -- an MFC editor
+ * faulting inside its own CMapPtrToPtr::Lookup on a bucket array full of small
+ * integers, several subsystems away from whatever had scribbled on it.
+ *
+ * So every block handed to a plug-in is recorded, and every free asks whether
+ * this is one of them.
+ *
+ * A header in front of the block was the obvious way to do that and is wrong:
+ * validating a foreign pointer then means reading the sixteen bytes before it,
+ * which is out of bounds by definition. ASan says so immediately, and a pointer
+ * that happens to sit at the start of a page says so with the fault this exists
+ * to prevent. A side table never touches memory it does not own, and it keeps
+ * the pointers we hand out as ordinary malloc pointers -- so host code that
+ * frees one directly still works.
+ *
+ * All the families share the table deliberately. On Windows malloc *is*
+ * HeapAlloc on the process heap, so a plug-in may legally allocate with one and
+ * free with another; separate bookkeeping per family would break exactly the
+ * mixing that works on the real thing. The same goes for every stub that hands
+ * back a buffer the caller frees -- FormatMessage, _wcsdup, _Getdays -- which
+ * must allocate here rather than with malloc.
+ *
+ * Removal happens before the free, which is what catches a double free: the
+ * second one no longer finds the pointer. Refusing it leaks rather than
+ * corrupting, and a leak is something a host survives. */
+
+#define W32_HEAP_MIN 1024u
+#define W32_HEAP_DEAD ((void *)(uintptr_t)1)     /* tombstone */
+
+static struct {
+    void   **key;
+    size_t  *size;
+    size_t   cap, used, dead;
+    pthread_mutex_t m;
+    int      ready;
+} g_heap;
+
+/* Refused frees, counted rather than reported: each one is logged under
+ * PELOAD_VERBOSE, and a plug-in that does this does it thousands of times. */
+static long g_alloc_foreign;
+
+static size_t w32_heap_hash(const void *p, size_t cap)
+{
+    /* The low four bits of a malloc pointer carry no information; mix the rest
+     * so a run of same-sized allocations does not walk one probe chain. */
+    uintptr_t v = (uintptr_t)p >> 4;
+    v ^= v >> 13;
+    v *= 0x9E3779B1u;
+    return (size_t)(v ^ (v >> 15)) & (cap - 1);
+}
+
+/* Insert into a table known to have room. Used by both the public insert and
+ * the rehash, which is why it takes the arrays rather than reading the global. */
+static void w32_heap_put(void **key, size_t *size, size_t cap,
+                         void *p, size_t n)
+{
+    size_t i = w32_heap_hash(p, cap);
+    while (key[i] && key[i] != W32_HEAP_DEAD && key[i] != p)
+        i = (i + 1) & (cap - 1);
+    key[i] = p;
+    size[i] = n;
+}
+
+static int w32_heap_grow(void)
+{
+    size_t cap = g_heap.cap ? g_heap.cap * 2 : W32_HEAP_MIN;
+    void **key;
+    size_t *size, i;
+
+    /* Tombstones alone can fill a table; rehashing at the same capacity clears
+     * them, which is why the new capacity is chosen from the live count. */
+    while (cap > W32_HEAP_MIN && g_heap.used * 4 < cap) cap /= 2;
+    if (!(key = (void **)calloc(cap, sizeof *key))) return 0;
+    if (!(size = (size_t *)calloc(cap, sizeof *size))) { free(key); return 0; }
+    for (i = 0; i < g_heap.cap; i++)
+        if (g_heap.key[i] && g_heap.key[i] != W32_HEAP_DEAD)
+            w32_heap_put(key, size, cap, g_heap.key[i], g_heap.size[i]);
+    free(g_heap.key);
+    free(g_heap.size);
+    g_heap.key = key; g_heap.size = size; g_heap.cap = cap; g_heap.dead = 0;
+    return 1;
+}
+
+static void w32_heap_lock(void)
+{
+    if (!g_heap.ready) {                  /* first call, before any thread */
+        pthread_mutex_init(&g_heap.m, NULL);
+        g_heap.ready = 1;
+    }
+    pthread_mutex_lock(&g_heap.m);
+}
+static void w32_heap_unlock(void) { pthread_mutex_unlock(&g_heap.m); }
+
+static void w32_heap_note(void *p, size_t n)
+{
+    if (!p) return;
+    w32_heap_lock();
+    if ((g_heap.used + g_heap.dead + 1) * 4 >= g_heap.cap * 3) {
+        if (!w32_heap_grow()) { w32_heap_unlock(); return; }
+    }
+    w32_heap_put(g_heap.key, g_heap.size, g_heap.cap, p, n);
+    g_heap.used++;
+    w32_heap_unlock();
+}
+
+/* Find and remove. Returns the recorded size, or (size_t)-1 when the pointer is
+ * not ours -- which a caller must distinguish from a genuine zero-sized block. */
+static size_t w32_heap_take(void *p)
+{
+    size_t i, n;
+
+    if (!p || !g_heap.cap) return (size_t)-1;
+    w32_heap_lock();
+    i = w32_heap_hash(p, g_heap.cap);
+    while (g_heap.key[i]) {
+        if (g_heap.key[i] == p) {
+            n = g_heap.size[i];
+            g_heap.key[i] = W32_HEAP_DEAD;
+            g_heap.used--; g_heap.dead++;
+            w32_heap_unlock();
+            return n;
+        }
+        i = (i + 1) & (g_heap.cap - 1);
+    }
+    w32_heap_unlock();
+    return (size_t)-1;
+}
+
+static size_t w32_heap_peek(const void *p)
+{
+    size_t i;
+
+    if (!p || !g_heap.cap) return (size_t)-1;
+    w32_heap_lock();
+    i = w32_heap_hash(p, g_heap.cap);
+    while (g_heap.key[i]) {
+        if (g_heap.key[i] == p) {
+            size_t n = g_heap.size[i];
+            w32_heap_unlock();
+            return n;
+        }
+        i = (i + 1) & (g_heap.cap - 1);
+    }
+    w32_heap_unlock();
+    return (size_t)-1;
+}
+
+static void *w32_alloc(size_t n, int zero)
+{
+    void *p;
+    if (!n) n = 1;
+    if (!(p = zero ? calloc(1, n) : malloc(n))) return NULL;
+    w32_heap_note(p, n);
+    return p;
+}
+
+static void w32_free(void *p)
+{
+    if (!p) return;                               /* free(NULL) is a no-op */
+    if (w32_heap_take(p) == (size_t)-1) {
+        g_alloc_foreign++;
+        PLOG("  [heap] refused a free of %p: not an allocation of ours\n", p);
+        return;
+    }
+    free(p);
+}
+
+static void *w32_realloc(void *p, size_t n, int zero)
+{
+    size_t was;
+    void *fresh;
+
+    if (!p) return w32_alloc(n, zero);
+    if ((was = w32_heap_take(p)) == (size_t)-1) {
+        g_alloc_foreign++;
+        PLOG("  [heap] refused a realloc of %p: not an allocation of ours\n", p);
+        return NULL;
+    }
+    if (!n) n = 1;
+    if (!(fresh = realloc(p, n))) {
+        w32_heap_note(p, was);                    /* still live: put it back */
+        return NULL;
+    }
+    if (zero && n > was) memset((char *)fresh + was, 0, n - was);
+    w32_heap_note(fresh, n);
+    return fresh;
+}
+
+/* The requested size, which is what MSVC's _msize and HeapSize report -- glibc's
+ * usable size is larger, so a caller comparing it against its own request saw a
+ * mismatch. Zero for a pointer we do not know, as those calls do for a bad
+ * handle. */
+static size_t w32_alloc_size(const void *p)
+{
+    size_t n = w32_heap_peek(p);
+    return n == (size_t)-1 ? 0 : n;
+}
+
+/* Through w32_alloc, not strdup: the plug-in's free is w32_free, and that only
+ * frees what this host recorded handing out. */
+static MSCRT char *w32_strdup_guest(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *d = (char *)w32_alloc(n, 0);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
 static MS void *st_GetProcessHeap(void) { return (void *)0x48454150; /* 'HEAP' */ }
 
 static MS void *st_HeapAlloc(void *h, uint32_t flags, size_t sz)
-{
-    void *p;
-    (void)h;
-    p = (flags & 8) ? calloc(1, sz ? sz : 1) : malloc(sz ? sz : 1);
-    return p;
-}
-static MS int32_t st_HeapFree(void *h, uint32_t f, void *p) { (void)h;(void)f; free(p); return 1; }
+{ (void)h; return w32_alloc(sz, (flags & 8) != 0); }
+static MS int32_t st_HeapFree(void *h, uint32_t f, void *p)
+{ (void)h;(void)f; w32_free(p); return 1; }
 static MS void *st_HeapReAlloc(void *h, uint32_t f, void *p, size_t sz)
-{ (void)h;(void)f; return realloc(p, sz ? sz : 1); }
+{ (void)h; return w32_realloc(p, sz, (f & 8) != 0); }
 static MS size_t st_HeapSize(void *h, uint32_t f, void *p)
-{ (void)h;(void)f; return p ? malloc_usable_size(p) : 0; }
+{ (void)h;(void)f; return w32_alloc_size(p); }
 static MS void *st_HeapCreate(uint32_t a, size_t b, size_t c)
 { (void)a;(void)b;(void)c; return (void *)0x48454150; }
 static MS int32_t st_HeapDestroy(void *h) { (void)h; return 1; }
@@ -184,13 +393,13 @@ static MS size_t st_VirtualQuery(void *a, void *buf, size_t len)
 { (void)a; if (buf) memset(buf, 0, len); return len; }
 
 static MS void *st_GlobalAlloc(uint32_t f, size_t sz)
-{ return (f & 0x40) ? calloc(1, sz ? sz : 1) : malloc(sz ? sz : 1); }
-static MS void *st_GlobalFree(void *p) { free(p); return NULL; }
+{ return w32_alloc(sz, (f & 0x40) != 0); }
+static MS void *st_GlobalFree(void *p) { w32_free(p); return NULL; }
 static MS void *st_GlobalLock(void *p) { return p; }
 static MS int32_t st_GlobalUnlock(void *p) { (void)p; return 1; }
 static MS void *st_LocalAlloc(uint32_t f, size_t sz)
-{ return (f & 0x40) ? calloc(1, sz ? sz : 1) : malloc(sz ? sz : 1); }
-static MS void *st_LocalFree(void *p) { free(p); return NULL; }
+{ return w32_alloc(sz, (f & 0x40) != 0); }
+static MS void *st_LocalFree(void *p) { w32_free(p); return NULL; }
 
 /* The rest of the Local/Global family, which is not optional the moment a
  * plug-in is old enough to use it.
@@ -210,18 +419,7 @@ static MS void *st_LocalFree(void *p) { free(p); return NULL; }
  * Windows', for the same reason, so a caller that trusts the answer is already
  * required to cope with it. */
 static void *w32_heap_realloc(void *p, size_t sz, uint32_t flags)
-{
-    size_t was = p ? malloc_usable_size(p) : 0;
-    void *n;
-
-    if (!p) return (flags & 0x40) ? calloc(1, sz ? sz : 1) : malloc(sz ? sz : 1);
-    /* Windows frees on a zero size only for a moveable handle; reallocating to
-     * zero elsewhere would hand back a block the caller still means to use. */
-    if (!sz) sz = 1;
-    if (!(n = realloc(p, sz))) return NULL;
-    if ((flags & 0x40) && sz > was) memset((char *)n + was, 0, sz - was);
-    return n;
-}
+{ return w32_realloc(p, sz, (flags & 0x40) != 0); }
 static MS void *st_LocalReAlloc(void *p, size_t sz, uint32_t f)
 { return w32_heap_realloc(p, sz, f); }
 static MS void *st_GlobalReAlloc(void *p, size_t sz, uint32_t f)
@@ -230,8 +428,8 @@ static MS void *st_LocalLock(void *p) { return p; }
 static MS int32_t st_LocalUnlock(void *p) { (void)p; return 1; }
 static MS void *st_LocalHandle(void *p) { return p; }
 static MS void *st_GlobalHandle(void *p) { return p; }
-static MS size_t st_LocalSize(void *p) { return p ? malloc_usable_size(p) : 0; }
-static MS size_t st_GlobalSize(void *p) { return p ? malloc_usable_size(p) : 0; }
+static MS size_t st_LocalSize(void *p) { return w32_alloc_size(p); }
+static MS size_t st_GlobalSize(void *p) { return w32_alloc_size(p); }
 /* LMEM_/GMEM_ flags of a live fixed block: not discarded, lock count zero. */
 static MS uint32_t st_LocalFlags(void *p) { (void)p; return 0; }
 static MS uint32_t st_GlobalFlags(void *p) { (void)p; return 0; }
@@ -1892,8 +2090,8 @@ static MS int32_t st_PathFileExistsW(const uint16_t *p)
 
 /* ---------------------------------------------------------------- ole32 */
 
-static MS void *st_CoTaskMemAlloc(size_t n) { return malloc(n ? n : 1); }
-static MS void st_CoTaskMemFree(void *p) { free(p); }
+static MS void *st_CoTaskMemAlloc(size_t n) { return w32_alloc(n, 0); }
+static MS void st_CoTaskMemFree(void *p) { w32_free(p); }
 static MS int32_t st_OleInitialize(void *r) { (void)r; return 0; }
 static MS void st_OleUninitialize(void) { }
 static MS int32_t st_CoInitialize(void *r) { (void)r; return 0; }
@@ -2200,24 +2398,24 @@ static MS int32_t st_GetVolumeInformationW(const uint16_t *root, uint16_t *nameb
  *
  * Everything here is __cdecl at both widths, hence MSCRT rather than MS. */
 
-static MSCRT void  *st_malloc(size_t n)                    { return malloc(n); }
-static MSCRT void  *st_calloc(size_t n, size_t s)          { return calloc(n, s); }
-static MSCRT void  *st_realloc(void *p, size_t n)          { return realloc(p, n); }
-static MSCRT void   st_free(void *p)                       { free(p); }
+static MSCRT void  *st_malloc(size_t n)                    { return w32_alloc(n, 0); }
+static MSCRT void  *st_calloc(size_t n, size_t s)          { return w32_alloc(n * s, 1); }
+static MSCRT void  *st_realloc(void *p, size_t n)          { return w32_realloc(p, n, 0); }
+static MSCRT void   st_free(void *p)                       { w32_free(p); }
 static MSCRT void  *st__recalloc(void *p, size_t n, size_t s)
 {
     /* Grows without zeroing the new tail, which is what the CRT documents;
      * callers that need it zeroed use _recalloc_crt on fresh memory. */
-    return realloc(p, n * s);
+    return w32_realloc(p, n * s, 0);
 }
 /* MSVC's _msize reports the requested size; glibc reports the usable size,
  * which is >= that. Callers use it to decide whether to grow, so erring
  * large is safe -- but it is not exact, and a caller comparing it for
  * equality against its own request would see a mismatch. */
-static MSCRT size_t st__msize(void *p) { return p ? malloc_usable_size(p) : 0; }
+static MSCRT size_t st__msize(void *p) { return w32_alloc_size(p); }
 
-static MSCRT void *st_op_new(size_t n)    { void *p = malloc(n ? n : 1); return p; }
-static MSCRT void  st_op_delete(void *p)  { free(p); }
+static MSCRT void *st_op_new(size_t n)    { return w32_alloc(n, 0); }
+static MSCRT void  st_op_delete(void *p)  { w32_free(p); }
 
 static MSCRT void   *st_memcpy(void *d, const void *s, size_t n)  { return memcpy(d, s, n); }
 static MSCRT void   *st_memmove(void *d, const void *s, size_t n) { return memmove(d, s, n); }
@@ -2236,7 +2434,8 @@ static MSCRT int     st__stricmp(const char *a, const char *b)    { return strca
 static MSCRT char   *st_strchr(const char *s, int c)              { return (char *)strchr(s, c); }
 static MSCRT char   *st_strrchr(const char *s, int c)             { return (char *)strrchr(s, c); }
 static MSCRT char   *st_strstr(const char *h, const char *n)      { return (char *)strstr(h, n); }
-static MSCRT char   *st__strdup(const char *s)                    { return strdup(s); }
+static MSCRT char   *st__strdup(const char *s)
+{ return w32_strdup_guest(s ? s : ""); }
 static MSCRT size_t  st_wcslen(const uint16_t *s)
 { size_t n = 0; while (s && s[n]) n++; return n; }
 
@@ -2298,7 +2497,7 @@ static MSCRT uint16_t *st_wcsstr(const uint16_t *h, const uint16_t *n)
 static MSCRT uint16_t *st__wcsdup(const uint16_t *s)
 {
     size_t n = st_wcslen(s), i;
-    uint16_t *d = (uint16_t *)malloc((n + 1) * sizeof *d);
+    uint16_t *d = (uint16_t *)w32_alloc((n + 1) * sizeof *d, 0);
     if (!d) return NULL;
     for (i = 0; i <= n; i++) d[i] = s[i];
     return d;
@@ -3658,12 +3857,12 @@ static MS int32_t st___vcrt_InitializeCriticalSectionEx(void *cs, uint32_t spin,
  * stub had been. The plug-in's free is this host's free, so one strdup matches
  * the other side exactly. */
 static MSCRT char *st__Getdays(void)
-{ return strdup(":Sun:Sunday:Mon:Monday:Tue:Tuesday:Wed:Wednesday:Thu:Thursday"
-                ":Fri:Friday:Sat:Saturday"); }
+{ return w32_strdup_guest(":Sun:Sunday:Mon:Monday:Tue:Tuesday:Wed:Wednesday"
+                          ":Thu:Thursday:Fri:Friday:Sat:Saturday"); }
 static MSCRT char *st__Getmonths(void)
-{ return strdup(":Jan:January:Feb:February:Mar:March:Apr:April:May:May:Jun:June"
-                ":Jul:July:Aug:August:Sep:September:Oct:October:Nov:November"
-                ":Dec:December"); }
+{ return w32_strdup_guest(":Jan:January:Feb:February:Mar:March:Apr:April:May:May"
+                          ":Jun:June:Jul:July:Aug:August:Sep:September:Oct:October"
+                          ":Nov:November:Dec:December"); }
 
 /* ------------------------------------------------------------ the scanf family --- */
 
@@ -4405,7 +4604,7 @@ static MS uint32_t st_FormatMessageA(uint32_t flags, void *src, uint32_t id,
          * frees with LocalFree. Writing the string into it instead would store
          * text over a pointer variable. */
         char **out = (char **)buf;
-        char *p = malloc(n + 1);
+        char *p = (char *)w32_alloc(n + 1, 0);
         if (!p) return 0;
         memcpy(p, msg, n + 1);
         if (out) *out = p; else { free(p); return 0; }
@@ -4425,7 +4624,7 @@ static MS uint32_t st_FormatMessageW(uint32_t flags, void *src, uint32_t id,
     n = (uint32_t)strlen(msg);
     if (flags & W_FM_ALLOCATE_BUFFER) {
         uint16_t **out = (uint16_t **)buf;
-        uint16_t *p = malloc((n + 1) * sizeof *p);
+        uint16_t *p = (uint16_t *)w32_alloc((n + 1) * sizeof *p, 0);
         if (!p) return 0;
         for (i = 0; i <= n; i++) p[i] = (uint16_t)(unsigned char)msg[i];
         if (out) *out = p; else { free(p); return 0; }
@@ -6811,6 +7010,18 @@ static const winstub g_stubs[] = {
     S("gdi32.dll", StretchDIBits), S("gdi32.dll", BitBlt),
     S("gdi32.dll", CreateCompatibleDC), S("gdi32.dll", CreateCompatibleBitmap),
     S("gdi32.dll", CreateBitmap), S("gdi32.dll", CreateDIBSection),
+    S("gdi32.dll", CreateFontA), S("gdi32.dll", GetBkColor),
+    S("gdi32.dll", GetBkMode),
+    S("gdi32.dll", TextOutA), S("gdi32.dll", TextOutW),
+    S("gdi32.dll", ExtTextOutA), S("gdi32.dll", ExtTextOutW),
+    S("gdi32.dll", SetTextAlign), S("gdi32.dll", GetTextAlign),
+    S("gdi32.dll", GetTextMetricsA), S("gdi32.dll", GetTextMetricsW),
+    S("gdi32.dll", GetTextExtentPointA),
+    S("user32.dll", DrawTextA), S("user32.dll", DrawTextW),
+    S("gdi32.dll", CreatePen), S("gdi32.dll", Rectangle),
+    S("gdi32.dll", PatBlt), S("gdi32.dll", SetPixel),
+    S("gdi32.dll", SetPixelV), S("gdi32.dll", GetPixel),
+    S("gdi32.dll", Polyline), S("gdi32.dll", GetTextColor),
     S("gdi32.dll", RectVisible), S("gdi32.dll", IntersectClipRect),
     S("gdi32.dll", ExcludeClipRect), S("gdi32.dll", SetViewportOrgEx),
     S("gdi32.dll", OffsetViewportOrgEx), S("gdi32.dll", GetViewportOrgEx),
