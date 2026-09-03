@@ -503,14 +503,66 @@ static w32_surf *w32_target_in(w32_dc *d, w32_surf *tmp)
     return w32_target_in_raw(d, tmp);
 }
 
+/* Push back only the rows a call touched. A full push is 1.7 MB for a panel-
+ * sized DIB and the blits come in the dozens, so the rectangle matters. */
+static void w32_dib_push_rect(w32_obj *o, int x0, int y0, int x1, int y1)
+{
+    int y, x;
+
+    if (!o || !o->dib || o->dib_alias || !o->px) return;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > o->w) x1 = o->w;
+    if (y1 > o->h) y1 = o->h;
+    for (y = y0; y < y1; y++) {
+        uint8_t *dst = o->dib +
+            (size_t)(o->dib_flip ? o->h - 1 - y : y) * o->dib_stride;
+        const uint32_t *src = o->px + (size_t)y * o->w;
+        for (x = x0; x < x1; x++) {
+            switch (o->dib_bpp) {
+            case 32: { uint32_t v = src[x]; memcpy(dst + x * 4, &v, 4); break; }
+            case 24: dst[x * 3 + 0] = (uint8_t)(src[x]);
+                     dst[x * 3 + 1] = (uint8_t)(src[x] >> 8);
+                     dst[x * 3 + 2] = (uint8_t)(src[x] >> 16); break;
+            case 16: { uint32_t v = src[x];
+                       uint16_t p = o->dib_565
+                         ? (uint16_t)((((v >> 16) & 0xff) >> 3 << 11) |
+                                      (((v >> 8)  & 0xff) >> 2 << 5)  |
+                                       ((v        & 0xff) >> 3))
+                         : (uint16_t)((((v >> 16) & 0xff) >> 3 << 10) |
+                                      (((v >> 8)  & 0xff) >> 3 << 5)  |
+                                       ((v        & 0xff) >> 3));
+                       memcpy(dst + x * 2, &p, 2); break; }
+            default: return;
+            }
+        }
+    }
+}
+
+/* Called by every primitive that writes through a DC, so a DIB section the
+ * plug-in also writes directly is current the moment the call returns.
+ *
+ * Without it the two buffers take turns being right and the picture is
+ * whichever won last: a plug-in that composes its interface with BitBlt into a
+ * DIB and then blits that DIB onward gets its work overwritten by the pull on
+ * the way out, and two controls out of forty survive. */
+static void w32_dib_out(w32_dc *d, int x0, int y0, int x1, int y1)
+{
+    if (!d || !d->bitmap) return;
+    w32_dib_push_rect(&W.obj[d->bitmap], x0, y0, x1, y1);
+}
+static void w32_dib_out_all(w32_dc *d)
+{
+    if (!d || !d->bitmap) return;
+    w32_dib_push_rect(&W.obj[d->bitmap], 0, 0,
+                      W.obj[d->bitmap].w, W.obj[d->bitmap].h);
+}
+
 /* A blit source. Pulls the plugin's own pixels in when they are the newer of
  * the two; see w32_dib_push for why that is conditional. */
 static w32_surf *w32_source_in(w32_dc *d, w32_surf *tmp)
 {
-    if (d && d->bitmap) {
-        w32_obj *o = &W.obj[d->bitmap];
-        if (!o->px_drawn) w32_dib_pull(o);
-    }
+    if (d && d->bitmap) w32_dib_pull(&W.obj[d->bitmap]);
     return w32_target_in_raw(d, tmp);
 }
 
@@ -1405,12 +1457,35 @@ static MS int32_t st_GetClipBox(void *hdc, W32RECT *r)
 {
     w32_dc *d = w32_dcget(hdc);
     w32_surf ttmp;
-    w32_surf *t = w32_target_in(d, &ttmp);
+    w32_surf *t = w32_target_in_raw(d, &ttmp);
+
     if (!r) return 0;
     r->left = 0; r->top = 0;
     r->right  = t ? t->w : 0;
     r->bottom = t ? t->h : 0;
-    return t ? 2 /* SIMPLEREGION */ : 0;
+    /* Honour a clip the caller set. Reporting the whole surface while
+     * IntersectClipRect quietly recorded something smaller is not a harmless
+     * over-estimate: a caller that clips its own drawing against this answer
+     * concludes it may write anywhere on the surface, and writes there.
+     *
+     * SynthEdit composes through 128x128 tiles and asks for this to bound each
+     * one. Given the whole surface it never clamped, and its alpha blit ran
+     * twelve rows off the end of a tile into the next allocation -- which is
+     * what had MFC faulting inside its own handle map, a subsystem away. */
+    if (d && d->has_clip) {
+        if (d->clip.left   > r->left)   r->left   = d->clip.left;
+        if (d->clip.top    > r->top)    r->top    = d->clip.top;
+        if (d->clip.right  < r->right)  r->right  = d->clip.right;
+        if (d->clip.bottom < r->bottom) r->bottom = d->clip.bottom;
+    }
+    /* Back into the caller's space: it draws in logical coordinates, and the
+     * viewport origin is what separates those from the surface. */
+    if (d) {
+        r->left -= d->org_x; r->right  -= d->org_x;
+        r->top  -= d->org_y; r->bottom -= d->org_y;
+    }
+    if (!t) return 0;
+    return w32_rect_empty(r) ? W32_RGN_NULL : W32_RGN_SIMPLE;
 }
 
 /* ---- clipping and the viewport origin ------------------------------------ */
@@ -1494,12 +1569,31 @@ static MS int32_t st_OffsetViewportOrgEx(void *hdc, int32_t dx, int32_t dy, W32P
     d->org_x += dx; d->org_y += dy;
     return 1;
 }
+/* Always writes the point, even when the DC is not one we know.
+ *
+ * A caller reads this back to work out where in its own buffer to draw, and
+ * does not check the return value -- there is nothing it could do about a
+ * failure anyway. Leaving the POINT untouched therefore does not report an
+ * error, it hands back whatever was on the caller's stack, and the index
+ * computed from it lands wherever that garbage points.
+ *
+ * SynthEdit's alpha blit is exactly this caller. It composes into a fixed
+ * 128x128 tile at a stride of 128 pixels:
+ *
+ *     GetViewportOrgEx(dc, &org);
+ *     dst = tile + (((0x7f - org.y) - y) * 0x80 + org.x + x) * 4;
+ *
+ * so an uninitialised org is a wild write into whatever follows that tile. It
+ * is the corruption that had MFC faulting in its own handle map, several
+ * subsystems away. Zero is the honest answer for a DC with no origin set, and
+ * it is what Windows would have left there. */
 static MS int32_t st_GetViewportOrgEx(void *hdc, W32POINT *p)
 {
     w32_dc *d = w32_dcget(hdc);
-    if (!d || !p) return 0;
-    p->x = d->org_x; p->y = d->org_y;
-    return 1;
+    if (!p) return 0;
+    p->x = d ? d->org_x : 0;
+    p->y = d ? d->org_y : 0;
+    return d != NULL;
 }
 /* The window origin is the same translation with the opposite sign: it names the
  * logical point that maps to the viewport origin. Only one of the two is used by
@@ -1516,9 +1610,10 @@ static MS int32_t st_SetWindowOrgEx(void *hdc, int32_t x, int32_t y, W32POINT *o
 static MS int32_t st_GetWindowOrgEx(void *hdc, W32POINT *p)
 {
     w32_dc *d = w32_dcget(hdc);
-    if (!d || !p) return 0;
-    p->x = -d->org_x; p->y = -d->org_y;
-    return 1;
+    if (!p) return 0;                             /* see st_GetViewportOrgEx */
+    p->x = d ? -d->org_x : 0;
+    p->y = d ? -d->org_y : 0;
+    return d != NULL;
 }
 
 static MS int32_t st_GdiFlush(void) { return 1; }
@@ -1588,6 +1683,17 @@ static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t 
     (void)rop;
     if (!ds || !ds->px) return 0;
     if (!ss || !ss->px) return 0;
+    /* Both DCs' viewport origins apply, each to its own coordinates.
+     *
+     * Leaving them out is not a small offset error. SynthEdit composes its
+     * panel as forty 128x128 tiles through one small bitmap, moving the origin
+     * to bring each tile's region into it -- so a source offset of 128,0 with
+     * an origin of -128,0 means "the start of the tile", and taken literally it
+     * is 128 pixels off the end of a 128-wide bitmap, which clips away to
+     * nothing. Every tile but the first came out empty, which looks exactly
+     * like a plug-in that stopped drawing after the first control. */
+    x += dd->org_x;  y += dd->org_y;
+    sx += sd->org_x; sy += sd->org_y;
     for (j = 0; j < h; j++) {
         int ty = y + j, fy = sy + j;
         if (ty < 0 || ty >= ds->h || fy < 0 || fy >= ss->h) continue;
@@ -1597,6 +1703,10 @@ static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t 
             ds->px[(size_t)ty * ds->w + tx] = ss->px[(size_t)fy * ss->w + fx];
         }
     }
+    w32_dib_out(dd, x, y, x + w, y + h);
+    PLOG("  [w32] BitBlt %dx%d to %s#%d at %d,%d from %s#%d at %d,%d\n", w, h,
+         dd->bitmap ? "bmp" : "wnd", dd->bitmap ? dd->bitmap : dd->wnd, x, y,
+         sd->bitmap ? "bmp" : "wnd", sd->bitmap ? sd->bitmap : sd->wnd, sx, sy);
     if (dd->wnd && !dd->bitmap && !dd->in_paint) w32_present(dd->wnd);
     return 1;
 }
@@ -1609,10 +1719,166 @@ static MS void *st_CreateCompatibleBitmap(void *hdc, int32_t w, int32_t h)
      * nothing; handing back a bitmap with no pixels invites a null write. */
     if (w <= 0) w = 1;
     if (h <= 0) h = 1;
-    r = w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_BITMAP, w, h, 0));
-    PLOG("  [w32] CreateCompatibleBitmap %dx%d -> %p\n", w, h, r);
+    { int ix = w32_i(W32_OBJ_BASE, (r = w32_h(W32_OBJ_BASE,
+                                    w32_obj_new(OBJ_BITMAP, w, h, 0))));
+      PLOG("  [w32] CreateCompatibleBitmap bmp#%d %dx%d\n", ix, w, h); }
     return r;
 }
+/* SetDIBits and its relatives: putting DIB pixels into a device bitmap.
+ *
+ * A plug-in that builds a picture in memory and then wants GDI to blit it
+ * creates the bitmap with CreateBitmap and fills it with these -- none of which
+ * existed here, so the bitmap stayed the zeroes it was created with and every
+ * blit from it drew black. That is how MinimogueVA's background panel came out
+ * black with its whole interface drawn on top.
+ *
+ * Rows are DWORD-aligned, and bottom-up unless the height is negative, which is
+ * the same convention w32_bitmap_from_dib decodes and the opposite of the
+ * WORD-aligned top-down bits CreateBitmap itself takes. */
+static int w32_dib_into_obj(w32_obj *o, const void *bmi, const void *bits,
+                            uint32_t start, uint32_t lines, uint32_t usage)
+{
+    const uint8_t *h = (const uint8_t *)bmi;
+    const uint8_t *pal, *rows;
+    uint32_t hdrsz, comp, clrused, stride, pal_n;
+    int32_t w, ht, y, x;
+    uint16_t bpp;
+    int flip = 1;
+
+    if (!o || o->kind != OBJ_BITMAP || !o->px || !bmi || !bits) return 0;
+    memcpy(&hdrsz, h + 0, 4);
+    if (hdrsz < 40) return 0;
+    memcpy(&w, h + 4, 4);
+    memcpy(&ht, h + 8, 4);
+    memcpy(&bpp, h + 14, 2);
+    memcpy(&comp, h + 16, 4);
+    memcpy(&clrused, h + 32, 4);
+    if (ht < 0) { ht = -ht; flip = 0; }
+    if (w <= 0 || ht <= 0 || comp != 0) return 0;
+
+    pal_n = clrused ? clrused : (bpp <= 8 ? (1u << bpp) : 0);
+    pal = h + hdrsz;
+    rows = (const uint8_t *)bits;
+    stride = ((uint32_t)w * bpp + 31) / 32 * 4;
+    if (start + lines > (uint32_t)ht) lines = (uint32_t)ht - start;
+
+    for (y = 0; y < (int32_t)lines; y++) {
+        int32_t sy = (int32_t)start + y;                 /* row within the DIB */
+        int32_t dy = flip ? ht - 1 - sy : sy;            /* row in our surface */
+        const uint8_t *src = rows + (size_t)y * stride;
+        uint32_t *dst;
+        if (dy < 0 || dy >= o->h) continue;
+        dst = o->px + (size_t)dy * o->w;
+        for (x = 0; x < w && x < o->w; x++) {
+            uint32_t p;
+            switch (bpp) {
+            case 32: memcpy(&dst[x], src + x * 4, 4); dst[x] &= 0x00ffffffu; continue;
+            case 24: dst[x] = ((uint32_t)src[x * 3 + 2] << 16) |
+                              ((uint32_t)src[x * 3 + 1] << 8) | src[x * 3 + 0]; continue;
+            case 16: { uint16_t v; memcpy(&v, src + x * 2, 2);
+                       dst[x] = ((uint32_t)(((v >> 10) & 0x1f) * 255 / 31) << 16) |
+                                ((uint32_t)(((v >> 5)  & 0x1f) * 255 / 31) << 8)  |
+                                 (uint32_t)((  v        & 0x1f) * 255 / 31); continue; }
+            case 8:  p = src[x]; break;
+            case 4:  p = (x & 1) ? (src[x >> 1] & 0xf) : (uint32_t)(src[x >> 1] >> 4); break;
+            case 1:  p = (src[x >> 3] >> (7 - (x & 7))) & 1; break;
+            default: return 0;
+            }
+            /* DIB_PAL_COLORS indexes the DC's palette, which this layer does
+             * not keep; the table that follows the header is the other case
+             * and the one everything here uses. */
+            if (usage == 0 && pal_n && p < pal_n)
+                dst[x] = ((uint32_t)pal[p * 4 + 2] << 16) |
+                         ((uint32_t)pal[p * 4 + 1] << 8) | pal[p * 4 + 0];
+            else
+                dst[x] = p ? 0xFFFFFFu : 0;
+        }
+    }
+    o->px_drawn = 1;
+    return (int)lines;
+}
+
+static MS int32_t st_SetDIBits(void *hdc, void *hbm, uint32_t start, uint32_t lines,
+                               const void *bits, const void *bmi, uint32_t usage)
+{
+    w32_obj *o = w32_oget(hbm);
+    int n;
+    (void)hdc;
+    n = w32_dib_into_obj(o, bmi, bits, start, lines, usage);
+    PLOG("  [w32] SetDIBits %u lines -> bmp %p (%d done)\n", lines, hbm, n);
+    return n;
+}
+
+/* CreateDIBitmap(hdc, header, init, bits, bmi, usage): a device bitmap made
+ * from DIB data, which is CreateBitmap and SetDIBits in one call. */
+#define W32_CBM_INIT 4
+static MS void *st_CreateDIBitmap(void *hdc, const void *hdr, uint32_t init,
+                                  const void *bits, const void *bmi, uint32_t usage)
+{
+    int32_t w = 0, ht = 0;
+    int idx, flip;
+    (void)hdc;
+    if (!hdr) return NULL;
+    memcpy(&w, (const uint8_t *)hdr + 4, 4);
+    memcpy(&ht, (const uint8_t *)hdr + 8, 4);
+    flip = ht < 0 ? -1 : 1;
+    if (flip < 0) ht = -ht;
+    if (w <= 0 || ht <= 0) return NULL;
+    if (!(idx = w32_obj_new(OBJ_BITMAP, w, ht, 0))) return NULL;
+    PLOG("  [w32] CreateDIBitmap bmp#%d %dx%d\n", idx, w, ht);
+    if ((init & W32_CBM_INIT) && bits && bmi)
+        w32_dib_into_obj(&W.obj[idx], bmi, bits, 0, (uint32_t)ht, usage);
+    return w32_h(W32_OBJ_BASE, idx);
+}
+
+/* The reverse: our pixels back out as a DIB. A caller passing a null buffer is
+ * asking for the header to be filled in, which is how it learns the size. */
+static MS int32_t st_GetDIBits(void *hdc, void *hbm, uint32_t start, uint32_t lines,
+                               void *bits, void *bmi, uint32_t usage)
+{
+    w32_obj *o = w32_oget(hbm);
+    uint8_t *h = (uint8_t *)bmi;
+    uint32_t hdrsz, stride;
+    uint16_t bpp;
+    int32_t ht;
+    uint32_t y;
+
+    (void)hdc; (void)usage;
+    if (!o || o->kind != OBJ_BITMAP || !h) return 0;
+    memcpy(&hdrsz, h, 4);
+    if (hdrsz < 40) return 0;
+    if (!bits) {                                   /* describe the bitmap */
+        int32_t w = o->w, hh = o->h;
+        uint16_t planes = 1, b = 32;
+        uint32_t comp = 0, szimg = (uint32_t)o->w * o->h * 4;
+        memcpy(h + 4, &w, 4); memcpy(h + 8, &hh, 4);
+        memcpy(h + 12, &planes, 2); memcpy(h + 14, &b, 2);
+        memcpy(h + 16, &comp, 4); memcpy(h + 20, &szimg, 4);
+        return o->h;
+    }
+    memcpy(&bpp, h + 14, 2);
+    memcpy(&ht, h + 8, 4);
+    if (bpp != 32 && bpp != 24) return 0;           /* what a caller asks for */
+    stride = ((uint32_t)o->w * bpp + 31) / 32 * 4;
+    if (start + lines > (uint32_t)o->h) lines = (uint32_t)o->h - start;
+    for (y = 0; y < lines; y++) {
+        uint32_t sy = start + y;
+        uint32_t dy = ht > 0 ? (uint32_t)o->h - 1 - sy : sy;   /* bottom-up */
+        const uint32_t *src;
+        uint8_t *dst = (uint8_t *)bits + (size_t)y * stride;
+        int x;
+        if (dy >= (uint32_t)o->h) continue;
+        src = o->px + (size_t)dy * o->w;
+        for (x = 0; x < o->w; x++) {
+            if (bpp == 32) { uint32_t v = src[x]; memcpy(dst + x * 4, &v, 4); }
+            else { dst[x * 3 + 0] = (uint8_t)src[x];
+                   dst[x * 3 + 1] = (uint8_t)(src[x] >> 8);
+                   dst[x * 3 + 2] = (uint8_t)(src[x] >> 16); }
+        }
+    }
+    return (int32_t)lines;
+}
+
 /* The bitmap a plugin can draw into itself.
  *
  * This is how an application gets at pixels directly, and every GDI-era editor
@@ -1690,13 +1956,61 @@ static MS void *st_CreateDIBSection(void *hdc, const void *bmi, uint32_t usage,
     }
 
     if (bits) *bits = o->dib;
-    PLOG("  [w32] CreateDIBSection %dx%d %ubpp %s%s -> bits %p\n", w, ht, bpp,
-         flip ? "bottom-up" : "top-down", alias ? " (aliased)" : "", (void *)o->dib);
+    PLOG("  [w32] CreateDIBSection bmp#%d %dx%d %ubpp %s%s -> bits %p\n",
+         idx, w, ht, bpp, flip ? "bottom-up" : "top-down",
+         alias ? " (aliased)" : "", (void *)o->dib);
     return w32_h(W32_OBJ_BASE, idx);
 }
 
-static MS void *st_CreateBitmap(int32_t w, int32_t h, uint32_t planes, uint32_t bpp, const void *bits)
-{ (void)planes;(void)bpp;(void)bits; return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_BITMAP, w, h, 0)); }
+/* CreateBitmap(w, h, planes, bitsPerPixel, bits) -- and the bits are the point.
+ *
+ * Discarding them returned a bitmap of the right size full of zeroes, which is
+ * indistinguishable from success until something blits it: MinimogueVA builds
+ * its background panel this way and drew its whole interface onto black.
+ *
+ * The rows are packed to a two-byte boundary here, not the four a DIB uses --
+ * CreateBitmap takes device-dependent bits, and getting that wrong shears the
+ * picture by a pixel per row rather than failing. */
+static MS void *st_CreateBitmap(int32_t w, int32_t h, uint32_t planes,
+                                uint32_t bpp, const void *bits)
+{
+    int idx, x, y;
+    w32_obj *o;
+    uint32_t stride;
+    const uint8_t *src = (const uint8_t *)bits;
+
+    if (w <= 0) w = 1;
+    if (h <= 0) h = 1;
+    if (!(idx = w32_obj_new(OBJ_BITMAP, w, h, 0))) return NULL;
+    o = &W.obj[idx];
+    PLOG("  [w32] CreateBitmap bmp#%d %dx%d %u planes %ubpp bits=%p\n",
+         idx, w, h, planes, bpp, bits);
+    if (!src || planes != 1) return w32_h(W32_OBJ_BASE, idx);
+
+    stride = ((uint32_t)w * bpp + 15) / 16 * 2;
+    for (y = 0; y < h; y++) {
+        const uint8_t *row = src + (size_t)y * stride;
+        uint32_t *dst = o->px + (size_t)y * w;
+        for (x = 0; x < w; x++) {
+            switch (bpp) {
+            case 32: memcpy(&dst[x], row + x * 4, 4); dst[x] &= 0x00ffffffu; break;
+            case 24: dst[x] = ((uint32_t)row[x * 3 + 2] << 16) |
+                              ((uint32_t)row[x * 3 + 1] << 8) | row[x * 3 + 0]; break;
+            case 16: { uint16_t v; memcpy(&v, row + x * 2, 2);
+                       dst[x] = ((uint32_t)(((v >> 10) & 0x1f) * 255 / 31) << 16) |
+                                ((uint32_t)(((v >> 5)  & 0x1f) * 255 / 31) << 8)  |
+                                 (uint32_t)((  v        & 0x1f) * 255 / 31); break; }
+            /* Monochrome, which is what a mask created this way is: set means
+             * white. Anything deeper without a palette cannot be resolved, and
+             * leaving it black is better than inventing colours. */
+            case 1:  dst[x] = ((row[x >> 3] >> (7 - (x & 7))) & 1) ? 0xFFFFFFu : 0;
+                     break;
+            default: y = h; x = w; break;
+            }
+        }
+    }
+    return w32_h(W32_OBJ_BASE, idx);
+}
 
 static MS void *st_SelectObject(void *hdc, void *obj)
 {
@@ -1895,7 +2209,32 @@ static MS void *st_CreateRectRgn(int32_t l, int32_t t, int32_t r, int32_t b)
     }
     return w32_h(W32_OBJ_BASE, i);
 }
-static MS int32_t st_SelectClipRgn(void *dc, void *rgn) { (void)dc;(void)rgn; return 1; }
+/* Selecting a clip region replaces whatever the DC had; a NULL region removes
+ * the clip entirely, and that is the only way a caller has of widening one
+ * again -- IntersectClipRect can only narrow.
+ *
+ * Answering 1 and doing nothing meant the clip a caller set for one piece of
+ * work stayed set for the next. SynthEdit composes its panel as forty 128x128
+ * tiles through one DC, clipping to each in turn: the first tile drew, the
+ * second intersected with the first and came out empty, and every tile after
+ * that was empty too. Two controls out of a hundred, both in the top-left
+ * corner, which is exactly the shape that says "the first one worked". */
+static MS int32_t st_SelectClipRgn(void *hdc, void *rgn)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_obj *o = w32_oget(rgn);
+
+    if (!d) return W32_RGN_ERROR;
+    if (!rgn) { d->has_clip = 0; return W32_RGN_SIMPLE; }
+    if (!o || o->kind != OBJ_RGN) return W32_RGN_ERROR;
+    d->clip = o->rc;
+    d->has_clip = 1;
+    return w32_rect_empty(&d->clip) ? W32_RGN_NULL : W32_RGN_SIMPLE;
+}
+/* The same, and the extra flags are about how the region is combined with the
+ * meta-region, which this layer does not have. */
+static MS int32_t st_ExtSelectClipRgn(void *hdc, void *rgn, int32_t mode)
+{ (void)mode; return st_SelectClipRgn(hdc, rgn); }
 static MS int32_t st_GetRgnBox(void *rgn, W32RECT *r)
 {
     w32_obj *o = w32_oget(rgn);
@@ -2144,6 +2483,7 @@ static MS int32_t st_LineTo(void *hdc, int32_t x, int32_t y)
         w32_line(t, d, d->cur_x, d->cur_y, x, y, w32_pen_rgb(d),
                  d->pen ? W.obj[d->pen].w : 1);
     d->cur_x = x; d->cur_y = y;
+    w32_dib_out_all(d);
     return 1;
 }
 static MS int32_t st_Rectangle(void *hdc, int32_t l, int32_t tp, int32_t r, int32_t b)
@@ -2167,6 +2507,7 @@ static MS int32_t st_Rectangle(void *hdc, int32_t l, int32_t tp, int32_t r, int3
         w32_line(t, d, r - 1, b - 1, l, b - 1, c, wd);
         w32_line(t, d, l, b - 1, l, tp, c, wd);
     }
+    w32_dib_out(d, l, tp, r, b);
     return 1;
 }
 /* Midpoint ellipse: four symmetric arcs, filled by spanning between the two
@@ -2196,6 +2537,7 @@ static MS int32_t st_Ellipse(void *hdc, int32_t l, int32_t tp, int32_t r, int32_
             w32_plot(t, d, x1 - 1, y, c);
         }
     }
+    w32_dib_out(d, l, tp, r, b);
     return 1;
 }
 /* PatBlt with PATCOPY is how MFC's FillSolidRect paints, so it is a rectangle
@@ -2215,6 +2557,7 @@ static MS int32_t st_PatBlt(void *hdc, int32_t x, int32_t y, int32_t w, int32_t 
     else if (w32_brush_on(d)) c = w32_brush_rgb(d);
     else return 1;
     for (j = y; j < y + h; j++) w32_fill_span(t, d, x, x + w, j, c);
+    w32_dib_out(d, x, y, x + w, y + h);
     return 1;
 }
 static MS uint32_t st_SetPixel(void *hdc, int32_t x, int32_t y, uint32_t c)
@@ -2223,6 +2566,7 @@ static MS uint32_t st_SetPixel(void *hdc, int32_t x, int32_t y, uint32_t c)
     w32_surf ttmp, *t;
     if (!d || !(t = w32_target_in(d, &ttmp))) return 0xFFFFFFFFu;
     w32_plot(t, d, x + d->org_x, y + d->org_y, w32_cr(c));
+    w32_dib_out(d, x + d->org_x, y + d->org_y, x + d->org_x + 1, y + d->org_y + 1);
     return c;
 }
 static MS int32_t st_SetPixelV(void *hdc, int32_t x, int32_t y, uint32_t c)
@@ -2249,6 +2593,7 @@ static MS int32_t st_Polyline(void *hdc, const W32POINT *pts, int32_t n)
         w32_line(t, d, pts[i].x + d->org_x, pts[i].y + d->org_y,
                  pts[i + 1].x + d->org_x, pts[i + 1].y + d->org_y,
                  w32_pen_rgb(d), d->pen ? W.obj[d->pen].w : 1);
+    w32_dib_out_all(d);
     return 1;
 }
 static MS int32_t st_DPtoLP(void *dc, W32POINT *p, int32_t n) { (void)dc;(void)p;(void)n; return 1; }
@@ -2265,6 +2610,8 @@ static MS int32_t st_FillRect(void *hdc, const W32RECT *r, void *brush)
     c = w32_cr(b ? b->color : 0xFFFFFFu);
     for (y = r->top + d->org_y; y < r->bottom + d->org_y; y++)
         w32_fill_span(t, d, r->left + d->org_x, r->right + d->org_x, y, c);
+    w32_dib_out(d, r->left + d->org_x, r->top + d->org_y,
+                r->right + d->org_x, r->bottom + d->org_y);
     return 1;
 }
 /* ---- GDI text ------------------------------------------------------------ */
@@ -2327,6 +2674,7 @@ static void w32_text_at(w32_dc *d, w32_surf *t, int x, int y,
     }
     dw_text_draw(t->px, t->w, t->h, x, y + asc, s, n, em,
                  w32_cr(d->text_color), pclip);
+    w32_dib_out(d, x, y, x + tw, y + th);
 }
 
 static int w32_strn(const char *s, int32_t n)
@@ -2993,6 +3341,24 @@ void w32_show_editor(void)
  * pushed to. Returns 0 if there is nothing to show. */
 void w32_stats(void)
 {
+    /* Which window actually holds pixels. "Nothing was drawn" and "everything
+     * was drawn into a window we do not present" look identical from the
+     * capture, and the difference is the whole question. */
+    {
+        int i;
+        for (i = 1; i < W32_MAX_WND; i++) {
+            long nb = 0, n;
+            if (!W.wnd[i].used || !W.wnd[i].surf.px) continue;
+            n = (long)W.wnd[i].surf.w * W.wnd[i].surf.h;
+            { long k; for (k = 0; k < n; k++)
+                if (W.wnd[i].surf.px[k] & 0xFFFFFF) nb++; }
+            fprintf(stderr, "  [w32] window #%d '%s' %dx%d parent=%d %ld/%ld "
+                            "painted%s%s\n", i, W.wnd[i].cls,
+                    W.wnd[i].w, W.wnd[i].h, W.wnd[i].parent, nb, n,
+                    i == W.display ? "  <- presented" : "",
+                    i == W.host ? "  (container)" : "");
+        }
+    }
     fprintf(stderr, "  [w32] calls: WM_PAINT %ld, BeginPaint %ld, GetDC %ld, "
                     "StretchDIBits %ld, BitBlt %ld, TIMERPROC %ld\n",
             W.n_paint, W.n_beginpaint, W.n_getdc, W.n_stretch, W.n_bitblt, W.n_timerproc);

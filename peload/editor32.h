@@ -117,6 +117,11 @@ static int ed_render_png(AEffect32 *fx, const char *path, int frames)
     }
     npix = w * h;
     for (i = 0; i < npix; i++) if ((px[i] & 0xFFFFFF) != 0) nonblack++;
+    /* The same counters the 64-bit CLI prints. Without them "nothing was
+     * drawn" and "everything was drawn into the wrong buffer" look identical
+     * from here, and several of the blits this layer performs carry no log
+     * line of their own. */
+    if (pe_verbose()) w32_stats();
     printf("editor: %d of %d pixels painted (%.1f%%)\n",
            nonblack, npix, 100.0 * nonblack / npix);
     if (ed_write_png(path, px, w, h)) return 1;
