@@ -3,9 +3,11 @@
 Every plug-in the two windows and the command-line hosts are exercised against:
 **270** across seven platform/format combinations.
 
-None of them are in this repository. They live outside the tree, under
-`../windows`, `../linux` and `../macos`, and they are their authors' own — nothing
-here redistributes any of them. This is the list so that a result can be
+None of them are in this repository. They live outside the tree -- on the
+machine this was developed on, under `/storage01/synth_stuff/vst/{windows,linux,
+macos}` -- and they are their authors' own; nothing here redistributes any of
+them. The paths were once written as `../windows` and friends, which was true
+while this tree sat beside them and has not been since it moved. This is the list so that a result can be
 reproduced against the same corpus.
 
 The list is generated rather than maintained by hand: `peload --detect` reads each

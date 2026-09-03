@@ -248,7 +248,9 @@ Deliberately, and listed with reasons in `.gitignore`:
 - **Build directories**, which is where every binary lands.
 
 No plug-in binaries are included. The corpora the windows browse live outside
-this tree, under `../windows`, `../linux` and `../macos`.
+this tree -- on the machine this was developed on, under
+`/storage01/synth_stuff/vst/{windows,linux,macos}`. Point the browsers at
+wherever yours are; nothing here depends on the location.
 
 ## Licence
 
