@@ -545,6 +545,13 @@ static int map_image(image *im, const char *path)
     im->base = mmap(NULL, im->size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (im->base == MAP_FAILED) { im->base = NULL; perror("mmap image"); goto fail; }
+    /* Where it landed, because every question about a crash in guest code
+     * starts here: an address minus this is an RVA, and an RVA is what a
+     * disassembler and a Ghidra project can both be asked about. Finding it
+     * from /proc/self/maps instead -- the anonymous r-xp region -- works and is
+     * a detour for something the loader already knows. */
+    PLOG("image: %u KiB at %p (link base 0x%llx)\n", im->size / 1024,
+         (void *)im->base, (unsigned long long)im->opt->ImageBase);
 
     if (!FITS(0, im->opt->SizeOfHeaders)) BAD("SizeOfHeaders exceeds the file");
     memcpy(im->base, f, im->opt->SizeOfHeaders);
@@ -3608,6 +3615,18 @@ int pehost_editor_open(pehost *h)
     if (h->is_v3) {
         int r = v3_editor_attach_hwnd(h->v3, container);
         if (r) return r;
+        /* Then tell it how big it is. attached() alone is not the sequence a
+         * VST3 host performs -- onSize follows it -- and a plug-in that lays
+         * itself out on that call has, until now, never been asked to.
+         *
+         * This is what left MinimogueVA's editor blank. Its window opened, its
+         * Direct2D chain was built, its 96 images were decoded, and its paint
+         * handler ran on every WM_PAINT and returned immediately, because the
+         * handler draws only the rectangles in its dirty list and nothing had
+         * ever put one there. Reading the object at paint time said so exactly:
+         * the view pointer set, the device context created, and the list's
+         * begin and end both null. Laying out is what fills it. */
+        v3_editor_resized(h->v3, w, ht);
         /* Same guard as the VST2 path: a font that never reached the text
          * backend means the first paint dereferences an empty cache. */
         if (!w32_font_pipeline_ok()) {

@@ -350,6 +350,30 @@ static uint32_t d2_color(const float *c)
     return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
+/* The transform, which everything drawn goes through.
+ *
+ * Discarding it was not a missing feature, it was every control drawn at the
+ * origin: a skinned editor positions each piece of its interface by setting the
+ * transform and then blitting at 0,0, so ignoring it stacks the whole interface
+ * in the top-left corner. That is what the first picture out of this shim was
+ * -- a logo and one knob, overdrawing each other.
+ *
+ * D2D1_MATRIX_3X2_F is m11, m12, m21, m22, dx, dy, which is the order and the
+ * convention gp_matrix already uses, so it copies straight across. */
+static float g_d2_xf[6] = { 1, 0, 0, 1, 0, 0 };
+
+static MS void d2_SetTransform(void *self, const float *m)
+{
+    (void)self;
+    if (m) memcpy(g_d2_xf, m, sizeof g_d2_xf);
+    else { g_d2_xf[0] = g_d2_xf[3] = 1; g_d2_xf[1] = g_d2_xf[2] = 0;
+           g_d2_xf[4] = g_d2_xf[5] = 0; }
+}
+/* Read back far more often than it is set -- 298 calls to 0 in one paint here.
+ * A slot that answers E_NOTIMPL leaves the caller's matrix whatever was on its
+ * stack, and it then draws relative to that. */
+static MS void d2_GetTransform(void *self, float *m)
+{ (void)self; if (m) memcpy(m, g_d2_xf, sizeof g_d2_xf); }
 /* A graphics object over the window surface, made fresh per call: the
  * rasteriser keeps no state worth caching and the transform lives on the
  * context. */
@@ -360,10 +384,34 @@ static gp_graphics *d2_gfx(dwprobe *ctx)
     memset(&g, 0, sizeof g);
     g.tag = GPO_GRAPHICS;
     g.surf = s;
-    gp_ident(&g.xf);
+    memcpy(g.xf.m, g_d2_xf, sizeof g_d2_xf);
     (void)ctx;
     return s ? &g : NULL;
 }
+
+/* A brush is set up once and recoloured per control, so SetColor is not
+ * optional: 56 calls in a paint that creates 158 brushes. */
+static MS void d2_brush_SetColor(void *self, const float *color)
+{
+    dwprobe *o = self;
+    d2_brush *b = o ? o->ctx : NULL;
+    if (b) b->argb = d2_color(color);
+}
+static MS void *d2_brush_GetColor(void *self, float *out)
+{
+    dwprobe *o = self;
+    d2_brush *b = o ? o->ctx : NULL;
+    uint32_t c = b ? b->argb : 0xFF000000u;
+    if (out) {
+        out[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+        out[1] = (float)((c >> 8) & 0xFF) / 255.0f;
+        out[2] = (float)(c & 0xFF) / 255.0f;
+        out[3] = (float)((c >> 24) & 0xFF) / 255.0f;
+    }
+    return out;
+}
+static MS void d2_brush_SetOpacity(void *self, float o) { (void)self; (void)o; }
+static MS float d2_brush_GetOpacity(void *self) { (void)self; return 1.0f; }
 
 static MS int32_t d2_CreateSolidColorBrush(void *self, const float *color,
                                            const void *props, void **out)
@@ -383,6 +431,10 @@ static MS int32_t d2_CreateSolidColorBrush(void *self, const float *color,
         o->ctx = b;
         dwp_set(o, 1, (void *)d3d_addref);
         dwp_set(o, 2, (void *)d3d_release);
+        dwp_set(o, 4, (void *)d2_brush_SetOpacity);
+        dwp_set(o, 5, (void *)d2_brush_GetOpacity);
+        dwp_set(o, 8, (void *)d2_brush_SetColor);
+        dwp_set(o, 9, (void *)d2_brush_GetColor);
         *out = o;
     }
     return D3D_OK;
@@ -467,10 +519,239 @@ static MS int32_t d2_CreateBitmapFromDxgiSurface(void *self, void *surface,
 }
 static MS int32_t d2_SetTarget(void *self, void *target)
 { (void)self; PLOG("  [d2d] SetTarget(%p)\n", target); return D3D_OK; }
-static MS void d2_SetTransform(void *self, const float *m) { (void)self; (void)m; }
 static MS void d2_SetDpi(void *self, float x, float y) { (void)self; (void)x; (void)y; }
 static MS void d2_GetDpi(void *self, float *x, float *y)
 { (void)self; if (x) *x = 96.0f; if (y) *y = 96.0f; }
+
+/* ID2D1RenderTarget::DrawText -- the labels on every control. The size comes
+ * from the text format, the colour from the brush, and the glyphs from the same
+ * FreeType face the GDI text calls and DirectWrite use. */
+static MS int32_t d2_DrawText(void *self, const uint16_t *str, uint32_t len,
+                              void *format, const float *rc, void *brush,
+                              uint32_t opts, uint32_t measure)
+{
+    gp_graphics *g = d2_gfx(self);
+    dwprobe *fo = format;
+    dw_format *f = fo ? (dw_format *)fo->ctx : NULL;
+    char buf[512];
+    uint32_t i;
+    int n = 0, tw = 0, th = 0, asc = 0, em;
+    float x, y;
+    uint32_t argb;
+    int W, H;
+    uint32_t *px = gp_pixels(g, &W, &H);
+
+    (void)opts; (void)measure;
+    if (!g || !px || !str || !rc) return D3D_NOTIMPL;
+    em = (int)((f ? f->size : 12.0f) + 0.5f);
+    for (i = 0; i < len && n + 1 < (int)sizeof buf; i++)
+        buf[n++] = str[i] < 256 ? (char)str[i] : '?';
+    buf[n] = 0;
+    if (!n) return D3D_OK;
+
+    dw_text_measure(buf, n, em, &tw, &th, &asc);
+    /* The layout rectangle is in the caller's space; the transform is what puts
+     * it where the control actually is. */
+    gp_apply(&g->xf, rc[0], rc[1], &x, &y);
+    argb = d2_brush_argb(brush);
+    dw_text_draw(px, W, H, (int)x, (int)y + asc, buf, n, em,
+                 argb & 0x00FFFFFFu, NULL);
+    return D3D_OK;
+}
+
+/* ---- bitmaps ------------------------------------------------------------
+ *
+ * A skinned editor is almost entirely bitmaps: this one decodes 96 PNGs through
+ * WIC, hands each to Direct2D, and then draws its whole interface by blitting
+ * pieces of them. So an ID2D1Bitmap here is a gp_image, which is what the GDI+
+ * rasteriser beside this already knows how to scale and alpha-blend.
+ *
+ * Two ABI details, both observed rather than assumed. GetPixelFormat returns an
+ * eight-byte struct, and MSVC compiled its caller to pass a buffer and use the
+ * returned pointer -- so it takes a hidden out-pointer and returns it, which is
+ * what the disassembly of the caller requires:
+ *
+ *     puVar2 = (*(code **)(*rt + 400))(rt, local_res8);
+ *     local_18 = *puVar2;
+ *
+ * A stub returning 0 there is not a missing pixel format, it is a null
+ * dereference two instructions later. GetSize and GetPixelSize are the same
+ * shape for the same reason. */
+
+/* DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED: what the window
+ * surface actually is. */
+static MS void *d2_GetPixelFormat(void *self, uint32_t *out)
+{
+    (void)self;
+    if (out) { out[0] = 87; out[1] = 1; }
+    return out;
+}
+static MS void *d2_GetSize(void *self, float *out)
+{
+    w32_surf *s = d2_window_surface();
+    (void)self;
+    if (out) { out[0] = s ? (float)s->w : 0.0f; out[1] = s ? (float)s->h : 0.0f; }
+    return out;
+}
+static MS void *d2_GetPixelSize(void *self, uint32_t *out)
+{
+    w32_surf *s = d2_window_surface();
+    (void)self;
+    if (out) { out[0] = s ? (uint32_t)s->w : 0u; out[1] = s ? (uint32_t)s->h : 0u; }
+    return out;
+}
+
+static MS void *d2_bmp_GetSize(void *self, float *out)
+{
+    dwprobe *o = self;
+    gp_image *im = o ? o->ctx : NULL;
+    if (out) { out[0] = im ? (float)im->w : 0.0f; out[1] = im ? (float)im->h : 0.0f; }
+    return out;
+}
+static MS void *d2_bmp_GetPixelSize(void *self, uint32_t *out)
+{
+    dwprobe *o = self;
+    gp_image *im = o ? o->ctx : NULL;
+    if (out) { out[0] = im ? (uint32_t)im->w : 0u; out[1] = im ? (uint32_t)im->h : 0u; }
+    return out;
+}
+static MS void *d2_bmp_GetDpi(void *self, float *out)
+{ (void)self; if (out) { out[0] = 96.0f; out[1] = 96.0f; } return out; }
+
+static dwprobe *d2_bitmap_wrap(gp_image *im)
+{
+    dwprobe *o = dwp_new("ID2D1Bitmap");
+    if (!o) return NULL;
+    o->ctx = im;
+    dwp_set(o, 0, (void *)dxgi_qi_self);
+    dwp_set(o, 1, (void *)d3d_addref);
+    dwp_set(o, 2, (void *)d3d_release);
+    dwp_set(o, 4, (void *)d2_bmp_GetSize);
+    dwp_set(o, 5, (void *)d2_bmp_GetPixelSize);
+    dwp_set(o, 6, (void *)d2_GetPixelFormat);
+    dwp_set(o, 7, (void *)d2_bmp_GetDpi);
+    return o;
+}
+
+/* ID2D1RenderTarget::CreateBitmap(D2D1_SIZE_U, const void *src, UINT pitch,
+ *                                 const D2D1_BITMAP_PROPERTIES *, ID2D1Bitmap **)
+ * The size is an eight-byte struct passed by value, which lands in one
+ * register: two packed 32-bit unsigneds. */
+static MS int32_t d2_CreateBitmap(void *self, uint64_t size, const void *src,
+                                  uint32_t pitch, const void *props, void **out)
+{
+    gp_image *im;
+    uint32_t w = (uint32_t)(size & 0xFFFFFFFFu), h = (uint32_t)(size >> 32);
+    uint32_t y;
+
+    (void)self; (void)props;
+    if (!out) return D3D_NOTIMPL;
+    if (!w || !h || w > 16384 || h > 16384) return D3D_FAIL;
+    if (!(im = (gp_image *)calloc(1, sizeof *im))) return D3D_FAIL;
+    im->tag = GPO_IMAGE; im->w = (int)w; im->h = (int)h; im->owns = 1;
+    if (!(im->px = (uint32_t *)calloc((size_t)w * h, 4))) { free(im); return D3D_FAIL; }
+    if (src) {
+        if (!pitch) pitch = w * 4;
+        for (y = 0; y < h; y++)
+            memcpy(im->px + (size_t)y * w, (const uint8_t *)src + (size_t)y * pitch, w * 4);
+    }
+    PLOG("  [d2d] CreateBitmap %ux%u\n", w, h);
+    *out = d2_bitmap_wrap(im);
+    if (!*out) { free(im->px); free(im); return D3D_FAIL; }
+    return D3D_OK;
+}
+
+/* The one the skin goes through: a decoded WIC image becomes a D2D bitmap. */
+static MS int32_t d2_CreateBitmapFromWicBitmap(void *self, void *wicsrc,
+                                               const void *props, void **out)
+{
+    dwprobe *w = wicsrc;
+    wic_image *src = w ? (wic_image *)w->ctx : NULL;
+    gp_image *im;
+
+    (void)self; (void)props;
+    if (!out) return D3D_NOTIMPL;
+    if (!src || !src->px || src->w <= 0 || src->h <= 0) return D3D_FAIL;
+    if (!(im = (gp_image *)calloc(1, sizeof *im))) return D3D_FAIL;
+    im->tag = GPO_IMAGE; im->w = src->w; im->h = src->h; im->owns = 1;
+    if (!(im->px = (uint32_t *)malloc((size_t)src->w * src->h * 4))) {
+        free(im); return D3D_FAIL;
+    }
+    /* Copied rather than aliased: the caller is entitled to release the WIC
+     * bitmap the moment this returns, and a skin that then draws from freed
+     * pixels is a picture that is right the first time and garbage afterwards. */
+    memcpy(im->px, src->px, (size_t)src->w * src->h * 4);
+    PLOG("  [d2d] CreateBitmapFromWicBitmap %dx%d\n", im->w, im->h);
+    *out = d2_bitmap_wrap(im);
+    if (!*out) { free(im->px); free(im); return D3D_FAIL; }
+    return D3D_OK;
+}
+
+/* DrawBitmap(bitmap, destRect, opacity, interpolation, srcRect). The opacity is
+ * the fourth argument and a float, so it arrives in XMM3 -- writing the
+ * signature out in this order is what puts it there. */
+static MS int32_t d2_DrawBitmap(void *self, void *bitmap, const float *dest,
+                                float opacity, uint32_t interp, const float *src)
+{
+    gp_graphics *g = d2_gfx(self);
+    dwprobe *o = bitmap;
+    gp_image *im = o ? (gp_image *)o->ctx : NULL;
+    float dl, dt, dr, db, sl, st, sr, sb;
+
+    (void)interp;
+    if (!g || !im) return D3D_NOTIMPL;
+    if (src) { sl = src[0]; st = src[1]; sr = src[2]; sb = src[3]; }
+    else     { sl = 0; st = 0; sr = (float)im->w; sb = (float)im->h; }
+    if (dest) { dl = dest[0]; dt = dest[1]; dr = dest[2]; db = dest[3]; }
+    else      { dl = 0; dt = 0; dr = sr - sl; db = sb - st; }
+    if (dr <= dl || db <= dt || sr <= sl || sb <= st) return D3D_OK;
+    /* Opacity below a whole pixel's worth is not worth a pass over the bitmap;
+     * above it, the alpha row of a colour matrix is what GDI+ honours here. */
+    if (opacity < 0.004f) return D3D_OK;
+    {
+        gp_imageattr ia;
+        memset(&ia, 0, sizeof ia);
+        ia.tag = GPO_IMAGEATTR;
+        if (opacity < 0.996f) {
+            int i;
+            for (i = 0; i < 5; i++) ia.m[i][i] = 1.0f;
+            ia.m[3][3] = opacity;
+            ia.has_matrix = 1;
+        }
+        st_GdipDrawImageRectRectI(g, im, (int32_t)dl, (int32_t)dt,
+                                  (int32_t)(dr - dl), (int32_t)(db - dt),
+                                  (int32_t)sl, (int32_t)st,
+                                  (int32_t)(sr - sl), (int32_t)(sb - st),
+                                  2, ia.has_matrix ? &ia : NULL, NULL, NULL);
+    }
+    return D3D_OK;
+}
+
+/* Clipping. A rectangle pushed here bounds every later call until it is popped;
+ * the rasteriser takes one clip rectangle, so they nest by intersection. */
+#define D2_CLIP_DEPTH 16
+static W32RECT g_d2_clip[D2_CLIP_DEPTH];
+static int     g_d2_clipn;
+
+static MS int32_t d2_PushAxisAlignedClip(void *self, const float *rc, uint32_t mode)
+{
+    (void)self; (void)mode;
+    if (g_d2_clipn >= D2_CLIP_DEPTH || !rc) return D3D_OK;
+    g_d2_clip[g_d2_clipn].left   = (int32_t)rc[0];
+    g_d2_clip[g_d2_clipn].top    = (int32_t)rc[1];
+    g_d2_clip[g_d2_clipn].right  = (int32_t)rc[2];
+    g_d2_clip[g_d2_clipn].bottom = (int32_t)rc[3];
+    g_d2_clipn++;
+    return D3D_OK;
+}
+static MS int32_t d2_PopAxisAlignedClip(void *self)
+{ (void)self; if (g_d2_clipn > 0) g_d2_clipn--; return D3D_OK; }
+
+static MS int32_t d2_Flush(void *self, void *tag1, void *tag2)
+{ (void)self; (void)tag1; (void)tag2; return D3D_OK; }
+static MS int32_t d2_SetAntialiasMode(void *self, uint32_t m)
+{ (void)self; (void)m; return D3D_OK; }
+static MS uint32_t d2_GetAntialiasMode(void *self) { (void)self; return 0; }
 
 static dwprobe *d2d_context(void)
 {
@@ -479,9 +760,22 @@ static dwprobe *d2d_context(void)
         dwp_set(o, 0,  (void *)dxgi_qi_self);
         dwp_set(o, 1,  (void *)d3d_addref);
         dwp_set(o, 2,  (void *)d3d_release);
+        dwp_set(o, 4,  (void *)d2_CreateBitmap);
+        dwp_set(o, 5,  (void *)d2_CreateBitmapFromWicBitmap);
         dwp_set(o, 8,  (void *)d2_CreateSolidColorBrush);
         dwp_set(o, 17, (void *)d2_FillRectangle);
+        dwp_set(o, 26, (void *)d2_DrawBitmap);
+        dwp_set(o, 32, (void *)d2_SetAntialiasMode);
+        dwp_set(o, 33, (void *)d2_GetAntialiasMode);
+        dwp_set(o, 42, (void *)d2_Flush);
+        dwp_set(o, 45, (void *)d2_PushAxisAlignedClip);
+        dwp_set(o, 46, (void *)d2_PopAxisAlignedClip);
+        dwp_set(o, 50, (void *)d2_GetPixelFormat);
+        dwp_set(o, 53, (void *)d2_GetSize);
+        dwp_set(o, 54, (void *)d2_GetPixelSize);
+        dwp_set(o, 27, (void *)d2_DrawText);
         dwp_set(o, 30, (void *)d2_SetTransform);
+        dwp_set(o, 31, (void *)d2_GetTransform);
         dwp_set(o, 47, (void *)d2_Clear);
         dwp_set(o, 48, (void *)d2_BeginDraw);
         dwp_set(o, 49, (void *)d2_EndDraw);

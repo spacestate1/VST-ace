@@ -7093,6 +7093,7 @@ static const winstub g_stubs[] = {
     S("gdi32.dll", GetTextMetricsA), S("gdi32.dll", GetTextMetricsW),
     S("gdi32.dll", GetTextExtentPointA),
     S("user32.dll", DrawTextA), S("user32.dll", DrawTextW),
+    S("gdi32.dll", SetRectRgn), S("gdi32.dll", CombineRgn),
     S("gdi32.dll", CreatePen), S("gdi32.dll", Rectangle),
     S("gdi32.dll", PatBlt), S("gdi32.dll", SetPixel),
     S("gdi32.dll", SetPixelV), S("gdi32.dll", GetPixel),

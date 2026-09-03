@@ -411,6 +411,40 @@ static MS int32_t wic_CreateBitmapFromSource(void *self, void *src, uint32_t cac
     return DW_S_OK;
 }
 
+/* IWICImagingFactory::CreateBitmap(w, h, pixelFormat, cacheOption, IWICBitmap**)
+ *
+ * A blank bitmap for the plug-in to compose into -- it locks this, writes its
+ * pixels, and hands the result to Direct2D. Refusing it is not a missing
+ * feature: the caller has nowhere to put the artwork it was about to build, so
+ * whatever that artwork was simply never appears. Here that was the panel every
+ * other control is drawn on top of, which is why the interface came out on a
+ * flat grey background.
+ *
+ * The format argument is accepted and not honoured: everything in this shim is
+ * 32-bit BGRA, which is what a caller composing an interface asks for, and
+ * quietly producing a different depth would be worse than the refusal was. */
+static MS int32_t wic_CreateBitmap(void *self, uint32_t w, uint32_t h,
+                                   const void *fmt, uint32_t cache, void **out)
+{
+    dwprobe *b;
+    wic_image *im;
+
+    (void)self; (void)fmt; (void)cache;
+    if (!out) return DW_E_NOTIMPL;
+    *out = NULL;
+    if (!w || !h || w > 16384 || h > 16384) return (int32_t)0x80070057; /* E_INVALIDARG */
+    if (!(im = (wic_image *)calloc(1, sizeof *im))) return DW_E_NOTIMPL;
+    if (!(im->px = (uint32_t *)calloc((size_t)w * h, 4))) { free(im); return DW_E_NOTIMPL; }
+    im->w = (int)w; im->h = (int)h; im->refs = 1;
+    if (!(b = dwp_new("IWICBitmap"))) { free(im->px); free(im); return DW_E_NOTIMPL; }
+    b->ctx = im;
+    wic_source_slots(b);
+    dwp_set(b, 8, (void *)wicb_Lock);
+    PLOG("  [wic]   created a %ux%u bitmap to compose into\n", w, h);
+    *out = b;
+    return DW_S_OK;
+}
+
 static MS int32_t wic_CreateFormatConverter(void *self, void **out)
 {
     dwprobe *c;
@@ -477,6 +511,7 @@ static void *wic_factory(void)
         if (g_wic_factory) {
             dwp_set(g_wic_factory,  3, (void *)wic_CreateDecoderFromFilename);
             dwp_set(g_wic_factory, 10, (void *)wic_CreateFormatConverter);
+            dwp_set(g_wic_factory, 17, (void *)wic_CreateBitmap);
             dwp_set(g_wic_factory, 18, (void *)wic_CreateBitmapFromSource);
         }
     }

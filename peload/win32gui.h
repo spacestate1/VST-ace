@@ -1891,12 +1891,95 @@ static MS int32_t st_GetRgnBox(void *rgn, W32RECT *r)
     return (o->rc.right > o->rc.left && o->rc.bottom > o->rc.top)
              ? W32_RGN_SIMPLE : W32_RGN_NULL;
 }
+/* The rectangles making up a region, in the form GDI reports them.
+ *
+ * The old stub returned 0 on the theory that a caller would fall back to
+ * GetRgnBox. Some do. The one that matters here does not:
+ *
+ *     n = GetRegionData(hrgn, 0, NULL);
+ *     if (n != 0) { ... read the rects, add each to the dirty list ... }
+ *
+ * so zero is not "ask me another way", it is "this region is empty" -- and a
+ * plug-in whose paint handler draws only what its dirty list contains then
+ * draws nothing, on every WM_PAINT, having built its whole interface and its
+ * whole Direct2D device chain first. That was the blank editor.
+ *
+ * RGNDATA is a 32-byte header followed by the rectangles: dwSize, iType,
+ * nCount, nRgnSize, then the bounding box. Regions here are a single rectangle,
+ * so nCount is one and the bound is that rectangle.
+ *
+ * The three return values are all specified and all different: the required
+ * byte count when there is no buffer, the byte count again on success, and zero
+ * when the buffer given is too small. */
+#define W32_RDH_RECTANGLES 1
+
 static MS uint32_t st_GetRegionData(void *rgn, uint32_t n, void *d)
 {
-    /* Returning 0 is a legitimate failure that makes callers fall back to
-     * GetRgnBox, which carries the same single rect we track. */
-    (void)rgn; (void)n; (void)d;
-    return 0;
+    w32_obj *o = w32_oget(rgn);
+    struct {
+        uint32_t dwSize, iType, nCount, nRgnSize;
+        W32RECT  rcBound;
+    } hdr;
+    uint32_t need = (uint32_t)(sizeof hdr + sizeof(W32RECT));
+
+    if (!o || o->kind != OBJ_RGN) return 0;
+    if (!d) return need;                          /* just asking the size */
+    if (n < need) return 0;
+
+    hdr.dwSize   = (uint32_t)sizeof hdr;
+    hdr.iType    = W32_RDH_RECTANGLES;
+    hdr.nCount   = 1;
+    hdr.nRgnSize = (uint32_t)sizeof(W32RECT);
+    hdr.rcBound  = o->rc;
+    memcpy(d, &hdr, sizeof hdr);
+    memcpy((char *)d + sizeof hdr, &o->rc, sizeof o->rc);
+    PLOG("  [w32] GetRegionData -> 1 rect %d,%d..%d,%d\n",
+         o->rc.left, o->rc.top, o->rc.right, o->rc.bottom);
+    return need;
+}
+
+/* Two more that go with it, now that regions carry meaning. A region here is
+ * one rectangle, so a union is the bounding box of the two -- larger than GDI's
+ * answer, never smaller, which costs some overdraw and cannot lose a pixel that
+ * should have been repainted. */
+static MS int32_t st_SetRectRgn(void *rgn, int32_t l, int32_t t, int32_t r, int32_t b)
+{
+    w32_obj *o = w32_oget(rgn);
+    if (!o || o->kind != OBJ_RGN) return 0;
+    o->rc.left = l; o->rc.top = t; o->rc.right = r; o->rc.bottom = b;
+    return 1;
+}
+static MS int32_t st_CombineRgn(void *dst, void *a, void *b, int32_t mode)
+{
+    w32_obj *od = w32_oget(dst), *oa = w32_oget(a), *ob = w32_oget(b);
+    W32RECT r;
+
+    if (!od || od->kind != OBJ_RGN) return W32_RGN_ERROR;
+    if (!oa || oa->kind != OBJ_RGN) return W32_RGN_ERROR;
+    switch (mode) {
+    case 5:                                       /* RGN_COPY */
+        od->rc = oa->rc;
+        break;
+    case 2:                                        /* RGN_AND */
+        if (!ob || ob->kind != OBJ_RGN) return W32_RGN_ERROR;
+        if (!st_IntersectRect(&r, &oa->rc, &ob->rc)) { st_SetRectEmpty(&od->rc); break; }
+        od->rc = r;
+        break;
+    case 3:                                        /* RGN_OR  */
+    case 4:                                        /* RGN_XOR: as a union */
+        if (!ob || ob->kind != OBJ_RGN) return W32_RGN_ERROR;
+        st_UnionRect(&r, &oa->rc, &ob->rc);
+        od->rc = r;
+        break;
+    case 1:                                        /* RGN_DIFF */
+        if (!ob || ob->kind != OBJ_RGN) return W32_RGN_ERROR;
+        st_SubtractRect(&r, &oa->rc, &ob->rc);
+        od->rc = r;
+        break;
+    default:
+        return W32_RGN_ERROR;
+    }
+    return w32_rect_empty(&od->rc) ? W32_RGN_NULL : W32_RGN_SIMPLE;
 }
 /* The stock objects, each of the kind it is actually named after.
  *
@@ -2744,6 +2827,10 @@ static MS uintptr_t st_SetTimer(void *hwnd, uintptr_t id, uint32_t ms, void *pro
     for (i = 0; i < W32_MAX_TIMER; i++)
         if (W.timer[i].used && W.timer[i].wnd == wi && W.timer[i].id == id) {
             W.timer[i].ms = ms ? ms : 10;
+            /* Re-arming may also change the callback, and keeping the old one
+             * means the plug-in's new handler never runs while the old one
+             * keeps being called. */
+            W.timer[i].proc = proc;
             W.timer[i].next = w32_now() + W.timer[i].ms / 1000.0;
             return id;
         }
@@ -2935,6 +3022,9 @@ void w32_pump(void)
                 (MS void (*)(void *, uint32_t, uintptr_t, uint32_t))W.timer[i].proc;
             void *hw = W.timer[i].wnd ? w32_h(W32_HWND_BASE, W.timer[i].wnd) : NULL;
             W.n_timerproc++;
+            PLOG("  [w32] timer #%d id=%llu %ums -> proc %p\n", i,
+                 (unsigned long long)W.timer[i].id, W.timer[i].ms,
+                 W.timer[i].proc);
             tp(hw, WM_TIMER, W.timer[i].id, (uint32_t)(now * 1000.0));
         } else if (W.timer[i].wnd && W.wnd[W.timer[i].wnd].used) {
             w32_call(&W.wnd[W.timer[i].wnd], WM_TIMER, W.timer[i].id, 0);
