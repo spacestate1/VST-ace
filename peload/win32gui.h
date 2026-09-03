@@ -4087,6 +4087,9 @@ int w32_font_pipeline_ok(void) { return dw_font_pipeline_ok(); }
 void w32_reset(void)
 {
     int i;
+    /* First, because the rest of this drops the windows those threads would
+     * paint into, and the plug-in's image goes right after it. */
+    w32_stop_workers();
     for (i = 1; i < W32_MAX_WND; i++) {
         if (!W.wnd[i].used) continue;
         w32_surf_free(&W.wnd[i].surf);

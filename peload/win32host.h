@@ -64,6 +64,8 @@ void  w32_pump(void);
 
 /* Discard all window state. Call when the plugin that owns it goes away. */
 void  w32_reset(void);
+/* Threads currently executing inside the plug-in image. */
+int   w32_guest_threads(void);
 
 /* False when a plugin registered a font that never made it through to the text
  * backend -- its editor cannot paint and must not be pumped. */

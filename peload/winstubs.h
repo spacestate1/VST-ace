@@ -2257,12 +2257,25 @@ static MS int32_t st_SleepConditionVariableSRW(void *cv, void *l, uint32_t ms, u
 
 /* Every thread that will run plugin code needs its own fake TEB, or the first
  * gs:[0x30] access on that thread faults. */
+/* How many threads are inside the plug-in's own code right now.
+ *
+ * The image is unmapped when the plug-in closes, and a thread still running in
+ * it at that moment faults on whatever instruction it was about to execute --
+ * a segfault on a thread nobody is watching, after every line the run was
+ * going to print. Windows has the same hazard and leaves it to the plug-in to
+ * shut its threads down; this host cannot rely on that, so it counts them and
+ * declines to unmap while any are left. */
+static volatile int g_guest_threads;
+int w32_guest_threads(void) { return g_guest_threads; }
+
 static void *thread_trampoline(void *ud)
 {
     hobj *o = ud;
     MS uint32_t (*start)(void *) = (MS uint32_t (*)(void *))o->start;
     teb_install();
+    __sync_fetch_and_add(&g_guest_threads, 1);
     start(o->param);
+    __sync_fetch_and_sub(&g_guest_threads, 1);
     return NULL;
 }
 static MS void *st_CreateThread(void *sa, size_t stack, void *start, void *param,
@@ -2287,6 +2300,37 @@ static MS void *st_CreateThread(void *sa, size_t stack, void *start, void *param
  * call back on some other thread. A thread each is not how Windows does it,
  * but it is the same contract, and the callback runs where the caller expects
  * it to -- not on the thread that registered it. */
+/* Threads this layer started that will call back into the plug-in.
+ *
+ * Each of them holds a function pointer into the plug-in's image, so each has
+ * to be stopped before that image is unmapped -- the same reason w32_reset
+ * drops the windows and the timers. A wait or a timer still running when the
+ * plug-in goes calls its callback through freed memory, which is a segfault
+ * with no handler on it and nothing in the log: the crash lands after every
+ * line the run was going to print. */
+#define W32_WORKER_MAX 256
+static void *g_w32_waits[W32_WORKER_MAX];
+static void *g_w32_tps[W32_WORKER_MAX];
+static int   g_w32_nwaits, g_w32_ntps;
+static volatile int g_w32_worker_quit;      /* set once teardown starts */
+static volatile int g_w32_work_running;     /* detached QueueUserWorkItem threads */
+static pthread_mutex_t g_w32_worker_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void w32_worker_add(void **list, int *n, void *p)
+{
+    pthread_mutex_lock(&g_w32_worker_lock);
+    if (*n < W32_WORKER_MAX) list[(*n)++] = p;
+    pthread_mutex_unlock(&g_w32_worker_lock);
+}
+static void w32_worker_drop(void **list, int *n, void *p)
+{
+    int i;
+    pthread_mutex_lock(&g_w32_worker_lock);
+    for (i = 0; i < *n; i++)
+        if (list[i] == p) { list[i] = list[--(*n)]; break; }
+    pthread_mutex_unlock(&g_w32_worker_lock);
+}
+
 typedef struct {
     void    *obj;                 /* the handle waited on */
     void    *cb, *ctx;            /* WAITORTIMERCALLBACK and its parameter */
@@ -2303,11 +2347,13 @@ static void *w32_wait_thread(void *ud)
     teb_install();
     while (!w->stop) {
         uint32_t r = st_WaitForSingleObject(w->obj, w->ms);
-        if (w->stop) break;
+        if (w->stop || g_w32_worker_quit) break;
         if (r == 0xFFFFFFFFu) break;                      /* WAIT_FAILED */
         if (w->cb) {
             void (MS *cb)(void *, uint8_t) = (void (MS *)(void *, uint8_t))w->cb;
+            __sync_fetch_and_add(&g_guest_threads, 1);
             cb(w->ctx, (uint8_t)(r == 0x102));            /* TimerOrWaitFired */
+            __sync_fetch_and_sub(&g_guest_threads, 1);
         }
         if (w->flags & W32_WT_EXECUTEONLYONCE) break;
     }
@@ -2329,6 +2375,7 @@ static MS int32_t st_RegisterWaitForSingleObject(void **out, void *obj, void *cb
         return 0;
     }
     *out = w;
+    w32_worker_add(g_w32_waits, &g_w32_nwaits, w);
     PLOG("  [win] RegisterWaitForSingleObject(obj=%p ms=%u flags=0x%x) -> %p\n",
          obj, ms, flags, (void *)w);
     return 1;
@@ -2340,14 +2387,19 @@ static MS void *st_RegisterWaitForSingleObjectEx(void *obj, void *cb, void *ctx,
     void *h = NULL;
     return st_RegisterWaitForSingleObject(&h, obj, cb, ctx, ms, flags) ? h : NULL;
 }
-static MS int32_t st_UnregisterWait(void *h)
+static void w32_wait_stop(w32_wait *w)
 {
-    w32_wait *w = h;
-    if (!w) { g_last_error = 6; return 0; }
+    if (!w) return;
     w->stop = 1;
     st_SetEvent(w->obj);                       /* wake it so it can notice */
     pthread_join(w->th, NULL);
     free(w);
+}
+static MS int32_t st_UnregisterWait(void *h)
+{
+    if (!h) { g_last_error = 6; return 0; }
+    w32_worker_drop(g_w32_waits, &g_w32_nwaits, h);
+    w32_wait_stop(h);
     return 1;
 }
 static MS int32_t st_UnregisterWaitEx(void *h, void *ev)
@@ -2398,7 +2450,7 @@ static void *w32_tp_thread(void *ud)
     for (;;) {
         while (!t->armed && !t->stop)
             pthread_cond_wait(&t->c, &t->m);
-        if (t->stop) break;
+        if (t->stop || g_w32_worker_quit) break;
         if (t->kind == 0) {                       /* timer */
             int64_t due = t->due_ms;
             uint32_t period = t->period_ms;
@@ -2457,12 +2509,14 @@ static void *w32_tp_new(int kind, void *cb, void *ctx)
         return NULL;
     }
     t->started = 1;
+    w32_worker_add(g_w32_tps, &g_w32_ntps, t);
     return t;
 }
 static void w32_tp_close(void *h)
 {
     w32_tp *t = h;
     if (!t) return;
+    w32_worker_drop(g_w32_tps, &g_w32_ntps, t);
     pthread_mutex_lock(&t->m);
     t->stop = 1;
     t->armed = 0;
@@ -2545,6 +2599,38 @@ static MS void st_WaitForThreadpoolWorkCallbacks(void *h, int32_t cancel)
 { w32_tp_flush(h, cancel); }
 static MS void st_CloseThreadpoolWork(void *h) { w32_tp_close(h); }
 
+/* Stop everything this layer started that could call into the plug-in, and wait
+ * for it to actually be out of that code. Called from w32_reset, which runs
+ * while the image is still mapped. */
+static void w32_stop_workers(void)
+{
+    void *waits[W32_WORKER_MAX], *tps[W32_WORKER_MAX];
+    int nw, nt, i, spins;
+
+    g_w32_worker_quit = 1;
+    /* Copied out and the lists cleared under the lock; the stopping itself
+     * joins threads, which must not be done holding it. */
+    pthread_mutex_lock(&g_w32_worker_lock);
+    nw = g_w32_nwaits; nt = g_w32_ntps;
+    for (i = 0; i < nw; i++) waits[i] = g_w32_waits[i];
+    for (i = 0; i < nt; i++) tps[i]  = g_w32_tps[i];
+    g_w32_nwaits = g_w32_ntps = 0;
+    pthread_mutex_unlock(&g_w32_worker_lock);
+
+    for (i = 0; i < nw; i++) w32_wait_stop(waits[i]);
+    for (i = 0; i < nt; i++) w32_tp_close(tps[i]);
+
+    /* Work items are detached and cannot be joined, so wait for the count to
+     * come back to zero -- briefly, because a plug-in that never returns from
+     * one must not hold up the teardown for ever. */
+    for (spins = 0; g_w32_work_running > 0 && spins < 500; spins++)
+        usleep(1000);
+    if (g_w32_work_running > 0)
+        PLOG("  [win] %d work item(s) still running at teardown\n",
+             g_w32_work_running);
+    g_w32_worker_quit = 0;                    /* the next plug-in starts clean */
+}
+
 /* A full barrier across every thread. __sync_synchronize is the local half of
  * it; the cross-thread half is what the kernel call does on Windows, and there
  * is no portable equivalent -- but every caller uses this to publish writes it
@@ -2564,7 +2650,12 @@ static void *w32_work_thread(void *ud)
     w32_workitem it = *(w32_workitem *)ud;
     free(ud);
     teb_install();
-    if (it.fn) ((uint32_t (MS *)(void *))it.fn)(it.ctx);
+    if (it.fn && !g_w32_worker_quit) {
+        __sync_fetch_and_add(&g_guest_threads, 1);
+        ((uint32_t (MS *)(void *))it.fn)(it.ctx);
+        __sync_fetch_and_sub(&g_guest_threads, 1);
+    }
+    __sync_fetch_and_sub(&g_w32_work_running, 1);
     return NULL;
 }
 static MS int32_t st_QueueUserWorkItem(void *fn, void *ctx, uint32_t flags)
@@ -2574,7 +2665,13 @@ static MS int32_t st_QueueUserWorkItem(void *fn, void *ctx, uint32_t flags)
     (void)flags;
     if (!(it = malloc(sizeof *it))) { g_last_error = 8; return 0; }
     it->fn = fn; it->ctx = ctx;
-    if (pthread_create(&t, NULL, w32_work_thread, it) != 0) { free(it); g_last_error = 8; return 0; }
+    __sync_fetch_and_add(&g_w32_work_running, 1);
+    if (pthread_create(&t, NULL, w32_work_thread, it) != 0) {
+        __sync_fetch_and_sub(&g_w32_work_running, 1);
+        free(it);
+        g_last_error = 8;
+        return 0;
+    }
     pthread_detach(t);
     return 1;
 }

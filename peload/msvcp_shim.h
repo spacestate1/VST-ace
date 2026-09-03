@@ -2667,9 +2667,14 @@ typedef struct { mp_thrd_start_t fn; void *arg; } mp_thrd_launch;
 static void *mp_thrd_tramp(void *v)
 {
     mp_thrd_launch l = *(mp_thrd_launch *)v;
+    int32_t r;
     free(v);
     teb_install();
-    return (void *)(intptr_t)(l.fn ? l.fn(l.arg) : 0);
+    if (!l.fn) return NULL;
+    __sync_fetch_and_add(&g_guest_threads, 1);
+    r = l.fn(l.arg);
+    __sync_fetch_and_sub(&g_guest_threads, 1);
+    return (void *)(intptr_t)r;
 }
 static MS int32_t mp_Thrd_create(mp_thrd *thr, mp_thrd_start_t fn, void *arg)
 {

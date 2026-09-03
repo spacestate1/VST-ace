@@ -1665,6 +1665,28 @@ void pe_module_unload(pe_module *m)
      * entry naming an unmapped base is worse than no entry at all. Losing the
      * plug-in itself also frees the thread-local slots it was holding. */
     if (winstubs_drop_image(m->base)) winstubs_reset_tls();
+    /* Not while the plug-in still has a thread of its own running in there.
+     * Its threads are its business on Windows, where the process usually ends
+     * before anyone notices; here the image really is unmapped, and a thread
+     * mid-instruction in it dies on the spot -- which is a segfault on a thread
+     * nobody is watching, printed after every line the run had to say.
+     *
+     * Give them a moment to finish, and if they will not, leave the mapping
+     * where it is. One leaked mapping in a host that is closing a plug-in
+     * costs nothing worth the alternative. */
+    {
+        int spins;
+        for (spins = 0; w32_guest_threads() > 0 && spins < 200; spins++)
+            usleep(1000);
+        if (w32_guest_threads() > 0) {
+            PLOG("  [win] %d plug-in thread(s) still running -- "
+                 "leaving its image mapped rather than pulling it out "
+                 "from under them\n", w32_guest_threads());
+            m->base = NULL;
+            m->size = 0;
+            return;
+        }
+    }
     munmap(m->base, m->size);
     m->base = NULL;
     m->size = 0;
