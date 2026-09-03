@@ -53,6 +53,9 @@ typedef struct {
     /* --drag x1,y1,x2,y2: press, sweep, release. See drag_pump. */
     int         drag[4];
     int         has_drag;
+    /* --live N: hold the note and run the audio for N seconds with the editor
+     * pumped between blocks, so the picture is of a plugin that is playing. */
+    int         live;
 } opts;
 
 /* A scripted drag, driven from inside the plug-in's own tracking loop.
@@ -178,6 +181,9 @@ static void usage(void)
         "                                    mac-au, classic-mac)\n"
         "              [--save-patch out.json]  write the current state\n"
         "              [--editor out.ppm]   open the GUI and capture it\n"
+        "              [--live N]           hold the note and run the audio for N\n"
+        "                                   seconds first, so an animated editor\n"
+        "                                   is photographed while it is playing\n"
        "              [--click X,Y]        click there first (repeatable)\n"
        "              [--drag X1,Y1,X2,Y2] press, sweep, release -- and report\n"
        "                                   whether a control tracked the sweep\n"
@@ -201,6 +207,7 @@ static int parse_args(int argc, char **argv, opts *o)
         if (!strcmp(argv[i], "--render") && i + 1 < argc)        o->wav   = argv[++i];
         else if (!strcmp(argv[i], "--secs") && i + 1 < argc)     o->secs  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--note") && i + 1 < argc)     o->note  = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--live") && i + 1 < argc)     o->live  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--program") && i + 1 < argc)  o->prog  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--params"))                   o->dump  = 1;
         else if (!strcmp(argv[i], "--editor") && i + 1 < argc)   o->shot  = argv[++i];
@@ -618,6 +625,39 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
                            tracked, swept - 1);
                 }
             }
+        }
+        /* An editor whose lights are driven by what the plugin is playing --
+         * an arpeggiator's step LEDs, a level meter, an envelope display --
+         * shows none of it in a photograph taken while the plugin is silent.
+         * --live holds the note and runs the audio with the editor pumped
+         * between blocks, so the capture is of something actually sounding. */
+        if (o->live > 0 && o->note >= 0) {
+            int   bs = 512, total = RATE * o->live, done = 0;
+            float *out = malloc((size_t)bs * 2 * sizeof *out);
+            float *src = pehost_num_inputs(h) > 0
+                       ? calloc((size_t)bs * 2, sizeof *src) : NULL;
+            if (out) {
+                printf("  playing note %d for %ds with the editor running\n",
+                       o->note, o->live);
+                pehost_note_on(h, o->note, 100);
+                while (done < total) {
+                    int n = (total - done < bs) ? total - done : bs;
+                    if (src) fill_test_signal(src, n, done);
+                    pehost_render_io(h, src, out, n);
+                    done += n;
+                    pehost_editor_pump(h);
+                    /* Paced to the audio it just produced. An editor's lights
+                     * are driven by its own timer, and a loop that renders two
+                     * seconds in two hundred milliseconds gives that timer
+                     * almost nothing to fire on. */
+                    usleep((useconds_t)((double)n * 1000000.0 / RATE));
+                }
+                /* The note is deliberately left down: the photograph is meant
+                 * to be of a plugin that is playing, and everything an
+                 * arpeggiator lights up goes dark the moment the key is up. */
+                free(out);
+            }
+            free(src);
         }
         if (pehost_editor_pixels(h, &px, &pw, &ph) && px && pw > 0 && ph > 0) {
             long nonzero = 0;

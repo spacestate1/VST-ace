@@ -63,6 +63,8 @@ int  v3_editor_attach_nsview(v3host *h, void *nsview);
 void v3_editor_detach(v3host *h);
 /* Tell a resizable editor its new size. */
 void v3_editor_resized(v3host *h, int w, int h_px);
+/* Deliver what the processor reported back to the controller. UI thread. */
+void v3_ui_idle(v3host *h);
 
 /* `path` may be a .vst3 bundle directory or the shared object inside it. */
 v3host *v3_open(const char *path, double samplerate, int blocksize,

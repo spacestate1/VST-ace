@@ -47,6 +47,7 @@
     int   pfx##_v3_editor_attach_nsview(void *, void *); \
     void  pfx##_v3_editor_detach(void *); \
     void  pfx##_v3_editor_resized(void *, int, int); \
+    void  pfx##_v3_ui_idle(void *); \
     void  pfx##_v3_set_runloop_hooks(const v3_runloop_hooks *); \
     void  pfx##_v3_runloop_fd(void *, int); \
     void  pfx##_v3_runloop_timer(void *)
@@ -251,6 +252,9 @@ int v3_editor_attach_nsview(v3host *h, void *nsview)
 void v3_editor_detach(v3host *h)
 { if (!h || !h->inner) return;
   if (h->ms) ms_v3_editor_detach(h->inner); else sv_v3_editor_detach(h->inner); }
+
+void v3_ui_idle(v3host *h)
+{ if (!h) return; if (h->ms) ms_v3_ui_idle(h->inner); else sv_v3_ui_idle(h->inner); }
 
 void v3_editor_resized(v3host *h, int w, int hp)
 { if (!h || !h->inner) return;

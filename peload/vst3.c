@@ -947,6 +947,11 @@ struct v3host {
     int        program;
 
     qev_t             q[EVQ];
+    /* What the processor reports back for the editor to show -- an
+     * arpeggiator's step, a meter, an envelope. Filled where process()
+     * returns, drained on the UI thread by v3_ui_idle. */
+    struct { uint32_t id; float v; } oq[EVQ];
+    _Atomic unsigned  ohead, otail;
     _Atomic unsigned  head, tail;
 };
 
@@ -1696,6 +1701,22 @@ int V3N(v3_has_editor)(v3host *h)
     return v->vt->isPlatformTypeSupported(v, PLATFORM_X11) == V3_OK;
 }
 
+/* Called from the editor pump, which is the UI thread. Hands the controller
+ * everything the processor reported since the last one. */
+void V3N(v3_ui_idle)(v3host *h)
+{
+    unsigned hd, tl;
+
+    if (!h || !h->ctrl) return;
+    hd = atomic_load_explicit(&h->ohead, memory_order_acquire);
+    tl = atomic_load_explicit(&h->otail, memory_order_relaxed);
+    for (; tl != hd; tl++) {
+        unsigned i = tl & (EVQ - 1);
+        h->ctrl->vt->setParamNormalized(h->ctrl, h->oq[i].id, h->oq[i].v);
+    }
+    atomic_store_explicit(&h->otail, hd, memory_order_release);
+}
+
 void V3N(v3_editor_size)(v3host *h, int *w, int *hh)
 {
     IPlugView *v = view_of(h);
@@ -1951,6 +1972,25 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
         if (pr != V3_OK && !h->process_complained) {
             h->process_complained = 1;
             VLOG("vst3: process -> %d (0x%08x)\n", (int)pr, (unsigned)pr);
+        }
+        /* The other direction of the same wire. A processor reports what its
+         * display should show through outputParameterChanges -- the step an
+         * arpeggiator has reached, a meter, a tempo-synced light -- and the
+         * host is what carries those to the controller. This collection was
+         * handed over and never read, so every one of those lights stayed
+         * dark. Queued rather than applied here: the controller belongs to the
+         * UI thread and this is the audio one. */
+        {
+            int qi;
+            if (outchanges.n) VLOG("vst3: processor reported %d out-param(s)\n", outchanges.n);
+            for (qi = 0; qi < outchanges.n; qi++) {
+                unsigned hd = atomic_load_explicit(&h->ohead, memory_order_relaxed);
+                unsigned tl = atomic_load_explicit(&h->otail, memory_order_acquire);
+                if (((hd + 1) & (EVQ - 1)) == (tl & (EVQ - 1))) break;
+                h->oq[hd & (EVQ - 1)].id = outchanges.q[qi].id;
+                h->oq[hd & (EVQ - 1)].v  = (float)outchanges.q[qi].value;
+                atomic_store_explicit(&h->ohead, hd + 1, memory_order_release);
+            }
         }
     }
 

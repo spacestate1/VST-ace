@@ -3886,6 +3886,8 @@ void pehost_editor_pump(pehost *h)
     /* VST2 editors animate off effEditIdle rather than a timer of their own. */
     if (h && !h->is_v3 && h->fx)
         h->fx->dispatcher(h->fx, effEditIdle, 0, 0, NULL, 0.0f);
+    /* A VST3's editor is told here what its processor reported. */
+    if (h && h->is_v3 && h->v3) v3_ui_idle(h->v3);
 }
 
 int pehost_editor_pixels(pehost *h, const unsigned int **px, int *w, int *height)
