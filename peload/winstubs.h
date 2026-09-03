@@ -6077,6 +6077,39 @@ static MSCRT const char *st___wine_dbg_strdup(const char *str)
     return slot;
 }
 
+#ifndef PELOAD_NO_GUI_LAYER
+/* CoCreateInstance, for the one class this host can actually make.
+ *
+ * Everything else is refused by name rather than silently: a plug-in that
+ * asked for something unavailable gets REGDB_E_CLASSNOTREG, which is what
+ * Windows says when a class is not registered and is a condition callers
+ * already handle. */
+static void *wic_factory(void);
+static MS int32_t st_CoCreateInstance(const void *rclsid, void *outer, uint32_t ctx,
+                                      const void *riid, void **ppv)
+{
+    /* CLSID_WICImagingFactory {CACAF262-9370-4615-A13B-9F5539DA4C0A} and the
+     * _2 spelling {317D06E8-5F24-433D-BDF7-79CE68D8ABC2}, which is the same
+     * object with a longer vtable. */
+    static const uint8_t wic1[16] = {
+        0x62,0xF2,0xCA,0xCA, 0x70,0x93, 0x15,0x46,
+        0xA1,0x3B, 0x9F,0x55,0x39,0xDA,0x4C,0x0A };
+    static const uint8_t wic2[16] = {
+        0xE8,0x06,0x7D,0x31, 0x24,0x5F, 0x3D,0x43,
+        0xBD,0xF7, 0x79,0xCE,0x68,0xD8,0xAB,0xC2 };
+    (void)outer; (void)ctx; (void)riid;
+    if (!ppv) return (int32_t)0x80070057;                    /* E_INVALIDARG */
+    *ppv = NULL;
+    if (rclsid && (!memcmp(rclsid, wic1, 16) || !memcmp(rclsid, wic2, 16))) {
+        *ppv = wic_factory();
+        PLOG("  [win] CoCreateInstance(WICImagingFactory) -> %p\n", *ppv);
+        return *ppv ? 0 : (int32_t)0x80004005;
+    }
+    PLOG("  [win] CoCreateInstance(<unknown class>) -> REGDB_E_CLASSNOTREG\n");
+    return (int32_t)0x80040154;                              /* REGDB_E_CLASSNOTREG */
+}
+#endif
+
 static const winstub g_stubs[] = {
     /* CRT: registered against msvcrt.dll and reached from every versioned
      * runtime name through crt_alias() below */
@@ -6195,6 +6228,9 @@ static const winstub g_stubs[] = {
      * DWrite.dll reached the generic stub instead, and that returns E_NOTIMPL
      * without filling the factory out-parameter the caller then dereferences. */
     { "dwrite.dll", "DWriteCreateFactory", (void *)st_DWriteCreateFactory },
+#endif
+#ifndef PELOAD_NO_GUI_LAYER
+    { "ole32.dll", "CoCreateInstance", (void *)st_CoCreateInstance },
 #endif
     S("gdi32.dll", GetDeviceCaps),
     S("gdi32.dll", SetDIBitsToDevice), S("gdi32.dll", GetClipBox),

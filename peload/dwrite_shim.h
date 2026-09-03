@@ -17,6 +17,11 @@
 #ifndef PELOAD_DWRITE_SHIM_H
 #define PELOAD_DWRITE_SHIM_H
 
+/* The PNG and BMP readers the WIC shim below decodes with. Already written
+ * for the macOS side's ImageIO, and the same two formats a Windows plug-in
+ * ships its artwork in. */
+#include "png_in.h"
+
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
@@ -228,6 +233,188 @@ static MS int32_t dwf_GetSystemFontCollection(void *self, void **out, int32_t ch
 
 /* The FreeType face everything here measures with, opened on demand below. */
 static FT_Face dw_ftface(void);
+
+/* ---- WIC, the imaging factory -------------------------------------------
+ *
+ * A plug-in that draws a bitmap interface asks COM for an IWICImagingFactory
+ * and decodes its skin through it. Nothing here provided one, so
+ * CoCreateInstance failed and the factory pointer stayed null in a structure
+ * the plug-in then used without checking.
+ *
+ * Only the decoding path is here: name a file, get its pixels. Encoding,
+ * metadata, palettes and colour management are not what a plug-in loading its
+ * own artwork needs. */
+/* One decoded image, shared by the decoder, its frame and any converter
+ * wrapped around it. BGRA, top row first -- the format image_decode already
+ * produces and the one WIC callers overwhelmingly ask for. */
+typedef struct { uint32_t *px; int w, h; int refs; } wic_image;
+
+static MS int32_t wic_GetSize(void *self, uint32_t *w, uint32_t *h)
+{
+    dwprobe *o = self;
+    wic_image *im = o ? o->ctx : NULL;
+    if (!im) return DW_E_NOTIMPL;
+    if (w) *w = (uint32_t)im->w;
+    if (h) *h = (uint32_t)im->h;
+    return DW_S_OK;
+}
+
+/* GUID_WICPixelFormat32bppBGRA. The whole family shares a prefix and differs
+ * in the last byte, which is what identifies the layout. */
+static const uint8_t WIC_FMT_32bppBGRA[16] = {
+    0x24,0xC3,0xDD,0x6F, 0x03,0x4E, 0xFE,0x4B,
+    0xB1,0x85, 0x3D,0x77,0x76,0x8D,0xC9,0x0F };
+
+static MS int32_t wic_GetPixelFormat(void *self, void *guid)
+{
+    (void)self;
+    if (!guid) return DW_E_NOTIMPL;
+    memcpy(guid, WIC_FMT_32bppBGRA, 16);
+    return DW_S_OK;
+}
+
+static MS int32_t wic_GetResolution(void *self, double *dx, double *dy)
+{ (void)self; if (dx) *dx = 96.0; if (dy) *dy = 96.0; return DW_S_OK; }
+
+/* IWICBitmapSource::CopyPixels(WICRect const*, UINT stride, UINT bufsize, BYTE*)
+ * A null rect means the whole image, which is how a caller blitting a skin
+ * asks for it. */
+static MS int32_t wic_CopyPixels(void *self, const void *rect, uint32_t stride,
+                                 uint32_t bufsz, uint8_t *buf)
+{
+    dwprobe *o = self;
+    wic_image *im = o ? o->ctx : NULL;
+    int32_t x = 0, y = 0, w, h, row;
+    const int32_t *r = rect;
+
+    if (!im || !buf) return DW_E_NOTIMPL;
+    w = im->w; h = im->h;
+    if (r) { x = r[0]; y = r[1]; w = r[2]; h = r[3]; }
+    if (x < 0 || y < 0 || w < 0 || h < 0 ||
+        x + w > im->w || y + h > im->h) return (int32_t)0x80070057; /* E_INVALIDARG */
+    if ((uint64_t)stride * (uint64_t)(h ? h - 1 : 0) + (uint64_t)w * 4 > bufsz)
+        return (int32_t)0x8007000E;                                /* E_OUTOFMEMORY */
+    for (row = 0; row < h; row++)
+        memcpy(buf + (size_t)row * stride,
+               im->px + (size_t)(y + row) * im->w + x, (size_t)w * 4);
+    return DW_S_OK;
+}
+
+static void wic_source_slots(dwprobe *o)
+{
+    dwp_set(o, 3, (void *)wic_GetSize);
+    dwp_set(o, 4, (void *)wic_GetPixelFormat);
+    dwp_set(o, 5, (void *)wic_GetResolution);
+    dwp_set(o, 7, (void *)wic_CopyPixels);
+}
+
+/* IWICBitmapDecoder::GetFrameCount / GetFrame. One frame: none of the artwork
+ * a plug-in ships is animated. */
+static MS int32_t wicd_GetFrameCount(void *self, uint32_t *n)
+{ (void)self; if (!n) return DW_E_NOTIMPL; *n = 1; return DW_S_OK; }
+
+static MS int32_t wicd_GetFrame(void *self, uint32_t idx, void **out)
+{
+    dwprobe *o = self, *f;
+    if (!out) return DW_E_NOTIMPL;
+    *out = NULL;
+    if (idx != 0 || !o || !o->ctx) return DW_E_NOTIMPL;
+    if (!(f = dwp_new("IWICBitmapFrameDecode"))) return DW_E_NOTIMPL;
+    f->ctx = o->ctx;
+    ((wic_image *)f->ctx)->refs++;
+    wic_source_slots(f);
+    *out = f;
+    return DW_S_OK;
+}
+
+/* IWICFormatConverter::Initialize(source, format, dither, palette, alpha, type)
+ * Everything decoded here is already 32bpp BGRA, so the conversion is a
+ * hand-over rather than a conversion -- but the object still has to behave
+ * like a source afterwards, which is what the caller goes on to use. */
+static MS int32_t wicc_Initialize(void *self, void *src, const void *fmt, uint32_t dither,
+                                  void *pal, double alpha, uint32_t paltype)
+{
+    dwprobe *o = self, *s = src;
+    (void)fmt; (void)dither; (void)pal; (void)alpha; (void)paltype;
+    if (!o || !s || !s->ctx) return DW_E_NOTIMPL;
+    o->ctx = s->ctx;
+    ((wic_image *)o->ctx)->refs++;
+    return DW_S_OK;
+}
+static MS int32_t wicc_CanConvert(void *self, const void *from, const void *to, int32_t *can)
+{ (void)self; (void)from; (void)to; if (can) *can = 1; return DW_S_OK; }
+
+static MS int32_t wic_CreateFormatConverter(void *self, void **out)
+{
+    dwprobe *c;
+    (void)self;
+    if (!out) return DW_E_NOTIMPL;
+    if (!(c = dwp_new("IWICFormatConverter"))) return DW_E_NOTIMPL;
+    wic_source_slots(c);
+    dwp_set(c, 8, (void *)wicc_Initialize);
+    dwp_set(c, 9, (void *)wicc_CanConvert);
+    *out = c;
+    return DW_S_OK;
+}
+
+/* IWICImagingFactory::CreateDecoderFromFilename(name, vendor, access, opts,
+ *                                               IWICBitmapDecoder**) */
+static MS int32_t wic_CreateDecoderFromFilename(void *self, const uint16_t *name,
+                                                const void *vendor, uint32_t access,
+                                                uint32_t opts, void **out)
+{
+    char n[1024], fixed[1024];
+    dwprobe *dec;
+    wic_image *im;
+    uint8_t *bytes = NULL;
+    long len = 0;
+    FILE *fp;
+    int w = 0, h = 0;
+    uint32_t *px;
+
+    (void)self; (void)vendor; (void)access; (void)opts;
+    if (!out) return DW_E_NOTIMPL;
+    *out = NULL;
+    w2c(name, n, sizeof n);
+    path_fix(n, fixed, sizeof fixed);
+    PLOG("  [wic] CreateDecoderFromFilename(\"%s\")\n", fixed);
+
+    if (!(fp = fopen(fixed, "rb"))) return (int32_t)0x88982F04;  /* not found */
+    fseek(fp, 0, SEEK_END); len = ftell(fp); fseek(fp, 0, SEEK_SET);
+    if (len > 0 && (bytes = malloc((size_t)len)) &&
+        fread(bytes, 1, (size_t)len, fp) != (size_t)len) { free(bytes); bytes = NULL; }
+    fclose(fp);
+    if (!bytes) return (int32_t)0x8007000E;
+
+    px = image_decode(bytes, (size_t)len, &w, &h);
+    free(bytes);
+    if (!px || w <= 0 || h <= 0) { free(px); return (int32_t)0x88982F50; } /* unsupported */
+
+    if (!(im = calloc(1, sizeof *im))) { free(px); return (int32_t)0x8007000E; }
+    im->px = px; im->w = w; im->h = h; im->refs = 1;
+    if (!(dec = dwp_new("IWICBitmapDecoder"))) { free(px); free(im); return DW_E_NOTIMPL; }
+    dec->ctx = im;
+    dwp_set(dec, 12, (void *)wicd_GetFrameCount);
+    dwp_set(dec, 13, (void *)wicd_GetFrame);
+    PLOG("  [wic]   decoded %dx%d\n", w, h);
+    *out = dec;
+    return DW_S_OK;
+}
+
+static dwprobe *g_wic_factory;
+
+static void *wic_factory(void)
+{
+    if (!g_wic_factory) {
+        g_wic_factory = dwp_new("IWICImagingFactory");
+        if (g_wic_factory) {
+            dwp_set(g_wic_factory,  3, (void *)wic_CreateDecoderFromFilename);
+            dwp_set(g_wic_factory, 10, (void *)wic_CreateFormatConverter);
+        }
+    }
+    if (g_wic_factory) g_wic_factory->refs++;
+    return g_wic_factory;
+}
 
 /* ---- text format and layout --------------------------------------------
  *
