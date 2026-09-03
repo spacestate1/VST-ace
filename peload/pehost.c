@@ -821,6 +821,61 @@ static pe_module *real_module(const char *dll)
     return &g_real[i].m;
 }
 
+/* ------------------------------------------------ LoadLibrary, for real DLLs --- */
+
+/* A plug-in that ships part of itself as separate DLLs and loads them at run
+ * time. SynthEdit does exactly this: its modules are .sem files beside the
+ * plug-in, ordinary PE DLLs under another extension, and it calls LoadLibrary
+ * on each one by full path.
+ *
+ * Kept in a table so a module asked for twice is mapped once and keeps the same
+ * handle, which is what a caller comparing handles expects -- and what stops a
+ * graph with forty references to one module mapping it forty times.
+ *
+ * The primary image is saved across the load for the same reason real_module
+ * does it: pe_module_load installs whatever it maps as the primary image, and a
+ * module loaded on the plug-in's behalf must not become the answer to "where am
+ * I" or take over the plug-in's resources. */
+#define MAX_LOADED 64
+static struct { char path[1024]; pe_module m; } g_loaded[MAX_LOADED];
+static int g_nloaded;
+
+static void *pehost_load_dll(const char *path)
+{
+    char err[256] = "", ppath[1024];
+    void *pbase, *prsrc;
+    int i, rc;
+
+    for (i = 0; i < g_nloaded; i++)
+        if (!strcmp(g_loaded[i].path, path)) return g_loaded[i].m.base;
+    if (g_nloaded >= MAX_LOADED) return NULL;
+
+    winstubs_primary_save(&pbase, &prsrc);
+    winstubs_image_path_save(ppath, sizeof ppath);
+    rc = pe_module_load(path, &g_loaded[g_nloaded].m, err, sizeof err);
+    winstubs_primary_restore(pbase, prsrc);
+    winstubs_image_path_restore(ppath);
+
+    if (rc != 0) {
+        if (pe_verbose())
+            fprintf(stderr, "  [win] %s would not load: %s\n", path, err);
+        return NULL;
+    }
+    snprintf(g_loaded[g_nloaded].path, sizeof g_loaded[g_nloaded].path, "%s", path);
+    if (pe_verbose())
+        fprintf(stderr, "  [win] loaded %s\n", path);
+    return g_loaded[g_nloaded++].m.base;
+}
+
+static void *pehost_dll_symbol(void *module, const char *name)
+{
+    int i;
+    for (i = 0; i < g_nloaded; i++)
+        if (g_loaded[i].m.base == module)
+            return pe_module_export(&g_loaded[i].m, name);
+    return NULL;
+}
+
 /* Names the C++ runtime a plug-in needed and could not have, for the caller to
  * report. Empty when nothing was missing. */
 static char g_missing_real[64];
@@ -1688,7 +1743,14 @@ struct pehost {
 static char g_err[256];
 const char *pehost_last_error(void) { return g_err; }
 
-int pehost_thread_init(void) { return g_teb ? 0 : teb_install(); }
+int pehost_thread_init(void)
+{
+    /* Installed here rather than at each entry point: every path into this
+     * host goes through thread init first, and LoadLibrary has to be able to
+     * reach the real loader from whichever one was used. */
+    winstubs_set_loader(pehost_load_dll, pehost_dll_symbol);
+    return g_teb ? 0 : teb_install();
+}
 
 /* The transport handed back from audioMasterGetTime. File scope because the
  * plugin keeps the pointer after the callback returns. */

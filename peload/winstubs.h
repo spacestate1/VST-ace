@@ -673,9 +673,42 @@ static void *w32_lib_handle(const char *name)
 
 static void *winstub_lookup(const char *dll, const char *sym);      /* below */
 
+/* Loading a DLL that is genuinely on disk.
+ *
+ * LoadLibrary only ever answered for the system DLLs this host shims and
+ * returned NULL for everything else -- including a file sitting right there
+ * that this program, a PE loader, knows exactly how to map. A plug-in shipping
+ * part of itself as separate DLLs got nothing back: SynthEdit keeps its modules
+ * in .sem files beside the plug-in and loads them this way, so its DSP graph
+ * came up empty and it rendered silence with no error anywhere.
+ *
+ * The mapping cannot happen here. The loader that can do it is whichever one
+ * included this header, and there are two of them at different widths, so each
+ * installs its own pair and a wrong-width DLL simply fails to map. */
+static void *(*g_real_load)(const char *path);
+static void *(*g_real_sym)(void *module, const char *name);
+static void winstubs_set_loader(void *(*load)(const char *),
+                                void *(*sym)(void *, const char *))
+{ g_real_load = load; g_real_sym = sym; }
+
+/* Defined further down, with the rest of the path handling. */
+static const char *path_fix(const char *in, char *buf, size_t n);
+
+/* A real module's handle is its mapped base -- an ordinary address, and never
+ * one of the small tagged values the shimmed DLLs use. */
+static void *w32_load_real(const char *name)
+{
+    char p[1024];
+    if (!name || !*name || !g_real_load) return NULL;
+    path_fix(name, p, sizeof p);
+    if (access(p, R_OK) != 0) return NULL;
+    return g_real_load(p);
+}
+
 static MS void *st_LoadLibraryA(const char *n)
 {
     void *h = w32_lib_handle(n);
+    if (!h) h = w32_load_real(n);
     PLOG("  [win] LoadLibraryA(\"%s\") -> %p\n", n ? n : "?", h);
     return h;
 }
@@ -685,6 +718,7 @@ static MS void *st_LoadLibraryW(const uint16_t *n)
     void *h;
     w2c(n, b, sizeof b);
     h = w32_lib_handle(b);
+    if (!h) h = w32_load_real(b);
     PLOG("  [win] LoadLibraryW(\"%s\") -> %p\n", b, h);
     return h;
 }
@@ -695,7 +729,17 @@ static MS void *st_LoadLibraryExW(const uint16_t *n, void *hf, uint32_t f)
     (void)hf; (void)f;
     w2c(n, b, sizeof b);
     h = w32_lib_handle(b);
+    if (!h) h = w32_load_real(b);
     PLOG("  [win] LoadLibraryExW(\"%s\") -> %p\n", b, h);
+    return h;
+}
+static MS void *st_LoadLibraryExA(const char *n, void *hf, uint32_t f)
+{
+    void *h;
+    (void)hf; (void)f;
+    h = w32_lib_handle(n);
+    if (!h) h = w32_load_real(n);
+    PLOG("  [win] LoadLibraryExA(\"%s\") -> %p\n", n ? n : "?", h);
     return h;
 }
 static MS int32_t st_FreeLibrary(void *h) { (void)h; return 1; }
@@ -707,6 +751,14 @@ static MS void *st_GetProcAddress(void *h, const char *n)
         return (void *)st_DWriteCreateFactory;
     }
 #endif
+    /* A handle this host mapped itself answers from its own exports first: the
+     * module really does define these, and a same-named stub would shadow the
+     * genuine one. A miss falls through rather than returning -- the handle may
+     * simply not be one of ours, and the name search below still has to run. */
+    if (n && h && h != H_DWRITE && w32_dll_index(h) < 0 && g_real_sym) {
+        void *fn = g_real_sym(h, n);
+        if (fn) { PLOG("  [win] GetProcAddress(\"%s\") -> real\n", n); return fn; }
+    }
     if (n) {
         int d = w32_dll_index(h);
         void *fn = NULL;
@@ -3186,8 +3238,6 @@ static MS void *st___RTDynamicCast(void *inptr, int32_t VfDelta,
     if (isReference)
         fprintf(stderr, "[win] dynamic_cast to %s failed on a reference; "
                         "std::bad_cast cannot be thrown from here\n", want);
-    PLOG("  [win] dynamic_cast to %s -> no match among %u base(s)\n",
-         want, (unsigned)h->numBaseClasses);
     return NULL;
 }
 
@@ -6414,7 +6464,8 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", FindCloseChangeNotification),
     S("kernel32.dll", GetModuleFileNameA), S("kernel32.dll", GetModuleFileNameW),
     S("kernel32.dll", LoadLibraryA), S("kernel32.dll", LoadLibraryW),
-    S("kernel32.dll", LoadLibraryExW), S("kernel32.dll", FreeLibrary),
+    S("kernel32.dll", LoadLibraryExW), S("kernel32.dll", LoadLibraryExA),
+    S("kernel32.dll", FreeLibrary),
     S("kernel32.dll", GetProcAddress), S("kernel32.dll", DisableThreadLibraryCalls),
     S("kernel32.dll", GetCommandLineA), S("kernel32.dll", GetCommandLineW),
     S("kernel32.dll", GetEnvironmentStringsW), S("kernel32.dll", FreeEnvironmentStringsW),
