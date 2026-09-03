@@ -610,6 +610,29 @@ static MS int32_t st_GetClientRect(void *hwnd, W32RECT *r)
     r->bottom = w ? w->h : 0;
     return 1;
 }
+/* GetWindowInfo. The whole structure, not a return code: a caller reads
+ * rcClient out of it and never looks at what the call returned. */
+static MS int32_t st_GetWindowInfo(void *hwnd, void *pwi)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    uint8_t *p = pwi;
+    W32RECT rc;
+    if (!p) return 0;
+    /* cbSize at 0, rcWindow at 4, rcClient at 20, dwStyle 36, dwExStyle 40,
+     * dwWindowStatus 44, cxWindowBorders 48, cyWindowBorders 52,
+     * atomWindowType 56, wCreatorVersion 58. Sixty bytes, both widths. */
+    memset(p + 4, 0, 56);
+    st_GetWindowRect(hwnd, &rc);
+    memcpy(p + 4, &rc, sizeof rc);
+    rc.left = rc.top = 0;
+    rc.right  = w ? w->w : 0;
+    rc.bottom = w ? w->h : 0;
+    memcpy(p + 20, &rc, sizeof rc);
+    *(uint32_t *)(p + 44) = 1;              /* WS_ACTIVECAPTION */
+    *(uint16_t *)(p + 58) = 0x0500;
+    return 1;
+}
+
 static MS void *st_GetParent(void *hwnd)
 {
     w32_wnd *w = w32_wget(hwnd);

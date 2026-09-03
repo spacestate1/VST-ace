@@ -409,6 +409,18 @@ static uint64_t stub_failure_value(const char *dll, const char *sym)
             if (!strcasecmp(g_failvals[i].dll, "msvcrt.dll") &&
                 !strcmp(g_failvals[i].sym, sym))
                 return g_failvals[i].val;
+    /* GDI+ spells success as 0, which is what a stub returns by default -- so
+     * every unimplemented GDI+ call was reporting that it had worked. A
+     * plug-in drawing its interface that way is told each step succeeded,
+     * takes the handle it was never given, and faults on it much later.
+     *
+     * GenericError instead, for the whole library at once: there are ninety-six
+     * entry points in this corpus alone and none of them are implemented, so
+     * the rule is the library rather than the function. A caller that checks
+     * takes its own failure path, which is the outcome that leaves the plug-in
+     * running. */
+    if (!strncasecmp(dll, "gdiplus", 7)) return 1;         /* Gdiplus::GenericError */
+
     if (ntdll_status_call(dll, sym)) return FV_STATUS;
     return 0;
 }
@@ -876,6 +888,13 @@ static void *pehost_dll_symbol(void *module, const char *name)
     return NULL;
 }
 
+/* Set when the loaded image imports GDI+. There are ninety-six entry points
+ * in it across this corpus and none are implemented, so an editor drawn that
+ * way cannot come up -- and finding that out by opening it costs the whole
+ * plug-in, audio included, because the drawing code does not check the status
+ * it is handed and faults on a handle it never received. */
+static int g_image_wants_gdiplus;
+
 /* Names the C++ runtime a plug-in needed and could not have, for the caller to
  * report. Empty when nothing was missing. */
 static char g_missing_real[64];
@@ -891,6 +910,10 @@ static int resolve_imports(image *im)
     if (!d.VirtualAddress) return 0;
     for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
         const char *dll = rva(im, desc->Name);
+        /* Noted while the names are already in hand: a plug-in that draws with
+         * GDI+ cannot have a working editor here, and the editor path checks
+         * this rather than finding out by dying. */
+        if (!strncasecmp(dll, "gdiplus", 7)) g_image_wants_gdiplus = 1;
         uint64_t *lookup = rva(im, desc->OriginalFirstThunk ? desc->OriginalFirstThunk
                                                             : desc->FirstThunk);
         uint64_t *iat = rva(im, desc->FirstThunk);
@@ -3468,6 +3491,20 @@ void pehost_render_io(pehost *h, const float *src, float *inter, int frames)
 
 int pehost_editor_kind(pehost *h)
 {
+    /* Refused before it is attempted. Saying "no editor" costs a window the
+     * plug-in could not have drawn anyway; opening it costs the plug-in. */
+    if (h && g_image_wants_gdiplus) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "editor: this plug-in draws with GDI+, which is not "
+                            "implemented here -- reporting no editor rather than "
+                            "opening one that would take the plug-in down with "
+                            "it. Audio is unaffected.\n");
+        }
+        return PEHOST_EDITOR_NONE;
+    }
+
     /* A Classic editor draws into a GWorld -- guest memory -- so what comes
      * back is pixels, the same as a Windows editor. */
     if (h && h->cl) return (pefvst_flags(h->cl) & PV_FLAG_HAS_EDITOR)

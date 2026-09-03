@@ -4892,6 +4892,30 @@ static MS void *st_FindWindowW(const uint16_t *cls, const uint16_t *name)
 static MS void *st_FindWindowExW(void *p, void *c, const uint16_t *cls, const uint16_t *nm)
 { (void)p;(void)c;(void)cls;(void)nm; return NULL; }
 
+/* GDI+ startup, answering honestly.
+ *
+ * There is no GDI+ here -- a plug-in that draws with it needs ninety-odd
+ * entry points, paths and text and image transforms among them, and none of
+ * them exist. The danger is that GDI+ spells success as 0, which is exactly
+ * what the generic stub returns, so a plug-in was told GDI+ had started and
+ * then spun waiting for a subsystem that was never going to answer. Clicking
+ * the editor tab hung the plug-in and, with it, the audio.
+ *
+ * GenericError instead. A caller that checks the status takes its own failure
+ * path -- usually falling back to another renderer, or declining to build an
+ * editor at all -- which is a far better outcome than a hang, and an honest
+ * description of the situation. */
+static MS int32_t st_GdiplusStartup(void *token, const void *input, void *output)
+{
+    (void)input; (void)output;
+    if (token) *(uintptr_t *)token = 0;
+    fprintf(stderr, "[win] GdiplusStartup: GDI+ is not implemented here, "
+                    "reporting failure rather than letting the caller wait "
+                    "for it\n");
+    return 1;                                  /* Gdiplus::GenericError */
+}
+static MS void st_GdiplusShutdown(uintptr_t token) { (void)token; }
+
 /* GetDeviceCaps.
  *
  * A stub answering 0 to everything is not neutral here. LOGPIXELSX is how a
@@ -6232,6 +6256,7 @@ static const winstub g_stubs[] = {
 #ifndef PELOAD_NO_GUI_LAYER
     { "ole32.dll", "CoCreateInstance", (void *)st_CoCreateInstance },
 #endif
+    S("gdiplus.dll", GdiplusStartup), S("gdiplus.dll", GdiplusShutdown),
     S("gdi32.dll", GetDeviceCaps),
     S("gdi32.dll", SetDIBitsToDevice), S("gdi32.dll", GetClipBox),
     S("gdi32.dll", GdiFlush),
@@ -6629,6 +6654,7 @@ static const winstub g_stubs[] = {
     S("user32.dll", DestroyWindow), S("user32.dll", ShowWindow),
     S("user32.dll", SetWindowPos), S("user32.dll", MoveWindow),
     S("user32.dll", GetWindowRect), S("user32.dll", GetClientRect),
+    S("user32.dll", GetWindowInfo),
     S("user32.dll", GetParent), S("user32.dll", GetAncestor),
     S("user32.dll", GetClassNameA), S("user32.dll", GetClassNameW),
     S("user32.dll", SetWindowTextA), S("user32.dll", SetWindowTextW),
