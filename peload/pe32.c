@@ -720,6 +720,63 @@ static realdll *real_dll_get(const char *dll)
     return r;
 }
 
+/* LoadLibrary, for a DLL that is genuinely on disk.
+ *
+ * The same job as the 64-bit side's, and kept apart from the runtime table
+ * above: that one is keyed by bare DLL name and searched for in runtime32/,
+ * while this is a full path a plug-in handed over. SynthEdit's .sem modules
+ * arrive this way -- ordinary PE DLLs under another extension, loaded by the
+ * plug-in as it builds its DSP graph.
+ *
+ * A module asked for twice is mapped once and keeps the same handle, which is
+ * what a caller comparing handles expects. */
+#define MAX_LOADED32 64
+static struct { char path[1024]; image32 im; } g_loaded32[MAX_LOADED32];
+static int g_nloaded32;
+
+static void *pe32_load_dll(const char *path)
+{
+    image32 *im;
+    int i;
+
+    for (i = 0; i < g_nloaded32; i++)
+        if (!strcmp(g_loaded32[i].path, path)) return g_loaded32[i].im.base;
+    if (g_nloaded32 >= MAX_LOADED32) return NULL;
+
+    im = &g_loaded32[g_nloaded32].im;
+    if (map_image(im, path) != 0) return NULL;
+    if (apply_relocs(im) < 0) {
+        munmap(im->base, im->size); im->base = NULL; return NULL;
+    }
+    resolve_imports(im);
+    protect_sections(im);
+    /* DllMain, for the same reason the runtime loader above calls it: static
+     * constructors run here, and a module whose objects were never built is
+     * worse than one that failed to load. */
+    if (im->opt->AddressOfEntryPoint) {
+        int32_t WINAPI_ (*dllmain)(void *, uint32_t, void *) =
+            (int32_t WINAPI_ (*)(void *, uint32_t, void *))
+            (im->base + im->opt->AddressOfEntryPoint);
+        dllmain(im->base, 1, NULL);
+    }
+    snprintf(g_loaded32[g_nloaded32].path, sizeof g_loaded32[g_nloaded32].path,
+             "%s", path);
+    PLOG("  [win] loaded %s\n", path);
+    return g_loaded32[g_nloaded32++].im.base;
+}
+
+static void *pe32_dll_symbol(void *base, const char *name)
+{
+    int i;
+    /* By name only, as real_dll_export is: resolving an ordinal would mean
+     * walking the export table's ordinal base rather than its name array. */
+    if (!name || !strncmp(name, "ordinal#", 8)) return NULL;
+    for (i = 0; i < g_nloaded32; i++)
+        if (g_loaded32[i].im.base == base)
+            return find_export(&g_loaded32[i].im, name);
+    return NULL;
+}
+
 static void *real_dll_export(const char *dll, const char *sym)
 {
     realdll *r = real_dll_get(dll);
@@ -983,6 +1040,8 @@ int main(int argc, char **argv)
      * SynthEdit reads its .sem modules that way -- has no other way to find
      * out where it is. */
     winstubs_set_image_path(path);
+    /* And how to load a DLL that is not one of the shimmed system ones. */
+    winstubs_set_loader(pe32_load_dll, pe32_dll_symbol);
     if (apply_relocs(&im) < 0) {
         if (serve_fd >= 0) serve_report_fail(serve_fd, "relocation failed");
         return 1;
