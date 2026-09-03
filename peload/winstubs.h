@@ -291,24 +291,83 @@ static size_t w32_heap_peek(const void *p)
     return (size_t)-1;
 }
 
+/* PELOAD_GUARD_HEAP: put every plug-in allocation against an unmapped page.
+ *
+ * The checked heap above stops a bad free from corrupting anything. It does
+ * nothing about the other direction -- a plug-in writing past the end of a
+ * block it legitimately owns -- and that is the harder failure, because the
+ * damage lands in whatever the allocator handed out next. It cost a long chase
+ * here: an MFC editor faulting inside its own CMapPtrToPtr::Lookup on a bucket
+ * array full of small integers, with nothing to say who had written them.
+ *
+ * With this set, a block ends exactly at a page boundary and the page after it
+ * is PROT_NONE, so the overrunning store faults on the instruction that makes
+ * it. The guest's address minus the image base is an RVA, which is a question
+ * Ghidra can answer.
+ *
+ * A page and some rounding per allocation, so this is a diagnostic and not a
+ * default. The offset from the mapping to the pointer is recomputed from the
+ * recorded size rather than stored in a header, because reading a header means
+ * reading memory in front of a pointer that may not be ours. */
+static int w32_guard_heap(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("PELOAD_GUARD_HEAP"); v = e && *e != '0'; }
+    return v;
+}
+
+#define W32_PAGE 4096u
+
+static size_t w32_guard_pad(size_t n)
+{ return (W32_PAGE - (n % W32_PAGE)) % W32_PAGE; }
+
+static void *w32_guard_alloc(size_t n)
+{
+    size_t pad = w32_guard_pad(n);
+    size_t len = pad + n + W32_PAGE;
+    uint8_t *m = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) return NULL;
+    /* The last page of the mapping is the guard; the block ends where it
+     * begins, so one byte past the block is already unmapped. */
+    if (mprotect(m + pad + n, W32_PAGE, PROT_NONE) != 0) {
+        munmap(m, len);
+        return NULL;
+    }
+    return m + pad;
+}
+
+static void w32_guard_free(void *p, size_t n)
+{
+    size_t pad = w32_guard_pad(n);
+    munmap((uint8_t *)p - pad, pad + n + W32_PAGE);
+}
+
 static void *w32_alloc(size_t n, int zero)
 {
     void *p;
     if (!n) n = 1;
-    if (!(p = zero ? calloc(1, n) : malloc(n))) return NULL;
+    if (w32_guard_heap()) {
+        if (!(p = w32_guard_alloc(n))) return NULL;   /* mmap is already zero */
+        (void)zero;
+    } else if (!(p = zero ? calloc(1, n) : malloc(n))) {
+        return NULL;
+    }
     w32_heap_note(p, n);
     return p;
 }
 
 static void w32_free(void *p)
 {
+    size_t n;
     if (!p) return;                               /* free(NULL) is a no-op */
-    if (w32_heap_take(p) == (size_t)-1) {
+    if ((n = w32_heap_take(p)) == (size_t)-1) {
         g_alloc_foreign++;
         PLOG("  [heap] refused a free of %p: not an allocation of ours\n", p);
         return;
     }
-    free(p);
+    if (w32_guard_heap()) w32_guard_free(p, n);
+    else free(p);
 }
 
 static void *w32_realloc(void *p, size_t n, int zero)
@@ -323,6 +382,18 @@ static void *w32_realloc(void *p, size_t n, int zero)
         return NULL;
     }
     if (!n) n = 1;
+    if (w32_guard_heap()) {
+        /* No realloc against a guard page: a fresh mapping, a copy, and the old
+         * one unmapped, so the block keeps ending where the guard begins. */
+        if (!(fresh = w32_guard_alloc(n))) {
+            w32_heap_note(p, was);
+            return NULL;
+        }
+        memcpy(fresh, p, was < n ? was : n);
+        w32_guard_free(p, was);
+        w32_heap_note(fresh, n);
+        return fresh;
+    }
     if (!(fresh = realloc(p, n))) {
         w32_heap_note(p, was);                    /* still live: put it back */
         return NULL;

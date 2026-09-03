@@ -514,12 +514,26 @@ static w32_surf *w32_source_in(w32_dc *d, w32_surf *tmp)
     return w32_target_in_raw(d, tmp);
 }
 
+/* A window's pixels. Under PELOAD_GUARD_HEAP these sit against an unmapped page
+ * like every plug-in allocation does -- a surface is one of the few host buffers
+ * a plug-in is handed a pointer into, so it is one of the few a plug-in can run
+ * off the end of, and finding that by watching which free() aborts is the slow
+ * way round. */
+static void w32_surf_free(w32_surf *s)
+{
+    if (!s || !s->px) return;
+    if (w32_guard_heap()) w32_guard_free(s->px, (size_t)s->w * s->h * 4);
+    else free(s->px);
+    s->px = NULL;
+}
+
 static void w32_surf_size(w32_surf *s, int w, int h)
 {
     if (w <= 0 || h <= 0) return;
     if (s->w == w && s->h == h && s->px) return;
-    free(s->px);
-    s->px = calloc((size_t)w * h, 4);
+    w32_surf_free(s);
+    s->px = w32_guard_heap() ? (uint32_t *)w32_guard_alloc((size_t)w * h * 4)
+                             : (uint32_t *)calloc((size_t)w * h, 4);
     s->w = s->px ? w : 0;
     s->h = s->px ? h : 0;
 }
@@ -932,7 +946,7 @@ static MS int32_t st_DestroyWindow(void *hwnd)
     if (!w) return 0;
     w32_call(w, WM_DESTROY, 0, 0);
     i = (int)(w - W.wnd);
-    free(w->surf.px);
+    w32_surf_free(&w->surf);
     memset(w, 0, sizeof *w);
     if (W.display == i) W.display = 0;
     if (W.host == i) W.host = 0;
@@ -3047,7 +3061,7 @@ void w32_reset(void)
     int i;
     for (i = 1; i < W32_MAX_WND; i++) {
         if (!W.wnd[i].used) continue;
-        free(W.wnd[i].surf.px);
+        w32_surf_free(&W.wnd[i].surf);
         memset(&W.wnd[i], 0, sizeof W.wnd[i]);
     }
     for (i = 1; i < W32_MAX_OBJ; i++) {
