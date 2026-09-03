@@ -8414,6 +8414,8 @@ static const win32_arity g_win32_arity[] = {
     { "SetCaretBlinkTime", 4 },
     { "SetCaretPos", 8 },
     { "SetClassLongA", 12 },
+    { "SetClassLongPtrA", 12 },
+    { "SetClassLongPtrW", 12 },
     { "SetClassLongW", 12 },
     { "SetClassWord", 12 },
     { "SetClientTimeZoneInformation", 4 },

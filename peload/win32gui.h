@@ -3644,6 +3644,52 @@ static MS void *st_SetCapture(void *hwnd)
     W.capture = w ? (int)(w - W.wnd) : 0;
     return prev;
 }
+static int w32_child_at(int wnd, int *x, int *y);          /* below */
+
+/* Which window is under a point. The editor picture is this host's whole
+ * screen, so a screen point and a client point of the root are the same thing.
+ * A plug-in that hit-tests its own panel this way got zero from the stub and
+ * concluded the pointer was over nothing. */
+static MS void *st_WindowFromPoint(W32POINT pt)
+{
+    int root = (W.host && W.wnd[W.host].used) ? W.host
+             : (W.display && W.wnd[W.display].used) ? W.display : 0;
+    int x = pt.x, y = pt.y, hit;
+    if (!root) return NULL;
+    hit = w32_child_at(root, &x, &y);
+    return hit ? w32_h(W32_HWND_BASE, hit) : NULL;
+}
+/* The immediate child of a parent that contains a point given in the parent's
+ * client coordinates -- the parent itself when none does. */
+static MS void *st_ChildWindowFromPoint(void *parent, W32POINT pt)
+{
+    w32_wnd *p = w32_wget(parent);
+    int i, pi;
+    if (!p) return NULL;
+    pi = (int)(p - W.wnd);
+    for (i = W32_MAX_WND - 1; i >= 1; i--) {
+        w32_wnd *c = &W.wnd[i];
+        if (!c->used || c->parent != pi || !c->visible) continue;
+        if (pt.x < c->x || pt.x >= c->x + c->w) continue;
+        if (pt.y < c->y || pt.y >= c->y + c->h) continue;
+        return w32_h(W32_HWND_BASE, i);
+    }
+    return parent;
+}
+static MS void *st_ChildWindowFromPointEx(void *parent, W32POINT pt, uint32_t flags)
+{ (void)flags; return st_ChildWindowFromPoint(parent, pt); }
+/* SetClassLongPtr keeps no per-class state here beyond what RegisterClass
+ * recorded, and every caller in the corpus uses it to swap a cursor or an
+ * icon; reporting the previous value as none is what a fresh class holds. */
+static MS W_LRESULT st_SetClassLongPtrW(void *hwnd, int32_t index, W_LRESULT v)
+{ (void)hwnd; (void)index; (void)v; return 0; }
+static MS W_LRESULT st_SetClassLongPtrA(void *hwnd, int32_t index, W_LRESULT v)
+{ return st_SetClassLongPtrW(hwnd, index, v); }
+static MS uint32_t st_SetClassLongW(void *hwnd, int32_t index, uint32_t v)
+{ (void)hwnd; (void)index; (void)v; return 0; }
+static MS uint32_t st_SetClassLongA(void *hwnd, int32_t index, uint32_t v)
+{ return st_SetClassLongW(hwnd, index, v); }
+
 static MS int32_t st_ReleaseCapture(void) { W.capture = 0; return 1; }
 static MS void *st_GetCapture(void)
 { return W.capture ? w32_h(W32_HWND_BASE, W.capture) : NULL; }
@@ -4060,12 +4106,85 @@ void w32_reset(void)
     dw_reset();
 }
 
+/* Windows hands the mouse to the deepest child window under the pointer, in
+ * that child's own client coordinates -- and to the capture window alone once
+ * one is held. Delivering everything to the plug-in's top-level window instead
+ * meant an editor whose controls live on a child saw nothing at all: a VSTGUI
+ * wrapper around a GMPI panel, which is how SynthEdit builds one, painted
+ * perfectly and ignored every click. The window under the pointer is also what
+ * WindowFromPoint answers, and a plug-in that asks got zero.
+ *
+ * The walk keeps the last window that has a WndProc, because a container with
+ * none cannot be a target: the message would go nowhere rather than to the
+ * parent that would have handled it. */
+static int w32_child_at(int wnd, int *x, int *y)
+{
+    int best = wnd, bx = *x, by = *y, stepped = 1;
+    while (stepped) {
+        int i;
+        stepped = 0;
+        for (i = W32_MAX_WND - 1; i >= 1; i--) {          /* last created is on top */
+            w32_wnd *c = &W.wnd[i];
+            if (!c->used || c->parent != wnd || !c->visible) continue;
+            if (*x < c->x || *x >= c->x + c->w) continue;
+            if (*y < c->y || *y >= c->y + c->h) continue;
+            *x -= c->x;
+            *y -= c->y;
+            wnd = i;
+            stepped = 1;
+            if (c->wndproc) { best = i; bx = *x; by = *y; }
+            break;
+        }
+    }
+    *x = bx;
+    *y = by;
+    return best;
+}
+/* A window's client origin, relative to the root the host's coordinates are in. */
+static void w32_origin_of(int i, int root, int *ox, int *oy)
+{
+    int x = 0, y = 0;
+    while (i > 0 && i != root && W.wnd[i].used) {
+        x += W.wnd[i].x;
+        y += W.wnd[i].y;
+        i = W.wnd[i].parent;
+    }
+    *ox = x;
+    *oy = y;
+}
+
 void w32_mouse(int x, int y, int msg, int buttons, int wheel)
 {
     w32_wnd *w;
-    int target = W.capture ? W.capture : (W.display ? W.display : W.host);
+    int root = (W.host && W.wnd[W.host].used) ? W.host
+             : (W.display && W.wnd[W.display].used) ? W.display : 0;
+    int target;
+    int cx = x, cy = y;
+
+    if (!root) return;
+    if (W.capture && W.wnd[W.capture].used) {
+        int ox, oy;
+        w32_origin_of(W.capture, root, &ox, &oy);
+        target = W.capture;
+        cx = x - ox;
+        cy = y - oy;
+    } else {
+        target = w32_child_at(root, &cx, &cy);
+        if (!W.wnd[target].wndproc && W.display && W.wnd[W.display].used) {
+            int ox, oy;
+            w32_origin_of(W.display, root, &ox, &oy);
+            target = W.display;
+            cx = x - ox;
+            cy = y - oy;
+        }
+    }
     if (!target || !W.wnd[target].used) return;
     w = &W.wnd[target];
+    PLOG("  [w32] mouse msg 0x%x at %d,%d -> wnd #%d cls='%s' local %d,%d%s\n",
+         (unsigned)msg, x, y, target, w->cls, cx, cy,
+         W.capture ? " (captured)" : "");
+    x = cx;
+    y = cy;
     W.mouse_x = x; W.mouse_y = y;
     /* Record the buttons as key state too. Not every GUI reads the mouse from
      * messages: TAL's polls GetAsyncKeyState(VK_LBUTTON) with GetCursorPos on

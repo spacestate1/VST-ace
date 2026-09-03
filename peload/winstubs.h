@@ -9579,6 +9579,10 @@ static const winstub g_stubs[] = {
     S("user32.dll", FillRect), S("user32.dll", DrawTextA),
     /* user32: input */
     S("user32.dll", SetCapture), S("user32.dll", ReleaseCapture), S("user32.dll", GetCapture),
+    S("user32.dll", WindowFromPoint), S("user32.dll", ChildWindowFromPoint),
+    S("user32.dll", ChildWindowFromPointEx),
+    S("user32.dll", SetClassLongPtrW), S("user32.dll", SetClassLongPtrA),
+    S("user32.dll", SetClassLongW), S("user32.dll", SetClassLongA),
     S("user32.dll", SetFocus), S("user32.dll", GetCursorPos), S("user32.dll", SetCursorPos),
     S("user32.dll", SetCursor), S("user32.dll", GetCursor), S("user32.dll", LoadCursorA),
     S("user32.dll", ShowCursor), S("user32.dll", GetKeyState), S("user32.dll", GetAsyncKeyState),

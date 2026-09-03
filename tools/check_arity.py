@@ -29,8 +29,12 @@ def real_arities():
             out.setdefault(m.group(1), None)
     return out
 
-# argument sizes as pushed on the i386 stack
-EIGHT = ('uint64_t', 'int64_t', 'double', 'long long')
+# argument sizes as pushed on the i386 stack. W32POINT is there because a POINT
+# is passed *by value* to WindowFromPoint and ChildWindowFromPoint -- two dwords
+# on i386, and one register on x86-64, which is why it cannot be spelled as two
+# int parameters instead. The pointer test above this runs first, so a
+# W32POINT * still counts as four.
+EIGHT = ('uint64_t', 'int64_t', 'double', 'long long', 'W32POINT')
 def argbytes(arglist):
     a = arglist.strip()
     if a in ('', 'void'):
