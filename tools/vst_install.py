@@ -15,8 +15,8 @@ What it handles, and what it does not:
                 OriginalFilename in its own version resource.
   .exe (NSIS)   yes, through 7z.
   .zip .7z      yes.
-  .exe (Inno)   no. 7z cannot read them and this reports that rather than
-                leaving an empty directory behind. innoextract does read them.
+  .exe (Inno)   only with innoextract installed, which this calls when it is
+                there and names when it is not. 7z cannot read them.
 
 A DLL is only treated as a plug-in if it exports a VST entry point, which keeps
 an installer's own helper DLLs out of the results.
@@ -89,10 +89,23 @@ VST_ENTRIES = {'VSTPluginMain', 'main', 'main_macho', 'GetPluginFactory',
                'InitDll', 'VSTPluginMain@12'}
 
 
+# Formats this host does not load, however VST-shaped their exports look. An
+# AAX plug-in is a Pro Tools binary that a wrapper often builds from the same
+# sources, so it exports VSTPluginMain and passed the test below -- and then
+# four of them were installed as plug-ins that nothing can open.
+NOT_OURS = ('.aaxplugin', '.aax', '.component', '.clap', '.lv2')
+
+
 def looks_like_plugin(path, exports):
+    if path.lower().endswith(NOT_OURS):
+        return False
     if path.lower().endswith('.vst3'):
         return True
     return bool(exports & VST_ENTRIES)
+
+
+def have(prog):
+    return shutil.which(prog) is not None
 
 
 def installer_kind(path):
@@ -108,13 +121,115 @@ def installer_kind(path):
         return 'inno'
     if b'Nullsoft' in head or b'NSIS' in head:
         return 'nsis'
+    # Neither marker in the first 400 KB, which does not mean it is neither.
+    # ChowMultiTool is Inno Setup 6 and its marker sits at byte 751888 -- past
+    # the window, so it was handed to 7z, which cheerfully "extracted" the PE
+    # into its own sections (.text, .rsrc_1, CERTIFICATE) and reported success.
+    # An installer that unpacks to nothing but section names is the shape of
+    # that mistake. Asking innoextract is authoritative and costs one process
+    # on the handful of files that get this far.
+    if have('innoextract'):
+        r = subprocess.run(['innoextract', '-l', '-s', path],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return 'inno'
     return 'exe'
 
 
-def extract(path, into):
+# Installer scaffolding, which is not part of the plug-in: NSIS unpacks its own
+# helpers into $PLUGINSDIR, and 7z surfaces an MSI's database streams under
+# names beginning with "!".
+def is_scaffold(rel):
+    parts = rel.replace('\\', '/').split('/')
+    for q in parts:
+        if q.startswith('$') or q.startswith('!'):
+            return True
+        if q.lower().startswith('uninst'):
+            return True
+    return False
+
+
+def copy_companions(srcdir, outdir, already):
+    """Everything beside the plug-in, in the layout it shipped in.
+
+    A plug-in is often not one file. Maize Sampler instruments keep their
+    samples in `<name>.instruments/<name>.mse` next to the DLL, and without it
+    the plug-in loads, reports no parameters and draws an empty editor -- which
+    looks exactly like a host bug and is not one. Copying only the PE threw all
+    of that away.
+    """
+    n = 0
+    for root, _dirs, files in os.walk(srcdir):
+        for f in files:
+            src = os.path.join(root, f)
+            rel = os.path.relpath(src, srcdir)
+            if src in already or is_scaffold(rel):
+                continue
+            dst = os.path.join(outdir, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            n += 1
+    return n
+
+
+def extract(path, into, kind):
+    """7z reads MSI, NSIS and the plain archives; Inno Setup needs its own."""
+    if kind == 'inno':
+        if not have('innoextract'):
+            return False
+        r = subprocess.run(['innoextract', '-e', '-s', '-d', into, path],
+                           capture_output=True, text=True)
+        return r.returncode == 0
     r = subprocess.run(['7z', 'x', '-y', '-o' + into, path],
                        capture_output=True, text=True)
     return r.returncode == 0
+
+
+# How deep to chase an installer inside an installer. Two is enough for
+# everything seen: a zip holding a setup.exe, and that setup's own payload.
+NEST_MAX = 2
+
+
+def unpack(path, into, depth=0):
+    """Extract `path` into `into`, following any installer it turns out to hold.
+
+    Half these downloads are a zip with a setup.exe inside it -- Graillon,
+    Lokomotiv and the Ignite bundle all are -- and extracting one step leaves an
+    installer where a plug-in was wanted, which reads as "no VST entry point in
+    anything it contained". Each nested installer is unpacked beside itself, so
+    a caller still walks one tree.
+    """
+    kind = installer_kind(path)
+    if kind == 'unreadable':
+        return False
+    if kind == 'inno' and not have('innoextract'):
+        return False
+    if not extract(path, into, kind):
+        return False
+    if depth >= NEST_MAX:
+        return True
+    # The tree is listed before anything is added to it: the loop below creates
+    # directories inside `into`, and walking it live would descend into what it
+    # had just written.
+    candidates = []
+    for root, _dirs, files in os.walk(into):
+        for f in files:
+            if f.lower().endswith(('.exe', '.msi')):
+                candidates.append(os.path.join(root, f))
+    for inner in candidates:
+            root, f = os.path.split(inner)
+            # Only if it is an installer in its own right; a plug-in's own
+            # helper .exe is not, and unpacking it would scatter its sections.
+            k = installer_kind(inner)
+            if k == 'exe' or k == 'unreadable':
+                continue
+            sub = os.path.join(root, '_nested_' + os.path.splitext(f)[0])
+            try:
+                os.makedirs(sub, exist_ok=True)
+                unpack(inner, sub, depth + 1)
+            except OSError:
+                pass
+    return True
 
 
 def main():
@@ -131,19 +246,22 @@ def main():
     for inst in a.installers:
         kind = installer_kind(inst)
         name = os.path.splitext(os.path.basename(inst))[0]
-        if kind == 'inno':
-            skipped.append((inst, 'Inno Setup -- 7z cannot read it; innoextract can'))
+        if kind == 'inno' and not have('innoextract'):
+            skipped.append((inst, 'Inno Setup -- install innoextract to read it '
+                                  '(pacman -S innoextract)'))
             continue
         if kind == 'unreadable':
             skipped.append((inst, 'unreadable'))
             continue
         tmp = tempfile.mkdtemp(prefix='vstinst-')
         try:
-            if not extract(inst, tmp):
-                skipped.append((inst, '7z could not extract it'))
+            if not unpack(inst, tmp):
+                skipped.append((inst, 'nothing could extract it'))
                 continue
             out = os.path.join(a.dest, name)
             found = 0
+            copied = set()
+            plugin_dirs = []
             for root, _dirs, files in os.walk(tmp):
                 for f in files:
                     p = os.path.join(root, f)
@@ -157,11 +275,32 @@ def main():
                     target = f if '.' in f else (orig or (f + '.dll'))
                     os.makedirs(out, exist_ok=True)
                     dst = os.path.join(out, target)
+                    # An installer usually carries both builds under one name.
+                    # Copying them both to it left whichever came last, so
+                    # "Marvel GEQ.dll" was installed twice and was only ever one
+                    # of the two -- and which one depended on the walk order.
+                    if os.path.exists(dst):
+                        stem, ext = os.path.splitext(target)
+                        alt = '%s-%s%s' % (stem, '64' if is64 else '32', ext)
+                        if os.path.exists(os.path.join(out, alt)):
+                            continue                  # already have this build
+                        dst = os.path.join(out, alt)
                     shutil.copy2(p, dst)
+                    copied.add(p)
+                    if root not in plugin_dirs:
+                        plugin_dirs.append(root)
                     installed.append((dst, '64' if is64 else '32'))
                     found += 1
             if not found:
                 skipped.append((inst, 'no VST entry point in anything it contained'))
+            else:
+                # The plug-in's own directory, minus the PEs already placed:
+                # data folders, presets, skins, anything it shipped with.
+                extra = 0
+                for d in plugin_dirs:
+                    extra += copy_companions(d, out, copied)
+                if extra:
+                    print('    %s: kept %d companion file(s)' % (name, extra))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
