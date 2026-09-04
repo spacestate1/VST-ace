@@ -7,11 +7,16 @@
  * field or a tag from some later version still loads. */
 #define _GNU_SOURCE
 #include "patch.h"
+#include "vstdirs.h"
 
 #include <ctype.h>
+#include <dirent.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #define KEYMAX 128
 
@@ -462,17 +467,77 @@ badval:
 
 /* Resolve one "pluginPath" against the directory the bank was read from, so a
  * bank kept beside its plugin travels with it. Absolute paths are left alone. */
+/* The plug-in a bank names, when the path it recorded no longer finds it.
+ *
+ * A bank records where the plug-in was, which is right until either of them
+ * moves -- and then every patch in it is unopenable, with nothing to say why
+ * beyond "No such file or directory". Moving this tree out of the corpus it
+ * used to sit inside did exactly that to all sixty-four banks here at once:
+ * they record ../../../windows/VST2-64/<name>, which was correct and is not
+ * any more.
+ *
+ * So a path that does not resolve falls back to the plug-in's own file name,
+ * looked up in the folders this machine is configured to search -- the same
+ * list both windows browse, which is the one answer per machine to "where are
+ * my plug-ins". A bank written on another machine entirely resolves the same
+ * way, which it could not before at all. */
+static int file_exists(const char *p)
+{
+    struct stat st;
+    return p && *p && stat(p, &st) == 0;
+}
+
+static int find_by_name(const char *want, char *out, size_t n)
+{
+    vstdir dirs[VSTDIRS_MAX];
+    int nd, i;
+
+    if (!want || !*want) return 0;
+    nd = vstdirs_load(dirs, VSTDIRS_MAX);
+    for (i = 0; i < nd; i++) {
+        char cand[2048];
+        DIR *d;
+        struct dirent *e;
+        /* Directly in the folder first: the common case, and no walk at all. */
+        snprintf(cand, sizeof cand, "%s/%s", dirs[i].path, want);
+        if (file_exists(cand)) { snprintf(out, n, "%s", cand); return 1; }
+        /* Then one level down, which is where a .vst3 bundle or a per-plug-in
+         * subdirectory puts it. Not deeper: a full walk of a plug-in corpus is
+         * not worth doing on every bank that names a file that moved. */
+        if (!(d = opendir(dirs[i].path))) continue;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            snprintf(cand, sizeof cand, "%s/%s/%s", dirs[i].path, e->d_name, want);
+            if (file_exists(cand)) {
+                snprintf(out, n, "%s", cand);
+                closedir(d);
+                return 1;
+            }
+        }
+        closedir(d);
+    }
+    return 0;
+}
+
 static void resolve_one(char *path, int cap, const char *bank_path)
 {
-    char  dir[1024], joined[2048];
+    char  dir[1024], joined[2048], found[2048];
     char *slash;
+    const char *base;
 
-    if (!path[0] || path[0] == '/') return;
-    snprintf(dir, sizeof dir, "%s", bank_path);
-    if (!(slash = strrchr(dir, '/'))) return;      /* bank is in the cwd */
-    *slash = 0;
-    snprintf(joined, sizeof joined, "%s/%s", dir, path);
-    snprintf(path, (size_t)cap, "%s", joined);
+    if (!path[0]) return;
+    if (path[0] != '/') {
+        snprintf(dir, sizeof dir, "%s", bank_path);
+        if ((slash = strrchr(dir, '/')) != NULL) {
+            *slash = 0;
+            snprintf(joined, sizeof joined, "%s/%s", dir, path);
+            snprintf(path, (size_t)cap, "%s", joined);
+        }
+    }
+    if (file_exists(path)) return;
+    base = strrchr(path, '/');
+    if (find_by_name(base ? base + 1 : path, found, sizeof found))
+        snprintf(path, (size_t)cap, "%s", found);
 }
 
 static void resolve_path(patch_bank *b, const char *bank_path)
@@ -561,6 +626,110 @@ const char *patch_bank_patch_plugin_path(const patch_bank *b, int i)
 {
     if (!b || i < 0 || i >= b->n) return "";
     return b->p[i].path[0] ? b->p[i].path : b->path;
+}
+
+/* ------------------------------------------------------ finding patches ---- */
+
+const char *patch_user_dir(void)
+{
+    static char dir[1024];
+    const char *xdg, *home;
+
+    if (dir[0]) return dir;
+    if ((xdg = getenv("XDG_DATA_HOME")) != NULL && *xdg)
+        snprintf(dir, sizeof dir, "%s/vst-ace/patches", xdg);
+    else if ((home = getenv("HOME")) != NULL && *home)
+        snprintf(dir, sizeof dir, "%s/.local/share/vst-ace/patches", home);
+    else
+        return "";
+    return dir;
+}
+
+const char *patch_user_dir_ensure(void)
+{
+    const char *dir = patch_user_dir();
+    char tmp[1024];
+    size_t i;
+
+    if (!dir || !*dir) return dir;
+    /* Each component in turn, because none of them need exist. Deliberately
+     * not done by patch_user_dir itself: loading a plug-in looks in here, and
+     * merely opening a synth should not create a directory in someone's home.
+     * Saving a patch is the user asking for one, and that is where this is
+     * called from. */
+    snprintf(tmp, sizeof tmp, "%s", dir);
+    for (i = 1; tmp[i]; i++)
+        if (tmp[i] == '/') { tmp[i] = 0; mkdir(tmp, 0755); tmp[i] = '/'; }
+    mkdir(tmp, 0755);
+    return dir;
+}
+
+/* Does this bank belong to that plug-in? */
+static int bank_is_for(const patch_bank *b, const pehost *h, const char *plugin_path)
+{
+    char want[32];
+    const char *id = patch_bank_plugin_id(b);
+    const char *bp = patch_bank_plugin_path(b);
+
+    /* The id is the strong test: it is the plug-in's own, and it survives the
+     * file being moved, renamed or copied to another machine. */
+    if (h && id && *id) {
+        snprintf(want, sizeof want, "0x%08x", (unsigned)pehost_unique_id((pehost *)h));
+        return strcasecmp(id, want) == 0;
+    }
+    /* Failing that, the path it was written for. Compared with realpath so a
+     * bank holding "../installed/x.dll" still matches the file it names. */
+    if (bp && *bp && plugin_path && *plugin_path) {
+        char a[PATH_MAX], c[PATH_MAX];
+        const char *ra = realpath(bp, a), *rc = realpath(plugin_path, c);
+        return ra && rc && strcmp(ra, rc) == 0;
+    }
+    return 0;                       /* claims nothing, so it claims nobody */
+}
+
+static int find_in_dir(const char *dir, const pehost *h, const char *plugin_path,
+                       char (*out)[1024], int max, int n)
+{
+    DIR *d;
+    struct dirent *e;
+
+    if (!dir || !*dir || !(d = opendir(dir))) return n;
+    while (n < max && (e = readdir(d)) != NULL) {
+        char full[1024], err[128];
+        size_t len = strlen(e->d_name);
+        patch_bank *b;
+        int dup = 0, i;
+        if (len < 6 || strcasecmp(e->d_name + len - 5, ".json")) continue;
+        snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
+        for (i = 0; i < n; i++) if (!strcmp(out[i], full)) { dup = 1; break; }
+        if (dup) continue;
+        if (!(b = patch_bank_read(full, err, sizeof err))) continue;
+        if (bank_is_for(b, h, plugin_path))
+            snprintf(out[n++], sizeof out[0], "%s", full);
+        patch_bank_free(b);
+    }
+    closedir(d);
+    return n;
+}
+
+int patch_find_for(const pehost *h, const char *plugin_path,
+                   char (*out)[1024], int max)
+{
+    int n = 0;
+
+    if (!out || max <= 0) return 0;
+    n = find_in_dir(patch_user_dir(), h, plugin_path, out, max, n);
+    /* And beside the plug-in, which is where a patch that shipped with one, or
+     * one saved deliberately next to it, would be. */
+    if (plugin_path && *plugin_path) {
+        char dir[1024], *slash;
+        snprintf(dir, sizeof dir, "%s", plugin_path);
+        if ((slash = strrchr(dir, '/')) != NULL) {
+            *slash = 0;
+            n = find_in_dir(dir, h, plugin_path, out, max, n);
+        }
+    }
+    return n;
 }
 
 int patch_bank_is_multi_plugin(const patch_bank *b)

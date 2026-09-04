@@ -43,10 +43,30 @@ void plugview_scan(const char *dir);
 void plugview_open_vst(GtkWindow *parent);
 void plugview_load_folder(GtkWindow *parent);
 
+/* File > Save Patch / Open Patch: the plug-in's current parameters written as
+ * JSON, and read back. The plug-in's own programs are its factory presets and
+ * cannot be written to; this is where a sound somebody made goes. Same format
+ * and same files as `va peload --save-patch` and `--patch`, and as pestudio.
+ *
+ * Opening a file holding several patches applies the first -- pestudio lists
+ * them all, which is the one place the two windows differ, because this one has
+ * no list to put them in. */
+void plugview_save_patch(GtkWindow *parent);
+void plugview_load_patch(GtkWindow *parent);
+
 /* Settings > Plug-in Folders: the folders searched for plug-ins, each under
  * the platform it holds. Persisted, and shared with pestudio -- one answer per
  * machine to "where are my plug-ins", not one per window. See vstdirs.h. */
 void plugview_edit_folders(GtkWindow *parent);
+
+/* Settings > Enter Key / Serial: type a registration key into the editor of
+ * whatever is loaded. Some plug-ins do nothing until something has been typed
+ * into them -- daHornet keeps a registration panel over its own interface and
+ * makes no sound until its serial number has been entered into an edit box on
+ * it -- and a key is twenty-five characters nobody wants to mistype into a
+ * skinned field with no visible caret. Asks once, then sends it a character at
+ * a time to whatever the editor has focused. */
+void plugview_enter_key(GtkWindow *parent);
 
 /* True when a plug-in is loaded, i.e. when it -- and not an engine -- is what
  * should be heard. Cheap enough for the audio callback. */

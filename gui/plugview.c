@@ -8,6 +8,7 @@
 
 #include "pehost.h"
 #include "vstdirs.h"
+#include "patch.h"
 #include "vst3.h"
 
 /* gdk_x11_display_get_xdisplay and gdk_x11_surface_get_xid are marked
@@ -109,6 +110,9 @@ static struct {
     GtkWidget *list;          /* plug-ins */
     GtkWidget *proglist;      /* the loaded plug-in's programs */
     GtkWidget *paramlist;
+    /* What is open, so a saved patch can name the plug-in it came from and be
+     * opened later without naming it again. */
+    char       loaded_path[1024];
     GtkWidget *paramsw;
     GtkWidget *editor;        /* GtkDrawingArea fed by pehost_editor_pixels */
     GtkWidget *editorsw;
@@ -1719,6 +1723,7 @@ static void load(const entry *e)
     if (P.park) P.park();
     unload_locked();
     P.host = pehost_open_as(e->path, PEHOST_KIND_AUTO, P.rate, P.block);
+    snprintf(P.loaded_path, sizeof P.loaded_path, "%s", P.host ? e->path : "");
     if (P.host) atomic_store_explicit(&P.live, 1, memory_order_release);
     if (P.unpark) P.unpark();
 
@@ -1779,6 +1784,21 @@ static void load(const entry *e)
         if (e->warn[0])
             snprintf(msg + strlen(msg), sizeof msg - strlen(msg),
                      "   \xc2\xb7   %s", e->warn);
+        /* And whether anyone has already made a sound with it.
+         *
+         * Saving a patch and never seeing it again is the failure this stops:
+         * the plug-in says on load that its patches exist and where to get at
+         * them. pestudio puts them straight in its Patches list; this window
+         * has no list to put them in, so it says the count and names the menu
+         * item that opens them. */
+        {
+            char hits[16][1024];
+            int  n = patch_find_for(P.host, e->path, hits, 16);
+            if (n > 0)
+                snprintf(msg + strlen(msg), sizeof msg - strlen(msg),
+                         "   \xc2\xb7   %d patch file(s) saved for it "
+                         "— File > Open Patch", n);
+        }
         plug_status("%s", msg);
     }
     in_plugin--;
@@ -1957,6 +1977,122 @@ void plugview_open_vst(GtkWindow *parent)
     gtk_file_dialog_open(d, parent, NULL, on_vst_chosen, NULL);
 }
 
+/* ------------------------------------------------------------- patches ---- */
+
+/* A plug-in's own programs are its factory presets and are read-only; this is
+ * where a sound somebody made goes. The file is the same JSON the command line
+ * reads and writes -- parameter names and values -- so a patch saved here opens
+ * with `va peload <patch.json>`, and a bank written by hand opens here.
+ *
+ * pestudio shows every patch in a bank as a list; this window applies the first
+ * and says so. A single saved patch is a bank of one, so the common case is the
+ * same in both. */
+static void on_patch_save_chosen(GObject *src, GAsyncResult *res, gpointer ud)
+{
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *path;
+    char err[256] = "";
+    (void)ud;
+    if (!f) return;
+    if ((path = g_file_get_path(f)) != NULL) {
+        char with_ext[1100];
+        size_t n = strlen(path);
+        if (n < 5 || g_ascii_strcasecmp(path + n - 5, ".json"))
+            snprintf(with_ext, sizeof with_ext, "%s.json", path);
+        else
+            snprintf(with_ext, sizeof with_ext, "%s", path);
+        if (!P.host)
+            plug_status("load a plug-in first");
+        else if (patch_save(P.host, with_ext,
+                            P.loaded_path[0] ? P.loaded_path : NULL,
+                            err, sizeof err) != 0)
+            plug_status("save failed: %s", err);
+        else
+            plug_status("saved %s", strrchr(with_ext, '/')
+                                        ? strrchr(with_ext, '/') + 1 : with_ext);
+        g_free(path);
+    }
+    g_object_unref(f);
+}
+
+/* Both dialogs start in the directory patch_find_for searches, so a patch
+ * saved without thinking about where it goes is found again without thinking
+ * about where it went. Anywhere else still works -- a patch beside its plug-in
+ * is found too -- it just is not the default. */
+static void patch_dialog_start_here(GtkFileDialog *d)
+{
+    const char *dir = patch_user_dir();
+    GFile *f;
+    if (!dir || !*dir) return;
+    f = g_file_new_for_path(dir);
+    gtk_file_dialog_set_initial_folder(d, f);
+    g_object_unref(f);
+}
+
+void plugview_save_patch(GtkWindow *parent)
+{
+    GtkFileDialog *d;
+    char suggest[160] = "patch.json";
+
+    if (!P.host) { plug_status("load a plug-in first"); return; }
+    patch_user_dir_ensure();              /* saving is the ask; looking is not */
+    if (P.loaded_path[0]) {
+        const char *base = strrchr(P.loaded_path, '/');
+        const char *dot;
+        base = base ? base + 1 : P.loaded_path;
+        snprintf(suggest, sizeof suggest, "%s", base);
+        if ((dot = strrchr(suggest, '.')) != NULL) *(char *)dot = 0;
+        g_strlcat(suggest, ".json", sizeof suggest);
+    }
+    d = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(d, "Save patch");
+    gtk_file_dialog_set_initial_name(d, suggest);
+    patch_dialog_start_here(d);
+    gtk_file_dialog_save(d, parent, NULL, on_patch_save_chosen, NULL);
+    g_object_unref(d);
+}
+
+static void on_patch_open_chosen(GObject *src, GAsyncResult *res, gpointer ud)
+{
+    GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *path;
+    (void)ud;
+    if (!f) return;
+    if ((path = g_file_get_path(f)) != NULL) {
+        char err[256] = "";
+        int applied = 0, missed = 0;
+        if (!P.host) {
+            plug_status("load a plug-in first");
+        } else if (patch_load(P.host, path, err, sizeof err, &applied, &missed) != 0) {
+            plug_status("open failed: %s", err);
+        } else {
+            /* The values changed under the list, so it has to be rebuilt --
+             * otherwise the patch is audible and invisible. */
+            fill_params();
+            if (missed)
+                plug_status("%d parameter(s) set, %d matched nothing%s%s",
+                            applied, missed, err[0] ? " -- " : "", err);
+            else
+                plug_status("%d parameter(s) set%s%s", applied,
+                            err[0] ? " -- " : "", err);
+        }
+        g_free(path);
+    }
+    g_object_unref(f);
+}
+
+void plugview_load_patch(GtkWindow *parent)
+{
+    GtkFileDialog *d;
+
+    if (!P.host) { plug_status("load a plug-in first"); return; }
+    d = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(d, "Open patch");
+    patch_dialog_start_here(d);
+    gtk_file_dialog_open(d, parent, NULL, on_patch_open_chosen, NULL);
+    g_object_unref(d);
+}
+
 static void on_dir_chosen(GObject *src, GAsyncResult *res, gpointer ud)
 {
     GFile *f = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res, NULL);
@@ -2126,6 +2262,96 @@ static void on_folders_gone(GtkWidget *w, gpointer ud)
 {
     (void)w; (void)ud;
     F.win = NULL; F.list = NULL; F.rm = NULL; F.asdd = NULL;
+}
+
+/* Send text to whatever the editor has focused, as if it were typed.
+ *
+ * Each character goes down, as a character, and up, because a control that
+ * reads only one of the three is common; Return follows, since a field that
+ * commits on Enter commits on nothing else. The editor is pumped between keys
+ * so a plug-in that repaints per keystroke gets the chance to. */
+static void plugview_type(const char *text)
+{
+    const unsigned char *t;
+    if (!P.host || !P.ed_open || !text) return;
+    for (t = (const unsigned char *)text; *t; t++) {
+        int ch = *t, vk;
+        if (ch < 32 || ch > 126) continue;
+        vk = (ch >= 'a' && ch <= 'z') ? ch - 'a' + 'A' : ch;
+        pehost_editor_key(P.host, vk, 1, ch);
+        pehost_editor_pump(P.host);
+        pehost_editor_key(P.host, vk, 0, ch);
+        pehost_editor_pump(P.host);
+    }
+    pehost_editor_key(P.host, 0x0D, 1, 13);          /* VK_RETURN */
+    pehost_editor_pump(P.host);
+    pehost_editor_key(P.host, 0x0D, 0, 0);
+    pehost_editor_pump(P.host);
+}
+
+static void key_status(const char *msg)
+{
+    if (P.status) gtk_label_set_text(GTK_LABEL(P.status), msg);
+}
+
+/* Both the Enter key on the field and the button land here; the window to
+ * close is hung off the entry so one callback serves both signals. */
+static void on_key_entry_done(GtkWidget *entry, gpointer ud)
+{
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(entry));
+    GtkWidget *win = ud ? GTK_WIDGET(ud)
+                        : GTK_WIDGET(g_object_get_data(G_OBJECT(entry), "win"));
+    char msg[128];
+    int n = text ? (int)strlen(text) : 0;
+    if (n > 0) {
+        plugview_type(text);
+        snprintf(msg, sizeof msg, "sent %d character(s) to the editor", n);
+        key_status(msg);
+    }
+    if (win) gtk_window_destroy(GTK_WINDOW(win));
+}
+
+static void on_key_send_clicked(GtkButton *b, gpointer entry)
+{ (void)b; on_key_entry_done(GTK_WIDGET(entry), NULL); }
+
+void plugview_enter_key(GtkWindow *parent)
+{
+    GtkWidget *win, *box, *lbl, *entry, *send;
+
+    if (!P.host || !P.ed_open) {
+        key_status("open a plug-in and its editor first");
+        return;
+    }
+    win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(win), "Enter key or serial");
+    gtk_window_set_default_size(GTK_WINDOW(win), 460, -1);
+    gtk_window_set_transient_for(GTK_WINDOW(win), parent);
+    gtk_window_set_modal(GTK_WINDOW(win), TRUE);
+
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(box, 10);    gtk_widget_set_margin_bottom(box, 10);
+    gtk_widget_set_margin_start(box, 10);  gtk_widget_set_margin_end(box, 10);
+
+    lbl = gtk_label_new("Click the plug-in's own field first, then type the key "
+                        "here.\nIt is sent to the editor a character at a time, "
+                        "then Return.");
+    gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
+    gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+    gtk_box_append(GTK_BOX(box), lbl);
+
+    entry = gtk_entry_new();
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    g_signal_connect(entry, "activate", G_CALLBACK(on_key_entry_done), win);
+    gtk_box_append(GTK_BOX(box), entry);
+
+    g_object_set_data(G_OBJECT(entry), "win", win);
+    send = gtk_button_new_with_label("Send to editor");
+    g_signal_connect(send, "clicked", G_CALLBACK(on_key_send_clicked), entry);
+    gtk_box_append(GTK_BOX(box), send);
+
+    gtk_window_set_child(GTK_WINDOW(win), box);
+    gtk_window_present(GTK_WINDOW(win));
+    gtk_widget_grab_focus(entry);
 }
 
 void plugview_edit_folders(GtkWindow *parent)

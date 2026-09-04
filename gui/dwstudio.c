@@ -1527,6 +1527,36 @@ static void act_plugin_folders(GSimpleAction *a, GVariant *p, gpointer ud)
     plugview_edit_folders(GTK_WINDOW(U.win));
 }
 
+/* A plug-in's own programs are its factory presets and are read-only, so a
+ * sound somebody made has nowhere to live without these. The file is the JSON
+ * the command line already reads and writes, and pestudio reads and writes the
+ * same one, so a patch travels between all three. */
+static void act_save_patch(GSimpleAction *a, GVariant *p, gpointer ud)
+{
+    (void)a; (void)p; (void)ud;
+    gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
+    plugview_save_patch(GTK_WINDOW(U.win));
+}
+
+static void act_open_patch(GSimpleAction *a, GVariant *p, gpointer ud)
+{
+    (void)a; (void)p; (void)ud;
+    gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
+    plugview_load_patch(GTK_WINDOW(U.win));
+}
+
+/* Some plug-ins do nothing until something has been typed into them: a
+ * registration panel over the plug-in's own interface, and no sound until its
+ * serial number has been entered into it. Typing already reaches an editor --
+ * the editor widget forwards every key -- so what this adds is somewhere to
+ * paste a key rather than typing it blind into a skinned field. */
+static void act_enter_key(GSimpleAction *a, GVariant *p, gpointer ud)
+{
+    (void)a; (void)p; (void)ud;
+    gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
+    plugview_enter_key(GTK_WINDOW(U.win));
+}
+
 /* Plug-ins that need data they have not got are marked in the list and spelled
  * out in the status line; this is what does something about the ones that can
  * be. Under File because it acts on the whole scanned folder rather than on
@@ -1577,7 +1607,10 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "open-vst",    act_open_vst,    NULL, NULL, NULL, {0} },
         { "load-folder", act_load_folder, NULL, NULL, NULL, {0} },
         { "install-data", act_install_data, NULL, NULL, NULL, {0} },
+        { "save-patch",  act_save_patch,  NULL, NULL, NULL, {0} },
+        { "open-patch",  act_open_patch,  NULL, NULL, NULL, {0} },
         { "plugin-folders", act_plugin_folders, NULL, NULL, NULL, {0} },
+        { "enter-key",   act_enter_key,   NULL, NULL, NULL, {0} },
         { "quit",        act_quit,        NULL, NULL, NULL, {0} },
         { "about",       act_about,       NULL, NULL, NULL, {0} },
     };
@@ -1594,18 +1627,25 @@ static GtkWidget *build_menubar(GtkApplication *app)
                                           (const char *[]){ "<Control>o", NULL });
     gtk_application_set_accels_for_action(app, "win.load-folder",
                                           (const char *[]){ "<Control>l", NULL });
+    gtk_application_set_accels_for_action(app, "win.save-patch",
+                                          (const char *[]){ "<Control>s", NULL });
+    gtk_application_set_accels_for_action(app, "win.open-patch",
+                                          (const char *[]){ "<Control>p", NULL });
     gtk_application_set_accels_for_action(app, "win.quit",
                                           (const char *[]){ "<Control>q", NULL });
 
     g_menu_append(file, "Open VST…",    "win.open-vst");
     g_menu_append(file, "Load Folder…", "win.load-folder");
     g_menu_append(file, "Install Missing Plug-in Data", "win.install-data");
+    g_menu_append(file, "Save Patch…", "win.save-patch");
+    g_menu_append(file, "Open Patch…", "win.open-patch");
     g_menu_append(sect, "Quit",         "win.quit");
     g_menu_append_section(file, NULL, G_MENU_MODEL(sect));
     g_menu_append_submenu(bar, "File", G_MENU_MODEL(file));
 
     /* Between File and About, matching pestudio. */
     g_menu_append(settings, "Plug-in Folders…", "win.plugin-folders");
+    g_menu_append(settings, "Enter Key / Serial…", "win.enter-key");
     g_menu_append_submenu(bar, "Settings", G_MENU_MODEL(settings));
 
     /* Next to File, matching pestudio, so the same question is answered the

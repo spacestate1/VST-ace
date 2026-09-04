@@ -1809,6 +1809,13 @@ public:
 
 /* -------------------------------------------------------------- main window */
 
+/* A patch row names the bank it came from, because they no longer all come
+ * from one: the bank opened on the command line, and every patch file found on
+ * disk for the plug-in that is loaded, are offered in the same list. ix < 0 is
+ * the "none" row, which stands the patches down and gives the Programs list
+ * back. */
+struct PatchRef { patch_bank *bank; int ix; };
+
 class Window : public QMainWindow {
     Q_OBJECT
 public:
@@ -1834,6 +1841,7 @@ public:
         if (pixelEditor_) pixelEditor_->detach();
         patch_bank_free(bank_);
         patch_bank_free(autoBank_);
+        for (patch_bank *b : foundBanks_) patch_bank_free(b);
     }
 
     /* --cycle walks every plugin in the list, opening each editor in turn.
@@ -2891,7 +2899,11 @@ private slots:
             if (!bankApplied_) {
                 /* --pick names a patch in the whole bank; the list holds only
                  * this plugin's, so translate rather than index straight in. */
-                want = patchRows_.indexOf(startPatch_);
+                want = -1;
+                for (int i = 0; i < patchRows_.size(); i++)
+                    if (patchRows_[i].bank == bank_ && patchRows_[i].ix == startPatch_) {
+                        want = i; break;
+                    }
                 if (want < 0) want = 0;
             } else {
                 /* Same row as before the switch. Every bank here carries the
@@ -2911,6 +2923,52 @@ private slots:
     }
 
     /* Instantiate the plugin's editor the first time its tab is shown. */
+    /* Send text to whatever the editor has focused, as if it were typed.
+     * Each character goes down, as a character, and up, because a control that
+     * reads only one of the three is common; Return follows, since a field that
+     * commits on Enter commits on nothing else. The editor is pumped between
+     * keys so a plug-in that repaints per keystroke gets the chance. */
+    void typeIntoEditor(const QString &text)
+    {
+        pehost *h = eng_.host();
+        if (!h) return;
+        for (const QChar qc : text) {
+            const int ch = qc.unicode();
+            if (ch < 32 || ch > 126) continue;
+            const int vk = (ch >= 'a' && ch <= 'z') ? ch - 'a' + 'A' : ch;
+            pehost_editor_key(h, vk, 1, ch);
+            pehost_editor_pump(h);
+            pehost_editor_key(h, vk, 0, ch);
+            pehost_editor_pump(h);
+        }
+        pehost_editor_key(h, 0x0D, 1, 13);          /* VK_RETURN */
+        pehost_editor_pump(h);
+        pehost_editor_key(h, 0x0D, 0, 0);
+        pehost_editor_pump(h);
+    }
+
+    void enterPluginKey()
+    {
+        pehost *h = eng_.host();
+        if (!h || !editorOpened_) {
+            statusBar()->showMessage(
+                "open a plug-in and its editor first", 4000);
+            return;
+        }
+        bool ok = false;
+        const QString text = QInputDialog::getText(
+            this, "Enter key or serial",
+            "Click the plug-in's own field first, then type the key here.\n"
+            "It is sent to the editor a character at a time, then Return.",
+            QLineEdit::Normal, QString(), &ok);
+        if (!ok) return;
+        const QString key = text.trimmed();
+        if (key.isEmpty()) return;
+        typeIntoEditor(key);
+        statusBar()->showMessage(
+            QString("sent %1 character(s) to the editor").arg(key.size()), 5000);
+    }
+
     void openEditor()
     {
         pehost *h = eng_.host();
@@ -3557,8 +3615,8 @@ private:
             statusBar()->showMessage("finish the gesture before changing patch", 2000);
             return;
         }
-        patch_bank *b  = activeBank();
-        const int   ix = patchRows_[row];
+        patch_bank *b  = patchRows_[row].bank;
+        const int   ix = patchRows_[row].ix;
         wantPatchRow_  = row;
         if (ix < 0) {                       /* the "none" row: stand down */
             statusBar()->showMessage("no patch -- the Programs list is live again",
@@ -3635,16 +3693,124 @@ private:
     void reassertPatch()
     {
         const int row = patchList_ ? patchList_->currentRow() : -1;
-        if (!bank_ || row < 1 || row >= patchRows_.size()) return;
-        if (patchRows_[row] < 0) return;
+        if (row < 1 || row >= patchRows_.size()) return;
+        if (patchRows_[row].ix < 0) return;
         char err[256];
         int  applied = 0, missed = 0;
-        if (patch_bank_apply_params(activeBank(), patchRows_[row], eng_.host(),
-                                    err, sizeof err, &applied, &missed) == 0)
+        if (patch_bank_apply_params(patchRows_[row].bank, patchRows_[row].ix,
+                                    eng_.host(), err, sizeof err,
+                                    &applied, &missed) == 0)
             statusBar()->showMessage(
                 QString("program changed; \"%1\" re-applied over it "
                         "(%2 parameters) -- patches override programs")
                     .arg(patchList_->item(row)->text()).arg(applied), 5000);
+    }
+
+    /* Where patches go by default. Remembered between sessions, because the
+     * second thing anybody does after saving one is save another beside it. */
+    QString patchDir()
+    {
+        QSettings st("pestudio", "pestudio");
+        QString d = st.value("patchDir").toString();
+        /* The shared one by default: it is where patch_find_for looks, so a
+         * patch saved here is in the list the next time the plug-in is opened,
+         * and dwstudio sees it too. Somewhere else is still allowed -- a patch
+         * saved beside its plug-in is found as well -- and is remembered. */
+        if (d.isEmpty() || !QDir(d).exists()) d = QString::fromLocal8Bit(patch_user_dir());
+        if (d.isEmpty() || !QDir(d).exists())
+            d = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+        if (d.isEmpty()) d = QDir::homePath();
+        return d;
+    }
+    void rememberPatchDir(const QString &file)
+    {
+        QSettings st("pestudio", "pestudio");
+        st.setValue("patchDir", QFileInfo(file).absolutePath());
+    }
+
+    /* Write the plug-in's whole parameter set, and the program it is on, to a
+     * file that names the plug-in it came from. */
+    void savePatchAs()
+    {
+        if (!eng_.host()) {
+            statusBar()->showMessage("load a plug-in first", 4000);
+            return;
+        }
+        if (g_inPlugin) {
+            statusBar()->showMessage("finish the gesture before saving", 2000);
+            return;
+        }
+        patch_user_dir_ensure();          /* saving is the ask; looking is not */
+        const QString stem = loadedPath_.isEmpty()
+            ? QString("patch") : QFileInfo(loadedPath_).completeBaseName();
+        QString f = QFileDialog::getSaveFileName(
+            this, "Save patch", QDir(patchDir()).filePath(stem + ".json"),
+            "Patches (*.json);;All files (*)");
+        if (f.isEmpty()) return;
+        if (!f.endsWith(".json", Qt::CaseInsensitive)) f += ".json";
+
+        char err[256] = "";
+        if (patch_save(eng_.host(), f.toLocal8Bit().constData(),
+                       loadedPath_.isEmpty() ? nullptr
+                                             : loadedPath_.toLocal8Bit().constData(),
+                       err, sizeof err) != 0) {
+            statusBar()->showMessage("save failed: " + QString::fromLocal8Bit(err), 0);
+            fprintf(stderr, "pestudio: patch save failed -- %s\n", err);
+            fflush(stderr);
+            return;
+        }
+        rememberPatchDir(f);
+        statusBar()->showMessage("saved " + QFileInfo(f).fileName(), 6000);
+    }
+
+    /* Open a patch file and make it the Patches list.
+     *
+     * A file holding one patch reads back as a bank of one, so the same path
+     * serves both -- and a bank someone wrote by hand arrives with all of its
+     * patches selectable rather than only the first. The first real patch is
+     * applied straight away, because opening a patch and hearing nothing change
+     * is not what anybody meant by it. */
+    void openPatchFile()
+    {
+        if (g_inPlugin) {
+            statusBar()->showMessage("finish the gesture before opening a patch", 2000);
+            return;
+        }
+        const QString f = QFileDialog::getOpenFileName(
+            this, "Open patch or bank", patchDir(),
+            "Patches (*.json);;All files (*)");
+        if (f.isEmpty()) return;
+
+        char err[256] = "";
+        patch_bank *b = patch_bank_read(f.toLocal8Bit().constData(), err, sizeof err);
+        if (!b) {
+            statusBar()->showMessage("open failed: " + QString::fromLocal8Bit(err), 0);
+            fprintf(stderr, "pestudio: %s\n", err);
+            fflush(stderr);
+            return;
+        }
+        rememberPatchDir(f);
+        patch_bank_free(bank_);
+        bank_     = b;
+        bankFile_ = f;
+        patchLabel_->setVisible(true);
+        patchList_->setVisible(true);
+
+        /* A patch may name the plug-in it belongs to, and opening one for a
+         * plug-in that is not loaded should load it -- which is what selecting
+         * the row does, so the list is built first and then driven. */
+        if (!eng_.host() && patch_bank_count(b) > 0) {
+            const QString want = QString::fromLocal8Bit(
+                patch_bank_patch_plugin_path(b, 0));
+            if (!want.isEmpty()) loadPluginPath(want);
+        }
+        rebuildPatchList();
+        if (patchRows_.size() > 1) {
+            patchList_->setCurrentRow(1);       /* row 0 is the "none" row */
+        } else {
+            statusBar()->showMessage(
+                QFileInfo(f).fileName() + " holds no patch for this plug-in", 8000);
+        }
     }
 
     /* Rebuild the Patches list for whatever plugin is now loaded.
@@ -3659,37 +3825,97 @@ private:
      * disk beside it, so that switching to any synth in the browser still brings
      * up that synth's patches rather than an empty list or -- worse -- another
      * machine's. */
+    /* Patches saved for this plug-in, wherever they live.
+     *
+     * Saving a sound and never seeing it again is the thing this stops: a
+     * plug-in arrives with the patches made for it already in the list, without
+     * anybody opening a file. patch_find_for decides what belongs -- by the
+     * plug-in's uniqueID, so it survives the plug-in being moved or renamed --
+     * and looks in the user patch directory and beside the plug-in itself.
+     *
+     * A file that is already open as the bank is skipped, or every one of its
+     * patches would appear twice. */
+    QVector<PatchRef> foundRows(const QString &cur)
+    {
+        QVector<PatchRef> rows;
+        for (patch_bank *b : foundBanks_) patch_bank_free(b);
+        foundBanks_.clear();
+        foundFiles_.clear();
+        if (!eng_.host()) return rows;
+
+        char hits[32][1024];
+        const int n = patch_find_for(eng_.host(),
+                                     loadedPath_.toLocal8Bit().constData(),
+                                     hits, 32);
+        const QString openedBank = bankFile_.isEmpty()
+            ? QString() : QFileInfo(bankFile_).canonicalFilePath();
+        const QString autoBank = autoBankFile_.isEmpty()
+            ? QString() : QFileInfo(autoBankFile_).canonicalFilePath();
+        for (int i = 0; i < n; i++) {
+            const QString f = QString::fromLocal8Bit(hits[i]);
+            const QString c = QFileInfo(f).canonicalFilePath();
+            if (c == openedBank || (usingAuto_ && c == autoBank)) continue;
+            char err[256];
+            patch_bank *b = patch_bank_read(f.toLocal8Bit().constData(),
+                                            err, sizeof err);
+            if (!b) { fprintf(stderr, "pestudio: %s\n", err); continue; }
+            foundBanks_ << b;
+            foundFiles_ << f;
+            for (int k = 0; k < patch_bank_count(b); k++)
+                rows << PatchRef{ b, k };
+        }
+        (void)cur;
+        return rows;
+    }
+
     void rebuildPatchList()
     {
-        if (!bank_) return;
         const QString cur = QFileInfo(loadedPath_).canonicalFilePath();
 
         usingAuto_ = false;
-        patchRows_ = rowsFor(bank_, cur);
+        patchRows_.clear();
+        for (int ix : rowsFor(bank_, cur)) patchRows_ << PatchRef{ bank_, ix };
         if (patchRows_.isEmpty() && loadPluginBank(cur)) {
             usingAuto_ = true;
-            patchRows_ = rowsFor(autoBank_, cur);
+            for (int ix : rowsFor(autoBank_, cur))
+                patchRows_ << PatchRef{ autoBank_, ix };
         }
+        patchRows_ << foundRows(cur);
 
         /* Row 0 is not a patch. With a patch selected the Programs list stops
          * being audible -- the patch is re-asserted over every program change,
          * which is the point -- so there has to be a way to stand down and hear
          * the plugin's own presets again. */
-        patchRows_.prepend(-1);
+        patchRows_.prepend(PatchRef{ nullptr, -1 });
 
         QSignalBlocker block(patchList_);   /* filling is not a selection */
         patchList_->clear();
-        patch_bank *b = activeBank();
-        for (int ix : patchRows_)
-            patchList_->addItem(ix < 0
+        for (const PatchRef &r : patchRows_)
+            patchList_->addItem(r.ix < 0
                 ? QString("— none (use the Programs list) —")
-                : QString::fromLocal8Bit(patch_bank_patch_name(b, ix)));
+                : QString::fromLocal8Bit(patch_bank_patch_name(r.bank, r.ix)));
 
+        /* Where they came from. With one source, name it; with several, say how
+         * many were found, because "Patches -- three files" tells you nothing
+         * about which sound is which and the count is what is actually news. */
         const QString src = usingAuto_ ? autoBankFile_ : bankFile_;
-        patchLabel_->setText(patchRows_.isEmpty()
-            ? QString("Patches -- none for this plugin")
-            : QString("Patches -- %1").arg(QFileInfo(src).fileName()));
-        patchLabel_->setToolTip(src);
+        const int real = patchRows_.size() - 1;         /* less the "none" row */
+        QStringList where;
+        if (!src.isEmpty() && real > foundFiles_.size()) where << QFileInfo(src).fileName();
+        for (const QString &f : foundFiles_) where << QFileInfo(f).fileName();
+        if (real <= 0)
+            patchLabel_->setText("Patches -- none for this plug-in");
+        else if (where.size() == 1)
+            patchLabel_->setText(QString("Patches -- %1").arg(where.first()));
+        else
+            patchLabel_->setText(QString("Patches -- %1 from %2 file(s)")
+                                     .arg(real).arg(where.size()));
+        patchLabel_->setToolTip(where.isEmpty() ? src : where.join('\n'));
+        /* The list is worth showing whenever there is anything in it, even when
+         * nothing was opened on the command line -- which is the whole point of
+         * looking on disk. */
+        patchLabel_->setVisible(real > 0 || bank_ != nullptr);
+        patchList_->setVisible(real > 0 || bank_ != nullptr);
     }
 
     static QVector<int> rowsFor(patch_bank *b, const QString &plugin)
@@ -4195,6 +4421,20 @@ private:
             if (!dir.isEmpty()) addUserRoot(VSTDIRS_ANY, dir, /*select=*/true);
         });
 
+        /* Patches. The plug-in's own programs are its factory presets and are
+         * read-only; this is where a sound somebody made goes. The format is
+         * the one the command line already reads and writes -- parameter names
+         * and values as JSON -- so a patch saved here opens with
+         * `va peload <patch.json>`, and a bank written by hand opens here. */
+        file->addSeparator();
+        QAction *savePatch = file->addAction("&Save Patch...");
+        savePatch->setShortcut(QKeySequence::Save);
+        connect(savePatch, &QAction::triggered, this, &Window::savePatchAs);
+
+        QAction *openPatch = file->addAction("Open &Patch...");
+        openPatch->setShortcut(QKeySequence("Ctrl+P"));
+        connect(openPatch, &QAction::triggered, this, &Window::openPatchFile);
+
         file->addSeparator();
         QAction *quit = file->addAction("&Quit");
         quit->setShortcut(QKeySequence::Quit);
@@ -4209,6 +4449,20 @@ private:
         QMenu *settings = menuBar()->addMenu("&Settings");
         QAction *folders = settings->addAction("Plug-in &Folders...");
         connect(folders, &QAction::triggered, this, &Window::editPluginFolders);
+
+        /* Some plug-ins will not do anything until something has been typed
+         * into them. daHornet puts a registration panel over its own interface
+         * and makes neither a sound nor a repaint until its serial number has
+         * been entered into an edit box on that panel -- which looks exactly
+         * like a plug-in that loads and does nothing.
+         *
+         * Typing already reaches an editor: the editor widget forwards every
+         * key it gets. What it needs is the plug-in's own field focused first,
+         * and a key is twenty-five characters nobody wants to mistype into a
+         * skinned box with no visible caret. This asks for it once and sends
+         * it a character at a time, which is what the plug-in is waiting for. */
+        QAction *key = settings->addAction("Enter &Key / Serial...");
+        connect(key, &QAction::triggered, this, &Window::enterPluginKey);
 
         /* Inputs: what the machine is listening to. A microphone or USB
          * interface for audio, a keyboard for notes -- two different
@@ -4417,7 +4671,10 @@ private:
     patch_bank   *bank_ = nullptr;      /* owned; freed in ~Window */
     patch_bank   *autoBank_ = nullptr;  /* owned; freed on replace and in ~Window */
     bool          usingAuto_ = false;
-    QVector<int>  patchRows_;           /* list row -> patch index in activeBank() */
+    QVector<PatchRef> patchRows_;
+    /* Banks found by patch_find_for, owned here and freed on every rebuild. */
+    QVector<patch_bank *> foundBanks_;
+    QStringList           foundFiles_;
     int           wantPatchRow_ = 0;    /* filtered row kept across plugin switches */
     int           startPatch_ = 0;      /* which patch --pick chose */
     bool          bankApplied_ = false;

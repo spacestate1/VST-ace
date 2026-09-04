@@ -97,6 +97,40 @@ int patch_bank_apply_params(const patch_bank *b, int i, pehost *h,
 int patch_load(pehost *h, const char *path, char *err, int errn,
                int *applied, int *missed);
 
+/* Where a patch someone made goes, and therefore where one is looked for.
+ *
+ * $XDG_DATA_HOME/vst-ace/patches, else ~/.local/share/vst-ace/patches -- the
+ * data counterpart of the config directory vstdirs.h keeps folder settings in.
+ * Returns "" only when there is no home directory to put it under. Both windows
+ * save here by default, which is what makes a patch saved in one of them turn
+ * up in the other, and in the next session.
+ *
+ * patch_user_dir only names it; patch_user_dir_ensure creates it. Looking for
+ * patches happens on every load, and opening a plug-in is not a reason to make
+ * a directory in someone's home -- saving one is, and that is the only caller
+ * of the second form. */
+const char *patch_user_dir(void);
+const char *patch_user_dir_ensure(void);
+
+/* The patch files that belong to an open plug-in.
+ *
+ * Saving a patch and never seeing it again is the failure this exists to stop:
+ * a plug-in should arrive with the sounds made for it already listed. Two
+ * places are searched -- the user patch directory above, and the plug-in's own
+ * directory, which is where a patch shipped alongside a plug-in would sit.
+ *
+ * A file belongs to the plug-in when its recorded uniqueID matches, which
+ * survives the plug-in being moved or renamed; failing that, when its
+ * pluginPath names the same file. A bank that records neither is not claimed,
+ * because a patch that matches everything would be applied to anything.
+ *
+ * Writes up to `max` paths into `out` and returns how many were found. Cheap
+ * enough to call on every load: it reads each candidate's header, and a patch
+ * file is a few kilobytes.
+ */
+int patch_find_for(const pehost *h, const char *plugin_path,
+                   char (*out)[1024], int max);
+
 /* Write the plugin's current program and every parameter to `path` as a
  * single-patch file. `plugin_path`, when given, is recorded as "pluginPath" so
  * the patch can later be opened without naming the plugin again. */
