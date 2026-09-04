@@ -16,14 +16,41 @@ LIBDIR = "/usr/i686-w64-mingw32/lib"
 OUT    = os.path.join(os.path.dirname(__file__), "..", "peload", "win32_arity.h")
 
 # Every DLL the plugins here import, plus the neighbours a Windows audio plugin
-# plausibly reaches for. Scoping the list keeps the generated header to a
+# plausibly reaches for.
+#
+# A library this host refuses to LoadLibrary still belongs here. opengl32 is one:
+# nothing may open it, so a plug-in takes its software path -- but the imports it
+# already has are still resolved, symbol by symbol, and an i386 stub that pops
+# the wrong number of bytes corrupts the caller's stack instead of doing nothing.
+# Ignite's Emissary and NadIR import 28 wgl* entries and segfaulted on the first
+# one called. Scoping the list keeps the generated header to a
 # sensible size, and nothing is silently lost: a name the table does not cover
 # makes the loader print "unknown stdcall arity" for that import at load time.
 DLLS = """
     kernel32 user32 gdi32 shell32 shlwapi ole32 oleaut32 comctl32 comdlg32
     advapi32 wininet winmm msimg32 version msacm32 winspool imm32 uxtheme
-    dwmapi ntdll psapi userenv setupapi ws2_32 crypt32 gdiplus
+    dwmapi ntdll psapi userenv setupapi ws2_32 crypt32 gdiplus dsound hid
+    snmpapi oledlg odbc32 opengl32 glu32
 """.split()
+
+
+# Exports this table needs that are not in every mingw-w64's import libraries,
+# so that regenerating on one machine does not silently drop what another
+# machine's libraries supplied. Each is the documented stdcall byte count.
+#
+#   SetClassLongPtr{A,W} are a macro for SetClassLong at 32 bits, so the i386
+#   import library has no such symbol -- but a plug-in compiled for 64-bit and
+#   run through the 32-bit loader still names it.
+#   The Ro* entries are the Windows Runtime core, which lives in combase and is
+#   not shipped as an i686 import library at all.
+EXTRA = {
+    "RoActivateInstance":     8,
+    "RoGetActivationFactory": 12,
+    "RoInitialize":           4,
+    "RoUninitialize":         0,
+    "SetClassLongPtrA":       12,
+    "SetClassLongPtrW":       12,
+}
 
 
 def nm(path):
@@ -51,6 +78,9 @@ def main():
             # larger count: popping too much is caught loudly on the next call,
             # popping too little drifts quietly.
             arity[name] = max(arity.get(name, 0), n)
+
+    for name, n in EXTRA.items():
+        arity[name] = max(arity.get(name, 0), n)
 
     rows = sorted(arity.items())
     with open(OUT, "w") as f:

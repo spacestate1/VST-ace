@@ -32,6 +32,12 @@
 #define W32_MSGQ     512
 #define W32_MAX_TIMER 32
 
+/* What a bitmap may be. One side is bounded only against arithmetic that
+ * wraps; what really wants a limit is the allocation, and a quarter of a
+ * gigabyte is far past any skin and far short of anything that would matter. */
+#define W32_DIB_MAX_SIDE  (1 << 20)
+#define W32_DIB_MAX_BYTES (256u * 1024u * 1024u)
+
 #define W32_HWND_BASE 0x00110000u
 #define W32_HDC_BASE  0x00220000u
 #define W32_HOOK_BASE 0x00660000u
@@ -98,6 +104,7 @@ typedef struct {
 #define WM_NCCREATE 0x0081
 #define WM_NCCALCSIZE 0x0083
 #define WM_TIMER 0x0113
+#define WM_COMMAND 0x0111
 #define WM_KEYDOWN 0x0100
 #define WM_KEYUP 0x0101
 #define WM_CHAR 0x0102
@@ -127,6 +134,11 @@ static int  dw_text_draw(uint32_t *px, int pw, int ph, int x, int baseline,
 
 typedef struct { int w, h; uint32_t *px; } w32_surf;
 
+/* Windows lets a class ask for any number of extra bytes per window; what
+ * real code puts there is a pointer or two. */
+#define W32_WND_EXTRA 128
+#define W32_MAX_PROP  16
+
 typedef struct {
     int      used;
     void    *wndproc;              /* MS-ABI LRESULT(HWND,UINT,WPARAM,LPARAM) */
@@ -142,15 +154,26 @@ typedef struct {
      * they do not remember what it set. */
     char     text[128];
     int      ctl_check;            /* BM_SETCHECK, or the current selection */
+    int      ctl_limit;            /* EM_LIMITTEXT, 0 = as much as text holds */
+    int      ctl_id;               /* CreateWindowEx's hMenu, for a child */
     char   (*items)[64];           /* combo box and list box contents */
     int      nitems;
     int      enabled;
     w32_surf surf;                 /* the client pixels the host displays */
     W32RECT  update;
     int      has_update;
+    /* The class's extra window bytes. JUCE keeps its peer pointer in here and
+     * reads it back on every message before it will do anything with one, so a
+     * window that cannot remember them answers nothing and paints nothing. */
+    unsigned char extra[W32_WND_EXTRA];
+    int      nextra;
+    /* Window properties, the other place a plug-in hangs its own pointer off a
+     * window it did not write the class for. */
+    struct { char name[64]; void *val; } prop[W32_MAX_PROP];
+    int      nprop;
 } w32_wnd;
 
-enum { OBJ_NONE = 0, OBJ_BITMAP, OBJ_BRUSH, OBJ_PEN, OBJ_FONT, OBJ_RGN };
+enum { OBJ_NONE = 0, OBJ_BITMAP, OBJ_BRUSH, OBJ_PEN, OBJ_FONT, OBJ_RGN, OBJ_PALETTE };
 
 typedef struct {
     int       used, kind;
@@ -195,6 +218,11 @@ typedef struct {
      * can answer honestly: see st_RectVisible. */
     W32RECT clip;
     int     has_clip;
+    /* GM_COMPATIBLE (1) or GM_ADVANCED (2), zero until asked; and the world
+     * transform, which only the advanced mode admits. See st_SetGraphicsMode. */
+    int32_t gfxmode;
+    float   xform[6];
+    int     has_xform;
     /* The rest of the drawing state. This layer was written for plug-ins that
      * rasterise their own interface and blit it, so none of it was here: an
      * editor that draws with GDI selects a pen and a brush, sets a text colour
@@ -205,7 +233,34 @@ typedef struct {
     uint32_t text_align;
     int32_t  cur_x, cur_y;         /* current position, for LineTo */
     int      inited;
+    /* Mapping mode and its extents. Only MM_TEXT is honoured -- a plug-in
+     * editor is laid out in pixels -- but the extents are remembered so a
+     * caller that sets and reads them back sees its own numbers. */
+    int32_t  map_mode;             /* 0 until set, then MM_* */
+    int32_t  wnd_ext_x, wnd_ext_y, vp_ext_x, vp_ext_y;
+    int32_t  wnd_org_x, wnd_org_y;
+    int32_t  poly_fill;            /* ALTERNATE 1, WINDING 2 */
+    W32RECT  bounds;               /* GetBoundsRect accumulator */
+    /* SaveDC/RestoreDC. Small and fixed: what a paint routine nests is two or
+     * three deep, and a caller that overflows is told so rather than being
+     * handed a depth it cannot restore to. */
+    struct w32_dcsave *save;
+    int      nsave;
 } w32_dc;
+
+/* One saved DC state. Everything SelectObject or a Set* call can change and a
+ * caller expects RestoreDC to put back. */
+#define W32_MAX_SAVE 16
+typedef struct w32_dcsave {
+    int      bitmap, font, pen, brush;
+    int32_t  org_x, org_y;
+    W32RECT  clip;
+    int      has_clip;
+    uint32_t text_color, bk_color, text_align;
+    int      bk_mode;
+    int32_t  map_mode, wnd_ext_x, wnd_ext_y, vp_ext_x, vp_ext_y, wnd_org_x, wnd_org_y;
+    int32_t  gfxmode, poly_fill;
+} w32_dcsave;
 
 typedef struct { int used; int wnd; uintptr_t id; uint32_t ms; double next; void *proc; } w32_timer;
 
@@ -214,7 +269,7 @@ static struct {
     w32_dc    dc[W32_MAX_DC];
     w32_obj   obj[W32_MAX_OBJ];
     w32_timer timer[W32_MAX_TIMER];
-    struct { int used; char name[64]; void *proc; } cls[W32_MAX_CLS];
+    struct { int used; char name[64]; void *proc; int wndextra; } cls[W32_MAX_CLS];
     struct { int used, id; void *proc; } hook[W32_MAX_HOOK];
     W32MSG    q[W32_MSGQ];
     int       qhead, qtail;
@@ -346,7 +401,8 @@ void *w32_bitmap_from_dib(const uint8_t *dib, uint32_t len)
     memcpy(&compression, dib + 16, 4);
     if (compression != 0) return NULL;              /* BI_RGB only */
     if (h < 0) { h = -h; flip = 0; }
-    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) return NULL;
+    if (w <= 0 || h <= 0 || w > W32_DIB_MAX_SIDE || h > W32_DIB_MAX_SIDE ||
+        (uint64_t)w * (uint64_t)h * 4u > W32_DIB_MAX_BYTES) return NULL;
 
     memcpy(&pal_entries, dib + 32, 4);              /* biClrUsed */
     if (!pal_entries && bpp <= 8) pal_entries = 1u << bpp;
@@ -356,11 +412,11 @@ void *w32_bitmap_from_dib(const uint8_t *dib, uint32_t len)
     row_bytes = ((uint32_t)w * bpp + 31) / 32 * 4;
     if ((uint32_t)(rows - dib) + row_bytes * (uint32_t)h > len) return NULL;
 
-    if (getenv("PELOAD_DIB"))
-        fprintf(stderr, "  [dib] %dx%d bpp=%u %s\n", w, h, bpp,
-                flip ? "bottom-up" : "top-down");
     if (!(idx = w32_obj_new(OBJ_BITMAP, w, h, 0))) return NULL;
     o = &W.obj[idx];
+    if (getenv("PELOAD_DIB"))
+        fprintf(stderr, "  [dib] bmp#%d %dx%d bpp=%u %s pal=%u\n", idx, w, h, bpp,
+                flip ? "bottom-up" : "top-down", pal_entries);
 
     for (y = 0; y < h; y++) {
         const uint8_t *src = rows + (uint32_t)(flip ? h - 1 - y : y) * row_bytes;
@@ -610,6 +666,11 @@ static void w32_surf_size(w32_surf *s, int w, int h)
 
 typedef MS W_LRESULT (*w32_wndproc)(void *, uint32_t, W_WPARAM, W_LPARAM);
 
+/* Read once: this is consulted on every message and every invalidation, and
+ * getenv walks the environment each time it is called. */
+static int w32_msgtrace(void)
+{ static int v = -1; if (v < 0) { const char *e = getenv("PELOAD_MSGTRACE"); v = e && *e != '0'; } return v; }
+
 static W_LRESULT w32_call(w32_wnd *w, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
 {
     w32_wndproc p;
@@ -617,6 +678,9 @@ static W_LRESULT w32_call(w32_wnd *w, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
     if (!w || !w->wndproc) return 0;
     p = (w32_wndproc)w->wndproc;
     idx = (int)(w - W.wnd);
+    if (w32_msgtrace())
+        fprintf(stderr, "[msg] wnd#%d '%s' msg=0x%04x wp=%#lx lp=%#lx\n",
+                idx, w->cls, msg, (unsigned long)wp, (unsigned long)lp);
     return p(w32_h(W32_HWND_BASE, idx), msg, wp, lp);
 }
 
@@ -846,6 +910,7 @@ static MS uint16_t st_RegisterClassA(const W32WNDCLASSA *c)
         W.cls[i].used = 1;
         snprintf(W.cls[i].name, sizeof W.cls[i].name, "%s", c->lpszClassName);
         W.cls[i].proc = c->lpfnWndProc;
+        W.cls[i].wndextra = c->cbWndExtra > 0 ? c->cbWndExtra : 0;
         return (uint16_t)(0xC000 + i);
     }
     return 0;
@@ -858,6 +923,49 @@ static MS uint16_t st_RegisterClassW(const W32WNDCLASSA *c)
     if (!c) return 0;
     a = *c;
     a.lpszClassName = w32_cls_name(c->lpszClassName, name, sizeof name, 1);
+    return st_RegisterClassA(&a);
+}
+
+/* WNDCLASSEX is WNDCLASS with a size at the front and a small icon at the
+ * back. Nothing here uses either, so the Ex forms hand the common part to the
+ * plain ones; what matters is that the class registers at all, because a
+ * plug-in that cannot register its class never creates its window. */
+typedef struct {
+    uint32_t cbSize, style;
+    void    *lpfnWndProc;
+    int32_t  cbClsExtra, cbWndExtra;
+    void    *hInstance, *hIcon, *hCursor, *hbrBackground;
+    const char *lpszMenuName, *lpszClassName;
+    void    *hIconSm;
+} W32WNDCLASSEXA;
+
+static void w32_wc_of_ex(const W32WNDCLASSEXA *e, W32WNDCLASSA *a)
+{
+    a->style = e->style;
+    a->lpfnWndProc = e->lpfnWndProc;
+    a->cbClsExtra = e->cbClsExtra;
+    a->cbWndExtra = e->cbWndExtra;
+    a->hInstance = e->hInstance;
+    a->hIcon = e->hIcon;
+    a->hCursor = e->hCursor;
+    a->hbrBackground = e->hbrBackground;
+    a->lpszMenuName = e->lpszMenuName;
+    a->lpszClassName = e->lpszClassName;
+}
+static MS uint16_t st_RegisterClassExA(const W32WNDCLASSEXA *e)
+{
+    W32WNDCLASSA a;
+    if (!e) return 0;
+    w32_wc_of_ex(e, &a);
+    return st_RegisterClassA(&a);
+}
+static MS uint16_t st_RegisterClassExW(const W32WNDCLASSEXA *e)
+{
+    W32WNDCLASSA a;
+    char name[64];
+    if (!e) return 0;
+    w32_wc_of_ex(e, &a);
+    a.lpszClassName = w32_cls_name(e->lpszClassName, name, sizeof name, 1);
     return st_RegisterClassA(&a);
 }
 static MS int32_t st_UnregisterClassA(const char *n, void *inst)
@@ -1211,16 +1319,120 @@ static MS W_LRESULT ctl_static_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPA
     return 0;
 }
 
+/* EDIT's own messages, and the handful of its behaviour that matters here.
+ *
+ * This control used to answer WM_PAINT and nothing else, so every character
+ * typed at it was dropped: a plug-in that puts up an edit box and reads it back
+ * with WM_GETTEXT got an empty string no matter what the user did. daHornet
+ * creates one for its serial number and will neither make a sound nor take its
+ * registration panel down until it reads a valid one out of it, which made an
+ * unregistered plug-in indistinguishable from a broken one.
+ *
+ * A caret and a selection are not modelled: text is appended at the end and
+ * backspace takes from the end, which is what entering a serial, a preset name
+ * or a value needs. EM_SETSEL is accepted and ignored for the same reason. */
+enum {
+    EM_GETSEL = 0x00B0, EM_SETSEL = 0x00B1, EM_REPLACESEL = 0x00C2,
+    EM_SETREADONLY = 0x00CF, EM_LIMITTEXT = 0x00C5, EM_SETMARGINS = 0x00D3,
+    EN_CHANGE = 0x0300, EN_UPDATE = 0x0400
+};
+
+/* Tell the parent its edit box changed, the way Windows does: WM_COMMAND with
+ * the control id in the low half of wParam and the notification in the high
+ * half. A plug-in that validates as you type is watching for exactly this. */
+static void ctl_edit_notify(w32_wnd *w, int wi, int code)
+{
+    w32_wnd *p = (w->parent > 0 && W.wnd[w->parent].used) ? &W.wnd[w->parent] : NULL;
+    /* Windows sends this synchronously and so does this, which means the
+     * parent is entered from inside the control's own procedure. A parent that
+     * answers by putting text back into the box -- validating as you type,
+     * upper-casing a serial -- arrives at WM_SETTEXT, which notifies again;
+     * without this that is unbounded, and it is the same shape as the SetFocus
+     * recursion that took an editor's stack out. One level deep is all the
+     * notification is worth. */
+    static int inside;
+    if (!p || inside) return;
+    inside = 1;
+    w32_call(p, WM_COMMAND,
+             (W_WPARAM)(((uint32_t)code << 16) | ((uint32_t)w->ctl_id & 0xffff)),
+             (W_LPARAM)(intptr_t)w32_h(W32_HWND_BASE, wi));
+    inside = 0;
+}
+
+static void ctl_edit_dirty(w32_wnd *w)
+{
+    w->has_update = 1;
+    w->update.left = 0; w->update.top = 0;
+    w->update.right = w->w; w->update.bottom = w->h;
+}
+
 static MS W_LRESULT ctl_edit_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
 {
     w32_wnd *w = w32_wget(hwnd);
     int wi = w ? (int)(w - W.wnd) : 0, handled;
     W_LRESULT r;
+    size_t n;
+    int cap;
+
     if (!w) return 0;
     r = ctl_common(w, wi, msg, wp, lp, &handled);
-    if (handled) return r;
-    if (msg == WM_PAINT) { ctl_paint_edit(w, wi); w->has_update = 0; }
-    return 0;
+    if (handled) {
+        /* WM_SETTEXT through the common handler is still a change the parent
+         * wants to hear about. */
+        if (msg == WM_SETTEXT) ctl_edit_notify(w, wi, EN_CHANGE);
+        return r;
+    }
+    n = strlen(w->text);
+    cap = (int)sizeof w->text - 1;
+    if (w->ctl_limit > 0 && w->ctl_limit < cap) cap = w->ctl_limit;
+
+    switch (msg) {
+    case WM_PAINT: ctl_paint_edit(w, wi); w->has_update = 0; return 0;
+    case WM_CHAR: {
+        int ch = (int)(wp & 0xff);
+        if (ch == 8) {                              /* backspace */
+            if (n) { w->text[n - 1] = 0; ctl_edit_dirty(w); ctl_edit_notify(w, wi, EN_CHANGE); }
+            return 0;
+        }
+        if (ch == '\r' || ch == '\n' || ch == 27 || ch == 9) return 0;
+        if (ch < 32 || ch > 126) return 0;          /* one byte, printable */
+        if ((int)n >= cap) return 0;
+        w->text[n] = (char)ch;
+        w->text[n + 1] = 0;
+        ctl_edit_dirty(w);
+        ctl_edit_notify(w, wi, EN_CHANGE);
+        return 0; }
+    case WM_KEYDOWN:
+        /* Delete acts on the end, like backspace: there is no caret to sit in
+         * front of. Backspace arrives here as well as through WM_CHAR on some
+         * paths, and is handled there so it is not taken twice. */
+        if (wp == 0x2E && n) {                      /* VK_DELETE */
+            w->text[n - 1] = 0;
+            ctl_edit_dirty(w);
+            ctl_edit_notify(w, wi, EN_CHANGE);
+        }
+        return 0;
+    case EM_LIMITTEXT:
+        w->ctl_limit = (int)wp;
+        return 0;
+    case EM_REPLACESEL:
+        snprintf(w->text, sizeof w->text, "%s", lp ? (const char *)(uintptr_t)lp : "");
+        ctl_edit_dirty(w);
+        ctl_edit_notify(w, wi, EN_CHANGE);
+        return 0;
+    case EM_GETSEL:
+        /* No selection is modelled, so the caret is reported at the end --
+         * which is where the next character goes. */
+        if (wp) *(uint32_t *)(uintptr_t)wp = (uint32_t)n;
+        if (lp) *(uint32_t *)(uintptr_t)lp = (uint32_t)n;
+        return (W_LRESULT)((n << 16) | n);
+    case EM_SETSEL:
+    case EM_SETMARGINS:
+    case EM_SETREADONLY:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 static MS W_LRESULT ctl_combo_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
@@ -1324,8 +1536,19 @@ static void *w32_class_proc(const char *name)
     return NULL;
 }
 
+static void *w32_create_id(const char *cls, const char *name, int x, int y, int w, int h,
+                           void *parent, void *param, uint32_t style, uint32_t exstyle,
+                           int id);
 static void *w32_create(const char *cls, const char *name, int x, int y, int w, int h,
                         void *parent, void *param, uint32_t style, uint32_t exstyle)
+{ return w32_create_id(cls, name, x, y, w, h, parent, param, style, exstyle, 0); }
+
+/* `id` is CreateWindowEx's hMenu, which for a child window is its control id
+ * rather than a menu -- and is the number a WM_COMMAND carries back to the
+ * parent to say which control it came from. */
+static void *w32_create_id(const char *cls, const char *name, int x, int y, int w, int h,
+                           void *parent, void *param, uint32_t style, uint32_t exstyle,
+                           int id)
 {
     int i, ci = 0, pi;
     void *hwnd;
@@ -1341,7 +1564,13 @@ static void *w32_create(const char *cls, const char *name, int x, int y, int w, 
          * created as BUTTON or EDIT gets no procedure at all otherwise, and
          * cannot draw or answer for itself. */
         W.wnd[i].wndproc = ci ? W.cls[ci].proc : w32_builtin_class(cls);
+        /* The extra bytes belong to the class, so the window gets as many as
+         * the class asked for -- capped at what it can hold. */
+        W.wnd[i].nextra = ci ? W.cls[ci].wndextra : 0;
+        if (W.wnd[i].nextra > (int)sizeof W.wnd[i].extra)
+            W.wnd[i].nextra = (int)sizeof W.wnd[i].extra;
         W.wnd[i].enabled = 1;
+        W.wnd[i].ctl_id = id;
         /* WS_VISIBLE. A control created without it is deliberately hidden, and
          * a helper window a plug-in keeps off-screen must not be composited
          * over the interface. */
@@ -1407,20 +1636,20 @@ static MS void *st_CreateWindowExA(uint32_t ex, const char *cls, const char *nam
                                   void *parent, void *menu, void *inst, void *param)
 {
     char c[64];
-    (void)menu; (void)inst;
-    return w32_create(w32_cls_name(cls, c, sizeof c, 0), name, x, y, w, h,
-                      parent, param, style, ex);
+    (void)inst;
+    return w32_create_id(w32_cls_name(cls, c, sizeof c, 0), name, x, y, w, h,
+                         parent, param, style, ex, (int)(intptr_t)menu);
 }
 static MS void *st_CreateWindowExW(uint32_t ex, const uint16_t *cls, const uint16_t *name,
                                   uint32_t style, int32_t x, int32_t y, int32_t w, int32_t h,
                                   void *parent, void *menu, void *inst, void *param)
 {
     char c[64], n[128];
-    (void)menu; (void)inst;
+    (void)inst;
     /* The caption arrives wide; the controls draw it narrow. */
     if (name) w2c_local(name, n, sizeof n);
-    return w32_create(w32_cls_name(cls, c, sizeof c, 1), name ? n : NULL,
-                      x, y, w, h, parent, param, style, ex);
+    return w32_create_id(w32_cls_name(cls, c, sizeof c, 1), name ? n : NULL,
+                         x, y, w, h, parent, param, style, ex, (int)(intptr_t)menu);
 }
 
 /* Whether a handle names a live window.
@@ -1525,10 +1754,27 @@ static MS int32_t st_MoveWindow(void *hwnd, int32_t x, int32_t y, int32_t w, int
     w32_resize(p, w, h);
     return 1;
 }
+/* A window this layer does not know is, in practice, the desktop: a plug-in
+ * asking about the screen calls GetClientRect(GetDesktopWindow()), and
+ * GetDesktopWindow has no window of its own to hand back. Answering an empty
+ * rectangle is worse than answering the screen -- VB-1 takes the height of what
+ * comes back and divides by it, so a zero was a SIGFPE before its editor drew a
+ * pixel. The screen size is the same one GetSystemMetrics reports. */
+static void w32_screen_rect(W32RECT *r)
+{
+    r->left = r->top = 0;
+    r->right = 1920;
+    r->bottom = 1080;
+}
 static MS int32_t st_GetWindowRect(void *hwnd, W32RECT *r)
 {
     w32_wnd *w = w32_wget(hwnd);
-    if (!w || !r) return 0;
+    if (!r) return 0;
+    /* NULL is not the desktop, it is an invalid handle, and Windows fails the
+     * call rather than answering with the screen. A window we simply do not
+     * know -- GetDesktopWindow's, say -- does get the screen. */
+    if (!hwnd) { r->left = r->top = r->right = r->bottom = 0; return 0; }
+    if (!w) { w32_screen_rect(r); return 1; }
     r->left = w->x; r->top = w->y;
     r->right = w->x + w->w; r->bottom = w->y + w->h;
     return 1;
@@ -1537,11 +1783,42 @@ static MS int32_t st_GetClientRect(void *hwnd, W32RECT *r)
 {
     w32_wnd *w = w32_wget(hwnd);
     if (!r) return 0;
+    if (!hwnd) { r->left = r->top = r->right = r->bottom = 0; return 0; }
+    if (!w) { w32_screen_rect(r); return 1; }
     r->left = r->top = 0;
-    r->right = w ? w->w : 0;
-    r->bottom = w ? w->h : 0;
+    r->right = w->w;
+    r->bottom = w->h;
     return 1;
 }
+/* WINDOWPLACEMENT, which a plug-in reads to find out whether it is minimised
+ * before it bothers to paint. Everything here is always shown and never
+ * minimised, so the answer is the window's own rectangle and SW_SHOWNORMAL. */
+typedef struct {
+    uint32_t length, flags, showCmd;
+    W32POINT ptMinPosition, ptMaxPosition;
+    W32RECT  rcNormalPosition;
+} W32WINDOWPLACEMENT;
+
+static MS int32_t st_GetWindowPlacement(void *hwnd, W32WINDOWPLACEMENT *p)
+{
+    if (!p) return 0;
+    p->flags = 0;
+    p->showCmd = 1;                      /* SW_SHOWNORMAL */
+    p->ptMinPosition.x = p->ptMinPosition.y = -1;
+    p->ptMaxPosition.x = p->ptMaxPosition.y = -1;
+    st_GetWindowRect(hwnd, &p->rcNormalPosition);
+    p->length = (uint32_t)sizeof *p;
+    return 1;
+}
+static MS int32_t st_SetWindowPlacement(void *hwnd, const W32WINDOWPLACEMENT *p)
+{ (void)hwnd; (void)p; return 1; }
+
+/* An editor is a child window, and a child window has no system menu. NULL is
+ * the truthful answer rather than a refusal, and it is what a caller that goes
+ * on to grey out Close is prepared for. */
+static MS void *st_GetSystemMenu(void *hwnd, int32_t revert)
+{ (void)hwnd; (void)revert; return NULL; }
+
 /* GetWindowInfo. The whole structure, not a return code: a caller reads
  * rcClient out of it and never looks at what the call returned. */
 static MS int32_t st_GetWindowInfo(void *hwnd, void *pwi)
@@ -1594,10 +1871,25 @@ static MS uint32_t st_GetWindowThreadProcessId(void *h, uint32_t *pid)
 { (void)h; if (pid) *pid = (uint32_t)getpid(); return (uint32_t)(uintptr_t)pthread_self(); }
 static MS int32_t st_EnumWindows(void *fn, intptr_t p) { (void)fn;(void)p; return 1; }
 
-static W_LRESULT w32_getlong(void *hwnd, int32_t idx)
+/* A non-negative index is a byte offset into the extra window bytes, and the
+ * width is the caller's: SetWindowLong writes four bytes there, the Ptr form
+ * writes a pointer. Anything past what the class asked for is out of bounds
+ * and reads as zero, the way an over-long index does on Windows. */
+static int w32_extra_ok(w32_wnd *w, int32_t idx, size_t width)
+{
+    return idx >= 0 && (size_t)idx + width <= (size_t)w->nextra
+           && (size_t)idx + width <= sizeof w->extra;
+}
+static W_LRESULT w32_getlong_n(void *hwnd, int32_t idx, size_t width)
 {
     w32_wnd *w = w32_wget(hwnd);
     if (!w) return 0;
+    if (idx >= 0) {
+        W_LRESULT v = 0;
+        if (!w32_extra_ok(w, idx, width)) return 0;
+        memcpy(&v, w->extra + idx, width);
+        return v;
+    }
     switch (idx) {
     case GWLP_USERDATA: return w->userdata;
     case GWLP_WNDPROC:  return (W_LRESULT)(intptr_t)w->wndproc;
@@ -1606,12 +1898,16 @@ static W_LRESULT w32_getlong(void *hwnd, int32_t idx)
     default:            return 0;
     }
 }
-static W_LRESULT w32_setlong(void *hwnd, int32_t idx, W_LRESULT v)
+static W_LRESULT w32_setlong_n(void *hwnd, int32_t idx, W_LRESULT v, size_t width)
 {
     w32_wnd *w = w32_wget(hwnd);
     W_LRESULT old;
     if (!w) return 0;
-    old = w32_getlong(hwnd, idx);
+    old = w32_getlong_n(hwnd, idx, width);
+    if (idx >= 0) {
+        if (w32_extra_ok(w, idx, width)) memcpy(w->extra + idx, &v, width);
+        return old;
+    }
     switch (idx) {
     case GWLP_USERDATA: w->userdata = v; break;
     case GWLP_WNDPROC:  w->wndproc = (void *)(intptr_t)v; break;
@@ -1621,25 +1917,105 @@ static W_LRESULT w32_setlong(void *hwnd, int32_t idx, W_LRESULT v)
     }
     return old;
 }
+static W_LRESULT w32_getlong(void *hwnd, int32_t idx)
+{ return w32_getlong_n(hwnd, idx, sizeof(W_LRESULT)); }
+static W_LRESULT w32_setlong(void *hwnd, int32_t idx, W_LRESULT v)
+{ return w32_setlong_n(hwnd, idx, v, sizeof(W_LRESULT)); }
 static MS W_LRESULT st_GetWindowLongPtrA(void *h, int32_t i) { return w32_getlong(h, i); }
 static MS W_LRESULT st_GetWindowLongPtrW(void *h, int32_t i) { return w32_getlong(h, i); }
-static MS int32_t st_GetWindowLongA(void *h, int32_t i) { return (int32_t)w32_getlong(h, i); }
-static MS int32_t st_GetWindowLongW(void *h, int32_t i) { return (int32_t)w32_getlong(h, i); }
+static MS int32_t st_GetWindowLongA(void *h, int32_t i)
+{ return (int32_t)w32_getlong_n(h, i, i >= 0 ? 4 : sizeof(W_LRESULT)); }
+static MS int32_t st_GetWindowLongW(void *h, int32_t i) { return st_GetWindowLongA(h, i); }
 static MS W_LRESULT st_SetWindowLongPtrA(void *h, int32_t i, W_LRESULT v) { return w32_setlong(h, i, v); }
 static MS W_LRESULT st_SetWindowLongPtrW(void *h, int32_t i, W_LRESULT v) { return w32_setlong(h, i, v); }
 static MS int32_t st_SetWindowLongA(void *h, int32_t i, int32_t v)
-{ return (int32_t)w32_setlong(h, i, v); }
+{ return (int32_t)w32_setlong_n(h, i, (W_LRESULT)(uint32_t)v, i >= 0 ? 4 : sizeof(W_LRESULT)); }
 static MS int32_t st_SetWindowLongW(void *h, int32_t i, int32_t v)
-{ return (int32_t)w32_setlong(h, i, v); }
+{ return st_SetWindowLongA(h, i, v); }
+
+/* Window properties: a named pointer hung off a window. A plug-in that
+ * subclasses a window it did not register uses these instead of the class's
+ * extra bytes, and reads its own object back out on every message.
+ *
+ * An atom is as good a key as a string, and callers pass both, so the key is
+ * the printed form of whichever arrived. */
+static const char *w32_prop_key(const void *name, char *buf, size_t n, int wide)
+{
+    if (!name) return NULL;
+    if ((uintptr_t)name < 0x10000) {
+        snprintf(buf, n, "#%u", (unsigned)((uintptr_t)name & 0xFFFF));
+        return buf;
+    }
+    if (wide) { w2c((const uint16_t *)name, buf, n); return buf; }
+    snprintf(buf, n, "%s", (const char *)name);
+    return buf;
+}
+static MS int32_t w32_setprop(void *hwnd, const void *name, void *val, int wide)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    char key[64];
+    const char *k = w32_prop_key(name, key, sizeof key, wide);
+    int i;
+    if (!w || !k) return 0;
+    for (i = 0; i < w->nprop; i++)
+        if (!strcmp(w->prop[i].name, k)) { w->prop[i].val = val; return 1; }
+    if (w->nprop >= W32_MAX_PROP) return 0;
+    snprintf(w->prop[w->nprop].name, sizeof w->prop[0].name, "%s", k);
+    w->prop[w->nprop].val = val;
+    w->nprop++;
+    return 1;
+}
+static void *w32_getprop(void *hwnd, const void *name, int wide)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    char key[64];
+    const char *k = w32_prop_key(name, key, sizeof key, wide);
+    int i;
+    if (!w || !k) return NULL;
+    for (i = 0; i < w->nprop; i++)
+        if (!strcmp(w->prop[i].name, k)) return w->prop[i].val;
+    return NULL;
+}
+static void *w32_removeprop(void *hwnd, const void *name, int wide)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    char key[64];
+    const char *k = w32_prop_key(name, key, sizeof key, wide);
+    int i;
+    if (!w || !k) return NULL;
+    for (i = 0; i < w->nprop; i++)
+        if (!strcmp(w->prop[i].name, k)) {
+            void *v = w->prop[i].val;
+            w->prop[i] = w->prop[--w->nprop];
+            return v;
+        }
+    return NULL;
+}
+static MS int32_t st_SetPropA(void *h, const char *n, void *v) { return w32_setprop(h, n, v, 0); }
+static MS int32_t st_SetPropW(void *h, const uint16_t *n, void *v) { return w32_setprop(h, n, v, 1); }
+static MS void *st_GetPropA(void *h, const char *n) { return w32_getprop(h, n, 0); }
+static MS void *st_GetPropW(void *h, const uint16_t *n) { return w32_getprop(h, n, 1); }
+static MS void *st_RemovePropA(void *h, const char *n) { return w32_removeprop(h, n, 0); }
+static MS void *st_RemovePropW(void *h, const uint16_t *n) { return w32_removeprop(h, n, 1); }
 
 /* ---- messages ----------------------------------------------------------- */
 
 static MS intptr_t st_DefWindowProcA(void *hwnd, uint32_t msg, uintptr_t wp, intptr_t lp)
 {
-    (void)hwnd; (void)wp; (void)lp;
+    (void)wp; (void)lp;
     /* Claiming the background is erased avoids a flash of undrawn window, and
      * the plugin repaints everything anyway. */
     if (msg == WM_ERASEBKGND) return 1;
+    /* Windows' DefWindowProc paints a WM_PAINT it is given -- BeginPaint and
+     * EndPaint around nothing -- which validates the window. Leaving it dirty
+     * instead means the pump hands it the same WM_PAINT for ever: JUCE's 1x1
+     * message window took 76 of them in one editor session, none of which it
+     * wanted. */
+    if (msg == WM_PAINT) {
+        w32_wnd *w = w32_wget(hwnd);
+        if (w) w->has_update = 0;
+        return 0;
+    }
     return 0;
 }
 static MS intptr_t st_DefWindowProcW(void *h, uint32_t m, uintptr_t w, intptr_t l)
@@ -1678,6 +2054,9 @@ static MS int32_t st_PeekMessageA(W32MSG *m, void *hwnd, uint32_t f1, uint32_t f
     if (rm & 1) W.qtail = (W.qtail + 1) % W32_MSGQ;   /* PM_REMOVE */
     return 1;
 }
+/* Nothing in the queue is text, so the W form is the A form. */
+static MS int32_t st_PeekMessageW(W32MSG *m, void *hwnd, uint32_t f1, uint32_t f2, uint32_t rm)
+{ return st_PeekMessageA(m, hwnd, f1, f2, rm); }
 static MS int32_t st_TranslateMessage(const W32MSG *m) { (void)m; return 0; }
 static MS W_LRESULT st_DispatchMessageA(const W32MSG *m)
 {
@@ -1749,8 +2128,31 @@ static MS int32_t st_ReleaseDC(void *hwnd, void *hdc)
     d->used = 0;
     return 1;
 }
+/* A memory DC comes with a 1x1 monochrome bitmap already selected.
+ *
+ * That detail is not cosmetic: SelectObject returns the object it replaced, so
+ * on a DC with nothing selected it returns NULL -- and NULL is also how it
+ * reports failure. Cairo's _create_dc_and_bitmap selects its new DIB section
+ * and treats a NULL return as the call having failed, so every surface it built
+ * through a memory DC was abandoned with "Error 18" and BC Free Amp went on to
+ * fault on the half-built font it had cached. The stock pen, brush and font are
+ * already handed out for exactly this reason -- see w32_dcget -- and the
+ * bitmap was the one missing.
+ *
+ * Only a memory DC gets one. A window DC draws at the screen and SelectObject
+ * of a bitmap on one fails on Windows too, so its `bitmap` stays zero, which is
+ * also what the rest of this file reads as "this DC draws into a window". */
 static MS void *st_CreateCompatibleDC(void *hdc)
-{ void *r; (void)hdc; r = w32_dc_new(0); PLOG("  [w32] CreateCompatibleDC -> %p\n", r); return r; }
+{
+    void *r;
+    w32_dc *d;
+    (void)hdc;
+    r = w32_dc_new(0);
+    if ((d = w32_dcget(r)) != NULL && !d->bitmap)
+        d->bitmap = w32_obj_new(OBJ_BITMAP, 1, 1, 0);
+    PLOG("  [w32] CreateCompatibleDC -> %p\n", r);
+    return r;
+}
 static MS int32_t st_DeleteDC(void *hdc)
 {
     w32_dc *d = w32_dcget(hdc);
@@ -1784,7 +2186,15 @@ static MS void *st_BeginPaint(void *hwnd, W32PAINTSTRUCT *ps)
                                 : (W32RECT){ 0, 0, w->w, w->h };
     {
         w32_dc *d = w32_dcget(hdc);
-        if (d) d->in_paint = 1;
+        if (d) {
+            d->in_paint = 1;
+            /* Windows clips this DC to the update region, and a caller may
+             * rely on that to throw away what it draws outside -- see
+             * w32_blit_box. Without it JUCE's reused offscreen image smeared
+             * the previous paint across the window on every hover. */
+            d->clip = ps->rcPaint;
+            d->has_clip = 1;
+        }
         g_w32_paint_depth++;
     }
     return hdc;
@@ -1815,6 +2225,10 @@ static MS int32_t st_InvalidateRect(void *hwnd, const W32RECT *r, int32_t erase)
         if (r->bottom > w->update.bottom) w->update.bottom = r->bottom;
     }
     w->has_update = 1;
+    if (w32_msgtrace())
+        fprintf(stderr, "[inv] wnd#%d %d,%d %dx%d\n", (int)(w - W.wnd),
+                w->update.left, w->update.top,
+                w->update.right - w->update.left, w->update.bottom - w->update.top);
     return 1;
 }
 static MS int32_t st_ValidateRect(void *hwnd, const W32RECT *r)
@@ -1880,6 +2294,27 @@ static MS int32_t st_RedrawWindow(void *hwnd, const W32RECT *r, void *rgn, uint3
  * and `scanLines` describe which band of the DIB `bits` actually covers, so a
  * caller may hand over one strip of a taller image; ignoring that draws the wrong
  * rows. */
+/* Where a blit through this DC may actually land.
+ *
+ * The surface bounds are not the whole answer: the DC returned by BeginPaint
+ * is clipped to the update region on Windows, and a caller is entitled to
+ * write outside it and have the excess dropped. JUCE does exactly that -- it
+ * rounds its offscreen image up (608x256 for a 600x250 window), reuses it
+ * across paints, and blits the whole thing at the dirty rectangle's corner, so
+ * everything past that rectangle is the *previous* paint's pixels. Unclipped,
+ * those land on the window: hovering one control redrew a piece of the
+ * interface from somewhere else entirely. */
+static void w32_blit_box(const w32_dc *d, const w32_surf *t, W32RECT *b)
+{
+    b->left = 0; b->top = 0; b->right = t->w; b->bottom = t->h;
+    if (d && d->has_clip) {
+        if (d->clip.left   > b->left)   b->left   = d->clip.left;
+        if (d->clip.top    > b->top)    b->top    = d->clip.top;
+        if (d->clip.right  < b->right)  b->right  = d->clip.right;
+        if (d->clip.bottom < b->bottom) b->bottom = d->clip.bottom;
+    }
+}
+
 static MS int32_t st_SetDIBitsToDevice(void *hdc, int32_t xd, int32_t yd,
                                       uint32_t w, uint32_t h,
                                       int32_t xs, int32_t ys,
@@ -1893,6 +2328,7 @@ static MS int32_t st_SetDIBitsToDevice(void *hdc, int32_t xd, int32_t yd,
     const W32BITMAPINFOHEADER *bh = bmi;
     const uint32_t *src = bits;
     int sw, sh, topdown, row, col;
+    W32RECT clipbox;
 
     (void)usage;
     if (!t || !t->px || !bh || !src) return 0;
@@ -1902,29 +2338,92 @@ static MS int32_t st_SetDIBitsToDevice(void *hdc, int32_t xd, int32_t yd,
          w, h, d->bitmap ? " (memory)" : " (window)", xd, yd, xs, ys,
          startScan, scanLines, bh->biBitCount);
     if (bh->biBitCount != 32) return 0;
+    /* PELOAD_SRCDUMP=<dir>: the plug-in's own back buffer, as handed over.
+     *
+     * A plug-in that composes its whole interface itself and pushes it through
+     * one call leaves exactly one question when the picture looks wrong -- did
+     * it draw that, or did we put it there? Writing the source out answers it
+     * in one run: compare against the captured window and a match means the
+     * fault is upstream of the blit, in whatever the plug-in was told when it
+     * laid the thing out. That is how the Absynth strip blit was pinned down,
+     * and how the NI editors were cleared of it afterwards.
+     *
+     * Written on any push whose buffer spans the whole image, not just a
+     * full-frame one: a plug-in repainting a menu sends a small rectangle out
+     * of the same whole-image buffer, and dumping only the full frames leaves
+     * the file a frame or more stale -- which reads as "the plug-in never drew
+     * that" for something it drew a moment ago. */
+    w32_blit_box(d, t, &clipbox);
+    {
+        /* Read once: this is the blit path, and getenv walks the environment
+         * every time it is called -- the same reason w32_msgtrace caches. */
+        static const char *dir; static int looked;
+        int ih = bh->biHeight < 0 ? -bh->biHeight : bh->biHeight;
+        if (!looked) { looked = 1; dir = getenv("PELOAD_SRCDUMP"); }
+        if (dir && *dir && startScan == 0 && (int)scanLines >= ih) {
+            char fn[512];
+            FILE *f;
+            snprintf(fn, sizeof fn, "%s/srcbuf.ppm", dir);
+            if ((f = fopen(fn, "wb"))) {
+                int yy, xx;
+                fprintf(f, "P6\n%d %d\n255\n", bh->biWidth, ih);
+                for (yy = 0; yy < ih; yy++) {
+                    /* Top row first, undoing whichever order the DIB is in. */
+                    const uint32_t *r = src + (size_t)(bh->biHeight < 0 ? yy
+                                                       : ih - 1 - yy) * bh->biWidth;
+                    for (xx = 0; xx < bh->biWidth; xx++) {
+                        fputc((r[xx] >> 16) & 0xff, f);
+                        fputc((r[xx] >> 8) & 0xff, f);
+                        fputc(r[xx] & 0xff, f);
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
     sw = bh->biWidth;
     sh = bh->biHeight < 0 ? -bh->biHeight : bh->biHeight;
     topdown = bh->biHeight < 0;
     if (sw <= 0 || sh <= 0 || (int32_t)w <= 0 || (int32_t)h <= 0) return 0;
     if (scanLines == 0) scanLines = (uint32_t)sh;
 
+    if (scanLines > (uint32_t)sh) scanLines = (uint32_t)sh;
+
     for (row = 0; row < (int)h; row++) {
         int ty = yd + row;
-        int sy = ys + row;                 /* same scale, so row for row */
         int band;
         const uint32_t *srow;
         uint32_t *drow;
-        if (ty < 0 || ty >= t->h) continue;
-        if (sy < 0 || sy >= sh) continue;
-        /* Which line of the supplied buffer holds source row sy. For a bottom-up
-         * DIB the buffer runs upward from the bottom of the image. */
-        band = topdown ? sy - (int)startScan : (sh - 1 - sy) - (int)startScan;
+        if (ty < clipbox.top || ty >= clipbox.bottom) continue;
+        /* Which line of the supplied buffer holds this destination row.
+         *
+         * SetDIBitsToDevice names the source by the *lower-left* corner of the
+         * rectangle, and it means that literally: ys counts up from the bottom
+         * of the image whichever way round the buffer is stored. Top-down only
+         * changes where a given scanline lives in memory, not which scanline
+         * the caller asked for.
+         *
+         * So the destination's topmost row is the rectangle's highest
+         * scanline, ys + h - 1 counting from the bottom, which is image row
+         * H - ys - h counting from the top. Both forms are that same line,
+         * indexed the way each buffer stores it.
+         *
+         * Getting this wrong is not a small offset. Absynth's editor is one
+         * 764x687 top-down DIB that it repaints in pieces: a 33-row strip from
+         * ys=645 to y=9 is its CPU and level meters redrawn exactly where they
+         * already are, and read as a downward offset it fetched the bottom
+         * keyboard and stamped it over the meters. Its other three blits, from
+         * ys=0, 3 and 5, were out by 0, 6 and 4 rows -- which is the doubled,
+         * clipped lettering along the top edge. Every one of the four is an
+         * identity blit once ys is read from the bottom. */
+        band = topdown ? sh - (int)ys - (int)h + row - (int)startScan
+                       : (int)ys + (int)h - 1 - row - (int)startScan;
         if (band < 0 || band >= (int)scanLines) continue;
         srow = src + (size_t)band * sw;
         drow = t->px + (size_t)ty * t->w;
         for (col = 0; col < (int)w; col++) {
             int tx = xd + col, sx = xs + col;
-            if (tx < 0 || tx >= t->w || sx < 0 || sx >= sw) continue;
+            if (tx < clipbox.left || tx >= clipbox.right || sx < 0 || sx >= sw) continue;
             drow[tx] = srow[sx];
         }
     }
@@ -2109,6 +2608,7 @@ static MS int32_t st_StretchDIBits(void *hdc, int32_t xd, int32_t yd, int32_t wd
     const W32BITMAPINFOHEADER *bh = bmi;
     const uint32_t *src = bits;
     int sw, sh, topdown, dy, dx;
+    W32RECT clipbox;
 
     (void)usage; (void)rop;
     if (!t || !t->px || !bh || !src) return 0;
@@ -2118,6 +2618,7 @@ static MS int32_t st_StretchDIBits(void *hdc, int32_t xd, int32_t yd, int32_t wd
          xd, yd, wd, hd, bh->biBitCount);
     if (bh->biBitCount != 32) return 0;           /* Skia always gives us 32bpp */
 
+    w32_blit_box(d, t, &clipbox);
     sw = bh->biWidth;
     sh = bh->biHeight < 0 ? -bh->biHeight : bh->biHeight;
     topdown = bh->biHeight < 0;
@@ -2128,7 +2629,7 @@ static MS int32_t st_StretchDIBits(void *hdc, int32_t xd, int32_t yd, int32_t wd
         int sy;
         const uint32_t *srow;
         uint32_t *drow;
-        if (ty < 0 || ty >= t->h) continue;
+        if (ty < clipbox.top || ty >= clipbox.bottom) continue;
         sy = ys + (hs == hd ? dy : (int)((int64_t)dy * hs / hd));
         if (sy < 0 || sy >= sh) continue;
         srow = src + (size_t)(topdown ? sy : sh - 1 - sy) * sw;
@@ -2136,14 +2637,14 @@ static MS int32_t st_StretchDIBits(void *hdc, int32_t xd, int32_t yd, int32_t wd
         if (ws == wd) {
             for (dx = 0; dx < wd; dx++) {
                 int tx = xd + dx, sx = xs + dx;
-                if (tx < 0 || tx >= t->w || sx < 0 || sx >= sw) continue;
+                if (tx < clipbox.left || tx >= clipbox.right || sx < 0 || sx >= sw) continue;
                 drow[tx] = srow[sx];
             }
         } else {
             for (dx = 0; dx < wd; dx++) {
                 int tx = xd + dx;
                 int sx = xs + (int)((int64_t)dx * ws / wd);
-                if (tx < 0 || tx >= t->w || sx < 0 || sx >= sw) continue;
+                if (tx < clipbox.left || tx >= clipbox.right || sx < 0 || sx >= sw) continue;
                 drow[tx] = srow[sx];
             }
         }
@@ -2224,6 +2725,7 @@ static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t 
     w32_surf dtmp, stmp;
     w32_surf *ds = w32_target_in(dd, &dtmp), *ss = w32_source_in(sd, &stmp);
     int j, i;
+    W32RECT clipbox;
 
     W.n_bitblt++;
     if (!ds || !ds->px) return 0;
@@ -2249,13 +2751,14 @@ static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t 
         uint32_t fg = w32_cr(dd->text_color), bg = w32_cr(dd->bk_color);
         uint32_t pat = w32_brush_on(dd) ? w32_brush_rgb(dd) : 0;
 
+        w32_blit_box(dd, ds, &clipbox);
         for (j = 0; j < h; j++) {
             int ty = y + j, fy = sy + j;
-            if (ty < 0 || ty >= ds->h) continue;
+            if (ty < clipbox.top || ty >= clipbox.bottom) continue;
             for (i = 0; i < w; i++) {
                 int tx = x + i, fx = sx + i;
                 uint32_t sv = 0, dv, out;
-                if (tx < 0 || tx >= ds->w) continue;
+                if (tx < clipbox.left || tx >= clipbox.right) continue;
                 if (w32_rop_needs_src(rop)) {
                     if (fy < 0 || fy >= ss->h || fx < 0 || fx >= ss->w) continue;
                     sv = ss->px[(size_t)fy * ss->w + fx];
@@ -2268,11 +2771,105 @@ static MS int32_t st_BitBlt(void *dst, int32_t x, int32_t y, int32_t w, int32_t 
         }
     }
     w32_dib_out(dd, x, y, x + w, y + h);
-    PLOG("  [w32] BitBlt %dx%d to %s#%d at %d,%d from %s#%d at %d,%d\n", w, h,
+    PLOG("  [w32] BitBlt %dx%d to %s#%d at %d,%d from %s#%d at %d,%d rop=0x%08x\n", w, h,
          dd->bitmap ? "bmp" : "wnd", dd->bitmap ? dd->bitmap : dd->wnd, x, y,
-         sd->bitmap ? "bmp" : "wnd", sd->bitmap ? sd->bitmap : sd->wnd, sx, sy);
+         sd->bitmap ? "bmp" : "wnd", sd->bitmap ? sd->bitmap : sd->wnd, sx, sy,
+         (unsigned)rop);
     if (dd->wnd && !dd->bitmap && !dd->in_paint) w32_present(dd->wnd);
     return 1;
+}
+
+/* msimg32's two blits.
+ *
+ * Neither existed before Windows 98, so a plug-in of that era does not import
+ * them -- it asks GetProcAddress and treats NULL as "this Windows is too old",
+ * which is a path it still has and which quietly does something else. daHornet
+ * fades its splash screen out with AlphaBlend; told NULL, it left the splash
+ * bitmap sitting on top of the interface for good. Every knob and label it had
+ * already drawn was underneath a 612x244 picture of a dimmed panel, so the
+ * editor read as a plug-in that had painted its background and stopped.
+ *
+ * BLENDFUNCTION is four bytes passed by value -- one dword pushed at i386, one
+ * register at x86-64 -- so taking it as a uint32_t is the same thing at both
+ * widths without a struct-passing rule per ABI. SourceConstantAlpha is its
+ * third byte.
+ *
+ * Per-pixel alpha (AC_SRC_ALPHA) cannot be honoured: a surface here is
+ * 0x00RRGGBB and the DIB loader drops the alpha byte, so there is none left to
+ * read. Such a call blends by the constant alpha alone, which is right when
+ * that is 255 and approximate otherwise -- and far closer than refusing. */
+static uint32_t w32_blend_px(uint32_t d, uint32_t s, unsigned a)
+{
+    unsigned ia = 255u - a;
+    unsigned r = (((s >> 16) & 0xff) * a + ((d >> 16) & 0xff) * ia) / 255u;
+    unsigned g = (((s >>  8) & 0xff) * a + ((d >>  8) & 0xff) * ia) / 255u;
+    unsigned b = (( s        & 0xff) * a + ( d        & 0xff) * ia) / 255u;
+    return (r << 16) | (g << 8) | b;
+}
+
+/* The body both calls share: a stretching copy where each destination pixel
+ * either takes the source, blends with it, or is left alone. */
+static int w32_blend_blit(void *dst, int32_t x, int32_t y, int32_t wd, int32_t hd,
+                          void *src, int32_t sx, int32_t sy, int32_t ws, int32_t hs,
+                          int alpha, int32_t transparent)
+{
+    w32_dc *dd = w32_dcget(dst), *sd = w32_dcget(src);
+    w32_surf dtmp, stmp;
+    w32_surf *ds = w32_target_in(dd, &dtmp), *ss = w32_source_in(sd, &stmp);
+    W32RECT clipbox;
+    int dy, dx;
+
+    if (!ds || !ds->px || !ss || !ss->px) return 0;
+    if (wd <= 0 || hd <= 0 || ws <= 0 || hs <= 0) return 0;
+    x += dd->org_x;  y += dd->org_y;
+    sx += sd->org_x; sy += sd->org_y;
+    w32_blit_box(dd, ds, &clipbox);
+
+    for (dy = 0; dy < hd; dy++) {
+        int ty = y + dy;
+        int fy = sy + (hs == hd ? dy : (int)((int64_t)dy * hs / hd));
+        const uint32_t *srow;
+        uint32_t *drow;
+        if (ty < clipbox.top || ty >= clipbox.bottom) continue;
+        if (fy < 0 || fy >= ss->h) continue;
+        srow = ss->px + (size_t)fy * ss->w;
+        drow = ds->px + (size_t)ty * ds->w;
+        for (dx = 0; dx < wd; dx++) {
+            int tx = x + dx;
+            int fx = sx + (ws == wd ? dx : (int)((int64_t)dx * ws / wd));
+            uint32_t sv;
+            if (tx < clipbox.left || tx >= clipbox.right) continue;
+            if (fx < 0 || fx >= ss->w) continue;
+            sv = srow[fx] & 0x00FFFFFFu;
+            if (transparent >= 0 && sv == (uint32_t)transparent) continue;
+            drow[tx] = alpha >= 255 ? sv
+                                    : w32_blend_px(drow[tx], sv, (unsigned)alpha);
+        }
+    }
+    w32_dib_out(dd, x, y, x + wd, y + hd);
+    if (dd->wnd && !dd->bitmap && !dd->in_paint) w32_present(dd->wnd);
+    return 1;
+}
+
+static MS int32_t st_AlphaBlend(void *dst, int32_t x, int32_t y, int32_t wd, int32_t hd,
+                                void *src, int32_t sx, int32_t sy, int32_t ws, int32_t hs,
+                                uint32_t blend)
+{
+    int alpha = (int)((blend >> 16) & 0xff);       /* SourceConstantAlpha */
+    PLOG("  [w32] AlphaBlend %dx%d -> %dx%d at %d,%d alpha=%d\n",
+         ws, hs, wd, hd, x, y, alpha);
+    return w32_blend_blit(dst, x, y, wd, hd, src, sx, sy, ws, hs, alpha, -1);
+}
+/* The colour to drop is a COLORREF, so it needs the same B-R swap every other
+ * colour taken from a plug-in does. */
+static MS int32_t st_TransparentBlt(void *dst, int32_t x, int32_t y, int32_t wd, int32_t hd,
+                                    void *src, int32_t sx, int32_t sy, int32_t ws, int32_t hs,
+                                    uint32_t key)
+{
+    PLOG("  [w32] TransparentBlt %dx%d -> %dx%d at %d,%d key=0x%06x\n",
+         ws, hs, wd, hd, x, y, (unsigned)w32_cr(key));
+    return w32_blend_blit(dst, x, y, wd, hd, src, sx, sy, ws, hs, 255,
+                          (int32_t)w32_cr(key));
 }
 
 static MS void *st_CreateCompatibleBitmap(void *hdc, int32_t w, int32_t h)
@@ -2478,7 +3075,21 @@ static MS void *st_CreateDIBSection(void *hdc, const void *bmi, uint32_t usage,
     memcpy(&comp, h + 16, 4);
     memcpy(&clrused, h + 32, 4);
     if (ht < 0) { ht = -ht; flip = 0; }
-    if (w <= 0 || ht <= 0 || w > 16384 || ht > 16384) return NULL;
+    /* A sanity limit on the size, not on either side of it.
+     *
+     * This refused anything over 16384 in one dimension, which sounds generous
+     * and is not: a knob filmstrip is one frame wide and one frame tall per
+     * step, and BC Free Amp ships a 128x20580 one. Refusing it returned NULL,
+     * the plug-in did not check, and libpng wrote its rows through the null --
+     * which is a segfault inside the host with the plug-in's own decoder on the
+     * stack. What actually needs bounding is the allocation, so that is what is
+     * bounded, in 64-bit arithmetic so the product cannot wrap. */
+    if (w <= 0 || ht <= 0 || w > W32_DIB_MAX_SIDE || ht > W32_DIB_MAX_SIDE ||
+        (uint64_t)w * (uint64_t)ht * 4u > W32_DIB_MAX_BYTES) {
+        PLOG("  [w32] CreateDIBSection refused %dx%d bpp=%u: beyond the size limit\n",
+             w, ht, bpp);
+        return NULL;
+    }
     if (comp != 0 && comp != 3) return NULL;            /* BI_RGB, BI_BITFIELDS */
     if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)
         return NULL;
@@ -2615,6 +3226,64 @@ static MS void *st_SelectObject(void *hdc, void *obj)
     }
     return obj;
 }
+/* The graphics mode, and the world transform that only exists in one of them.
+ *
+ * SetGraphicsMode had no implementation, so it fell through to the generic
+ * stub and answered zero -- which is failure. Cairo builds a global font DC and
+ * abandons it if GM_ADVANCED is refused, so its whole Win32 font path came
+ * apart: no font DC, then a SelectObject on a NULL one, then a fault on the
+ * half-built font it had cached. BC Free Amp dies exactly there.
+ *
+ * The mode is recorded and the transform is accepted and kept, but drawing
+ * here does not apply it: what a plug-in gets is text and blits at the
+ * identity, which is right for the overwhelmingly common case of a caller that
+ * asks for GM_ADVANCED only so it may set an identity or a translation. A
+ * rotation would come out unrotated -- visibly wrong, and still an editor,
+ * where refusing the mode is neither. */
+static MS int32_t st_SetGraphicsMode(void *hdc, int32_t mode)
+{
+    w32_dc *d = w32_dcget(hdc);
+    int32_t prev;
+    if (!d || (mode != 1 && mode != 2)) return 0;
+    prev = d->gfxmode ? d->gfxmode : 1;           /* GM_COMPATIBLE */
+    d->gfxmode = mode;
+    return prev;
+}
+static MS int32_t st_GetGraphicsMode(void *hdc)
+{
+    w32_dc *d = w32_dcget(hdc);
+    return d ? (d->gfxmode ? d->gfxmode : 1) : 0;
+}
+/* XFORM is six floats. Kept so GetWorldTransform gives back what was set --
+ * a caller that saves, changes and restores it must see its own values. */
+static MS int32_t st_SetWorldTransform(void *hdc, const void *xf)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d || !xf) return 0;
+    if (d->gfxmode != 2) return 0;                /* GM_ADVANCED only */
+    /* Only an approximation when there is something to approximate: the
+     * identity is applied exactly by ignoring it, and that is all cairo's
+     * Win32 backend ever sets -- 155 times over one BC Free Amp editor, every
+     * one of them the identity. Counting those would have pointed at this
+     * function for a blank editor it has nothing to do with. */
+    { const float *m = xf;
+      if (m[0] != 1.0f || m[1] != 0.0f || m[2] != 0.0f ||
+          m[3] != 1.0f || m[4] != 0.0f || m[5] != 0.0f)
+          W32_APPROX();
+    }
+    memcpy(d->xform, xf, sizeof d->xform);
+    d->has_xform = 1;
+    return 1;
+}
+static MS int32_t st_GetWorldTransform(void *hdc, void *xf)
+{
+    static const float identity[6] = { 1, 0, 0, 1, 0, 0 };
+    w32_dc *d = w32_dcget(hdc);
+    if (!d || !xf) return 0;
+    memcpy(xf, d->has_xform ? d->xform : identity, sizeof d->xform);
+    return 1;
+}
+
 static MS void *st_GetCurrentObject(void *hdc, uint32_t type)
 {
     w32_dc *d = w32_dcget(hdc);
@@ -2630,11 +3299,25 @@ static MS int32_t st_DeleteObject(void *obj)
     memset(o, 0, sizeof *o);
     return 1;
 }
+/* sizeof(DIBSECTION) as the guest sees it: BITMAP, BITMAPINFOHEADER, three
+ * masks, then an aligned HANDLE and a DWORD. The handle is pointer-width, so
+ * the whole thing is too, and a caller comparing the return against its own
+ * sizeof has to be answered in its own arithmetic. */
+#if defined(__i386__)
+#define W32_DIBSECTION_SIZE  84u                  /* 24 + 40 + 12 + 4 + 4 */
+#else
+#define W32_DIBSECTION_SIZE 104u                  /* 32 + 40 + 12 + pad + 8 + 4 + pad */
+#endif
+
 static MS int32_t st_GetObjectA(void *obj, int32_t n, void *out)
 {
     w32_obj *o = w32_oget(obj);
     /* BITMAP: { LONG type; LONG w; LONG h; LONG widthBytes; WORD planes; WORD bpp; void *bits; } */
     struct { int32_t type, w, h, widthBytes; uint16_t planes, bpp; void *bits; } bm;
+    /* BITMAPINFOHEADER, the second member of a DIBSECTION. */
+    struct { uint32_t biSize; int32_t biWidth, biHeight; uint16_t biPlanes, biBitCount;
+             uint32_t biCompression, biSizeImage; int32_t biXPelsPerMeter, biYPelsPerMeter;
+             uint32_t biClrUsed, biClrImportant; } dsh;
     if (!o || !out) return 0;
     if (o->kind == OBJ_FONT) {
         int copy = o->logfont_len ? o->logfont_len : 0;
@@ -2661,6 +3344,32 @@ static MS int32_t st_GetObjectA(void *obj, int32_t n, void *out)
              * Windows says so with NULL. Handing ours over invites a write at
              * whatever stride the caller assumes. */
             bm.widthBytes = o->w * 4; bm.bpp = 32; bm.bits = NULL;
+        }
+        /* A caller that asked for a whole DIBSECTION gets one.
+         *
+         * This filled the BITMAP at the front and returned 32 however much was
+         * asked for, and a caller that checks the return against
+         * sizeof(DIBSECTION) -- cairo's win32 surface does -- reads that as
+         * "this is not a DIB section" and carries on down its other path with
+         * an uninitialised bits pointer. BC Free Amp ended up copying a knob's
+         * pixels to address 0x220. The header describes the same layout the
+         * DIB was created with, which is what the caller's own row arithmetic
+         * is about to be built on. */
+        if (o->dib && n >= (int32_t)(sizeof bm + sizeof dsh)) {
+            memset(&dsh, 0, sizeof dsh);
+            dsh.biSize     = 40;
+            dsh.biWidth    = o->w;
+            dsh.biHeight   = -o->h;               /* top-down, as created */
+            dsh.biPlanes   = 1;
+            dsh.biBitCount = (uint16_t)o->dib_bpp;
+            dsh.biSizeImage = (uint32_t)(o->dib_stride * o->h);
+            memcpy(out, &bm, sizeof bm);
+            memcpy((char *)out + sizeof bm, &dsh, sizeof dsh);
+            /* dsBitfields, dshSection and dsOffset: no section object backs
+             * this and the format is not bitfield-encoded, so all zero. */
+            memset((char *)out + sizeof bm + sizeof dsh, 0,
+                   (size_t)n - (sizeof bm + sizeof dsh));
+            return (int32_t)W32_DIBSECTION_SIZE;
         }
         memcpy(out, &bm, sizeof bm);
         return (int32_t)sizeof bm;
@@ -2743,6 +3452,11 @@ static MS void *st_CreateFontIndirectA(const void *lf)
     PLOG("  [font] CreateFontIndirectA height=%d\n", (int)h);
     return w32_font_from_logfont(lf, 0);
 }
+static MS void *st_CreateFontIndirectW(const void *lf);
+/* ENUMLOGFONTEXDV begins with the LOGFONT, and the design vector after it is
+ * for multiple-master fonts that no plug-in here uses. */
+static MS void *st_CreateFontIndirectExW(const void *elf)
+{ return st_CreateFontIndirectW(elf); }
 static MS void *st_CreateFontIndirectW(const void *lf)
 {
     int32_t h = 0;
@@ -3165,6 +3879,495 @@ static MS int32_t st_Polyline(void *hdc, const W32POINT *pts, int32_t n)
     w32_dib_out_all(d);
     return 1;
 }
+/* ------------------------------------------------------------------------
+ * The rest of GDI32, as a VCL-era plug-in expects to find it.
+ *
+ * A C++Builder or MFC DLL names most of GDI32 in its import table whether it
+ * draws with it or not, and a packed one rebuilds that table through
+ * GetProcAddress and stops at the first name that will not resolve. Chord
+ * Organ stopped here, forty names deep, and PELOAD_PROBE_ALL named the lot in
+ * one run.
+ *
+ * Where the call has a real meaning for a layer that rasterises into a 32-bit
+ * buffer, it does it. Where it belongs to a world this host does not have --
+ * palettised displays, metafiles, printer escapes -- it answers the way a
+ * machine without that thing answers, which is a defined result a caller has a
+ * path for rather than a null it does not.
+ * ------------------------------------------------------------------------ */
+
+/* Save and restore. */
+static MS int32_t st_SaveDC(void *hdc)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_dcsave *st;
+    if (!d) return 0;
+    if (!d->save && !(d->save = calloc(W32_MAX_SAVE, sizeof *d->save))) return 0;
+    if (d->nsave >= W32_MAX_SAVE) return 0;
+    st = &d->save[d->nsave];
+    st->bitmap = d->bitmap; st->font = d->font; st->pen = d->pen; st->brush = d->brush;
+    st->org_x = d->org_x; st->org_y = d->org_y;
+    st->clip = d->clip; st->has_clip = d->has_clip;
+    st->text_color = d->text_color; st->bk_color = d->bk_color;
+    st->text_align = d->text_align; st->bk_mode = d->bk_mode;
+    st->map_mode = d->map_mode;
+    st->wnd_ext_x = d->wnd_ext_x; st->wnd_ext_y = d->wnd_ext_y;
+    st->vp_ext_x = d->vp_ext_x;   st->vp_ext_y = d->vp_ext_y;
+    st->wnd_org_x = d->wnd_org_x; st->wnd_org_y = d->wnd_org_y;
+    st->gfxmode = d->gfxmode; st->poly_fill = d->poly_fill;
+    return ++d->nsave;
+}
+static MS int32_t st_RestoreDC(void *hdc, int32_t level)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_dcsave *st;
+    int want;
+    if (!d || !d->save || d->nsave <= 0) return 0;
+    /* Negative is relative to the top of the stack: -1 is the last save. */
+    want = level < 0 ? d->nsave + level : level - 1;
+    if (want < 0 || want >= d->nsave) return 0;
+    st = &d->save[want];
+    d->bitmap = st->bitmap; d->font = st->font; d->pen = st->pen; d->brush = st->brush;
+    d->org_x = st->org_x; d->org_y = st->org_y;
+    d->clip = st->clip; d->has_clip = st->has_clip;
+    d->text_color = st->text_color; d->bk_color = st->bk_color;
+    d->text_align = st->text_align; d->bk_mode = st->bk_mode;
+    d->map_mode = st->map_mode;
+    d->wnd_ext_x = st->wnd_ext_x; d->wnd_ext_y = st->wnd_ext_y;
+    d->vp_ext_x = st->vp_ext_x;   d->vp_ext_y = st->vp_ext_y;
+    d->wnd_org_x = st->wnd_org_x; d->wnd_org_y = st->wnd_org_y;
+    d->gfxmode = st->gfxmode; d->poly_fill = st->poly_fill;
+    d->nsave = want;                              /* the level itself is popped */
+    return 1;
+}
+
+/* What kind of handle this is. MFC asks before it will use one. */
+enum { W_OBJ_PEN = 1, W_OBJ_BRUSH = 2, W_OBJ_DC = 3, W_OBJ_PAL = 5,
+       W_OBJ_FONT = 6, W_OBJ_BITMAP = 7, W_OBJ_REGION = 8, W_OBJ_MEMDC = 10 };
+static MS uint32_t st_GetObjectType(void *h)
+{
+    w32_dc  *d = w32_dcget(h);
+    w32_obj *o;
+    if (d) return d->wnd ? W_OBJ_DC : W_OBJ_MEMDC;
+    if (!(o = w32_oget(h))) return 0;
+    switch (o->kind) {
+    case OBJ_PEN:     return W_OBJ_PEN;
+    case OBJ_BRUSH:   return W_OBJ_BRUSH;
+    case OBJ_FONT:    return W_OBJ_FONT;
+    case OBJ_BITMAP:  return W_OBJ_BITMAP;
+    case OBJ_RGN:     return W_OBJ_REGION;
+    case OBJ_PALETTE: return W_OBJ_PAL;
+    default:          return 0;
+    }
+}
+
+/* Mapping mode and its extents.
+ *
+ * Everything here is drawn in pixels, which is MM_TEXT. Another mode is
+ * accepted and remembered -- a caller that sets one and reads it back sees its
+ * own answer -- but coordinates are not scaled by it. That is a real
+ * limitation and a visible one only for a plug-in that lays its editor out in
+ * millimetres, which none here does. */
+static MS int32_t st_SetMapMode(void *hdc, int32_t mode)
+{
+    w32_dc *d = w32_dcget(hdc);
+    int32_t prev;
+    if (!d || mode < 1 || mode > 8) return 0;
+    prev = d->map_mode ? d->map_mode : 1;         /* MM_TEXT */
+    d->map_mode = mode;
+    return prev;
+}
+static MS int32_t st_GetMapMode(void *hdc)
+{ w32_dc *d = w32_dcget(hdc); return d ? (d->map_mode ? d->map_mode : 1) : 0; }
+
+static int w32_ext_get(w32_dc *d, int viewport, int32_t *x, int32_t *y)
+{
+    int32_t ex = viewport ? d->vp_ext_x : d->wnd_ext_x;
+    int32_t ey = viewport ? d->vp_ext_y : d->wnd_ext_y;
+    *x = ex ? ex : 1; *y = ey ? ey : 1;           /* MM_TEXT is one to one */
+    return 1;
+}
+static MS int32_t st_SetWindowExtEx(void *hdc, int32_t x, int32_t y, W32POINT *old)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    if (old) w32_ext_get(d, 0, &old->x, &old->y);
+    d->wnd_ext_x = x; d->wnd_ext_y = y;
+    return 1;
+}
+static MS int32_t st_GetWindowExtEx(void *hdc, W32POINT *p)
+{ w32_dc *d = w32_dcget(hdc); if (!d || !p) return 0; return w32_ext_get(d, 0, &p->x, &p->y); }
+static MS int32_t st_SetViewportExtEx(void *hdc, int32_t x, int32_t y, W32POINT *old)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    if (old) w32_ext_get(d, 1, &old->x, &old->y);
+    d->vp_ext_x = x; d->vp_ext_y = y;
+    return 1;
+}
+static MS int32_t st_GetViewportExtEx(void *hdc, W32POINT *p)
+{ w32_dc *d = w32_dcget(hdc); if (!d || !p) return 0; return w32_ext_get(d, 1, &p->x, &p->y); }
+static MS int32_t st_ScaleWindowExtEx(void *hdc, int32_t xn, int32_t xd,
+                                      int32_t yn, int32_t yd, W32POINT *old)
+{
+    w32_dc *d = w32_dcget(hdc);
+    int32_t x, y;
+    if (!d || !xd || !yd) return 0;
+    w32_ext_get(d, 0, &x, &y);
+    if (old) { old->x = x; old->y = y; }
+    d->wnd_ext_x = (int32_t)((int64_t)x * xn / xd);
+    d->wnd_ext_y = (int32_t)((int64_t)y * yn / yd);
+    return 1;
+}
+static MS int32_t st_ScaleViewportExtEx(void *hdc, int32_t xn, int32_t xd,
+                                        int32_t yn, int32_t yd, W32POINT *old)
+{
+    w32_dc *d = w32_dcget(hdc);
+    int32_t x, y;
+    if (!d || !xd || !yd) return 0;
+    w32_ext_get(d, 1, &x, &y);
+    if (old) { old->x = x; old->y = y; }
+    d->vp_ext_x = (int32_t)((int64_t)x * xn / xd);
+    d->vp_ext_y = (int32_t)((int64_t)y * yn / yd);
+    return 1;
+}
+static MS int32_t st_OffsetWindowOrgEx(void *hdc, int32_t dx, int32_t dy, W32POINT *old)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    if (old) { old->x = d->wnd_org_x; old->y = d->wnd_org_y; }
+    d->wnd_org_x += dx; d->wnd_org_y += dy;
+    return 1;
+}
+/* Logical to device. At MM_TEXT that is the viewport origin and nothing else. */
+static MS int32_t st_LPtoDP(void *hdc, W32POINT *pts, int32_t n)
+{
+    w32_dc *d = w32_dcget(hdc);
+    int i;
+    if (!d || !pts || n < 0) return 0;
+    for (i = 0; i < n; i++) {
+        pts[i].x += d->org_x - d->wnd_org_x;
+        pts[i].y += d->org_y - d->wnd_org_y;
+    }
+    return 1;
+}
+/* Where this DC's surface sits on the desktop. Ours is always its own origin. */
+static MS int32_t st_GetDCOrgEx(void *hdc, W32POINT *p)
+{ (void)hdc; if (!p) return 0; W32_APPROX(); p->x = 0; p->y = 0; return 1; }
+
+/* Is any of this visible through the clip? Answered from the clip box, which
+ * is what RectVisible already does. */
+static MS int32_t st_PtVisible(void *hdc, int32_t x, int32_t y)
+{
+    w32_dc *d = w32_dcget(hdc);
+    if (!d) return 0;
+    if (!d->has_clip) return 1;
+    x += d->org_x; y += d->org_y;
+    return x >= d->clip.left && x < d->clip.right &&
+           y >= d->clip.top  && y < d->clip.bottom;
+}
+
+/* Regions beyond a rectangle are kept as their bounding box.
+ *
+ * Everything this layer does with a region is clip to it or fill it, and both
+ * already work on a rectangle. A rounded or elliptical region therefore clips
+ * square -- wrong at the corners, and the alternative was not clipping at all. */
+static MS void *st_CreateRectRgn(int32_t l, int32_t t, int32_t r, int32_t b);
+static MS void *st_CreateRectRgnIndirect(const W32RECT *r)
+{ return r ? st_CreateRectRgn(r->left, r->top, r->right, r->bottom) : NULL; }
+static MS void *st_CreateRoundRectRgn(int32_t l, int32_t t, int32_t r, int32_t b,
+                                      int32_t ew, int32_t eh)
+{ (void)ew; (void)eh; W32_APPROX(); return st_CreateRectRgn(l, t, r, b); }
+static MS void *st_CreateEllipticRgn(int32_t l, int32_t t, int32_t r, int32_t b)
+{ W32_APPROX(); return st_CreateRectRgn(l, t, r, b); }
+static MS void *st_CreateEllipticRgnIndirect(const W32RECT *r)
+{ return st_CreateRectRgnIndirect(r); }
+static MS void *st_CreatePolygonRgn(const W32POINT *pts, int32_t n, int32_t mode)
+{
+    int32_t l, t, r, b, i;
+    (void)mode;
+    if (!pts || n < 1) return NULL;
+    l = r = pts[0].x; t = b = pts[0].y;
+    for (i = 1; i < n; i++) {
+        if (pts[i].x < l) l = pts[i].x;
+        if (pts[i].x > r) r = pts[i].x;
+        if (pts[i].y < t) t = pts[i].y;
+        if (pts[i].y > b) b = pts[i].y;
+    }
+    return st_CreateRectRgn(l, t, r + 1, b + 1);
+}
+static MS int32_t st_OffsetRgn(void *rgn, int32_t dx, int32_t dy)
+{
+    w32_obj *o = w32_oget(rgn);
+    if (!o || o->kind != OBJ_RGN) return W32_RGN_ERROR;
+    o->rc.left += dx; o->rc.right += dx;
+    o->rc.top  += dy; o->rc.bottom += dy;
+    return w32_rect_empty(&o->rc) ? W32_RGN_NULL : W32_RGN_SIMPLE;
+}
+static MS int32_t st_PtInRegion(void *rgn, int32_t x, int32_t y)
+{
+    w32_obj *o = w32_oget(rgn);
+    if (!o || o->kind != OBJ_RGN) return 0;
+    return x >= o->rc.left && x < o->rc.right && y >= o->rc.top && y < o->rc.bottom;
+}
+static MS int32_t st_RectInRegion(void *rgn, const W32RECT *r)
+{
+    w32_obj *o = w32_oget(rgn);
+    if (!o || o->kind != OBJ_RGN || !r) return 0;
+    return r->left < o->rc.right && r->right > o->rc.left &&
+           r->top < o->rc.bottom && r->bottom > o->rc.top;
+}
+static MS int32_t st_FillRect(void *hdc, const W32RECT *r, void *brush);
+static MS int32_t st_FillRgn(void *hdc, void *rgn, void *brush)
+{
+    w32_obj *o = w32_oget(rgn);
+    if (!o || o->kind != OBJ_RGN) return 0;
+    return st_FillRect(hdc, &o->rc, brush);
+}
+static MS int32_t st_FrameRgn(void *hdc, void *rgn, void *brush, int32_t w, int32_t h)
+{
+    w32_obj *o = w32_oget(rgn);
+    W32RECT e;
+    if (!o || o->kind != OBJ_RGN || w <= 0 || h <= 0) return 0;
+    e = o->rc; e.bottom = e.top + h;            st_FillRect(hdc, &e, brush);
+    e = o->rc; e.top = e.bottom - h;            st_FillRect(hdc, &e, brush);
+    e = o->rc; e.right = e.left + w;            st_FillRect(hdc, &e, brush);
+    e = o->rc; e.left = e.right - w;            st_FillRect(hdc, &e, brush);
+    return 1;
+}
+
+/* Brushes this layer draws as a flat colour.
+ *
+ * A hatch is drawn in its own colour rather than as lines, and a pattern brush
+ * takes the average of the bitmap it was made from -- both are wrong in detail
+ * and right in tone, which for a background is what is actually noticed. */
+static MS void *st_CreateHatchBrush(int32_t style, uint32_t color)
+{ (void)style; W32_APPROX(); return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_BRUSH, 0, 0, color)); }
+static MS void *st_CreatePatternBrush(void *hbm)
+{
+    w32_obj *o = w32_oget(hbm);
+    W32_APPROX();                                 /* the average, not the tile */
+    uint64_t r = 0, g = 0, b = 0;
+    size_t n, i;
+    uint32_t avg = 0xC0C0C0u;
+    if (o && o->kind == OBJ_BITMAP && o->px && o->w > 0 && o->h > 0) {
+        n = (size_t)o->w * o->h;
+        for (i = 0; i < n; i++) {
+            r += (o->px[i] >> 16) & 0xff;
+            g += (o->px[i] >> 8) & 0xff;
+            b += o->px[i] & 0xff;
+        }
+        avg = (uint32_t)((r / n) << 16 | (g / n) << 8 | (b / n));
+    }
+    /* w32_obj colour is a COLORREF, which is the other way round. */
+    return w32_h(W32_OBJ_BASE, w32_obj_new(OBJ_BRUSH, 0, 0,
+                 ((avg & 0xff) << 16) | (avg & 0xff00) | ((avg >> 16) & 0xff)));
+}
+
+/* Palettes. Every surface here is 32 bits of direct colour, so a palette
+ * changes nothing about what is drawn -- but a caller that creates one, sets
+ * entries and reads them back gets its own entries, and one that asks the
+ * system palette gets an empty one, which is what a direct-colour display
+ * reports. */
+static MS void *st_CreatePalette(const void *logpal)
+{
+    const uint8_t *p = logpal;
+    uint16_t n = 0;
+    int i;
+    if (!p) return NULL;
+    memcpy(&n, p + 2, 2);                        /* palNumEntries */
+    if (n > 256) n = 256;
+    if (!(i = w32_obj_new(OBJ_PALETTE, 0, 0, 0))) return NULL;
+    W.obj[i].w = n;
+    if (n && (W.obj[i].px = calloc(n, 4)))
+        memcpy(W.obj[i].px, p + 4, (size_t)n * 4);
+    else W.obj[i].w = 0;
+    return w32_h(W32_OBJ_BASE, i);
+}
+static MS uint32_t st_GetPaletteEntries(void *pal, uint32_t start, uint32_t n, void *out)
+{
+    w32_obj *o = w32_oget(pal);
+    uint32_t have;
+    if (!o || o->kind != OBJ_PALETTE) return 0;
+    if (!out) return (uint32_t)o->w;
+    if (start >= (uint32_t)o->w) return 0;
+    have = (uint32_t)o->w - start;
+    if (n > have) n = have;
+    if (o->px) memcpy(out, o->px + start, (size_t)n * 4);
+    return n;
+}
+static MS uint32_t st_SetPaletteEntries(void *pal, uint32_t start, uint32_t n, const void *in)
+{
+    w32_obj *o = w32_oget(pal);
+    uint32_t have;
+    if (!o || o->kind != OBJ_PALETTE || !in || !o->px) return 0;
+    if (start >= (uint32_t)o->w) return 0;
+    have = (uint32_t)o->w - start;
+    if (n > have) n = have;
+    memcpy(o->px + start, in, (size_t)n * 4);
+    return n;
+}
+static MS uint32_t st_GetNearestPaletteIndex(void *pal, uint32_t color)
+{
+    w32_obj *o = w32_oget(pal);
+    uint32_t best = 0, bestd = 0xFFFFFFFFu;
+    int i;
+    if (!o || o->kind != OBJ_PALETTE || !o->px) return 0;
+    for (i = 0; i < o->w; i++) {
+        int dr = (int)((o->px[i] & 0xff) - (color & 0xff));
+        int dg = (int)(((o->px[i] >> 8) & 0xff) - ((color >> 8) & 0xff));
+        int db = (int)(((o->px[i] >> 16) & 0xff) - ((color >> 16) & 0xff));
+        uint32_t dd = (uint32_t)(dr * dr + dg * dg + db * db);
+        if (dd < bestd) { bestd = dd; best = (uint32_t)i; }
+    }
+    return best;
+}
+static MS uint32_t st_GetSystemPaletteEntries(void *hdc, uint32_t start, uint32_t n, void *out)
+{ (void)hdc; (void)start; (void)n; (void)out; W32_APPROX(); return 0; }   /* not palettised */
+
+/* The colour table of a DIB section, which is how an 8-bit DIB is recoloured
+ * without redrawing it. Real, because a plug-in that builds a paletted skin
+ * and then swaps the table is otherwise stuck with the first colours it set. */
+static MS uint32_t st_SetDIBColorTable(void *hdc, uint32_t start, uint32_t n,
+                                       const void *colors)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_obj *o = (d && d->bitmap) ? &W.obj[d->bitmap] : NULL;
+    const uint8_t *src = colors;
+    uint32_t i;
+    if (!o || !colors || !o->dib || o->dib_bpp > 8) return 0;
+    if (start >= (uint32_t)o->dib_pal_n) return 0;
+    if (n > (uint32_t)o->dib_pal_n - start) n = (uint32_t)o->dib_pal_n - start;
+    for (i = 0; i < n; i++) {
+        const uint8_t *e = src + i * 4;          /* RGBQUAD: B,G,R,reserved */
+        o->dib_pal[start + i] = ((uint32_t)e[2] << 16) | ((uint32_t)e[1] << 8) | e[0];
+    }
+    return n;
+}
+
+/* Shapes the primitives above can express. */
+static MS int32_t st_Rectangle(void *hdc, int32_t l, int32_t tp, int32_t r, int32_t b);
+static MS int32_t st_RoundRect(void *hdc, int32_t l, int32_t t, int32_t r, int32_t b,
+                               int32_t ew, int32_t eh)
+{ (void)ew; (void)eh; W32_APPROX(); return st_Rectangle(hdc, l, t, r, b); }
+static MS int32_t st_Polygon(void *hdc, const W32POINT *pts, int32_t n)
+{
+    w32_dc *d = w32_dcget(hdc);
+    w32_surf ttmp, *t;
+    int i;
+    if (!d || !pts || n < 2 || !(t = w32_target_in(d, &ttmp))) return 0;
+    /* Outline only: a scanline fill wants an edge list this layer does not
+     * keep, and an unfilled polygon is nearer the truth than a filled bounding
+     * box would be. */
+    if (w32_pen_on(d)) {
+        uint32_t c = w32_pen_rgb(d);
+        int wd = d->pen ? W.obj[d->pen].w : 1;
+        for (i = 0; i < n; i++) {
+            const W32POINT *a = &pts[i], *bb = &pts[(i + 1) % n];
+            w32_line(t, d, a->x + d->org_x, a->y + d->org_y,
+                     bb->x + d->org_x, bb->y + d->org_y, c, wd);
+        }
+    }
+    w32_dib_out_all(d);
+    return 1;
+}
+static MS int32_t st_SetPolyFillMode(void *hdc, int32_t mode)
+{
+    w32_dc *d = w32_dcget(hdc);
+    int32_t prev;
+    if (!d || mode < 1 || mode > 2) return 0;
+    prev = d->poly_fill ? d->poly_fill : 1;
+    d->poly_fill = mode;
+    return prev;
+}
+static MS int32_t st_GetPolyFillMode(void *hdc)
+{ w32_dc *d = w32_dcget(hdc); return d ? (d->poly_fill ? d->poly_fill : 1) : 0; }
+
+/* The bounding rectangle GDI accumulates for what has been drawn. Nothing here
+ * accumulates it, so it reports an empty box and says so with DCB_RESET. */
+static MS uint32_t st_GetBoundsRect(void *hdc, W32RECT *r, uint32_t flags)
+{
+    w32_dc *d = w32_dcget(hdc);
+    (void)flags;
+    if (!d || !r) return 0;
+    *r = d->bounds;
+    return 1;                                    /* DCB_RESET */
+}
+static MS uint32_t st_SetBoundsRect(void *hdc, const W32RECT *r, uint32_t flags)
+{
+    w32_dc *d = w32_dcget(hdc);
+    (void)flags;
+    if (!d) return 0;
+    if (r) d->bounds = *r;
+    return 1;
+}
+
+/* A flood fill needs a seed test this layer could do and a plug-in editor
+ * never asks for; it is here so the name resolves and it reports that it
+ * filled nothing. */
+static MS int32_t st_ExtFloodFill(void *hdc, int32_t x, int32_t y, uint32_t c, uint32_t t)
+{ (void)hdc;(void)x;(void)y;(void)c;(void)t; W32_APPROX(); return 0; }
+
+/* Printer and metafile escapes: there is no device to escape to. */
+static MS int32_t st_Escape(void *hdc, int32_t esc, int32_t n, const char *in, void *out)
+{ (void)hdc;(void)esc;(void)n;(void)in;(void)out; W32_APPROX(); return 0; }
+static MS void *st_CreateDCA(const char *driver, const char *dev, const char *port,
+                             const void *dm)
+{ (void)driver;(void)dev;(void)port;(void)dm; W32_APPROX(); return NULL; }
+static MS void *st_CopyMetaFileA(void *mf, const char *name)
+{ (void)mf; (void)name; W32_APPROX(); return NULL; }
+
+/* The stretching blit. Shares the scaling copy the msimg32 calls use, with the
+ * raster op applied per pixel the way BitBlt does -- a plug-in that scales a
+ * skin bitmap into place reaches for this rather than StretchDIBits when the
+ * source is already a bitmap. */
+static MS int32_t st_StretchBlt(void *dst, int32_t x, int32_t y, int32_t wd, int32_t hd,
+                                void *src, int32_t sx, int32_t sy, int32_t ws, int32_t hs,
+                                uint32_t rop)
+{
+    w32_dc *dd = w32_dcget(dst), *sd = w32_dcget(src);
+    w32_surf dtmp, stmp;
+    w32_surf *ds = w32_target_in(dd, &dtmp), *ss = w32_source_in(sd, &stmp);
+    W32RECT clipbox;
+    int dy, dx;
+
+    if (!ds || !ds->px || !ss || !ss->px) return 0;
+    if (wd <= 0 || hd <= 0 || ws <= 0 || hs <= 0) return 0;
+    x += dd->org_x;  y += dd->org_y;
+    sx += sd->org_x; sy += sd->org_y;
+    w32_blit_box(dd, ds, &clipbox);
+    {
+        uint32_t pat = w32_brush_on(dd) ? w32_brush_rgb(dd) : 0;
+        for (dy = 0; dy < hd; dy++) {
+            int ty = y + dy;
+            int fy = sy + (hs == hd ? dy : (int)((int64_t)dy * hs / hd));
+            const uint32_t *srow;
+            uint32_t *drow;
+            if (ty < clipbox.top || ty >= clipbox.bottom) continue;
+            if (fy < 0 || fy >= ss->h) continue;
+            srow = ss->px + (size_t)fy * ss->w;
+            drow = ds->px + (size_t)ty * ds->w;
+            for (dx = 0; dx < wd; dx++) {
+                int tx = x + dx;
+                int fx = sx + (ws == wd ? dx : (int)((int64_t)dx * ws / wd));
+                uint32_t sv;
+                if (tx < clipbox.left || tx >= clipbox.right) continue;
+                if (fx < 0 || fx >= ss->w) continue;
+                sv = srow[fx];
+                drow[tx] = w32_rop_apply(rop, sv, drow[tx], pat) & 0x00FFFFFFu;
+            }
+        }
+    }
+    w32_dib_out(dd, x, y, x + wd, y + hd);
+    if (dd->wnd && !dd->bitmap && !dd->in_paint) w32_present(dd->wnd);
+    return 1;
+}
+
+/* One face, which is what the font pipeline has. Reported once so a caller
+ * enumerating families finds something rather than concluding there are no
+ * fonts at all. */
+static MS int32_t st_GetTextCharsetInfo(void *hdc, void *sig, uint32_t flags)
+{ (void)hdc; (void)flags; if (sig) memset(sig, 0, 32); return 0; }   /* ANSI_CHARSET */
+
 static MS int32_t st_DPtoLP(void *dc, W32POINT *p, int32_t n) { (void)dc;(void)p;(void)n; return 1; }
 static MS int32_t st_FillRect(void *hdc, const W32RECT *r, void *brush)
 {
@@ -3564,6 +4767,14 @@ static MS int32_t st_EnumFontFamiliesExA(void *dc, void *lf, void *proc, intptr_
 /* Report the font the plugin installed from memory. Enumerating nothing leaves
  * it unable to discover the family name of its own embedded font. */
 
+/* The pre-Ex spellings, which are the Ex ones without the filter. A caller
+ * that enumerates this way -- a VCL font dialog does -- was told the machine
+ * has no fonts at all, because the name did not resolve. */
+static MS int32_t st_EnumFontFamiliesA(void *dc, const char *family, void *proc, intptr_t p)
+{ (void)family; return st_EnumFontFamiliesExA(dc, NULL, proc, p, 0); }
+static MS int32_t st_EnumFontsA(void *dc, const char *family, void *proc, intptr_t p)
+{ (void)family; return st_EnumFontFamiliesExA(dc, NULL, proc, p, 0); }
+
 static MS int32_t st_EnumFontFamiliesExW(void *dc, void *lf, void *proc, intptr_t p, uint32_t f)
 {
     uint8_t elf[348], ntm[100];
@@ -3617,6 +4828,38 @@ static MS int32_t st_GetTextExtentPoint32A(void *hdc, const char *s, int32_t n,
 static MS int32_t st_GetTextExtentPointA(void *hdc, const char *s, int32_t n,
                                          W32POINT *sz)
 { return st_GetTextExtentPoint32A(hdc, s, n, sz); }
+
+/* Advance widths, one entry per character in [first, last].
+ *
+ * There was no implementation, so it fell through to the generic stub and
+ * answered zero -- failure. Cairo asks for one character at a time while
+ * building its glyph metrics and abandons the glyph when the call fails, which
+ * is where BC Free Amp ended up faulting. Measured through the same face the
+ * text calls draw with, so a width here agrees with what GetTextExtentPoint32
+ * says and with what lands on the pixels. */
+static MS int32_t st_GetCharWidth32A(void *hdc, uint32_t first, uint32_t last,
+                                     int32_t *widths)
+{
+    w32_dc *d = w32_dcget(hdc);
+    int px = w32_font_px(d);
+    uint32_t c;
+    if (!widths || last < first || last - first > 65535u) return 0;
+    for (c = first; c <= last; c++) {
+        char ch[2] = { (char)(c < 256 ? c : '?'), 0 };
+        int w = 0, h = 0;
+        if (!dw_text_measure(ch, 1, px, &w, &h, NULL) || w <= 0)
+            w = px > 0 ? (px + 1) / 2 : 7;       /* no face: half an em */
+        widths[c - first] = w;
+    }
+    return 1;
+}
+static MS int32_t st_GetCharWidth32W(void *hdc, uint32_t first, uint32_t last,
+                                     int32_t *widths)
+{ return st_GetCharWidth32A(hdc, first, last, widths); }
+static MS int32_t st_GetCharWidthA(void *hdc, uint32_t f, uint32_t l, int32_t *w)
+{ return st_GetCharWidth32A(hdc, f, l, w); }
+static MS int32_t st_GetCharWidthW(void *hdc, uint32_t f, uint32_t l, int32_t *w)
+{ return st_GetCharWidth32A(hdc, f, l, w); }
 static MS int32_t st_GetTextFaceA(void *dc, int32_t n, char *buf)
 {
     const char *f = w32_dc_family(dc);
@@ -3693,12 +4936,30 @@ static MS uint32_t st_SetClassLongA(void *hwnd, int32_t index, uint32_t v)
 static MS int32_t st_ReleaseCapture(void) { W.capture = 0; return 1; }
 static MS void *st_GetCapture(void)
 { return W.capture ? w32_h(W32_HWND_BASE, W.capture) : NULL; }
+/* Windows sends nothing when the window already has the focus: SetFocus
+ * returns the same handle and no WM_SETFOCUS is generated. Sending it anyway
+ * is unbounded recursion waiting for a caller that answers the message by
+ * placing the focus -- which is what JUCE does, handing it to the child
+ * component that should hold it and calling SetFocus again. Aspen Trumpet
+ * recursed until the helper's 8 MB stack ran out, fourteen frames per turn.
+ *
+ * The window losing the focus is told, too, and each message carries the other
+ * window as Windows specifies: WM_KILLFOCUS names who is gaining it,
+ * WM_SETFOCUS names who lost it. The new focus is recorded before either is
+ * dispatched, so a handler that calls SetFocus straight back returns at the
+ * test above rather than going round again. */
 static MS void *st_SetFocus(void *hwnd)
 {
     w32_wnd *w = w32_wget(hwnd);
+    int idx = w ? (int)(w - W.wnd) : 0;
     void *prev = W.focus ? w32_h(W32_HWND_BASE, W.focus) : NULL;
-    W.focus = w ? (int)(w - W.wnd) : 0;
-    if (w) w32_call(w, WM_SETFOCUS, 0, 0);
+    w32_wnd *old;
+
+    if (idx == W.focus) return prev;
+    W.focus = idx;
+    if ((old = w32_wget(prev)) != NULL)
+        w32_call(old, WM_KILLFOCUS, (W_WPARAM)(uintptr_t)hwnd, 0);
+    if (w) w32_call(w, WM_SETFOCUS, (W_WPARAM)(uintptr_t)prev, 0);
     return prev;
 }
 static MS int32_t st_GetCursorPos(W32POINT *p)
@@ -3983,6 +5244,8 @@ void w32_stats(void)
     fprintf(stderr, "  [w32] calls: WM_PAINT %ld, BeginPaint %ld, GetDC %ld, "
                     "StretchDIBits %ld, BitBlt %ld, TIMERPROC %ld\n",
             W.n_paint, W.n_beginpaint, W.n_getdc, W.n_stretch, W.n_bitblt, W.n_timerproc);
+    /* And which of the answers it got were approximations. */
+    w32_placeholders_report();
 }
 
 /* Child windows drawn over their parent, which is what a window manager would

@@ -109,6 +109,131 @@ def check_stub_wiring(ctx):
     return PASS, "%d stubs, all reachable" % len(defined)
 
 
+def check_dll_reachable(ctx):
+    """Every DLL with a stub entry has to be one GetProcAddress can search.
+
+    A plug-in reaches an export two ways: through its import table, which
+    carries the DLL name and resolves against the stub table directly, or
+    through LoadLibrary + GetProcAddress. The second falls back to a name
+    search over g_sysdlls alone -- so a DLL listed only in g_stockdlls, or in
+    neither list, can never answer, however much is implemented behind it.
+
+    Would have caught: gdiplus, which sat in g_stockdlls with some ninety Gdip*
+    entries wired up and unreachable to anything that resolved them by name --
+    which is how GDI+ is normally reached, since it is not on a stock Windows
+    2000. ws2_32 was in neither list, so LoadLibrary could not even open it.
+    Between them, 128 implemented functions that nothing could call.
+    """
+    src = stripped_sources(rel("peload", "winstubs.h"))
+    tbl = stub_table(src)
+
+    def names(var):
+        m = re.search(r"static const char \*const %s\[\] = \{(.*?)\n\};" % var,
+                      src, re.S)
+        return set(re.findall(r'"([^"]+)"', m.group(1))) if m else set()
+
+    trim = lambda n: n[:-4].lower() if n.lower().endswith(".dll") else n.lower()
+    sysd = set(trim(d) for d in names("g_sysdlls"))
+
+    # Reached another way, on purpose, and each says so where it is defined:
+    # DirectWrite has its own handle in GetProcAddress, and the Direct2D and
+    # Direct3D libraries are deliberately not loadable so a plug-in takes the
+    # software path this host actually draws.
+    exempt = {"dwrite", "d2d1", "d3d11"}
+
+    used = [trim(d) for d in re.findall(r'S\(\s*"([^"]+)"', tbl)]
+    used += [trim(d) for d in re.findall(r'\{\s*"([^"]+\.dll)"\s*,', tbl)]
+    dead = {}
+    for d in used:
+        if d in sysd or d in exempt:
+            continue
+        dead[d] = dead.get(d, 0) + 1
+    if dead:
+        return FAIL, "stub entries GetProcAddress can never reach: " + ", ".join(
+            "%s (%d)" % (d, n) for d, n in sorted(dead.items()))
+    return PASS, "%d DLLs with stubs, all reachable by name" % len(set(used) - exempt)
+
+
+def check_dll_lists_disjoint(ctx):
+    """The three DLL lists have to say three different things about a name.
+
+    g_sysdlls is "implemented", g_stockdlls is "present and empty", and
+    g_absentdlls is "this host does not have it" -- and which one a library is
+    in is a decision, not an accident. A name in two of them is that decision
+    made twice and differently: whichever list is searched first silently wins,
+    and the other entry reads as intent that is not happening.
+
+    Would have caught the shape of the gdiplus bug from the other side -- a
+    library implemented and simultaneously declared empty -- and stops a
+    graphics library being added to g_stockdlls, which is what would turn the
+    three editors that render today into blank ones.
+    """
+    src = stripped_sources(rel("peload", "winstubs.h"))
+
+    def names(var):
+        m = re.search(r"static const char \*const %s\[\] = \{(.*?)\n\};" % var,
+                      src, re.S)
+        return set() if not m else set(
+            n[:-4].lower() if n.lower().endswith(".dll") else n.lower()
+            for n in re.findall(r'"([^"]+)"', m.group(1)))
+
+    sysd, stock, absent = names("g_sysdlls"), names("g_stockdlls"), names("g_absentdlls")
+    if not absent:
+        return FAIL, "g_absentdlls not found -- the deliberate refusals are gone"
+    clashes = []
+    for a, b, an, bn in ((sysd, stock, "g_sysdlls", "g_stockdlls"),
+                         (sysd, absent, "g_sysdlls", "g_absentdlls"),
+                         (stock, absent, "g_stockdlls", "g_absentdlls")):
+        for d in sorted(a & b):
+            clashes.append("%s in both %s and %s" % (d, an, bn))
+    if clashes:
+        return FAIL, "; ".join(clashes)
+    return PASS, "%d implemented, %d present-and-empty, %d refused, no overlap" % (
+        len(sysd), len(stock), len(absent))
+
+
+def check_aw_parity(ctx):
+    """An A/W pair where only one side is real.
+
+    The two forms of a Win32 call are the same function with a different string
+    width, and a plug-in picks whichever its own build used -- so implementing
+    one and leaving the other a stub does not halve the coverage, it makes the
+    behaviour depend on how the plug-in was compiled.
+
+    Would have caught: RegOpenKeyExA and RegQueryValueExA, which failed
+    unconditionally while the W forms did real work against the same table, so
+    an ANSI plug-in could write a registry value and never read it back. That
+    is what left daHornet unregistered on every load.
+
+    Only flags a pair where one side is wired and the other is not present at
+    all; a deliberate forward from A to W is exactly what this asks for and
+    reads as both being defined.
+    """
+    src = stripped_sources(rel("peload", "winstubs.h")) + \
+          stripped_sources(rel("peload", "win32gui.h"))
+    defined = set(re.findall(
+        r"static\s+(?:MS|MSCRT)\s+[\w \t\*]*?\bst_(\w+)\s*\(", src))
+    missing = []
+    for name in sorted(defined):
+        if name.endswith("A") and not name.endswith("EXA"):
+            other = name[:-1] + "W"
+        elif name.endswith("W") and not name.endswith("EXW"):
+            other = name[:-1] + "A"
+        else:
+            continue
+        # Only a pair: both spellings have to look like a Win32 name, and the
+        # stem has to be shared by something else too, or every name ending in
+        # a stray A or W is a false positive.
+        if other in defined or other in missing:
+            continue
+        missing.append(name)
+    # Reported rather than failed: the corpus needs one side of plenty of pairs
+    # and the other has never been asked for. The number is the signal -- a jump
+    # in it means a pair was added by halves.
+    return PASS, "%d A/W stubs, %d without their counterpart" % (
+        sum(1 for n in defined if n[-1:] in "AW"), len(missing))
+
+
 def check_arity_source(ctx):
     """Prototypes against the real stdcall arities, and the two conventions.
 
@@ -832,6 +957,9 @@ CHECKS = [
     ("png-decoder",        check_png_decoder),
     ("arity-source",       check_arity_source),
     ("build",              check_build),
+    ("dll-reachable",      check_dll_reachable),
+    ("dll-lists-disjoint", check_dll_lists_disjoint),
+    ("aw-parity",          check_aw_parity),
     ("arity-binary",       check_arity_binary),
     ("no-runpath",         check_no_runpath),
     ("peload32-complete",  check_peload32_complete),

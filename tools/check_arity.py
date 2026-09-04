@@ -138,12 +138,30 @@ def strip_x64_only(src):
     return "".join(out)
 
 
+def width_exempt(path):
+    """Typedefs whose 64-bit parameter is 64-bit on both architectures.
+
+    The width rule assumes a fixed 64-bit parameter is a pointer or handle
+    written with the wrong type, which is the usual mistake. A few interfaces
+    really do take a 64-bit value at i386 too -- IStream::Seek's LARGE_INTEGER
+    is the one here -- so the declaration says so with a WIDTH-OK marker and
+    this reads the markers back out.
+    """
+    names = set()
+    pat = re.compile(r'WIDTH-OK:\s*([\w, ]+)')
+    for f in sources(path):
+        for m in pat.finditer(open(f).read()):
+            names.update(n.strip() for n in m.group(1).split(',') if n.strip())
+    return names
+
 def callback_typedefs(path):
     src = "\n".join(open(p).read() for p in sources(path))
     src = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
     src = strip_x64_only(src)
     pat = re.compile(r'typedef\s+MS\s+[\w \t\*]*?\(\s*\*\s*(\w+)\s*\)\s*\(([^)]*)\)')
-    return [(m.group(1), m.group(2)) for m in pat.finditer(src)]
+    exempt = width_exempt(path)
+    return [(m.group(1), m.group(2)) for m in pat.finditer(src)
+            if m.group(1) not in exempt]
 
 
 def main():

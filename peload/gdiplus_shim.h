@@ -36,7 +36,7 @@
  * one it is mistaken for. */
 enum {
     GPO_GRAPHICS = 0x47500001, GPO_PATH, GPO_PEN, GPO_BRUSH,
-    GPO_FONT, GPO_FAMILY, GPO_MATRIX, GPO_IMAGE, GPO_IMAGEATTR
+    GPO_FONT, GPO_FAMILY, GPO_MATRIX, GPO_IMAGE, GPO_IMAGEATTR, GPO_STRINGFORMAT
 };
 
 typedef struct { float m[6]; } gp_matrix;          /* a b c d e f, as GDI+ */
@@ -558,6 +558,56 @@ static MS int32_t st_GdipSetClipRect(void *graphics, float x, float y, float w, 
     g->has_clip = 1;
     return GP_OK;
 }
+/* The integer form of the same call. A plug-in that clips with it and gets
+ * GDI+'s "not implemented" back gives up on the whole draw -- OrilRiver painted
+ * nothing at all and reached exactly one stub, this one. */
+static MS int32_t st_GdipSetClipRectI(void *graphics, int32_t x, int32_t y,
+                                      int32_t w, int32_t h, int32_t combine)
+{ return st_GdipSetClipRect(graphics, (float)x, (float)y, (float)w, (float)h, combine); }
+
+/* Save and restore, which is how a GDI+ caller brackets a change to the
+ * transform or the clip. There is no depth limit in GDI+; a small stack covers
+ * what a plug-in's paint routine nests and reports failure rather than
+ * silently restoring the wrong state. */
+#define GP_STATE_MAX 32
+typedef struct { gp_matrix xf; int has_clip; float cx0, cy0, cx1, cy1; int smoothing; } gp_state;
+static gp_state g_gp_states[GP_STATE_MAX];
+static int      g_gp_nstates;
+
+static MS int32_t st_GdipSaveGraphics(void *graphics, uint32_t *state)
+{
+    gp_graphics *g = gp_check(graphics, GPO_GRAPHICS);
+    gp_state *st;
+    if (!g || !state) return GP_INVALIDARG;
+    /* Written before anything can fail. Gdiplus::Graphics::Save() hands its
+     * caller the GraphicsState whatever the status says, so a failure that
+     * left it alone would return whatever was on the stack -- and a garbage
+     * value that happens to land in 1..nstates truncates the stack and
+     * restores some other state. Zero is the one value Restore refuses. */
+    *state = 0;
+    if (g_gp_nstates >= GP_STATE_MAX) return GP_INVALIDARG;
+    st = &g_gp_states[g_gp_nstates];
+    st->xf = g->xf;
+    st->has_clip = g->has_clip;
+    st->cx0 = g->cx0; st->cy0 = g->cy0; st->cx1 = g->cx1; st->cy1 = g->cy1;
+    st->smoothing = g->smoothing;
+    *state = (uint32_t)(++g_gp_nstates);
+    return GP_OK;
+}
+static MS int32_t st_GdipRestoreGraphics(void *graphics, uint32_t state)
+{
+    gp_graphics *g = gp_check(graphics, GPO_GRAPHICS);
+    gp_state *st;
+    if (!g || state == 0 || state > (uint32_t)g_gp_nstates) return GP_INVALIDARG;
+    g_gp_nstates = (int)state - 1;
+    st = &g_gp_states[g_gp_nstates];
+    g->xf = st->xf;
+    g->has_clip = st->has_clip;
+    g->cx0 = st->cx0; g->cy0 = st->cy0; g->cx1 = st->cx1; g->cy1 = st->cy1;
+    g->smoothing = st->smoothing;
+    return GP_OK;
+}
+
 static MS int32_t st_GdipSetPageUnit(void *g, int32_t unit) { (void)g; (void)unit; return GP_OK; }
 static MS int32_t st_GdipGetDpiY(void *g, float *dpi)
 { (void)g; if (dpi) *dpi = 96.0f; return GP_OK; }
@@ -973,8 +1023,107 @@ static MS int32_t st_GdipCreateBitmapFromResource(void *inst, const uint16_t *na
     *out = im;
     return GP_OK;
 }
+/* The other way artwork arrives: the plug-in wraps its own bytes in an IStream
+ * and hands that over. The stream is the plug-in's object, not ours, so the
+ * only way to read it is through its vtable. COM's slot numbers apply --
+ * 3 Read, 5 Seek -- and its methods are __stdcall with `this` first, which is
+ * what MS means on both architectures. Seek's LARGE_INTEGER is 64-bit at i386
+ * as well, so it is not the pointer-in-a-uint64 mistake: WIDTH-OK: fn_stm_seek */
+typedef MS int32_t (*fn_stm_read)(void *, void *, uint32_t, uint32_t *);
+typedef MS int32_t (*fn_stm_seek)(void *, int64_t, uint32_t, uint64_t *);
+
+#define GP_STREAM_CHUNK  (64u * 1024u)
+#define GP_STREAM_MAX    (64u * 1024u * 1024u)
+
+/* Read a stream out in full. Size it with Seek before reading rather than
+ * reading until it stops giving bytes: a plug-in's own IStream is often
+ * minimal, and answers a read that asks for more than remains with S_FALSE
+ * and nothing at all instead of the short count the interface calls for.
+ * OrilRiver's does exactly that, which cost every one of its images its last
+ * partial chunk and left the editor blank. */
+static uint8_t *gp_stream_slurp(void *stream, size_t *outn)
+{
+    void **vtbl;
+    uint8_t *buf;
+    size_t n = 0, cap, size = 0;
+    uint64_t end = 0;
+    uint32_t want = GP_STREAM_CHUNK;
+
+    *outn = 0;
+    if (!stream) return NULL;
+    vtbl = *(void ***)stream;
+    if (!vtbl || !vtbl[3] || !vtbl[5]) return NULL;
+
+    /* Seek is asked for the size, but not relied on: a minimal stream may
+     * refuse STREAM_SEEK_END or leave the position unwritten. */
+    if (((fn_stm_seek)vtbl[5])(stream, 0, 2 /* END */, &end) >= 0
+        && end && end <= GP_STREAM_MAX)
+        size = (size_t)end;
+    ((fn_stm_seek)vtbl[5])(stream, 0, 0 /* SET */, NULL);
+
+    cap = size ? size : (size_t)GP_STREAM_CHUNK * 2;
+    if (!(buf = malloc(cap))) return NULL;
+
+    for (;;) {
+        uint32_t got = 0;
+        int32_t hr;
+        if (size) {
+            if (n >= size) break;
+            if (size - n < want) want = (uint32_t)(size - n);
+        } else if (n + want > cap) {
+            uint8_t *q;
+            size_t bigger = cap * 2;
+            if (bigger > GP_STREAM_MAX) break;
+            if (!(q = realloc(buf, bigger))) break;
+            buf = q; cap = bigger;
+        }
+        hr = ((fn_stm_read)vtbl[3])(stream, buf + n, want, &got);
+        if (got > want) break;                  /* a broken stream */
+        n += got;
+        if (hr < 0) break;
+        if (got == 0) {
+            /* Nothing came back, but the stream may simply be refusing a read
+             * longer than what is left of it rather than shortening it as the
+             * interface requires. Halving the request finds the tail; only a
+             * refusal of a single byte means the end. */
+            if (want <= 1) break;
+            want /= 2;
+            continue;
+        }
+    }
+    if (!n) { free(buf); return NULL; }
+    *outn = n;
+    return buf;
+}
+
+static MS int32_t st_GdipCreateBitmapFromStream(void *stream, void **out)
+{
+    uint8_t *data;
+    size_t n = 0;
+    gp_image *im;
+    int w = 0, h = 0;
+    uint32_t *px;
+
+    if (!out) return GP_INVALIDARG;
+    *out = NULL;
+    if (!(data = gp_stream_slurp(stream, &n))) return GP_GENERIC;
+    px = image_decode(data, n, &w, &h);
+    free(data);
+    if (!px || w <= 0 || h <= 0) { free(px); return GP_GENERIC; }
+    if (!(im = gp_new(sizeof *im, GPO_IMAGE))) { free(px); return GP_OUTOFMEMORY; }
+    im->w = w; im->h = h; im->px = px; im->owns = 1;
+    *out = im;
+    return GP_OK;
+}
+/* ICM means "apply the colour profile"; there is none to apply here, and the
+ * loading is identical. GdipLoadImageFromStream is the same call under the
+ * name a caller uses when it does not care that the result is a bitmap. */
 static MS int32_t st_GdipCreateBitmapFromStreamICM(void *stream, void **out)
-{ (void)stream; if (out) *out = NULL; return GP_GENERIC; }
+{ return st_GdipCreateBitmapFromStream(stream, out); }
+static MS int32_t st_GdipLoadImageFromStream(void *stream, void **out)
+{ return st_GdipCreateBitmapFromStream(stream, out); }
+static MS int32_t st_GdipLoadImageFromStreamICM(void *stream, void **out)
+{ return st_GdipCreateBitmapFromStream(stream, out); }
 static MS int32_t st_GdipCreateHBITMAPFromBitmap(void *image, void **hbm, uint32_t back)
 {
     gp_image *im = gp_check(image, GPO_IMAGE);
@@ -1058,6 +1207,185 @@ static MS int32_t st_GdipSetImageAttributesColorMatrix(void *attr, int32_t type,
  * destination rectangle, scaled, with an optional colour matrix. Nearest
  * neighbour -- a skin is drawn at or near its own size, and the alternative
  * costs more than it shows. */
+/* The last of what a VCL-era plug-in resolves out of gdiplus.
+ *
+ * These were the remainder of Chord Organ's list once gdiplus became reachable
+ * at all -- see the note on g_stockdlls in winstubs.h. Each is either the
+ * integer or simplified form of something already here, or an honest answer
+ * about a feature this shim does not model. */
+
+/* Every image here is decoded to 32-bit ARGB, so the format is not a guess. */
+#define GP_PF_32BPP_ARGB 0x0026200Au
+static MS int32_t st_GdipGetImagePixelFormat(void *image, int32_t *fmt)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    if (!im || !fmt) return GP_INVALIDARG;
+    *fmt = (int32_t)GP_PF_32BPP_ARGB;
+    return GP_OK;
+}
+/* A direct-colour image has no palette, and the size of one is the header
+ * alone -- which is what a caller allocates before asking for the entries. */
+static MS int32_t st_GdipGetImagePaletteSize(void *image, int32_t *size)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    W32_APPROX();
+    if (!im || !size) return GP_INVALIDARG;
+    *size = 8;                                   /* flags + count, no entries */
+    return GP_OK;
+}
+static MS int32_t st_GdipGetImagePalette(void *image, void *pal, int32_t size)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    if (!im || !pal || size < 8) return GP_INVALIDARG;
+    memset(pal, 0, 8);                           /* no flags, zero entries */
+    return GP_OK;
+}
+
+/* Straight from a file, which is how a skin loads when it is not going through
+ * an IStream. The decoder is the same one the resource and stream paths use. */
+static MS int32_t st_GdipCreateBitmapFromFile(const uint16_t *name, void **out)
+{
+    char path[1024];
+    uint8_t *data = NULL;
+    size_t n = 0;
+    gp_image *im;
+    uint32_t *px;
+    int w = 0, h = 0;
+    FILE *f;
+
+    if (!out) return GP_INVALIDARG;
+    *out = NULL;
+    if (!name) return GP_INVALIDARG;
+    w2c_path(name, path, sizeof path);
+    if (!(f = fopen(path, "rb"))) return GP_GENERIC;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long len = ftell(f);
+        if (len > 0 && len <= (long)GP_STREAM_MAX && fseek(f, 0, SEEK_SET) == 0
+            && (data = malloc((size_t)len)) != NULL)
+            n = fread(data, 1, (size_t)len, f);
+    }
+    fclose(f);
+    if (!data || !n) { free(data); return GP_GENERIC; }
+    px = image_decode(data, n, &w, &h);
+    free(data);
+    if (!px || w <= 0 || h <= 0) { free(px); return GP_GENERIC; }
+    if (!(im = gp_new(sizeof *im, GPO_IMAGE))) { free(px); return GP_OUTOFMEMORY; }
+    im->w = w; im->h = h; im->px = px; im->owns = 1;
+    *out = im;
+    return GP_OK;
+}
+static MS int32_t st_GdipCreateBitmapFromFileICM(const uint16_t *name, void **out)
+{ return st_GdipCreateBitmapFromFile(name, out); }
+
+/* Draw at its natural size: the rect-to-rect form with both rectangles the
+ * image's own. */
+static MS int32_t st_GdipDrawImageRectRectI(void *graphics, void *image,
+                                            int32_t dx, int32_t dy, int32_t dw, int32_t dh,
+                                            int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+                                            int32_t unit, void *attr, void *cb, void *cbdata);
+static MS int32_t st_GdipDrawImageI(void *graphics, void *image, int32_t x, int32_t y)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    if (!im) return GP_INVALIDARG;
+    return st_GdipDrawImageRectRectI(graphics, image, x, y, im->w, im->h,
+                                     0, 0, im->w, im->h, 2 /* UnitPixel */,
+                                     NULL, NULL, NULL);
+}
+
+/* Regions are not modelled as objects; the clip is a rectangle on the
+ * graphics. Bounds therefore report the clip, or an empty rectangle when none
+ * is set, and deleting one is a no-op that must still succeed. */
+static MS int32_t st_GdipGetRegionBounds(void *region, void *graphics, void *rect)
+{
+    gp_graphics *g = gp_check(graphics, GPO_GRAPHICS);
+    W32_APPROX();                                /* the clip, not a region */
+    float *r = rect;
+    (void)region;
+    if (!r) return GP_INVALIDARG;
+    if (g && g->has_clip) {
+        r[0] = g->cx0; r[1] = g->cy0;
+        r[2] = g->cx1 - g->cx0; r[3] = g->cy1 - g->cy0;
+    } else {
+        r[0] = r[1] = r[2] = r[3] = 0.0f;
+    }
+    return GP_OK;
+}
+static MS int32_t st_GdipDeleteRegion(void *region) { (void)region; return GP_OK; }
+
+/* A pen made from a brush takes the brush's colour, which for a solid brush is
+ * exactly right and for a gradient is its starting colour. */
+static MS int32_t st_GdipCreatePen1(uint32_t argb, float width, int32_t unit, void **out);
+static MS int32_t st_GdipCreatePen2(void *brush, float width, int32_t unit, void **out)
+{
+    gp_brush *b = gp_check(brush, GPO_BRUSH);
+    return st_GdipCreatePen1(b ? b->argb : 0xFF000000u, width, unit, out);
+}
+static MS int32_t st_GdipSetPenEndCap(void *pen, int32_t cap)
+{ gp_pen *p = gp_check(pen, GPO_PEN); if (p) p->cap = cap; return p ? GP_OK : GP_INVALIDARG; }
+static MS int32_t st_GdipSetPenStartCap(void *pen, int32_t cap)
+{ return st_GdipSetPenEndCap(pen, cap); }
+
+/* A texture brush draws as the average of its image, the way a GDI pattern
+ * brush does here: a tiled fill needs an origin this layer does not track, and
+ * the tone is what a background is judged on. */
+static MS int32_t st_GdipCreateSolidFill(uint32_t argb, void **out);
+static MS int32_t st_GdipCreateTexture(void *image, int32_t wrap, void **out)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    W32_APPROX();                                /* the average, not the tile */
+    uint64_t a = 0, r = 0, g = 0, b = 0;
+    size_t n, i;
+    (void)wrap;
+    if (!out) return GP_INVALIDARG;
+    if (!im || !im->px || im->w <= 0 || im->h <= 0)
+        return st_GdipCreateSolidFill(0xFF808080u, out);
+    n = (size_t)im->w * im->h;
+    for (i = 0; i < n; i++) {
+        a += (im->px[i] >> 24) & 0xff; r += (im->px[i] >> 16) & 0xff;
+        g += (im->px[i] >> 8) & 0xff;  b += im->px[i] & 0xff;
+    }
+    return st_GdipCreateSolidFill((uint32_t)((a / n) << 24 | (r / n) << 16 |
+                                             (g / n) << 8 | (b / n)), out);
+}
+
+/* A string format is alignment and flags. Kept so a caller reads back what it
+ * set; the text calls here draw from the top left whatever it says, which is
+ * the alignment nearly every caller asks for anyway. */
+typedef struct { int tag, align, lalign, flags, trim; } gp_stringformat;
+static MS int32_t st_GdipCreateStringFormat(int32_t flags, uint16_t lang, void **out)
+{
+    gp_stringformat *f;
+    (void)lang;
+    if (!out) return GP_INVALIDARG;
+    if (!(f = gp_new(sizeof *f, GPO_STRINGFORMAT))) return GP_OUTOFMEMORY;
+    f->flags = flags;
+    *out = f;
+    return GP_OK;
+}
+static MS int32_t st_GdipStringFormatGetGenericDefault(void **out)
+{ return st_GdipCreateStringFormat(0, 0, out); }
+static MS int32_t st_GdipDeleteStringFormat(void *fmt)
+{ if (!gp_check(fmt, GPO_STRINGFORMAT)) return GP_INVALIDARG; free(fmt); return GP_OK; }
+static MS int32_t st_GdipSetStringFormatAlign(void *fmt, int32_t align)
+{
+    gp_stringformat *f = gp_check(fmt, GPO_STRINGFORMAT);
+    if (f) f->align = align;
+    return f ? GP_OK : GP_INVALIDARG;
+}
+static MS int32_t st_GdipSetStringFormatLineAlign(void *fmt, int32_t align)
+{
+    gp_stringformat *f = gp_check(fmt, GPO_STRINGFORMAT);
+    if (f) f->lalign = align;
+    return f ? GP_OK : GP_INVALIDARG;
+}
+static MS int32_t st_GdipGetStringFormatAlign(void *fmt, int32_t *align)
+{
+    gp_stringformat *f = gp_check(fmt, GPO_STRINGFORMAT);
+    if (!f || !align) return GP_INVALIDARG;
+    *align = f->align;
+    return GP_OK;
+}
+
 static MS int32_t st_GdipDrawImageRectRectI(void *graphics, void *image,
                                             int32_t dx, int32_t dy, int32_t dw, int32_t dh,
                                             int32_t sx, int32_t sy, int32_t sw, int32_t sh,
