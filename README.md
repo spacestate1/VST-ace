@@ -17,10 +17,35 @@ patch banks, a recorder, and the plug-in's own editor.
 | Linux VST3, x86-64 | 13 | 7 render, X11-embedded editors |
 | macOS VST2 / VST3 / AU | 99 | 90 render, editors open and are driven |
 
+## What it looks like
+
+![Basic in pestudio](docs/basic.png)
+
+*Basic (Audio Damage), a **macOS** VST2 playing on Linux — 372 plug-ins in the
+browser behind it.*
+
+![MinimogueVA in pestudio](docs/moog.png)
+
+*MinimogueVA, a Windows VST2 with 234 parameters, its editor drawn by the Win32
+layer and blitted.*
+
 ![FB-7999 in pestudio](docs/fb-7999.png)
 
-*FB-7999, a Windows VST2 running as native code, its editor drawn by the Win32
-layer and blitted.*
+*FB-7999, a Korg DW-8000 simulation and the plug-in this started on.*
+
+![FB-3300 in pestudio](docs/fb-3300.png)
+
+*FB-3300, four synthesiser blocks and 229 parameters, all of it drawn by the
+same layer.*
+
+![TAL U-NO-62 in pestudio](docs/juno.png)
+
+*TAL U-NO-62, a Juno-60 simulation, with its 120 factory programs listed.*
+
+![Cardinal in pestudio](docs/cardinal.png)
+
+*Cardinal — VCV Rack as a Linux VST3, an OpenGL editor embedded as an X11 child
+at 59 fps.*
 
 ## Installing
 
