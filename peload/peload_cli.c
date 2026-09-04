@@ -56,6 +56,11 @@ typedef struct {
     /* --live N: hold the note and run the audio for N seconds with the editor
      * pumped between blocks, so the picture is of a plugin that is playing. */
     int         live;
+    /* --type TEXT: typed into the editor after the clicks. A plug-in that will
+     * not work until something is typed into it cannot be tested any other way
+     * -- daHornet refuses to make a sound, and keeps its registration panel
+     * over the interface, until its serial number has been entered. */
+    const char *type;
 } opts;
 
 /* A scripted drag, driven from inside the plug-in's own tracking loop.
@@ -187,6 +192,7 @@ static void usage(void)
        "              [--click X,Y]        click there first (repeatable)\n"
        "              [--drag X1,Y1,X2,Y2] press, sweep, release -- and report\n"
        "                                   whether a control tracked the sweep\n"
+       "              [--type TEXT]        type it into whatever the clicks focused\n"
         "              [--block N]          frames per block (default 512)\n"
         "\n"
         "A bank names the plugin it was written for, so `peload bank.json`\n"
@@ -208,6 +214,7 @@ static int parse_args(int argc, char **argv, opts *o)
         else if (!strcmp(argv[i], "--secs") && i + 1 < argc)     o->secs  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--note") && i + 1 < argc)     o->note  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--live") && i + 1 < argc)     o->live  = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--type") && i + 1 < argc)     o->type  = argv[++i];
         else if (!strcmp(argv[i], "--program") && i + 1 < argc)  o->prog  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--params"))                   o->dump  = 1;
         else if (!strcmp(argv[i], "--editor") && i + 1 < argc)   o->shot  = argv[++i];
@@ -429,6 +436,17 @@ static void fill_test_signal(float *src, int frames, int at)
     }
 }
 
+/* --save-patch, wherever the caller decided the state is worth taking. */
+static void save_patch_out(pehost *h, const opts *o)
+{
+    char err[256];
+    if (!o->patch_out) return;
+    if (patch_save(h, o->patch_out, o->path, err, sizeof err) != 0)
+        fprintf(stderr, "save-patch: %s\n", err);
+    else
+        printf("\nwrote %s (%d parameters)\n", o->patch_out, pehost_num_params(h));
+}
+
 static int render_to_wav(pehost *h, const opts *o)
 {
     int     total = RATE * o->secs, bs = 512, done = 0, i;
@@ -534,6 +552,30 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
                 }
                 printf("%s\n", moved ? "" : " -- nothing moved");
             }
+        }
+
+        /* Then anything asked to be typed. Whatever the clicks above left
+         * focused is what receives it: a serial box, a name field, a preset
+         * search. Each character goes as a key down, a WM_CHAR and a key up,
+         * because a control that reads only one of the three is common; the
+         * virtual-key code for a printable character is its upper-case form,
+         * which is what a US layout reports. Return is sent at the end, since
+         * a field that commits on Enter will not commit on anything else. */
+        if (o->type && *o->type) {
+            const char *t;
+            for (t = o->type; *t; t++) {
+                int ch = (unsigned char)*t;
+                int vk = (ch >= 'a' && ch <= 'z') ? ch - 'a' + 'A' : ch;
+                pehost_editor_key(h, vk, 1, ch);
+                pehost_editor_pump(h); usleep(8000);
+                pehost_editor_key(h, vk, 0, ch);
+                pehost_editor_pump(h); usleep(8000);
+            }
+            pehost_editor_key(h, 13, 1, 13);          /* VK_RETURN */
+            pehost_editor_pump(h); usleep(8000);
+            pehost_editor_key(h, 13, 0, 13);
+            for (frame = 0; frame < 30; frame++) { pehost_editor_pump(h); usleep(16000); }
+            printf("  typed %d character(s)\n", (int)strlen(o->type));
         }
 
         /* The drag. Which parameter to watch is whichever the press moves --
@@ -662,9 +704,30 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
         if (pehost_editor_pixels(h, &px, &pw, &ph) && px && pw > 0 && ph > 0) {
             long nonzero = 0;
             int  k;
-            for (k = 0; k < pw * ph; k++) if (px[k] & 0x00FFFFFF) nonzero++;
-            printf("  captured %dx%d, %ld/%d pixels non-black (%.1f%%)\n",
-                   pw, ph, nonzero, pw * ph, 100.0 * nonzero / (pw * ph));
+            /* How many different colours are in it, up to a handful.
+             *
+             * "Non-black" alone cannot tell a drawn interface from a window
+             * flood-filled with one colour, and both score 100%. Four JUCE
+             * plug-ins were read as working editors for exactly that reason
+             * when what they had painted was their background and nothing
+             * else. Two colours or fewer is not an interface. */
+            enum { COLMAX = 8 };
+            uint32_t seen[COLMAX];
+            int ncol = 0;
+            for (k = 0; k < pw * ph; k++) {
+                uint32_t v = px[k] & 0x00FFFFFF;
+                int q, dup = 0;
+                if (v) nonzero++;
+                if (ncol >= COLMAX) continue;
+                for (q = 0; q < ncol; q++) if (seen[q] == v) { dup = 1; break; }
+                if (!dup) seen[ncol++] = v;
+            }
+            printf("  captured %dx%d, %ld/%d pixels non-black (%.1f%%), "
+                   "%s%d colour%s%s\n",
+                   pw, ph, nonzero, pw * ph, 100.0 * nonzero / (pw * ph),
+                   ncol >= COLMAX ? ">=" : "", ncol, ncol == 1 ? "" : "s",
+                   ncol <= 2 ? "  !! flat: nothing was drawn over the background"
+                             : "");
             if (write_ppm(shot, px, pw, ph)) printf("  wrote %s\n", shot);
         } else printf("  no pixels produced\n");
         w32_stats();
@@ -714,27 +777,29 @@ int main(int argc, char **argv)
     if (bank && apply_patch(h, bank, patch_ix, o.block)) { pehost_close(h); return 1; }
     dump_params(h, o.dump);
 
-    /* Written from the state the dump above just described, so the file and the
-     * listing always agree -- including when --patch put us here. */
-    if (o.patch_out) {
-        char err[256];
-        if (patch_save(h, o.patch_out, o.path, err, sizeof err) != 0)
-            fprintf(stderr, "save-patch: %s\n", err);
-        else
-            printf("\nwrote %s (%d parameters)\n", o.patch_out, pehost_num_params(h));
-    }
-
     /* Order matters when both are asked for. Normally the render comes first,
      * so a WAV describes the state the listing above just printed. But a --click
      * or --drag exists to change something, and the question it is asked to
      * answer is whether the change reached the audio -- so the gesture goes
-     * first and the render records what came out afterwards. */
-    if (o.shot && (o.nclick || o.has_drag)) {
-        capture_editor(h, o.shot, &o);
-        if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
-    } else {
-        if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
-        if (o.shot) capture_editor(h, o.shot, &o);
+     * first and the render records what came out afterwards.
+     *
+     * The patch file follows the same rule, for the same reason. Without a
+     * gesture it is written from the state the dump above just described, so
+     * the file and the listing always agree -- including when --patch put us
+     * here. With one, the state worth saving is the one the gesture produced;
+     * writing it first saved the values the user had just moved away from, and
+     * said nothing about having done so. */
+    {
+        const int gestured = o.shot && (o.nclick || o.has_drag);
+        if (!gestured) save_patch_out(h, &o);
+        if (gestured) {
+            capture_editor(h, o.shot, &o);
+            if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
+            save_patch_out(h, &o);
+        } else {
+            if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
+            if (o.shot) capture_editor(h, o.shot, &o);
+        }
     }
 
     {

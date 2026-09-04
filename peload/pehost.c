@@ -1993,11 +1993,20 @@ static int alloc_bufs(pehost *h, int frames)
     return 0;
 }
 
-/* True for a .vst3 file or bundle directory. */
+static int pe_exports_plugin_entry(const char *bin);   /* below */
+
+/* True for a .vst3 file or bundle directory -- and for a plain .dll that
+ * exports VST3's factory and nothing VST2 would use. The format is a property
+ * of the binary, not of the name someone saved it under. */
 static int looks_like_vst3(const char *path)
 {
     size_t l = path ? strlen(path) : 0;
-    return l > 5 && !strcasecmp(path + l - 5, ".vst3");
+    if (l > 5 && !strcasecmp(path + l - 5, ".vst3")) return 1;
+    if (l > 4 && !strcasecmp(path + l - 4, ".dll")) {
+        int e = pe_exports_plugin_entry(path);
+        return (e & 2) && !(e & 1);
+    }
+    return 0;
 }
 
 /* Is this a Classic Mac OS plug-in, and if so where is its code?
@@ -2623,6 +2632,11 @@ static int pe_rva_to_off(FILE *f, long sect_off, int nsec, uint32_t rva, uint32_
     return 0;
 }
 
+/* Which VST entry points a PE exports: bit 0 for VST2, bit 1 for VST3's
+ * factory. Non-zero means "worth offering as a plug-in" for the browsers, and
+ * the individual bits are what tells a VST3 shipped as a plain .dll from a
+ * VST2 -- Frontier is one, and going by the extension called it a VST2 and
+ * then complained it had no VSTPluginMain. */
 static int pe_exports_plugin_entry(const char *bin)
 {
     FILE *f;
@@ -2660,7 +2674,7 @@ static int pe_exports_plugin_entry(const char *bin)
     if (!namecnt || namecnt > 65536) goto out;
     if (!pe_rva_to_off(f, sect_off, nsec, namerva, &nameoff)) goto out;
 
-    for (i = 0; i < namecnt && !found; i++) {
+    for (i = 0; i < namecnt; i++) {
         uint32_t srva, soff;
         char nm[64];
         size_t n;
@@ -2673,9 +2687,10 @@ static int pe_exports_plugin_entry(const char *bin)
         /* VST2's entry point, its pre-2.4 spelling, and VST3's factory. The
          * bare "main" is why this cannot simply look for a substring: plenty
          * of libraries export something containing it. */
-        if (!strcmp(nm, "VSTPluginMain") || !strcmp(nm, "main") ||
-            !strcmp(nm, "GetPluginFactory"))
-            found = 1;
+        if (!strcmp(nm, "VSTPluginMain") || !strcmp(nm, "main"))
+            found |= 1;                       /* VST2 */
+        else if (!strcmp(nm, "GetPluginFactory"))
+            found |= 2;                       /* VST3 */
     }
 out:
     fclose(f);
