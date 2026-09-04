@@ -4,6 +4,42 @@
 own licence check.** The MSVCP120 blocker this document was originally written
 about is resolved.
 
+> **Updated 2026-08-30.** Everything below still describes the x86-64 side
+> accurately. What has changed since is the i386 side and the packaging, and
+> two of the loose ends this document left open have been closed:
+>
+> - **peload32 could not load a real dependency DLL at all.** That was the
+>   whole reason all four plug-ins crashed on i386 while the same four loaded
+>   on x86-64: they import several hundred `MSVCP120` iostream and locale
+>   symbols, every one took the generic stub, and on i386 that stub returns 0
+>   *and pops nothing*, so the stack drifted four bytes per argument until a
+>   later `ret` jumped into nothing. It loads them now, recursively, and with a
+>   runtime present binds 190 of them -- imports left on the generic stub drop
+>   from 313 to 16. Supplying the file is still open; see below.
+> - **Kontakt's twenty reached stubs are down to thirteen**, and it loads
+>   rather than segfaulting. The wide-character CRT was entirely absent --
+>   `_wfopen`, `_wopen`, `_waccess`, `_fdopen` -- so a sampler asked whether
+>   its library existed, was told yes by a stub returning 0 (which `_waccess`
+>   reads as *success*), opened it with `_wopen`, was handed descriptor 0, and
+>   read silence out of stdin. It now builds its database where it should.
+> - **The "escaping boost `runtime_error`" guess in this document was wrong.**
+>   It is not type matching being too strict. Kontakt no longer aborts at all;
+>   what remains is that the C++ exception frame walk uses a single
+>   `g_image_base` for the entire walk (`winstubs.h`), so a throw from a
+>   *dependency* image would never find its handlers. Latent rather than
+>   active when this was written, and fixed on 2026-09-04 (`db380b2`):
+>   `winstubs_image_for_addr` answers which registered image an address falls
+>   in, and the unwind loop recomputes the base per frame.
+> - **Where the runtime goes on an installed system**: `/usr/lib/vst-ace/runtime`
+>   for x86-64 and `.../runtime32` for i386. Both ship empty with a README, and
+>   the packages document it. Wine's builds of `msvcp120.dll` are refused
+>   rather than loaded -- they are compiled against Wine's own `ntdll` and
+>   fault inside their own startup, and searching Wine's directories once took
+>   peload32 from 36 of 40 plug-ins to none of them on a machine that had Wine
+>   installed.
+>
+> The macOS side has its own measured handoff now: `HANDOFF-2026-08-30-macos.md`.
+
 | plugin | result |
 |---|---|
 | Absynth 5 | editor **764x687**, **renders audio** (peak 0.198, ~C4) — `0x436c6d35`, 2 in / 6 out, 128 programs, 21 params |
