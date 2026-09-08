@@ -36,6 +36,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -281,6 +282,173 @@ static engine g_eng;
  * never allocates. */
 static float g_plug_buf[PERIOD_MAX * 2];
 
+/* ---- audio input ---------------------------------------------------------
+ *
+ * The Qt window has taken a microphone or a line in since it learned to; this
+ * one passed NULL to the plug-in unconditionally, so every effect in the
+ * corpus -- and the corpus is mostly effects -- rendered silence and looked
+ * broken. A vocoder had nothing to vocode.
+ *
+ * One ring between the two PipeWire callbacks, which run on different threads:
+ * capture writes, playback reads. Single producer, single consumer, power-of-
+ * two so the wrap is a mask -- the same shape the note queue below uses, and
+ * for the same reason: neither side may take a lock. */
+#define CAP_RING  16384                        /* frames, not samples */
+static float           g_cap_ring[CAP_RING * 2];
+static _Atomic unsigned g_cap_head, g_cap_tail;
+static _Atomic int      g_cap_peak_milli;      /* for the level meter */
+static _Atomic int      g_cap_gain_milli = 1000;   /* 1.000 */
+static float           g_cap_buf[PERIOD_MAX * 2];
+static struct pw_stream *g_cap_stream;
+/* The PipeWire source to record from; empty means whatever the system calls
+ * default. Changed from the Inputs menu while running, which is what
+ * capture_open is for. */
+static char             g_cap_target[128];
+static char             g_cap_lat[32];      /* node latency, as the output uses */
+static void            *g_cap_ud;           /* the engine the callback is given */
+/* How much has arrived. A device that is connected and silent and one that is
+ * not connected there at all look identical until something counts frames. */
+static _Atomic unsigned long g_cap_frames;
+static int capture_open(const char *target);
+
+static void cap_write(const float *src, int frames)
+{
+    unsigned h = atomic_load_explicit(&g_cap_head, memory_order_relaxed);
+    unsigned t = atomic_load_explicit(&g_cap_tail, memory_order_acquire);
+    int i;
+    for (i = 0; i < frames; i++) {
+        if (h - t >= CAP_RING) break;          /* full: drop, never block */
+        g_cap_ring[(h & (CAP_RING - 1)) * 2]     = src[i * 2];
+        g_cap_ring[(h & (CAP_RING - 1)) * 2 + 1] = src[i * 2 + 1];
+        h++;
+    }
+    atomic_store_explicit(&g_cap_head, h, memory_order_release);
+}
+
+/* Read `frames`, applying the input gain. Short reads are zero-filled: the
+ * plug-in is asked for a whole block whatever the input managed to deliver. */
+/* What feeds an effect's input, and the note gates the "keys" choice plays.
+ *
+ * A synth ignores the input; an effect renders silence without one and reads
+ * as broken. The four choices are pestudio's, because the question is the same
+ * one and the answer should not depend on which window is open: silence, a
+ * sawtooth per held key, white noise, or the microphone. */
+enum { SRC_SILENCE = 0, SRC_NOTES = 1, SRC_NOISE = 2, SRC_INPUT = 3 };
+static _Atomic int g_src = SRC_SILENCE;
+static _Atomic unsigned char g_gate[128];
+
+static int cap_read(float *dst, int frames)
+{
+    unsigned h = atomic_load_explicit(&g_cap_head, memory_order_acquire);
+    unsigned t = atomic_load_explicit(&g_cap_tail, memory_order_relaxed);
+    float g = atomic_load_explicit(&g_cap_gain_milli, memory_order_relaxed) / 1000.0f;
+    int i, got = 0;
+    for (i = 0; i < frames; i++) {
+        if (t == h) break;
+        {   /* Clamped, because the gain goes to 400%: a plug-in written for
+             * line level is entitled to a signal that stays inside it. */
+            float l = g_cap_ring[(t & (CAP_RING - 1)) * 2]     * g;
+            float r = g_cap_ring[(t & (CAP_RING - 1)) * 2 + 1] * g;
+            dst[i * 2]     = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
+            dst[i * 2 + 1] = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
+        }
+        t++; got++;
+    }
+    atomic_store_explicit(&g_cap_tail, t, memory_order_release);
+    if (got < frames)
+        memset(dst + (size_t)got * 2, 0, (size_t)(frames - got) * 2 * sizeof *dst);
+    return got;
+}
+
+/* The scale is a percentage; the ring applies it in thousandths so the audio
+ * thread reads one atomic int rather than a float it might see half of. */
+static void on_mic_gain(GtkRange *r, gpointer u)
+{
+    (void)u;
+    atomic_store_explicit(&g_cap_gain_milli,
+                          (int)(gtk_range_get_value(r) * 10.0), memory_order_relaxed);
+}
+
+static void on_capture_process(void *ud)
+{
+    struct pw_buffer *b;
+    struct spa_buffer *sb;
+    const float *src;
+    int n, i;
+    (void)ud;
+
+    if (!g_cap_stream || !(b = pw_stream_dequeue_buffer(g_cap_stream))) return;
+    sb = b->buffer;
+    src = sb->datas[0].data;
+    if (src && sb->datas[0].chunk) {
+        n = (int)(sb->datas[0].chunk->size / (sizeof(float) * 2));
+        if (n > PERIOD_MAX) n = PERIOD_MAX;
+        if (n > 0) {
+            float pk = 0.0f;
+            for (i = 0; i < n * 2; i++) {
+                float a = src[i] < 0 ? -src[i] : src[i];
+                if (a > pk) pk = a;
+            }
+            { int cur = (int)(pk * 1000.0f);
+              if (cur > atomic_load_explicit(&g_cap_peak_milli, memory_order_relaxed))
+                  atomic_store_explicit(&g_cap_peak_milli, cur, memory_order_relaxed); }
+            cap_write(src, n);
+            atomic_fetch_add_explicit(&g_cap_frames, (unsigned long)n,
+                                      memory_order_relaxed);
+        }
+    }
+    pw_stream_queue_buffer(g_cap_stream, b);
+}
+
+/* One block of input for the plug-in. Audio thread.
+ *
+ * The saw is what an effect can be judged on: it has harmonics and an envelope,
+ * where a sine tells you very little about a compressor. Scaled so a fistful of
+ * keys does not clip the plug-in's input before it has had a chance to act.
+ * Identical to pestudio's fillInput, down to the 5 ms attack and 120 ms
+ * release, so the same plug-in fed the same way sounds the same in both. */
+static void fill_input(float *dst, int n)
+{
+    static float  env[128];
+    static double phase[128];
+    static unsigned rng = 22222u;
+    const double sr = SR;
+    int src = atomic_load_explicit(&g_src, memory_order_relaxed);
+    int i, note;
+
+    memset(dst, 0, (size_t)n * 2 * sizeof *dst);
+    if (src == SRC_INPUT) { cap_read(dst, n); return; }   /* gain applied there */
+    if (src == SRC_NOISE) {
+        for (i = 0; i < n; i++) {
+            float v;
+            rng = rng * 1664525u + 1013904223u;
+            v = (float)((int32_t)rng >> 8) / 8388608.0f * 0.25f;
+            dst[2 * i] = dst[2 * i + 1] = v;
+        }
+        return;
+    }
+    if (src != SRC_NOTES) return;
+    for (note = 0; note < 128; note++) {
+        float target = (float)atomic_load_explicit(&g_gate[note],
+                                                   memory_order_relaxed) / 127.0f;
+        const float up = 1.0f - expf(-1.0f / (0.005f * (float)sr));
+        const float dn = 1.0f - expf(-1.0f / (0.120f * (float)sr));
+        double step;
+        if (target <= 0.0f && env[note] <= 1e-5f) { env[note] = 0.0f; continue; }
+        step = 440.0 * pow(2.0, (note - 69) / 12.0) / sr;
+        for (i = 0; i < n; i++) {
+            float e = env[note], v;
+            e += ((target > 0.0f ? target : 0.0f) - e) * (target > e ? up : dn);
+            env[note] = e;
+            phase[note] += step;
+            if (phase[note] >= 1.0) phase[note] -= 1.0;
+            v = (float)(2.0 * phase[note] - 1.0) * e * 0.18f;
+            dst[2 * i]     += v;
+            dst[2 * i + 1] += v;
+        }
+    }
+}
+
 static void render_block(engine *e, double *buf, int frames)
 {
     unsigned h, t;
@@ -291,7 +459,15 @@ static void render_block(engine *e, double *buf, int frames)
      * playing underneath it. */
     if (plugview_active()) {
         int i, n = frames > PERIOD_MAX ? PERIOD_MAX : frames;
-        if (plugview_render(g_plug_buf, n)) {
+        /* Whatever the effect input is set to -- an effect with nothing fed to
+         * it renders silence, which is the one setting that hands over NULL
+         * rather than a buffer of zeros. */
+        const float *in = NULL;
+        if (atomic_load_explicit(&g_src, memory_order_relaxed) != SRC_SILENCE) {
+            fill_input(g_cap_buf, n);
+            in = g_cap_buf;
+        }
+        if (plugview_render_io(in, g_plug_buf, n)) {
             for (i = 0; i < n * 2; i++) buf[i] = g_plug_buf[i];
             if (n < frames) memset(buf + (size_t)n * 2, 0,
                                    (size_t)(frames - n) * 2 * sizeof *buf);
@@ -455,6 +631,143 @@ static const struct pw_stream_events g_pw_events = {
     .process = pw_on_process,
 };
 
+/* The capture devices the machine has, as PipeWire reports them now.
+ *
+ * Asked at startup and from Rescan rather than watched: plugging a USB
+ * interface in is exactly when the list is wrong, and holding a registry
+ * listener open to keep it right would mean a second connection to the graph
+ * for the whole session. Same scan pestudio does, and the same node names, so
+ * a device picked in one window can be named in the other. */
+typedef struct { char node[128], label[160]; } indev;
+static indev g_indev[32];
+static int   g_nindev;
+
+typedef struct {
+    struct pw_main_loop *loop;
+    int sync;
+} devscan;
+
+static void dev_global(void *data, uint32_t id, uint32_t perm, const char *type,
+                       uint32_t ver, const struct spa_dict *props)
+{
+    const char *cls, *name, *desc;
+    (void)data; (void)id; (void)perm; (void)ver;
+    if (!type || strcmp(type, PW_TYPE_INTERFACE_Node) || !props) return;
+    cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+    if (!cls || strcmp(cls, "Audio/Source")) return;
+    name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (!name || g_nindev >= (int)(sizeof g_indev / sizeof g_indev[0])) return;
+    desc = spa_dict_lookup(props, PW_KEY_NODE_DESCRIPTION);
+    snprintf(g_indev[g_nindev].node, sizeof g_indev[0].node, "%s", name);
+    snprintf(g_indev[g_nindev].label, sizeof g_indev[0].label, "%s",
+             desc && *desc ? desc : name);
+    g_nindev++;
+}
+
+static void dev_core_done(void *data, uint32_t id, int seq)
+{
+    devscan *d = data;
+    if (id == PW_ID_CORE && seq == d->sync) pw_main_loop_quit(d->loop);
+}
+
+static void scan_input_devices(void)
+{
+    static const struct pw_registry_events rev = {
+        .version = PW_VERSION_REGISTRY_EVENTS,
+        .global  = dev_global,
+    };
+    static const struct pw_core_events cev = {
+        .version = PW_VERSION_CORE_EVENTS,
+        .done    = dev_core_done,
+    };
+    devscan scan;
+    struct pw_context  *ctx = NULL;
+    struct pw_core     *core = NULL;
+    struct pw_registry *reg = NULL;
+    struct spa_hook rl, cl;
+
+    spa_zero(rl); spa_zero(cl); spa_zero(scan);
+    g_nindev = 0;
+    scan.loop = pw_main_loop_new(NULL);
+    if (!scan.loop) return;
+    ctx = pw_context_new(pw_main_loop_get_loop(scan.loop), NULL, 0);
+    if (ctx) core = pw_context_connect(ctx, NULL, 0);
+    if (core) {
+        reg = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+        if (reg) {
+            pw_registry_add_listener(reg, &rl, &rev, &scan);
+            pw_core_add_listener(core, &cl, &cev, &scan);
+            /* Ask the server to say when it has finished replaying the globals
+             * it already has; without it the loop waits forever for a device
+             * that is not going to appear. */
+            scan.sync = pw_core_sync(core, PW_ID_CORE, 0);
+            pw_main_loop_run(scan.loop);
+        }
+    }
+    if (reg)  pw_proxy_destroy((struct pw_proxy *)reg);
+    if (core) pw_core_disconnect(core);
+    if (ctx)  pw_context_destroy(ctx);
+    pw_main_loop_destroy(scan.loop);
+}
+
+/* Point the capture stream at a source, or at the system default when `target`
+ * is empty. Called once when the audio starts and again whenever a device is
+ * picked from the Inputs menu, which is why the old stream is torn down here
+ * rather than at shutdown: PipeWire will not retarget a connected stream.
+ *
+ * The thread loop is locked around it because the capture callback runs on
+ * that loop, and destroying a stream underneath its own process callback is
+ * the crash this lock exists to prevent. Locking before the loop is started is
+ * harmless -- it is an ordinary mutex until then. */
+static int capture_open(const char *target)
+{
+    static const struct pw_stream_events cev = {
+        .version = PW_VERSION_STREAM_EVENTS,
+        .process = on_capture_process,
+    };
+    struct pw_properties *cp;
+    uint8_t cpod[1024];
+    struct spa_pod_builder cb = SPA_POD_BUILDER_INIT(cpod, sizeof cpod);
+    const struct spa_pod *cparams[1];
+    struct spa_audio_info_raw ci;
+
+    if (!g_pw_loop) return 0;
+    if (target != g_cap_target)
+        snprintf(g_cap_target, sizeof g_cap_target, "%s", target ? target : "");
+
+    pw_thread_loop_lock(g_pw_loop);
+    if (g_cap_stream) { pw_stream_destroy(g_cap_stream); g_cap_stream = NULL; }
+    cp = pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio",
+                           PW_KEY_MEDIA_CATEGORY, "Capture",
+                           PW_KEY_MEDIA_ROLE, "Production",
+                           PW_KEY_NODE_LATENCY, g_cap_lat[0] ? g_cap_lat : "256/48000",
+                           NULL);
+    if (g_cap_target[0])
+        pw_properties_set(cp, PW_KEY_TARGET_OBJECT, g_cap_target);
+    g_cap_stream = pw_stream_new_simple(pw_thread_loop_get_loop(g_pw_loop),
+                                        "dwstudio input", cp, &cev, g_cap_ud);
+    if (g_cap_stream) {
+        spa_zero(ci);
+        ci.format = SPA_AUDIO_FORMAT_F32;
+        ci.rate = SR;
+        ci.channels = 2;
+        ci.position[0] = SPA_AUDIO_CHANNEL_FL;
+        ci.position[1] = SPA_AUDIO_CHANNEL_FR;
+        cparams[0] = spa_format_audio_raw_build(&cb, SPA_PARAM_EnumFormat, &ci);
+        if (pw_stream_connect(g_cap_stream, PW_DIRECTION_INPUT, PW_ID_ANY,
+                              PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+                              PW_STREAM_FLAG_RT_PROCESS, cparams, 1) < 0) {
+            pw_stream_destroy(g_cap_stream);
+            g_cap_stream = NULL;
+        }
+    }
+    pw_thread_loop_unlock(g_pw_loop);
+    /* A new device starts a new count, so "nothing received yet" means this
+     * device and not the one before it. */
+    atomic_store_explicit(&g_cap_frames, 0, memory_order_relaxed);
+    return g_cap_stream != NULL;
+}
+
 /* Tear the stream down. Stopping the loop thread first is what makes the rest
  * safe: once it returns, no further pw_on_process can be in flight, so nothing
  * is rendering out of the engine while we destroy the stream. Also used on the
@@ -463,6 +776,7 @@ static const struct pw_stream_events g_pw_events = {
 static void engine_stop_pipewire(void)
 {
     if (g_pw_loop)   pw_thread_loop_stop(g_pw_loop);
+    if (g_cap_stream) { pw_stream_destroy(g_cap_stream); g_cap_stream = NULL; }
     if (g_pw_stream) { pw_stream_destroy(g_pw_stream); g_pw_stream = NULL; }
     if (g_pw_loop)   { pw_thread_loop_destroy(g_pw_loop); g_pw_loop = NULL; }
     free(g_pw_buf); g_pw_buf = NULL;
@@ -504,6 +818,13 @@ static int engine_start_pipewire(engine *e)
         engine_stop_pipewire();
         return -1;
     }
+
+    /* The input, opened beside the output. Optional in every sense: a machine
+     * with no microphone, or a user who does not want one, gets a host that
+     * behaves exactly as it did before -- the plug-in is simply fed nothing. */
+    snprintf(g_cap_lat, sizeof g_cap_lat, "%s", lat);
+    g_cap_ud = e;
+    capture_open(g_cap_target);
 
     if (pw_thread_loop_start(g_pw_loop) < 0) { engine_stop_pipewire(); return -1; }
     return 0;
@@ -625,7 +946,24 @@ typedef struct {
     char          midi[160];
 
     snd_seq_t    *seq;
-    int           seqport;
+    GtkWidget    *mic_level;       /* what the input is doing, after gain */
+    int           seqport;         /* what a sequencer plays into */
+    int           seqout;          /* ...and what this can play out of */
+    int           thru;            /* echo what arrives straight back out */
+    int           autoout;         /* subscribe the out port to hardware too */
+    int           clock_seen;      /* a sequencer's clock has arrived */
+    int           tempo_echo;      /* the box is following the clock, not typing */
+    int           chan_echo;       /* the menu and the drop-down agreeing */
+    char          port[64];        /* "128:0 (dwstudio in)", for a tracker */
+    char          srcs[512];       /* what is connected, in... */
+    char          snks[512];       /* ...and out */
+    GtkWidget    *midi_conn;       /* those two, on screen */
+    GtkWidget    *topbar, *midibar;/* the rows above the pane, shared by both */
+    GtkWidget    *chan_dd, *tempo_sb, *tempo_state, *srcdd;
+    GMenu        *midi_menu;       /* Inputs > MIDI input, refilled on scan */
+    GMenu        *audio_menu;      /* Inputs > Audio input, the device list */
+    GMenu        *audio_state;     /* ...and the line under it saying if it is live */
+    char          audio_said[32];  /* what that line says now */
 
     /* Juno control panel: one widget per parameter, shown in place of the
      * read-only text when the Juno engine is selected. */
@@ -667,18 +1005,27 @@ static const unsigned char *raw_body(int row)
     }
 }
 
+/* The line along the bottom: what is playing, what is connected, and which
+ * audio backend got it. The plug-in's own name and size are in the pane's
+ * status line, so this one answers the questions the pane cannot -- and since
+ * the engines stopped being a page, saying which of them would sound is only
+ * worth the room when one of them actually would. */
 static void set_status(void)
 {
     char msg[512];
     const instrument *in = (U.cur_inst >= 0) ? &g_inst[U.cur_inst] : NULL;
-    if (!in) return;
-    snprintf(msg, sizeof msg, "%s — %s, %d programs%s%s", in->name,
-             in->eng == ENG_DW ? "DW-8000 engine"
-                               : in->eng == ENG_FM ? "4-op FM engine"
-                               : in->eng == ENG_JUNO ? "Juno-6 engine"
-                               : in->eng == ENG_DRUM ? "drum kit"
-                                                   : "browse only (no engine)",
-             U.cur.count, U.midi, U.hint);
+
+    if (!GTK_IS_LABEL(U.status)) return;
+    if (plugview_active() || !in)
+        snprintf(msg, sizeof msg, "plug-in host%s%s", U.midi, U.hint);
+    else
+        snprintf(msg, sizeof msg, "nothing loaded — the %s would sound%s%s",
+                 in->eng == ENG_DW ? "DW-8000 engine"
+                                   : in->eng == ENG_FM ? "4-op FM engine"
+                                   : in->eng == ENG_JUNO ? "Juno-6 engine"
+                                   : in->eng == ENG_DRUM ? "drum kit"
+                                                       : "browser (no engine)",
+                 U.midi, U.hint);
     {   /* append the live audio backend so it is visible, not just on stderr */
         size_t l = strlen(msg);
         snprintf(msg + l, sizeof msg - l, "   [%s]", g_backend);
@@ -738,6 +1085,29 @@ static double piano_x0(int w, int hi)
     return used < w ? (w - used) / 2.0 : 0.0;
 }
 
+/* "C4" for middle C, the same numbering and the same real sharp sign the Qt
+ * window uses -- at the size a black key allows, "#" reads as a smudge. */
+static const char *note_name(int n, int with_octave, char *buf, size_t bufn)
+{
+    static const char *nm[12] = { "C", "C\u266f", "D", "D\u266f", "E", "F",
+                                  "F\u266f", "G", "G\u266f", "A", "A\u266f", "B" };
+    if (with_octave) snprintf(buf, bufn, "%s%d", nm[n % 12], n / 12 - 1);
+    else             snprintf(buf, bufn, "%s", nm[n % 12]);
+    return buf;
+}
+
+/* Centred on the key, sitting on its bottom edge. */
+static void piano_label(cairo_t *cr, const char *text, double cx, double bottom,
+                        double size)
+{
+    cairo_text_extents_t te;
+    cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, size);
+    cairo_text_extents(cr, text, &te);
+    cairo_move_to(cr, cx - (te.width / 2 + te.x_bearing), bottom);
+    cairo_show_text(cr, text);
+}
+
 static void piano_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
 {
     int n, i = 0, hi = key_hi_for_width(w);
@@ -759,6 +1129,25 @@ static void piano_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
         cairo_set_source_rgb(cr, 0.45, 0.45, 0.45);
         cairo_set_line_width(cr, 1);
         cairo_stroke(cr);
+        /* Every key named, not just the Cs -- and the octave dropped when the
+         * key is too narrow to hold it, because a truncated "C" is still the
+         * note where a truncated "C4" is a lie about which one. */
+        {
+            char buf[16];
+            double fs = kw * 0.30;
+            cairo_text_extents_t te;
+            if (fs < 6) fs = 6;
+            if (fs > 10) fs = 10;
+            cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL,
+                                   CAIRO_FONT_WEIGHT_NORMAL);
+            cairo_set_font_size(cr, fs);
+            note_name(n, 1, buf, sizeof buf);
+            cairo_text_extents(cr, buf, &te);
+            if (te.width > kw - 5) note_name(n, 0, buf, sizeof buf);
+            if (n % 12 == 0) cairo_set_source_rgb(cr, 0.27, 0.27, 0.31);
+            else             cairo_set_source_rgb(cr, 0.51, 0.51, 0.55);
+            piano_label(cr, buf, x0 + i * kw + (kw - 1) / 2.0, h - 4.0, fs);
+        }
         i++;
     }
     i = 0;
@@ -769,6 +1158,17 @@ static void piano_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
             else               cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
             cairo_rectangle(cr, x0 + i * kw + kw * 0.68, 0, kw * 0.62, h * 0.62);
             cairo_fill(cr);
+            /* The accidental only: at half a white key wide there is no room
+             * for the octave, and the white key beside it already says it. */
+            {
+                char buf[16];
+                double bw = kw * 0.62, fs = bw * 0.46;
+                if (fs < 5.5) fs = 5.5;
+                if (fs > 9) fs = 9;
+                cairo_set_source_rgb(cr, 0.75, 0.75, 0.78);
+                piano_label(cr, note_name(n + 1, 0, buf, sizeof buf),
+                            x0 + i * kw + kw * 0.68 + bw / 2.0, h * 0.62 - 4.0, fs);
+            }
         }
         i++;
     }
@@ -795,11 +1195,20 @@ static void piano_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
 #define BEND_CENTRE 8192
 #define BEND_MAX    16383
 
+static void midi_send(int status, int d1, int d2);
+
+/* A bend made here: the plug-in hears it, the port carries it, the wheel draws
+ * it. One that arrived over MIDI takes bend_show instead -- it has already
+ * reached the plug-in as a raw message, and putting it back out of the port it
+ * came in on is how two devices end up bending each other. */
 static void bend_send(void)
 {
     if (plugview_active()) plugview_bend(U.bend);
+    midi_send(0xE0, U.bend & 0x7f, (U.bend >> 7) & 0x7f);
     gtk_widget_queue_draw(U.wheel);
 }
+
+static void bend_show(void) { gtk_widget_queue_draw(U.wheel); }
 
 static void bend_recentre(void)
 {
@@ -937,27 +1346,76 @@ static int note_at(double x, double y, int w, int h)
     return -1;
 }
 
+/* Out of "dwstudio out", to whatever subscribed to it -- a tracker, a DAW, a
+ * hardware synth. Everything played here goes out as well as being heard,
+ * which is what makes this a MIDI instrument rather than a window that happens
+ * to make a noise.
+ *
+ * No lock, unlike pestudio's: every caller is on the GTK thread, because the
+ * MIDI poll is a GTK timeout rather than pestudio's reader thread. */
+static void midi_send(int status, int d1, int d2)
+{
+    snd_seq_event_t ev;
+    int ch = status & 0x0f;
+
+    if (!U.seq || U.seqout < 0) return;
+    snd_seq_ev_clear(&ev);
+    snd_seq_ev_set_source(&ev, (unsigned char)U.seqout);
+    snd_seq_ev_set_subs(&ev);
+    snd_seq_ev_set_direct(&ev);
+    switch (status & 0xf0) {
+    case 0x80: snd_seq_ev_set_noteoff(&ev, ch, d1, d2); break;
+    case 0x90:
+        if (d2 > 0) snd_seq_ev_set_noteon(&ev, ch, d1, d2);
+        else        snd_seq_ev_set_noteoff(&ev, ch, d1, 0);
+        break;
+    case 0xA0: snd_seq_ev_set_keypress(&ev, ch, d1, d2); break;
+    case 0xB0: snd_seq_ev_set_controller(&ev, ch, d1, d2); break;
+    case 0xC0: snd_seq_ev_set_pgmchange(&ev, ch, d1); break;
+    case 0xD0: snd_seq_ev_set_chanpress(&ev, ch, d1); break;
+    /* ALSA's bend is signed around zero; MIDI's is two 7-bit halves biased at
+     * 8192, which is the form everything here keeps it in. */
+    case 0xE0: snd_seq_ev_set_pitchbend(&ev, ch, ((d2 << 7) | d1) - BEND_CENTRE); break;
+    default: return;
+    }
+    snd_seq_event_output_direct(U.seq, &ev);
+}
+
 /* The keyboard plays whatever is loaded. pehost keeps its own lock-free queue
  * for exactly this, so a note goes straight to the plug-in rather than through
  * ours -- and both paths stay single-producer, since dwstudio's MIDI poll is a
- * GTK timeout on this same thread. */
-static void note_on(int n, int vel)
+ * GTK timeout on this same thread.
+ *
+ * `local` is where the note came from. A note played here -- on the on-screen
+ * keys, or on the computer keyboard -- is sounded, drawn and sent out of the
+ * MIDI port. A note that arrived over MIDI has already reached the plug-in as
+ * the raw message it came in as, so all it wants is drawing; sounding it again
+ * would play it twice, and sending it back out is what `thru` is for. */
+static void note_start(int n, int vel, int local)
 {
     if (n < 0 || n > 127 || U.held[n]) return;
     U.held[n] = 1;
-    if (plugview_active()) plugview_note_on(n, vel);
+    atomic_store_explicit(&g_gate[n], (unsigned char)(vel > 127 ? 127 : vel),
+                          memory_order_relaxed);
+    if (plugview_active()) { if (local) plugview_note_on(n, vel); }
     else                   ev_push(EV_ON, (unsigned char)n, (unsigned char)vel);
+    if (local) midi_send(0x90, n, vel);
     gtk_widget_queue_draw(U.piano);
 }
 
-static void note_off(int n)
+static void note_stop(int n, int local)
 {
     if (n < 0 || n > 127 || !U.held[n]) return;
     U.held[n] = 0;
-    if (plugview_active()) plugview_note_off(n);
+    atomic_store_explicit(&g_gate[n], 0, memory_order_relaxed);
+    if (plugview_active()) { if (local) plugview_note_off(n); }
     else                   ev_push(EV_OFF, (unsigned char)n, 0);
+    if (local) midi_send(0x80, n, 0);
     gtk_widget_queue_draw(U.piano);
 }
+
+static void note_on(int n, int vel) { note_start(n, vel, 1); }
+static void note_off(int n)         { note_stop(n, 1); }
 
 static void on_press(GtkGestureClick *g, int np, double x, double y, gpointer u)
 {
@@ -966,12 +1424,26 @@ static void on_press(GtkGestureClick *g, int np, double x, double y, gpointer u)
                     gtk_widget_get_height(U.piano)), 100);
 }
 
-static void on_release(GtkGestureClick *g, int np, double x, double y, gpointer u)
+/* Everything down, up. Reached from a mouse release -- the pointer leaves the
+ * key it pressed as often as not -- and from the window going inactive, where
+ * it matters more: from there no key-up will ever arrive, so a note held while
+ * the desktop or a plug-in's own window took focus would sound for good. */
+static void release_all(void)
 {
     int n;
-    (void)g; (void)np; (void)u;
     for (n = 0; n < 128; n++) note_off(n);
-    (void)x; (void)y;
+}
+
+static void on_release(GtkGestureClick *g, int np, double x, double y, gpointer u)
+{
+    (void)g; (void)np; (void)u; (void)x; (void)y;
+    release_all();
+}
+
+static void on_win_active(GObject *o, GParamSpec *ps, gpointer u)
+{
+    (void)ps; (void)u;
+    if (!gtk_window_is_active(GTK_WINDOW(o))) release_all();
 }
 
 /* Tracker layout, same as dwplay's. GTK gives real key-release events, so
@@ -993,8 +1465,16 @@ static gboolean on_key(GtkEventControllerKey *c, guint kv, guint kc,
                        GdkModifierType st, gpointer u)
 {
     int n = key_note(kv);
-    (void)c; (void)kc; (void)st; (void)u;
+    (void)c; (void)kc; (void)u;
     if (n < 0) return FALSE;
+    /* A press carrying Ctrl, Alt or Meta is a command, whether or not anything
+     * here claims it: Ctrl+C, Ctrl+V, Ctrl+X and Ctrl+B all land on note keys,
+     * and playing a note at the copy shortcut is not something to do in front
+     * of an audience. Presses only -- a release is delivered whatever is held
+     * with it, because reaching for a modifier while a note is down must not be
+     * what strands that note on. */
+    if (st & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_META_MASK | GDK_SUPER_MASK))
+        return FALSE;
     note_on(n, 100);
     return TRUE;
 }
@@ -1196,13 +1676,49 @@ static void on_bank_changed(GtkDropDown *d, GParamSpec *p, gpointer u)
     select_bank((int)gtk_drop_down_get_selected(d));
 }
 
-static void on_chan_changed(GtkDropDown *d, GParamSpec *ps, gpointer u)
+/* What feeds an effect's input. Same four in the same order as pestudio's, so
+ * "set it to input" means the same thing in either window. */
+static void on_src_changed(GtkDropDown *d, GParamSpec *ps, gpointer u)
 {
     (void)ps; (void)u;
-    /* index 0 = Omni, 1..16 = channels 0..15 */
-    atomic_store_explicit(&g_midi_ch, (int)gtk_drop_down_get_selected(d) - 1,
+    atomic_store_explicit(&g_src, (int)gtk_drop_down_get_selected(d),
                           memory_order_relaxed);
+}
+
+static void src_select(int src)
+{
+    atomic_store_explicit(&g_src, src, memory_order_relaxed);
+    if (GTK_IS_WIDGET(U.srcdd))
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(U.srcdd), (guint)src);
+}
+
+static void on_chan_changed(GtkDropDown *d, GParamSpec *ps, gpointer u)
+{
+    int ch = (int)gtk_drop_down_get_selected(d) - 1;   /* 0 = Omni */
+    (void)ps; (void)u;
+    atomic_store_explicit(&g_midi_ch, ch, memory_order_relaxed);
     ev_push(EV_ALLOFF, 0, 0);
+    /* The same setting is a radio item under Inputs, and a menu still showing
+     * the old channel is worse than no menu at all. The guard is for the trip
+     * back: the action's handler sets this drop-down too. */
+    if (!U.chan_echo && U.win) {
+        GAction *a = g_action_map_lookup_action(G_ACTION_MAP(U.win), "midi-channel");
+        if (a) {
+            U.chan_echo = 1;
+            g_action_change_state(a, g_variant_new_int32(ch));
+            U.chan_echo = 0;
+        }
+    }
+}
+
+/* Typed, not followed: echoing back a tempo that came from the clock would
+ * fight the sync, so poll_transport sets the box with U.tempo_echo raised and
+ * this does nothing while it is. */
+static void on_tempo(GtkSpinButton *sb, gpointer u)
+{
+    (void)u;
+    if (U.tempo_echo) return;
+    plugview_set_tempo(gtk_spin_button_get_value(sb));
 }
 
 static void on_vol(GtkRange *r, gpointer u)
@@ -1400,96 +1916,328 @@ static void show_params(int row)
 
 /* -------------------------------------------------------------------- MIDI */
 
+static gboolean poll_mic_level(gpointer u)
+{
+    int pk;
+    (void)u;
+    if (!GTK_IS_WIDGET(U.mic_level)) return G_SOURCE_CONTINUE;
+    pk = atomic_exchange_explicit(&g_cap_peak_milli, 0, memory_order_relaxed);
+    {   /* Fall back gently rather than snapping to zero between transients. */
+        static double shown;
+        double v = pk / 1000.0;
+        if (v > shown) shown = v; else shown = shown * 0.7;
+        if (shown > 1.0) shown = 1.0;
+        gtk_level_bar_set_value(GTK_LEVEL_BAR(U.mic_level), shown);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+/* What is connected, in and out, said in the window rather than only in the
+ * status line. "no MIDI in" and a list of one hardware port look nothing alike
+ * when a tracker will not play, and which of the two it is decides where to
+ * look next. */
+static void midi_conn_update(void)
+{
+    char txt[1100];
+
+    /* The port this window is, before what is plugged into it: connecting a
+     * tracker means picking this client out of its list, and the name it is
+     * listed under is the one thing the window alone can say. */
+    snprintf(txt, sizeof txt, "%s   in: %s   out: %s",
+             U.port[0] ? U.port : "no MIDI",
+             U.srcs[0] ? U.srcs : "nothing connected",
+             U.snks[0] ? U.snks : (U.autoout ? "nothing connected"
+                                             : "on request only"));
+    if (GTK_IS_LABEL(U.midi_conn)) {
+        char *line = g_strdup(txt), *nl;
+        /* One line in the row, the whole list on hover: the row is next to the
+         * tempo and cannot grow, and a port list is exactly the thing you want
+         * in full when something is missing from it. */
+        for (nl = line; (nl = strchr(nl, '\n')) != NULL; ) *nl = ' ';
+        gtk_label_set_text(GTK_LABEL(U.midi_conn), line);
+        gtk_widget_set_tooltip_text(U.midi_conn, txt);
+        g_free(line);
+    }
+    if (U.midi_menu) {
+        g_menu_remove_all(U.midi_menu);
+        if (!U.srcs[0]) {
+            /* An item with no action: a list, not a chooser. Everything that
+             * can send is subscribed already, so there is nothing to pick. */
+            g_menu_append(U.midi_menu, "nothing connected", NULL);
+        } else {
+            char *copy = g_strdup(U.srcs), *tok, *save = NULL;
+            for (tok = strtok_r(copy, "\n", &save); tok;
+                 tok = strtok_r(NULL, "\n", &save))
+                g_menu_append(U.midi_menu, tok, NULL);
+            g_free(copy);
+        }
+    }
+}
+
+/* Subscribe to everything that can send, and -- when asked -- to everything
+ * that can receive. Returns how many connections were new, so a keyboard
+ * plugged in after startup can be picked up without a restart and the window
+ * can say whether that did anything.
+ *
+ * Another dwstudio is skipped on purpose. Subscribing to everything that sends
+ * is right for keyboards and trackers, but two of these are both senders and
+ * both receivers: the second to scan grabs the first's output, the first grabs
+ * it back, and with thru on the pair is a closed loop. Chaining two of them is
+ * a reasonable thing to want and a terrible thing to do by accident -- aconnect
+ * still does it on purpose. */
+static int midi_rescan(void)
+{
+    const unsigned need_read  = SND_SEQ_PORT_CAP_READ  | SND_SEQ_PORT_CAP_SUBS_READ;
+    const unsigned need_write = SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE;
+    snd_seq_client_info_t *ci = NULL;
+    snd_seq_port_info_t   *pi = NULL;
+    int added = 0;
+
+    if (!U.seq) return 0;
+    if (snd_seq_client_info_malloc(&ci) < 0) return 0;
+    if (snd_seq_port_info_malloc(&pi) < 0) { snd_seq_client_info_free(ci); return 0; }
+
+    U.srcs[0] = U.snks[0] = '\0';
+    U.midi[0] = '\0';
+    snd_seq_client_info_set_client(ci, -1);
+    while (snd_seq_query_next_client(U.seq, ci) >= 0) {
+        int cl = snd_seq_client_info_get_client(ci);
+        const char *cname = snd_seq_client_info_get_name(ci);
+        if (cl == SND_SEQ_CLIENT_SYSTEM || cl == snd_seq_client_id(U.seq)) continue;
+        if (cname && !strncmp(cname, "dwstudio", 8)) continue;
+        snd_seq_port_info_set_client(pi, cl);
+        snd_seq_port_info_set_port(pi, -1);
+        while (snd_seq_query_next_port(U.seq, pi) >= 0) {
+            unsigned cap  = snd_seq_port_info_get_capability(pi);
+            unsigned type = snd_seq_port_info_get_type(pi);
+            int      pn   = snd_seq_port_info_get_port(pi);
+            const char *pname = snd_seq_port_info_get_name(pi);
+            if (!(type & SND_SEQ_PORT_TYPE_MIDI_GENERIC)) continue;
+            if ((cap & need_read) == need_read) {
+                size_t l;
+                /* Already subscribed answers EBUSY, which is still connected --
+                 * it just is not new. */
+                if (snd_seq_connect_from(U.seq, U.seqport, cl, pn) == 0) added++;
+                l = strlen(U.srcs);
+                snprintf(U.srcs + l, sizeof U.srcs - l, "%s%s:%s",
+                         l ? "\n" : "", cname ? cname : "?", pname ? pname : "?");
+                l = strlen(U.midi);
+                snprintf(U.midi + l, sizeof U.midi - l, "%s%s",
+                         l ? ", " : "  MIDI: ", cname ? cname : "?");
+            }
+            if (U.autoout && (cap & need_write) == need_write) {
+                size_t l;
+                if (snd_seq_connect_to(U.seq, U.seqout, cl, pn) == 0) added++;
+                l = strlen(U.snks);
+                snprintf(U.snks + l, sizeof U.snks - l, "%s%s:%s",
+                         l ? "\n" : "", cname ? cname : "?", pname ? pname : "?");
+            }
+        }
+    }
+    snd_seq_port_info_free(pi);
+    snd_seq_client_info_free(ci);
+    if (!U.midi[0]) snprintf(U.midi, sizeof U.midi, "  (no MIDI in)");
+    midi_conn_update();
+    return added;
+}
+
 static gboolean poll_midi(gpointer u)
 {
     snd_seq_event_t *ev;
     (void)u;
     if (!U.seq) return G_SOURCE_REMOVE;
     while (snd_seq_event_input(U.seq, &ev) >= 0) {
-        {   /* channel filter, applied to the voice messages only */
+        int status = -1, d1 = 0, d2 = 0, ch, voice;
+
+        /* Every message is turned back into the three bytes it was on the
+         * wire. That is what the plug-in wants -- a wheel, a pedal, aftertouch
+         * and a sequencer's clock are all raw MIDI and nothing else, and a poll
+         * that only understood notes dropped the lot -- and it is what the out
+         * port needs for thru. */
+        voice = ev->type == SND_SEQ_EVENT_NOTEON  || ev->type == SND_SEQ_EVENT_NOTEOFF ||
+                ev->type == SND_SEQ_EVENT_CONTROLLER || ev->type == SND_SEQ_EVENT_PGMCHANGE ||
+                ev->type == SND_SEQ_EVENT_PITCHBEND  || ev->type == SND_SEQ_EVENT_CHANPRESS ||
+                ev->type == SND_SEQ_EVENT_KEYPRESS;
+        {   /* channel filter, applied to the voice messages only, so clock
+             * still arrives when a single channel is picked out */
             int want = atomic_load_explicit(&g_midi_ch, memory_order_relaxed);
-            if (want >= 0 &&
-                (ev->type == SND_SEQ_EVENT_NOTEON || ev->type == SND_SEQ_EVENT_NOTEOFF ||
-                 ev->type == SND_SEQ_EVENT_PGMCHANGE || ev->type == SND_SEQ_EVENT_CONTROLLER) &&
-                ev->data.note.channel != want)
-                continue;
+            if (want >= 0 && voice && ev->data.note.channel != want) continue;
         }
+        ch = voice ? ev->data.note.channel : 0;
+
         switch (ev->type) {
         case SND_SEQ_EVENT_NOTEON:
-            if (ev->data.note.velocity > 0) note_on(ev->data.note.note,
-                                                    ev->data.note.velocity);
-            else                            note_off(ev->data.note.note);
+            status = 0x90 | ch; d1 = ev->data.note.note; d2 = ev->data.note.velocity;
+            if (d2 > 0) note_start(d1, d2, 0); else note_stop(d1, 0);
             break;
-        case SND_SEQ_EVENT_NOTEOFF: note_off(ev->data.note.note); break;
-        case SND_SEQ_EVENT_PITCHBEND:
+        case SND_SEQ_EVENT_NOTEOFF:
+            status = 0x80 | ch; d1 = ev->data.note.note;
+            note_stop(d1, 0);
+            break;
+        case SND_SEQ_EVENT_PITCHBEND: {
             /* ALSA hands it back signed around zero; MIDI's own form is
              * unsigned around 8192, which is what the plug-in wants and what
              * the wheel draws. */
-            U.bend = ev->data.control.value + BEND_CENTRE;
-            if (U.bend < 0) U.bend = 0;
-            if (U.bend > BEND_MAX) U.bend = BEND_MAX;
-            if (plugview_active()) plugview_bend(U.bend);
-            gtk_widget_queue_draw(U.wheel);
+            int v = ev->data.control.value + BEND_CENTRE;
+            if (v < 0) v = 0;
+            if (v > BEND_MAX) v = BEND_MAX;
+            U.bend = v;
+            status = 0xE0 | ch; d1 = v & 0x7f; d2 = (v >> 7) & 0x7f;
+            bend_show();
             break;
+        }
         case SND_SEQ_EVENT_PGMCHANGE:
-            if (U.cur.count) {
-                int i = ev->data.control.value % U.cur.count;
+            status = 0xC0 | ch; d1 = ev->data.control.value & 0x7f;
+            if (!plugview_active() && U.cur.count) {
+                int i = d1 % U.cur.count;
                 gtk_list_box_select_row(GTK_LIST_BOX(U.list),
                     gtk_list_box_get_row_at_index(GTK_LIST_BOX(U.list), i));
             }
             break;
         case SND_SEQ_EVENT_CONTROLLER:
-            if (ev->data.control.param == 123) ev_push(EV_ALLOFF, 0, 0);
+            status = 0xB0 | ch;
+            d1 = ev->data.control.param & 0x7f;
+            d2 = ev->data.control.value & 0x7f;
+            if (d1 == 123) { int n; for (n = 0; n < 128; n++) note_stop(n, 0);
+                             if (!plugview_active()) ev_push(EV_ALLOFF, 0, 0); }
             break;
+        case SND_SEQ_EVENT_CHANPRESS:
+            status = 0xD0 | ch; d1 = ev->data.control.value & 0x7f;
+            break;
+        case SND_SEQ_EVENT_KEYPRESS:
+            status = 0xA0 | ch; d1 = ev->data.note.note; d2 = ev->data.note.velocity;
+            break;
+        /* System realtime. No channel, which is why the filter above is for
+         * voice messages only, and this is how a sequencer says what its tempo
+         * is and whether the song is rolling -- without them every tempo-synced
+         * arpeggiator and delay runs at the host's default instead. */
+        case SND_SEQ_EVENT_SONGPOS: {
+            int v = ev->data.control.value & 0x3FFF;    /* sixteenths */
+            status = 0xF2; d1 = v & 0x7f; d2 = (v >> 7) & 0x7f;
+            break;
+        }
+        case SND_SEQ_EVENT_CLOCK:    status = 0xF8; U.clock_seen = 1; break;
+        case SND_SEQ_EVENT_START:    status = 0xFA; break;
+        case SND_SEQ_EVENT_CONTINUE: status = 0xFB; break;
+        case SND_SEQ_EVENT_STOP:     status = 0xFC; break;
         default: break;
         }
+
+        if (status < 0) continue;
+        plugview_midi(status, d1, d2);
+        /* Realtime is deliberately not echoed: thru exists to pass playing
+         * through to other gear, and re-sending a clock we were given is how
+         * two devices end up driving each other. */
+        if (U.thru && status < 0xF0) midi_send(status, d1, d2);
     }
+    return G_SOURCE_CONTINUE;
+}
+
+/* Defined with the rest of the Inputs menu, below; the transport poll is the
+ * one timer that runs often enough to notice a plug-in loading and an input
+ * going quiet. */
+static void apply_input_mask(void);
+static void audio_state_update(void);
+
+/* Follow the transport rather than assume it. Once a sequencer's clock is
+ * driving the tempo the box shows what it is doing instead of what somebody
+ * typed earlier -- two numbers disagreeing about the tempo is worse than one
+ * that is merely read-only. */
+static gboolean poll_transport(gpointer u)
+{
+    static int was_active = -1;
+    double bpm;
+    const char *state;
+    (void)u;
+    if (!GTK_IS_WIDGET(U.tempo_sb)) return G_SOURCE_CONTINUE;
+    /* The bottom line says whether a plug-in is what would sound, and nothing
+     * tells it when that changes -- loading happens in the pane, and a load
+     * that failed changes it back. Cheaper to notice here than to thread a
+     * callback out of plugview for one label. */
+    if (plugview_active() != was_active) {
+        was_active = plugview_active();
+        set_status();
+    }
+    audio_state_update();
+    if (!plugview_active()) return G_SOURCE_CONTINUE;
+    bpm = plugview_tempo();
+    if (bpm >= 20.0 &&
+        fabs(bpm - gtk_spin_button_get_value(GTK_SPIN_BUTTON(U.tempo_sb))) > 0.05) {
+        U.tempo_echo = 1;
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(U.tempo_sb), bpm);
+        U.tempo_echo = 0;
+    }
+    state = U.clock_seen ? (plugview_playing() ? "following clock" : "clock, stopped")
+                         : (plugview_playing() ? "internal" : "stopped");
+    if (GTK_IS_LABEL(U.tempo_state))
+        gtk_label_set_text(GTK_LABEL(U.tempo_state), state);
     return G_SOURCE_CONTINUE;
 }
 
 static void setup_midi(void)
 {
-    snd_seq_client_info_t *ci = NULL;
-    snd_seq_port_info_t   *pi = NULL;
-    const unsigned need = SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ;
-    int found = 0;
-
     U.midi[0] = '\0';
-    if (snd_seq_open(&U.seq, "default", SND_SEQ_OPEN_INPUT, SND_SEQ_NONBLOCK) < 0) {
+    /* DUPLEX rather than INPUT: one client owning both directions is what makes
+     * this look like an ordinary MIDI device to everything else, and it is the
+     * only way an out port can exist at all. The Qt window has done this from
+     * the start; this one could receive and never send. */
+    if (snd_seq_open(&U.seq, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK) < 0) {
         U.seq = NULL;
         snprintf(U.midi, sizeof U.midi, "  (no MIDI)");
         return;
     }
-    snd_seq_set_client_name(U.seq, "dwstudio");
+    /* A second instance must not be called "dwstudio" as well. ALSA allows
+     * duplicate client names, so two of them give a tracker two entries called
+     * "dwstudio:dwstudio in" with nothing to tell them apart, and picking the
+     * wrong one looks exactly like MIDI not working. Number the later ones,
+     * the way pestudio does. */
+    {
+        char name[32] = "dwstudio";
+        snd_seq_client_info_t *ci = NULL;
+        if (snd_seq_client_info_malloc(&ci) >= 0) {
+            int n;
+            for (n = 2; n < 32; n++) {
+                int taken = 0;
+                snd_seq_client_info_set_client(ci, -1);
+                while (snd_seq_query_next_client(U.seq, ci) >= 0) {
+                    const char *o = snd_seq_client_info_get_name(ci);
+                    if (snd_seq_client_info_get_client(ci) != snd_seq_client_id(U.seq)
+                        && o && !strcmp(o, name)) { taken = 1; break; }
+                }
+                if (!taken) break;
+                snprintf(name, sizeof name, "dwstudio %d", n);
+            }
+            snd_seq_client_info_free(ci);
+        }
+        snd_seq_set_client_name(U.seq, name);
+    }
     U.seqport = snd_seq_create_simple_port(U.seq, "dwstudio in",
                     SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
                     SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_SYNTHESIZER);
-
-    if (snd_seq_client_info_malloc(&ci) < 0) return;
-    if (snd_seq_port_info_malloc(&pi) < 0) { snd_seq_client_info_free(ci); return; }
-    snd_seq_client_info_set_client(ci, -1);
-    while (snd_seq_query_next_client(U.seq, ci) >= 0) {
-        int cl = snd_seq_client_info_get_client(ci);
-        if (cl == SND_SEQ_CLIENT_SYSTEM || cl == snd_seq_client_id(U.seq)) continue;
-        snd_seq_port_info_set_client(pi, cl);
-        snd_seq_port_info_set_port(pi, -1);
-        while (snd_seq_query_next_port(U.seq, pi) >= 0) {
-            if ((snd_seq_port_info_get_capability(pi) & need) != need) continue;
-            if (!(snd_seq_port_info_get_type(pi) & SND_SEQ_PORT_TYPE_MIDI_GENERIC)) continue;
-            if (snd_seq_connect_from(U.seq, U.seqport, cl,
-                                     snd_seq_port_info_get_port(pi)) == 0) {
-                size_t l = strlen(U.midi);
-                snprintf(U.midi + l, sizeof U.midi - l, "%s%s",
-                         found ? ", " : "  MIDI: ", snd_seq_client_info_get_name(ci));
-                found = 1;
-            }
-        }
+    U.seqout = snd_seq_create_simple_port(U.seq, "dwstudio out",
+                    SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ,
+                    SND_SEQ_PORT_TYPE_MIDI_GENERIC);
+    {   /* Said the way aconnect and every tracker's device list say it. */
+        snd_seq_client_info_t *ci = NULL;
+        const char *nm = "dwstudio";
+        if (snd_seq_client_info_malloc(&ci) >= 0 &&
+            snd_seq_get_client_info(U.seq, ci) >= 0)
+            nm = snd_seq_client_info_get_name(ci);
+        snprintf(U.port, sizeof U.port, "%d:%d (%s in)",
+                 snd_seq_client_id(U.seq), U.seqport, nm);
+        if (ci) snd_seq_client_info_free(ci);
     }
-    snd_seq_port_info_free(pi);
-    snd_seq_client_info_free(ci);
-    if (!found) snprintf(U.midi, sizeof U.midi, "  (no MIDI in)");
+
+    midi_rescan();
 
     g_timeout_add(1, poll_midi, NULL);   /* 1 ms: MIDI jitter is nearly free */
+    /* The input meter. Thirty a second is what the eye wants from a level and
+     * far less than the audio thread produces, so the peak is taken and reset
+     * rather than sampled -- a transient between two reads still shows. */
+    g_timeout_add(33, poll_mic_level, NULL);
+    /* The transport is read rather than watched: a clock arrives 24 times a
+     * quarter note and the number on screen only has to be right, not early. */
+    g_timeout_add(200, poll_transport, NULL);
 }
 
 /* -------------------------------------------------------------------- main */
@@ -1568,6 +2316,244 @@ static void act_install_data(GSimpleAction *a, GVariant *p, gpointer ud)
     plugview_install_missing_data();
 }
 
+/* --------------------------------------------------------------- Inputs menu */
+
+/* The audio device list, as a menu of radio items. "system default" is first
+ * and is what an empty target means; the rest are what the last scan found.
+ * pestudio's Audio input menu is the same list in the same order, built from
+ * the same node names, so a device chosen in one window can be named in the
+ * other. */
+static void audio_menu_rebuild(void)
+{
+    GMenuItem *it;
+    int i;
+
+    if (!U.audio_menu) return;
+    g_menu_remove_all(U.audio_menu);
+    it = g_menu_item_new("system default", NULL);
+    g_menu_item_set_action_and_target_value(it, "win.audio-input",
+                                            g_variant_new_string(""));
+    g_menu_append_item(U.audio_menu, it);
+    g_object_unref(it);
+    for (i = 0; i < g_nindev; i++) {
+        it = g_menu_item_new(g_indev[i].label, NULL);
+        g_menu_item_set_action_and_target_value(it, "win.audio-input",
+                                                g_variant_new_string(g_indev[i].node));
+        g_menu_append_item(U.audio_menu, it);
+        g_object_unref(it);
+    }
+}
+
+/* Whether anything is actually arriving, under the device that was picked. A
+ * device that is connected and silent and one that is not connected at all
+ * look identical until something counts frames, and "the microphone does
+ * nothing" is the same complaint either way. */
+static void audio_state_update(void)
+{
+    static unsigned long seen;
+    unsigned long now = atomic_load_explicit(&g_cap_frames, memory_order_relaxed);
+    const char *state = !g_cap_stream ? "no input stream"
+                      : now == 0      ? "open, nothing received yet"
+                      : now != seen   ? "receiving audio"
+                                      : "open, idle";
+    seen = now;
+    if (!U.audio_state || !strcmp(state, U.audio_said)) return;
+    snprintf(U.audio_said, sizeof U.audio_said, "%s", state);
+    g_menu_remove_all(U.audio_state);
+    g_menu_append(U.audio_state, state, NULL);   /* no action: a line, not a choice */
+}
+
+static void on_audio_input(GSimpleAction *a, GVariant *v, gpointer ud)
+{
+    const char *node = g_variant_get_string(v, NULL);
+    (void)ud;
+    if (!capture_open(node)) {
+        snprintf(U.hint, sizeof U.hint, "   could not open that input device");
+        set_status();
+        return;
+    }
+    g_simple_action_set_state(a, v);
+    /* Choosing an input is the whole of what "turn the microphone on" means to
+     * anyone doing it. Leaving the effect source elsewhere afterwards makes the
+     * choice do nothing audible, and the only sign is a meter that never moves
+     * -- so route it here and say so, rather than making it two steps that look
+     * like one. pestudio does the same on the same click. */
+    src_select(SRC_INPUT);
+    snprintf(U.hint, sizeof U.hint, "   input: %s — effect input switched to it",
+             node[0] ? node : "system default");
+    set_status();
+    audio_state_update();
+}
+
+/* The input-channel mask, which is a vocoder question: a vocoder has a
+ * modulator and a carrier bus and wants the microphone on one of them, and
+ * sending it to both puts the raw voice in the output beside the analysis.
+ * Re-applied on every load, because the mask lives on the plug-in handle and a
+ * fresh plug-in starts without one. */
+static void apply_input_mask(void)
+{
+    GAction *a;
+    if (!U.win) return;
+    a = g_action_map_lookup_action(G_ACTION_MAP(U.win), "mic-raw");
+    if (!a) return;
+    {
+        GVariant *st = g_action_get_state(a);
+        plugview_set_input_mask(g_variant_get_boolean(st) ? 0x3u : 0u);
+        g_variant_unref(st);
+    }
+}
+
+/* Everything the window has to re-send after a load. Both of these live on the
+ * plug-in handle rather than in the pane, so a fresh plug-in starts without
+ * them and a load onto one of the same shape would not be noticed by anything
+ * watching the pane. */
+static void on_plugin_loaded(void)
+{
+    apply_input_mask();
+    /* Ask what the plug-in has rather than whether it calls itself a synth --
+     * Full Bucket's vocoder is a synth with two inputs, and asking the wrong
+     * question leaves it on silence with nothing to vocode. The microphone is
+     * never overridden: choosing a device and then loading the plug-in you
+     * meant to use it with is the ordinary order to do things in, and
+     * reverting to the keys on every load is indistinguishable from the
+     * microphone not working. pestudio decides it the same way. */
+    if (atomic_load_explicit(&g_src, memory_order_relaxed) != SRC_INPUT)
+        src_select(plugview_num_inputs() > 0 ? SRC_NOTES : SRC_SILENCE);
+    set_status();
+}
+
+static void on_mic_raw(GSimpleAction *a, GVariant *v, gpointer ud)
+{
+    (void)ud;
+    g_simple_action_set_state(a, v);
+    apply_input_mask();
+}
+
+/* Both halves of "what is this machine listening to", rescanned together --
+ * plugging something in is exactly when both lists are wrong, and pestudio's
+ * Rescan does the same two things. */
+static void act_rescan(GSimpleAction *a, GVariant *p, gpointer ud)
+{
+    int n, i, kept = 0;
+    (void)a; (void)p; (void)ud;
+    scan_input_devices();
+    audio_menu_rebuild();
+    if (g_cap_target[0]) {
+        for (i = 0; i < g_nindev; i++)
+            if (!strcmp(g_indev[i].node, g_cap_target)) { kept = 1; break; }
+        /* The device that was chosen has gone. Say so rather than quietly
+         * listening to something else. */
+        if (!kept) {
+            capture_open("");
+            snprintf(U.hint, sizeof U.hint,
+                     "   that input device is gone — back to the system default");
+        }
+    }
+    n = midi_rescan();
+    if (kept || !g_cap_target[0])
+        snprintf(U.hint, sizeof U.hint, n ? "   MIDI: %d new connection(s)"
+                                          : "   MIDI: no new sources", n);
+    audio_state_update();
+    set_status();
+}
+
+/* ---------------------------------------------------------------- MIDI menu */
+
+/* Everything a tracker or a DAW at the other end of the port can ask of this
+ * window, in the place people look for it. The same settings sit in the row
+ * under the menu bar; pestudio carries both too, for the same reason -- one is
+ * where you look while playing, the other is where you look when it is not
+ * working. */
+static void on_midi_thru(GSimpleAction *a, GVariant *v, gpointer ud)
+{
+    (void)ud;
+    U.thru = g_variant_get_boolean(v);
+    g_simple_action_set_state(a, v);
+}
+
+static void on_midi_out_auto(GSimpleAction *a, GVariant *v, gpointer ud)
+{
+    (void)ud;
+    U.autoout = g_variant_get_boolean(v);
+    g_simple_action_set_state(a, v);
+    /* Turning it on is a request to connect now, not next time something is
+     * plugged in. Turning it off leaves the subscriptions that exist: dropping
+     * them would cut a synth off mid-note, and `aconnect -d` is the tool for
+     * unmaking a connection somebody wanted. */
+    if (U.autoout) midi_rescan();
+    else           midi_conn_update();
+}
+
+static void on_midi_channel(GSimpleAction *a, GVariant *v, gpointer ud)
+{
+    int ch = g_variant_get_int32(v);
+    (void)ud;
+    atomic_store_explicit(&g_midi_ch, ch, memory_order_relaxed);
+    g_simple_action_set_state(a, v);
+    if (GTK_IS_WIDGET(U.chan_dd) && !U.chan_echo) {
+        U.chan_echo = 1;
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(U.chan_dd), (guint)(ch + 1));
+        U.chan_echo = 0;
+    }
+}
+
+/* All notes off, and everything that goes with it.
+ *
+ * Not only the plug-in: a note stuck on is stuck wherever it is sounding, so
+ * the engines, the drawn keys and the port all hear about it. The wheel comes
+ * back to centre with them, because a bend the plug-in still thinks is applied
+ * survives every note being cut and puts the next thing played in the wrong
+ * key -- which is harder to recognise as the cause than a held note is. */
+static void act_panic(GSimpleAction *a, GVariant *p, gpointer ud)
+{
+    int n;
+    (void)a; (void)p; (void)ud;
+    for (n = 0; n < 128; n++) note_stop(n, 1);
+    if (plugview_active()) plugview_all_notes_off();
+    ev_push(EV_ALLOFF, 0, 0);
+    midi_send(0xB0, 123, 0);
+    bend_recentre();
+}
+
+/* ------------------------------------------------------------- the keyboard */
+
+/* Reaching the window without the mouse.
+ *
+ * A list that has focus is walked with the arrow keys and loads what it lands
+ * on, so these four plus the file commands are the whole window: find a
+ * plug-in, pick a program, look at its editor, and get back to the keys. */
+static void act_focus_plugins(GSimpleAction *a, GVariant *p, gpointer ud)
+{ (void)a; (void)p; (void)ud; plugview_focus_list(); }
+
+static void act_focus_programs(GSimpleAction *a, GVariant *p, gpointer ud)
+{ (void)a; (void)p; (void)ud; plugview_focus_programs(); }
+
+static void act_toggle_editor(GSimpleAction *a, GVariant *p, gpointer ud)
+{ (void)a; (void)p; (void)ud; plugview_toggle_editor(); }
+
+/* Back to playing. Focus in a list means the letters are keyboard navigation
+ * before they are notes, and Escape is where a hand goes to get out of
+ * something -- so it is what puts the keys back under the fingers. */
+static void act_focus_keys(GSimpleAction *a, GVariant *p, gpointer ud)
+{
+    (void)a; (void)p; (void)ud;
+    if (GTK_IS_WIDGET(U.piano)) gtk_widget_grab_focus(U.piano);
+}
+
+static void vol_nudge(int by)
+{
+    double v;
+    if (!GTK_IS_RANGE(U.vol)) return;
+    v = gtk_range_get_value(GTK_RANGE(U.vol)) + by;
+    gtk_range_set_value(GTK_RANGE(U.vol), v < 0 ? 0 : v > 150 ? 150 : v);
+}
+
+static void act_vol_up(GSimpleAction *a, GVariant *p, gpointer ud)
+{ (void)a; (void)p; (void)ud; vol_nudge(5); }
+
+static void act_vol_down(GSimpleAction *a, GVariant *p, gpointer ud)
+{ (void)a; (void)p; (void)ud; vol_nudge(-5); }
+
 static void act_quit(GSimpleAction *a, GVariant *p, gpointer ud)
 { (void)a; (void)p; (void)ud; gtk_window_close(GTK_WINDOW(U.win)); }
 
@@ -1611,6 +2597,24 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "open-patch",  act_open_patch,  NULL, NULL, NULL, {0} },
         { "plugin-folders", act_plugin_folders, NULL, NULL, NULL, {0} },
         { "enter-key",   act_enter_key,   NULL, NULL, NULL, {0} },
+        { "rescan",      act_rescan,      NULL, NULL, NULL, {0} },
+        { "panic",       act_panic,       NULL, NULL, NULL, {0} },
+        { "focus-plugins",  act_focus_plugins,  NULL, NULL, NULL, {0} },
+        { "focus-programs", act_focus_programs, NULL, NULL, NULL, {0} },
+        { "toggle-editor",  act_toggle_editor,  NULL, NULL, NULL, {0} },
+        { "focus-keys",     act_focus_keys,     NULL, NULL, NULL, {0} },
+        { "vol-up",         act_vol_up,         NULL, NULL, NULL, {0} },
+        { "vol-down",       act_vol_down,       NULL, NULL, NULL, {0} },
+        /* Stateful, so the menu draws the check itself and the state is the
+         * one place the answer lives. A boolean entry with no activate handler
+         * toggles on its own and reports through change_state. */
+        { "midi-thru",     NULL, NULL,  "false", on_midi_thru,     {0} },
+        { "midi-out-auto", NULL, NULL,  "false", on_midi_out_auto, {0} },
+        { "midi-channel",  NULL, "i",   "-1",    on_midi_channel,  {0} },
+        { "audio-input",   NULL, "s",   "''",    on_audio_input,   {0} },
+        /* Checked to begin with, like pestudio's: a vocoder fed on both buses
+         * is the case that sounds wrong, and it is the commoner one. */
+        { "mic-raw",       NULL, NULL,  "true",  on_mic_raw,       {0} },
         { "quit",        act_quit,        NULL, NULL, NULL, {0} },
         { "about",       act_about,       NULL, NULL, NULL, {0} },
     };
@@ -1618,8 +2622,18 @@ static GtkWidget *build_menubar(GtkApplication *app)
     GMenu *file     = g_menu_new();
     GMenu *sect     = g_menu_new();
     GMenu *settings = g_menu_new();
+    GMenu *view     = g_menu_new();
+    GMenu *inputs   = g_menu_new();
+    GMenu *midiin   = g_menu_new();
+    GMenu *midisrcs = g_menu_new();
+    GMenu *audioin  = g_menu_new();
+    GMenu *audiodevs = g_menu_new();
+    GMenu *audiostate = g_menu_new();
+    GMenu *chan     = g_menu_new();
+    GMenu *midisect = g_menu_new();
     GMenu *about    = g_menu_new();
     GtkWidget *w;
+    int i;
 
     g_action_map_add_action_entries(G_ACTION_MAP(U.win), entries,
                                     G_N_ELEMENTS(entries), NULL);
@@ -1633,6 +2647,45 @@ static GtkWidget *build_menubar(GtkApplication *app)
                                           (const char *[]){ "<Control>p", NULL });
     gtk_application_set_accels_for_action(app, "win.quit",
                                           (const char *[]){ "<Control>q", NULL });
+    /* Everything on this menu has a key, so the window can be driven without
+     * reaching for the mouse -- which is the difference between changing a
+     * MIDI setting mid-take and stopping to hunt through a menu for it. GTK
+     * prints them beside the items, so the menu is also where they are
+     * learned.
+     *
+     * All of them carry Ctrl. The note keys are plain letters, and a bare
+     * shortcut would be a letter that no longer plays -- z, x, c and v are
+     * the bottom octave, not commands. */
+    gtk_application_set_accels_for_action(app, "win.rescan",
+                                          (const char *[]){ "<Control>r", "F5", NULL });
+    gtk_application_set_accels_for_action(app, "win.midi-thru",
+                                          (const char *[]){ "<Control>t", NULL });
+    gtk_application_set_accels_for_action(app, "win.midi-out-auto",
+                                          (const char *[]){ "<Control>h", NULL });
+    /* Panic is the one that gets wanted in a hurry, so it is also the one that
+     * must not need aim: a note stuck on in front of an audience is fixed with
+     * one hand while the other is still on the keys. */
+    gtk_application_set_accels_for_action(app, "win.panic",
+                                          (const char *[]){ "<Control>period",
+                                                            "<Control>Escape", NULL });
+    gtk_application_set_accels_for_action(app, "win.plugin-folders",
+                                          (const char *[]){ "<Control>d", NULL });
+    gtk_application_set_accels_for_action(app, "win.enter-key",
+                                          (const char *[]){ "<Control>k", NULL });
+    gtk_application_set_accels_for_action(app, "win.install-data",
+                                          (const char *[]){ "<Control>i", NULL });
+    gtk_application_set_accels_for_action(app, "win.focus-plugins",
+                                          (const char *[]){ "<Control>f", NULL });
+    gtk_application_set_accels_for_action(app, "win.focus-programs",
+                                          (const char *[]){ "<Control>g", NULL });
+    gtk_application_set_accels_for_action(app, "win.toggle-editor",
+                                          (const char *[]){ "<Control>e", NULL });
+    gtk_application_set_accels_for_action(app, "win.focus-keys",
+                                          (const char *[]){ "Escape", NULL });
+    gtk_application_set_accels_for_action(app, "win.vol-up",
+                                          (const char *[]){ "<Control>Up", NULL });
+    gtk_application_set_accels_for_action(app, "win.vol-down",
+                                          (const char *[]){ "<Control>Down", NULL });
 
     g_menu_append(file, "Open VST…",    "win.open-vst");
     g_menu_append(file, "Load Folder…", "win.load-folder");
@@ -1644,9 +2697,47 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append_submenu(bar, "File", G_MENU_MODEL(file));
 
     /* Between File and About, matching pestudio. */
+    g_menu_append(view, "Plug-in List", "win.focus-plugins");
+    g_menu_append(view, "Programs", "win.focus-programs");
+    g_menu_append(view, "Parameters / Editor", "win.toggle-editor");
+    g_menu_append(view, "Back to the Keys", "win.focus-keys");
+    g_menu_append_submenu(bar, "Go", G_MENU_MODEL(view));
+
     g_menu_append(settings, "Plug-in Folders…", "win.plugin-folders");
     g_menu_append(settings, "Enter Key / Serial…", "win.enter-key");
     g_menu_append_submenu(bar, "Settings", G_MENU_MODEL(settings));
+
+    /* Inputs: what the machine is listening to, and what it plays out to.
+     * pestudio's menu of the same name holds the same things in the same
+     * order, so the question is answered the same way in either window.
+     *
+     * The list of sources is rebuilt by every scan rather than being filled in
+     * once here -- U.midi_menu is that section, and midi_conn_update owns it.
+     * The reference on it is deliberately kept for as long as the window
+     * lives, because that is how long it goes on being refilled. */
+    U.midi_menu   = midisrcs;
+    U.audio_menu  = audiodevs;
+    U.audio_state = audiostate;
+    g_menu_append_section(midiin, NULL, G_MENU_MODEL(midisrcs));
+    g_menu_append_section(audioin, NULL, G_MENU_MODEL(audiodevs));
+    g_menu_append_section(audioin, NULL, G_MENU_MODEL(audiostate));
+    g_menu_append(audioin, "Mute raw (first two channels only)", "win.mic-raw");
+    g_menu_append_submenu(inputs, "Audio input", G_MENU_MODEL(audioin));
+    for (i = -1; i < 16; i++) {
+        char label[16], action[32];
+        if (i < 0) snprintf(label, sizeof label, "All channels");
+        else       snprintf(label, sizeof label, "Channel %d", i + 1);
+        snprintf(action, sizeof action, "win.midi-channel(%d)", i);
+        g_menu_append(chan, label, action);
+    }
+    g_menu_append_submenu(midisect, "Channel", G_MENU_MODEL(chan));
+    g_menu_append(midisect, "Thru (in → out)", "win.midi-thru");
+    g_menu_append(midisect, "Connect out to hardware", "win.midi-out-auto");
+    g_menu_append_section(midiin, NULL, G_MENU_MODEL(midisect));
+    g_menu_append_submenu(inputs, "MIDI input", G_MENU_MODEL(midiin));
+    g_menu_append(inputs, "Rescan devices", "win.rescan");
+    g_menu_append(inputs, "All Notes Off", "win.panic");
+    g_menu_append_submenu(bar, "Inputs", G_MENU_MODEL(inputs));
 
     /* Next to File, matching pestudio, so the same question is answered the
      * same way in whichever window is open. */
@@ -1655,7 +2746,11 @@ static GtkWidget *build_menubar(GtkApplication *app)
 
     w = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(bar));
     gtk_widget_set_halign(w, GTK_ALIGN_START);
-    g_object_unref(about); g_object_unref(settings);
+    g_object_unref(about); g_object_unref(settings); g_object_unref(view);
+    /* midisrcs, audiodevs and audiostate are not unreffed with the rest: each
+     * is refilled for as long as the window lives -- see U.midi_menu above. */
+    g_object_unref(chan); g_object_unref(midisect);
+    g_object_unref(midiin); g_object_unref(audioin); g_object_unref(inputs);
     g_object_unref(sect); g_object_unref(file); g_object_unref(bar);
     return w;
 }
@@ -1729,30 +2824,37 @@ static void activate(GtkApplication *app, gpointer ud)
     gtk_widget_set_margin_start(box, 8); gtk_widget_set_margin_end(box, 8);
     gtk_widget_set_margin_top(box, 8);   gtk_widget_set_margin_bottom(box, 8);
 
-    /* Two halves of the same window: the engines in this tree, and the real
-     * plug-ins through pehost. They are separate pages rather than separate
-     * programs because they share the audio graph, the keyboard and the MIDI
-     * input -- only one of them is heard at a time, and which one is what the
-     * switcher picks. */
+    /* One window, hosting plug-ins.
+     *
+     * This began as a front end for the engines in c/src and grew a plug-in
+     * host beside them, with a switcher to pick which half you were looking
+     * at. Hosting is what it is for, so the switcher is gone and the plug-in
+     * pane is the window rather than half of it. The engines are still what
+     * sounds when nothing is loaded -- they cost nothing to keep and a window
+     * that makes no noise until a plug-in is picked is harder to tell from a
+     * broken one -- they are simply not something to be chosen any more.
+     *
+     * The rows above the pane are what both halves always shared: the input,
+     * the output level, and the MIDI ports. They live out here rather than on
+     * a page so they stay visible whatever the pane is showing. */
     {
         GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-        GtkWidget *sws;
-        U.outer = outer;
+        U.outer  = outer;
+        U.topbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        U.midibar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
 
         U.mode = gtk_stack_new();
         U.plug = plugview_new(plug_park, plug_unpark, SR, g_period);
         gtk_stack_add_titled(GTK_STACK(U.mode), box, "engines", "Engines");
         gtk_stack_add_titled(GTK_STACK(U.mode), U.plug, "plugins", "Plug-ins");
+        gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
         gtk_widget_set_vexpand(U.mode, TRUE);
-
-        sws = gtk_stack_switcher_new();
-        gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(sws), GTK_STACK(U.mode));
-        gtk_widget_set_halign(sws, GTK_ALIGN_CENTER);
 
         gtk_widget_set_margin_start(outer, 8); gtk_widget_set_margin_end(outer, 8);
         gtk_widget_set_margin_top(outer, 4);   gtk_widget_set_margin_bottom(outer, 8);
         gtk_box_append(GTK_BOX(outer), build_menubar(app));
-        gtk_box_append(GTK_BOX(outer), sws);
+        gtk_box_append(GTK_BOX(outer), U.topbar);
+        gtk_box_append(GTK_BOX(outer), U.midibar);
         gtk_box_append(GTK_BOX(outer), U.mode);
         gtk_window_set_child(GTK_WINDOW(U.win), outer);
         gtk_widget_set_margin_start(box, 0); gtk_widget_set_margin_end(box, 0);
@@ -1779,22 +2881,117 @@ static void activate(GtkApplication *app, gpointer ud)
     gtk_box_append(GTK_BOX(top), U.instdd);
     gtk_box_append(GTK_BOX(top), gtk_label_new("Bank"));
     gtk_box_append(GTK_BOX(top), U.bankdd);
+    gtk_box_append(GTK_BOX(box), top);
+
+    /* The microphone. An effect plug-in is only audible if something is fed to
+     * it, so this is not a nicety: without an input, every effect in the corpus
+     * renders silence and reads as broken.
+     *
+     * Mic gain and a level beside it, because the two are only useful together
+     * -- a gain with no meter is a guess, and the meter is what says whether
+     * the input is the reason nothing is coming out. */
+    {
+        GtkWidget *g;
+        gtk_box_append(GTK_BOX(U.topbar), gtk_label_new("Mic"));
+        U.mic_level = gtk_level_bar_new_for_interval(0.0, 1.0);
+        gtk_widget_set_size_request(U.mic_level, 90, -1);
+        gtk_widget_set_tooltip_text(U.mic_level,
+            "the audio input after the mic gain — what the plug-in receives");
+        gtk_box_append(GTK_BOX(U.topbar), U.mic_level);
+        g = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 400, 1);
+        gtk_range_set_value(GTK_RANGE(g), 100);
+        gtk_widget_set_size_request(g, 90, -1);
+        gtk_scale_set_draw_value(GTK_SCALE(g), FALSE);
+        gtk_widget_set_tooltip_text(g, "mic gain (100% is unity)");
+        g_signal_connect(g, "value-changed", G_CALLBACK(on_mic_gain), NULL);
+        gtk_box_append(GTK_BOX(U.topbar), g);
+        {   /* silence / keys / noise / input, in pestudio's order so the
+             * index means the same thing in both windows. */
+            static const char *srcs[] = { "silence", "keys", "noise", "input", NULL };
+            gtk_box_append(GTK_BOX(U.topbar), gtk_label_new("Effect in"));
+            U.srcdd = gtk_drop_down_new_from_strings(srcs);
+            gtk_drop_down_set_selected(GTK_DROP_DOWN(U.srcdd), SRC_SILENCE);
+            gtk_widget_set_tooltip_text(U.srcdd,
+                "what to feed an effect's input — a synth ignores it.\n"
+                "keys plays a sawtooth per held note; input is the microphone");
+            g_signal_connect(U.srcdd, "notify::selected",
+                             G_CALLBACK(on_src_changed), NULL);
+            gtk_box_append(GTK_BOX(U.topbar), U.srcdd);
+        }
+        g = gtk_check_button_new_with_label("Mute raw");
+        gtk_widget_set_tooltip_text(g,
+            "feed the input only to the plug-in's first two channels — what a "
+            "vocoder wants, so the raw voice is not in the output beside it");
+        gtk_actionable_set_action_name(GTK_ACTIONABLE(g), "win.mic-raw");
+        gtk_box_append(GTK_BOX(U.topbar), g);
+    }
+
+    /* The MIDI row: what a tracker at the other end of the port needs from
+     * this window, and what this window needs to say back. The same settings
+     * are under Inputs on the menu bar -- this row is where you look while
+     * playing, the menu is where you look when it is not working. */
     {
         static const char *chl[] = { "Omni","1","2","3","4","5","6","7","8",
                                      "9","10","11","12","13","14","15","16", NULL };
-        GtkWidget *cd = gtk_drop_down_new_from_strings(chl);
-        gtk_drop_down_set_selected(GTK_DROP_DOWN(cd), 0);
-        g_signal_connect(cd, "notify::selected", G_CALLBACK(on_chan_changed), NULL);
-        gtk_box_append(GTK_BOX(top), gtk_label_new("MIDI Ch"));
-        gtk_box_append(GTK_BOX(top), cd);
+        GtkWidget *b;
+        U.chan_dd = gtk_drop_down_new_from_strings(chl);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(U.chan_dd), 0);
+        gtk_widget_set_tooltip_text(U.chan_dd,
+            "which MIDI channel to listen on; Omni is all of them");
+        g_signal_connect(U.chan_dd, "notify::selected",
+                         G_CALLBACK(on_chan_changed), NULL);
+        gtk_box_append(GTK_BOX(U.midibar), gtk_label_new("MIDI Ch"));
+        gtk_box_append(GTK_BOX(U.midibar), U.chan_dd);
+
+        /* Somewhere to say the tempo when nothing is sending clock. An
+         * arpeggiator or a synced delay has to be told by someone, and if no
+         * sequencer is driving this is the only way to say it. When clock is
+         * arriving the box follows it rather than fighting it. */
+        gtk_box_append(GTK_BOX(U.midibar), gtk_label_new("Tempo"));
+        U.tempo_sb = gtk_spin_button_new_with_range(20.0, 999.0, 0.25);
+        gtk_spin_button_set_digits(GTK_SPIN_BUTTON(U.tempo_sb), 2);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(U.tempo_sb), 120.0);
+        gtk_widget_set_tooltip_text(U.tempo_sb,
+            "the tempo the plug-in is told, in BPM; a sequencer's clock "
+            "overrides it");
+        g_signal_connect(U.tempo_sb, "value-changed", G_CALLBACK(on_tempo), NULL);
+        gtk_box_append(GTK_BOX(U.midibar), U.tempo_sb);
+        U.tempo_state = gtk_label_new("stopped");
+        gtk_widget_add_css_class(U.tempo_state, "dim-label");
+        gtk_box_append(GTK_BOX(U.midibar), U.tempo_state);
+
+        /* The same two settings as the menu's, bound to the same actions, so
+         * either place shows what the other did. pestudio carries them as
+         * check boxes in its MIDI panel; this is that panel's row. */
+        b = gtk_check_button_new_with_label("Thru");
+        gtk_widget_set_tooltip_text(b,
+            "echo everything that arrives straight back out of the MIDI port");
+        gtk_actionable_set_action_name(GTK_ACTIONABLE(b), "win.midi-thru");
+        gtk_box_append(GTK_BOX(U.midibar), b);
+        b = gtk_check_button_new_with_label("Out → HW");
+        gtk_widget_set_tooltip_text(b,
+            "connect this window's MIDI out to every hardware input found");
+        gtk_actionable_set_action_name(GTK_ACTIONABLE(b), "win.midi-out-auto");
+        gtk_box_append(GTK_BOX(U.midibar), b);
+
+        b = gtk_button_new_with_label("All Notes Off");
+        gtk_widget_set_tooltip_text(b,
+            "cut every note, here and downstream, and recentre the wheel");
+        gtk_actionable_set_action_name(GTK_ACTIONABLE(b), "win.panic");
+        gtk_box_append(GTK_BOX(U.midibar), b);
+        b = gtk_button_new_with_label("Rescan");
+        gtk_widget_set_tooltip_text(b,
+            "look for MIDI devices connected since this window opened");
+        gtk_actionable_set_action_name(GTK_ACTIONABLE(b), "win.rescan");
+        gtk_box_append(GTK_BOX(U.midibar), b);
+
+        U.midi_conn = gtk_label_new("not open");
+        gtk_label_set_ellipsize(GTK_LABEL(U.midi_conn), PANGO_ELLIPSIZE_END);
+        gtk_label_set_xalign(GTK_LABEL(U.midi_conn), 0.0);
+        gtk_widget_set_hexpand(U.midi_conn, TRUE);
+        gtk_widget_add_css_class(U.midi_conn, "dim-label");
+        gtk_box_append(GTK_BOX(U.midibar), U.midi_conn);
     }
-    gtk_box_append(GTK_BOX(top), gtk_label_new("Volume"));
-    U.vol = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 150, 1);
-    gtk_range_set_value(GTK_RANGE(U.vol), 100);
-    gtk_widget_set_size_request(U.vol, 140, -1);
-    gtk_scale_set_draw_value(GTK_SCALE(U.vol), FALSE);
-    gtk_box_append(GTK_BOX(top), U.vol);
-    gtk_box_append(GTK_BOX(box), top);
 
     U.list = gtk_list_box_new();
     sw1 = gtk_scrolled_window_new();
@@ -1855,8 +3052,31 @@ static void activate(GtkApplication *app, gpointer ud)
     U.kbrow = kbox;
     gtk_widget_set_size_request(kbox, -1, KEY_H);
     gtk_widget_set_vexpand(kbox, FALSE);
-    frame = gtk_frame_new("Keyboard  —  click, or zsxdcvgbhnjm / q2w3er5t6y7u");
-    gtk_frame_set_child(GTK_FRAME(frame), kbox);
+
+    /* Master volume, directly over the keys.
+     *
+     * It is the control reached for while playing -- the hand is already down
+     * here -- and it does not need the width the row above was giving it: a
+     * short bar is enough for a level, and the room is worth more to the port
+     * list beside it. */
+    {
+        GtkWidget *vrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        GtkWidget *kb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        GtkWidget *lbl = gtk_label_new("Volume");
+        U.vol = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 150, 1);
+        gtk_range_set_value(GTK_RANGE(U.vol), 100);
+        gtk_widget_set_size_request(U.vol, 160, -1);
+        gtk_scale_set_draw_value(GTK_SCALE(U.vol), FALSE);
+        gtk_widget_set_tooltip_text(U.vol, "master volume (100% is unity)");
+        gtk_widget_add_css_class(lbl, "dim-label");
+        gtk_widget_set_halign(vrow, GTK_ALIGN_END);
+        gtk_box_append(GTK_BOX(vrow), lbl);
+        gtk_box_append(GTK_BOX(vrow), U.vol);
+        gtk_box_append(GTK_BOX(kb), vrow);
+        gtk_box_append(GTK_BOX(kb), kbox);
+        frame = gtk_frame_new("Keyboard  —  click, or zsxdcvgbhnjm / q2w3er5t6y7u");
+        gtk_frame_set_child(GTK_FRAME(frame), kb);
+    }
     gtk_box_append(GTK_BOX(U.outer), frame);
 
     U.status = gtk_label_new("");
@@ -1872,6 +3092,13 @@ static void activate(GtkApplication *app, gpointer ud)
     g_signal_connect(kc, "key-pressed",  G_CALLBACK(on_key), NULL);
     g_signal_connect(kc, "key-released", G_CALLBACK(on_key_up), NULL);
     gtk_widget_add_controller(U.win, kc);
+    /* The controller above is on the window, so it only sees what the focused
+     * widget let past. A plug-in's editor takes focus when one of its knobs is
+     * turned, so it has to be told which keys to let past -- this is that map.
+     * See plugview_set_note_key. */
+    plugview_set_note_key(key_note);
+    plugview_set_load_hook(on_plugin_loaded);
+    g_signal_connect(U.win, "notify::is-active", G_CALLBACK(on_win_active), NULL);
 
     g_signal_connect(U.instdd, "notify::selected", G_CALLBACK(on_inst_changed), NULL);
     g_signal_connect(U.bankdd, "notify::selected", G_CALLBACK(on_bank_changed), NULL);
@@ -1879,6 +3106,12 @@ static void activate(GtkApplication *app, gpointer ud)
     g_signal_connect(U.vol, "value-changed", G_CALLBACK(on_vol), NULL);
 
     setup_midi();
+    /* After the audio is up, so there is a capture stream to point at, and so
+     * the first Inputs menu opened is already the machine's real device list. */
+    scan_input_devices();
+    audio_menu_rebuild();
+    audio_state_update();
+    set_status();          /* now that there is something to say about MIDI */
     engine_start_audio(&g_eng);
     if (g_ninst) select_instrument(0);
 

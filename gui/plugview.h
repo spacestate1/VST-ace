@@ -68,6 +68,22 @@ void plugview_edit_folders(GtkWindow *parent);
  * a time to whatever the editor has focused. */
 void plugview_enter_key(GtkWindow *parent);
 
+/* Called after every load, successful or not, and after an unload. The window
+ * has things to re-send that live on the plug-in handle rather than in the
+ * pane -- the input-channel mask, and what an effect's input is fed from --
+ * and a fresh plug-in starts with neither. Polling for it would mean noticing
+ * a load only when something visible changed, which a load onto a plug-in of
+ * the same shape does not. */
+void plugview_set_load_hook(void (*fn)(void));
+
+/* Keyboard reach into the pane, for the window's accelerators. Everything here
+ * is otherwise only a click: which list has focus, and which of the two pages
+ * is showing. Focusing a list is what makes the arrow keys walk the corpus, so
+ * a plug-in can be picked without touching the mouse. */
+void plugview_focus_list(void);
+void plugview_focus_programs(void);
+void plugview_toggle_editor(void);
+
 /* True when a plug-in is loaded, i.e. when it -- and not an engine -- is what
  * should be heard. Cheap enough for the audio callback. */
 int  plugview_active(void);
@@ -75,6 +91,24 @@ int  plugview_active(void);
 /* Audio thread. Fills `out` with `frames` interleaved stereo frames and
  * returns 1; returns 0 when no plug-in is loaded, leaving `out` untouched. */
 int  plugview_render(float *out, int frames);
+
+/* The same, with the captured input the plug-in should process. An effect with
+ * no input renders silence, so this is what makes one audible at all. `in` is
+ * interleaved stereo of `frames` frames, or NULL for none. Audio thread. */
+int  plugview_render_io(const float *in, float *out, int frames);
+
+/* Which input channels that signal reaches, as a bitmask over channels; 0 is
+ * all of them. GTK thread. */
+void plugview_set_input_mask(unsigned mask);
+int  plugview_num_inputs(void);
+
+/* Which computer keys play notes. dwstudio owns that map, and this pane has to
+ * ask about it: a key over the plug-in's editor is given to the plug-in, and
+ * one the piano claims is then left to carry on to the window rather than
+ * being swallowed -- otherwise the note keys go dead the moment a knob in an
+ * editor is touched. `claims` returns non-zero for a key the piano wants.
+ * Without it the editor keeps every key it is given. */
+void plugview_set_note_key(int (*claims)(guint keyval));
 
 /* From the GTK thread, which is also where dwstudio's MIDI poll runs. No-ops
  * when nothing is loaded. */
@@ -87,6 +121,21 @@ void plugview_program(int idx);
  * form rather than converted to semitones because bend range is the plug-in's
  * parameter, and converting here would mean guessing it. */
 void plugview_bend(int value14);
+
+/* One raw MIDI message, as it arrived: status byte and up to two data bytes.
+ * Wheels, pedals, aftertouch and a sequencer's clock are all this and nothing
+ * else, so a port that only carried notes left every one of them on the floor.
+ * The clock messages (0xF8, 0xFA-0xFC, 0xF2) also drive the transport below
+ * without anybody setting a tempo by hand. */
+void plugview_midi(int status, int d1, int d2);
+
+/* The transport the plug-in reads for anything tempo-synced -- arpeggiators,
+ * synced delays, tempo-locked LFOs. plugview_tempo answers what the plug-in
+ * currently believes, which is the sequencer's tempo once its clock is
+ * arriving, and 0 when nothing is loaded. */
+void   plugview_set_tempo(double bpm);
+double plugview_tempo(void);
+int    plugview_playing(void);
 
 /* Walk the whole list unattended, opening each plug-in's editor in turn, and
  * report what happened for each. Switching plug-ins with an editor attached is

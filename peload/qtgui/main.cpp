@@ -8,6 +8,8 @@
  * touches the plugin during render -- notes and parameter writes go through
  * pehost's lock-free queue, and swapping plugins parks the stream first. */
 
+/* QtWidgets covers the rest; QProcess is QtCore. */
+#include <QProcess>
 #include <QtWidgets>
 #include <atomic>
 #include <chrono>
@@ -2110,6 +2112,7 @@ public:
 
         auto *bar = new QHBoxLayout;
         auto *panic = new QPushButton("All notes off");
+        panicBtn_ = panic;
         recBtn_ = new QPushButton("● Record");
         recBtn_->setToolTip("record what you play to a WAV in renders/");
         recLabel_ = new QLabel;
@@ -2183,9 +2186,27 @@ public:
         bar->addSpacing(8);
         bar->addWidget(new QLabel("Level"));
         bar->addWidget(level_);
-        bar->addWidget(new QLabel("Gain"));
-        bar->addWidget(gain_);
         cv->addLayout(bar);
+
+        /* Master volume, on its own directly over the keys.
+         *
+         * It is the control reached for while playing -- the hand is already
+         * down there -- and it does not need the width it had in the row
+         * above, where it sat at the end of a queue of things that are looked
+         * at rather than touched. dwstudio puts it in the same place, over the
+         * same keys. */
+        {
+            auto *vol = new QHBoxLayout;
+            vol->setContentsMargins(0, 0, 0, 0);
+            vol->addStretch(1);
+            auto *volLabel = new QLabel("Volume");
+            volLabel->setStyleSheet("color:#888");
+            gain_->setFixedWidth(160);
+            gain_->setToolTip("master volume (100% is unity)");
+            vol->addWidget(volLabel);
+            vol->addWidget(gain_);
+            cv->addLayout(vol);
+        }
 
         /* The wheel sits left of the keys, where a keyboard puts it. Same row so
          * it is the same height as them without being told a size. */
@@ -3309,15 +3330,34 @@ private slots:
             openEditor();
         /* A plug-in whose helper has died stops repainting and goes silent, and
          * both of those look exactly like a plug-in that is working and idle.
-         * Said once, where the user is looking, with what to do about it. */
+         *
+         * The first thing to try is starting it again, which the host can do on
+         * its own: it knows the file, and it has kept the program and the
+         * parameter values, so what comes back is what the user had. Three
+         * attempts, because a plug-in that faults on something it will meet
+         * again -- a preset it cannot load, a buffer size it cannot take --
+         * faults the same way every time, and restarting for ever is worse than
+         * saying so. Only after that is the failure reported, once, where the
+         * user is looking. */
         if (eng_.host() && !pehost_alive(eng_.host()) && !deadReported_) {
-            deadReported_ = true;
-            pixelEditor_->detach();
-            editor_->detach();
-            statusBar()->showMessage("this plug-in stopped responding -- its "
-                                     "editor and audio are gone until it is "
-                                     "loaded again", 0);
-            tabs_->setTabText(1, "Editor (stopped)");
+            if (pehost_restarts(eng_.host()) < 3 && pehost_recover(eng_.host())) {
+                pixelEditor_->detach();
+                editor_->detach();
+                editorOpened_ = false;      /* the self-heal above reopens it */
+                statusBar()->showMessage(
+                    QString("this plug-in stopped responding and was restarted "
+                            "(attempt %1) -- its settings were put back")
+                        .arg(pehost_restarts(eng_.host())), 8000);
+            } else {
+                deadReported_ = true;
+                pixelEditor_->detach();
+                editor_->detach();
+                statusBar()->showMessage("this plug-in stopped responding and "
+                                         "would not restart -- its editor and "
+                                         "audio are gone until it is loaded "
+                                         "again", 0);
+                tabs_->setTabText(1, "Editor (stopped)");
+            }
         }
         /* Gated on the source rather than on the widget being visible: a
          * child of a window that has not been shown yet reports invisible, and
@@ -4123,6 +4163,108 @@ private:
     /* Offer, once, to install a plug-in that was opened from outside the scan.
      * Returns the path to load -- the installed copy if one was made, and the
      * original otherwise, so declining still opens what was asked for. */
+    /* Where tools/vst_install.py is, from wherever this binary was started.
+     *
+     * The development tree and an installed package put it in different
+     * places, and both are searched the same way the plug-in corpora are:
+     * upwards from the binary, then the packaged location. Empty when it
+     * cannot be found, which the caller reports rather than working around. */
+    static QString installerTool()
+    {
+        static const char *rel[] = {
+            "tools/vst_install.py",
+            "../tools/vst_install.py",
+            "../lib/vst-ace/vst_install.py",
+            "../share/vst-ace/vst_install.py",
+        };
+        QDir d(QCoreApplication::applicationDirPath());
+        for (int up = 0; up < 6; up++) {
+            for (size_t i = 0; i < sizeof rel / sizeof rel[0]; i++) {
+                QString p = d.absoluteFilePath(rel[i]);
+                if (QFileInfo(p).isFile()) return QFileInfo(p).absoluteFilePath();
+            }
+            if (!d.cdUp()) break;
+        }
+        return QString();
+    }
+
+    static bool looksLikeInstaller(const QString &abs)
+    {
+        const QString s = abs.toLower();
+        return s.endsWith(".exe") || s.endsWith(".msi") || s.endsWith(".zip") ||
+               s.endsWith(".7z")  || s.endsWith(".dmg") || s.endsWith(".pkg");
+    }
+
+    /* Unpack an installer and hand back the plug-ins that came out of it.
+     *
+     * The installer is never run. A .msi is a database and most installer .exe
+     * files are an archive with a stub in front, so the payload comes out
+     * without a Windows to install into -- which is the whole reason this can
+     * work at all. tools/vst_install.py does the extracting and already knows
+     * which formats need which unpacker; this is the window around it.
+     *
+     * Long enough to matter: a V-Collection instrument is a quarter of a
+     * gigabyte and takes a while, so it runs behind a progress dialog rather
+     * than a frozen window. */
+    QStringList unpackInstaller(const QString &abs)
+    {
+        const QString tool = installerTool();
+        if (tool.isEmpty()) {
+            QMessageBox::warning(this, "Install plug-in",
+                "The installer unpacker (tools/vst_install.py) is not beside this "
+                "program, so an installer cannot be opened. A plug-in that is "
+                "already unpacked still opens normally.");
+            return QStringList();
+        }
+        const QStringList targets = standardPluginDirs();
+        const QString dest = targets.isEmpty()
+                                 ? QDir::homePath() + "/.vst"
+                                 : QFileInfo(targets.first()).absolutePath();
+
+        QProgressDialog prog(QString("Unpacking %1...").arg(QFileInfo(abs).fileName()),
+                             QString(), 0, 0, this);
+        prog.setWindowModality(Qt::WindowModal);
+        prog.setMinimumDuration(0);
+        prog.show();
+        QApplication::processEvents();
+
+        QProcess proc;
+        proc.setProcessChannelMode(QProcess::MergedChannels);
+        proc.start("python3", QStringList() << tool << abs << "--dest" << dest);
+        if (!proc.waitForStarted(5000)) {
+            prog.close();
+            QMessageBox::warning(this, "Install plug-in",
+                                 "python3 is needed to unpack an installer and could "
+                                 "not be started.");
+            return QStringList();
+        }
+        while (!proc.waitForFinished(100))
+            QApplication::processEvents();
+        prog.close();
+
+        const QString out = QString::fromUtf8(proc.readAll());
+        QStringList found;
+        /* The tool prints one indented path per plug-in under a heading; the
+         * paths are relative to --dest. */
+        bool inList = false;
+        for (const QString &lineRaw : out.split('\n')) {
+            const QString line = lineRaw.trimmed();
+            if (lineRaw.startsWith("installed ")) { inList = true; continue; }
+            if (line.isEmpty() || !lineRaw.startsWith("    ")) { inList = false; continue; }
+            if (!inList) continue;
+            const QString p = QDir(dest).absoluteFilePath(line);
+            if (QFileInfo::exists(p)) found << p;
+        }
+        if (found.isEmpty()) {
+            QMessageBox::warning(this, "Install plug-in",
+                QString("Nothing came out of %1.\n\n%2")
+                    .arg(QFileInfo(abs).fileName(), out.trimmed()));
+        } else {
+            addUserRoot(VSTDIRS_ANY, dest, /*select=*/true);
+        }
+        return found;
+    }
+
     QString offerInstall(const QString &abs)
     {
         if (pathAlreadyInstalled(abs)) return abs;
@@ -4402,11 +4544,41 @@ private:
         connect(openVst, &QAction::triggered, this, [this] {
             QString f = QFileDialog::getOpenFileName(
                 this, "Open VST", dirEdit_->text(),
-                "Plug-ins (*.dll *.so *.vst3 *.vst *.component);;All files (*)");
+                "Plug-ins and installers (*.dll *.so *.vst3 *.vst *.component "
+                "*.exe *.msi *.zip *.7z *.dmg *.pkg);;"
+                "Plug-ins (*.dll *.so *.vst3 *.vst *.component);;"
+                "Installers (*.exe *.msi *.zip *.7z *.dmg *.pkg);;All files (*)");
             if (f.isEmpty()) return;
+            f = QFileInfo(f).absoluteFilePath();
+            /* An installer is unpacked first, and what comes out is what gets
+             * loaded. One plug-in loads straight away; several are offered,
+             * because an instrument bundle usually ships its effects too. */
+            if (looksLikeInstaller(f)) {
+                QStringList got = unpackInstaller(f);
+                if (got.isEmpty()) return;
+                if (got.size() == 1) {
+                    f = got.first();
+                } else {
+                    QStringList names;
+                    for (const QString &g : got) names << QFileInfo(g).fileName();
+                    bool ok = false;
+                    QString pick = QInputDialog::getItem(
+                        this, "Install plug-in",
+                        QString("%1 contained %2 plug-ins. Load which?")
+                            .arg(QFileInfo(f).fileName()).arg(got.size()),
+                        names, 0, false, &ok);
+                    if (!ok) return;
+                    f = got.at(names.indexOf(pick));
+                }
+                statusBar()->showMessage(describeFile(f));
+                if (!loadPluginPath(f))
+                    statusBar()->showMessage("load failed: " +
+                                             QString::fromUtf8(pehost_last_error()));
+                return;
+            }
             /* Offer to install it before loading, so what gets loaded is the
              * copy that will still be here next session. */
-            f = offerInstall(QFileInfo(f).absoluteFilePath());
+            f = offerInstall(f);
             statusBar()->showMessage(describeFile(f));
             if (!loadPluginPath(f))
                 statusBar()->showMessage("load failed: " +
@@ -4448,6 +4620,7 @@ private:
          * binary are not listed here because they are not a setting. */
         QMenu *settings = menuBar()->addMenu("&Settings");
         QAction *folders = settings->addAction("Plug-in &Folders...");
+        folders->setShortcut(QKeySequence("Ctrl+D"));
         connect(folders, &QAction::triggered, this, &Window::editPluginFolders);
 
         /* Some plug-ins will not do anything until something has been typed
@@ -4462,6 +4635,7 @@ private:
          * skinned box with no visible caret. This asks for it once and sends
          * it a character at a time, which is what the plug-in is waiting for. */
         QAction *key = settings->addAction("Enter &Key / Serial...");
+        key->setShortcut(QKeySequence("Ctrl+K"));
         connect(key, &QAction::triggered, this, &Window::enterPluginKey);
 
         /* Inputs: what the machine is listening to. A microphone or USB
@@ -4474,13 +4648,82 @@ private:
         midiInMenu_  = inputs->addMenu("&MIDI input");
         inputs->addSeparator();
         QAction *rescanIn = inputs->addAction("&Rescan devices");
+        rescanIn->setShortcuts({ QKeySequence("Ctrl+R"), QKeySequence("F5") });
         connect(rescanIn, &QAction::triggered, this, [this] {
             refreshAudioInputs();
             if (midi_) midi_->rescan();
             updateMidiSources();
             statusBar()->showMessage("input devices rescanned", 3000);
         });
+        /* The two MIDI settings that are check boxes in the panel, as menu
+         * items with keys on them: the panel is where they are watched, the
+         * menu is where they are reached without letting go of the keyboard.
+         * Each follows the other, so neither can show the wrong state.
+         * dwstudio carries the same pair on the same two keys. */
+        inputs->addSeparator();
+        QAction *thru = inputs->addAction("MIDI &Thru (in -> out)");
+        thru->setCheckable(true);
+        thru->setShortcut(QKeySequence("Ctrl+T"));
+        connect(thru, &QAction::toggled, midiThru_, &QCheckBox::setChecked);
+        connect(midiThru_, &QCheckBox::toggled, thru, &QAction::setChecked);
+
+        QAction *outHw = inputs->addAction("Connect out to &hardware");
+        outHw->setCheckable(true);
+        outHw->setShortcut(QKeySequence("Ctrl+H"));
+        connect(outHw, &QAction::toggled, midiOutAuto_, &QCheckBox::setChecked);
+        connect(midiOutAuto_, &QCheckBox::toggled, outHw, &QAction::setChecked);
+
+        /* Panic is the one wanted in a hurry, so it is the one that must not
+         * need aim: a note stuck on in front of an audience is fixed with one
+         * hand while the other is still on the keys. */
+        QAction *allOff = inputs->addAction("All &Notes Off");
+        allOff->setShortcuts({ QKeySequence("Ctrl+."), QKeySequence("Ctrl+Esc") });
+        connect(allOff, &QAction::triggered, this,
+                [this] { if (panicBtn_) panicBtn_->click(); });
+
         connect(inputs, &QMenu::aboutToShow, this, [this] { rebuildInputMenus(); });
+
+        /* Go: the window without the mouse. A list that has focus is walked
+         * with the arrow keys and loads what it lands on, so these four plus
+         * the file commands are the whole window -- find a plug-in, pick a
+         * program, look at its editor, and get back to the keys. Same four
+         * keys as dwstudio's Go menu. */
+        QMenu *go = menuBar()->addMenu("&Go");
+        QAction *goPlugs = go->addAction("Plug-in &List");
+        goPlugs->setShortcut(QKeySequence("Ctrl+F"));
+        connect(goPlugs, &QAction::triggered, this,
+                [this] { if (pluginList_) pluginList_->setFocus(); });
+
+        QAction *goProgs = go->addAction("&Programs");
+        goProgs->setShortcut(QKeySequence("Ctrl+G"));
+        connect(goProgs, &QAction::triggered, this,
+                [this] { if (programList_) programList_->setFocus(); });
+
+        QAction *goEditor = go->addAction("Parameters / &Editor");
+        goEditor->setShortcut(QKeySequence("Ctrl+E"));
+        connect(goEditor, &QAction::triggered, this, [this] {
+            if (!tabs_) return;
+            const int want = tabs_->currentIndex() == 1 ? 0 : 1;
+            if (tabs_->isTabEnabled(want)) tabs_->setCurrentIndex(want);
+        });
+
+        /* Focus in a list means the letters are navigation before they are
+         * notes, and Escape is where a hand goes to get out of something -- so
+         * it is what puts the keys back under the fingers. */
+        QAction *goKeys = go->addAction("Back to the &Keys");
+        goKeys->setShortcut(QKeySequence("Esc"));
+        connect(goKeys, &QAction::triggered, this,
+                [this] { if (piano_) piano_->setFocus(); });
+
+        go->addSeparator();
+        QAction *volUp = go->addAction("Volume &Up");
+        volUp->setShortcut(QKeySequence("Ctrl+Up"));
+        connect(volUp, &QAction::triggered, this,
+                [this] { if (gain_) gain_->setValue(gain_->value() + 5); });
+        QAction *volDn = go->addAction("Volume &Down");
+        volDn->setShortcut(QKeySequence("Ctrl+Down"));
+        connect(volDn, &QAction::triggered, this,
+                [this] { if (gain_) gain_->setValue(gain_->value() - 5); });
 
         /* Which build this is. Worth having in the window rather than only on
          * the command line: the usual way this gets asked is somebody
@@ -4694,6 +4937,7 @@ private:
     QComboBox    *srcBox_;
     QListWidget  *pluginList_, *programList_, *patchList_;
     QPushButton  *recBtn_ = nullptr;
+    QPushButton  *panicBtn_ = nullptr;
     QString       saveDir_;      /* where the last take was saved */
     bool          pianoWasLive_ = true;  /* had focus before typing began */
     QLabel       *recLabel_ = nullptr;

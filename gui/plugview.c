@@ -187,6 +187,7 @@ static struct {
     int        ed_fit_auto;
     int        ed_fit_vw, ed_fit_vh;   /* pane size the last fit measured */
     GtkWidget *zoom_out, *zoom_in, *zoom_fit, *zoom_one, *zoom_lbl, *zoom_note;
+    int        dead_reported;   /* said once, not once per tick */
 
     int        ed_native;     /* the loaded plug-in wants an X11 window */
     int        ready;         /* the pane is built; page changes are real now */
@@ -1258,6 +1259,35 @@ static gboolean editor_tick(gpointer ud)
 {
     (void)ud;
     if (in_plugin) return G_SOURCE_CONTINUE;
+
+    /* A plug-in whose helper has died stops repainting and goes silent, and
+     * both look exactly like a plug-in that is working and idle. The Qt window
+     * has said so, and then restarted it, for a while; this one noticed
+     * nothing at all -- so a helper that died left a window that appeared to be
+     * playing and was not.
+     *
+     * Restarting is the first thing to try, because the host can: it knows the
+     * file and it has kept the program and the parameter values. Three
+     * attempts, because a plug-in that faults on something it will meet again
+     * faults the same way every time, and restarting for ever is worse than
+     * saying so. */
+    if (P.host && !pehost_alive(P.host) && !P.dead_reported) {
+        if (pehost_restarts(P.host) < 3 && pehost_recover(P.host)) {
+            P.ed_open = 0;                 /* reopened below, as after a load */
+            plug_status("this plug-in stopped responding and was restarted "
+                        "(attempt %d) — its settings were put back",
+                        pehost_restarts(P.host));
+            if (pehost_editor_kind(P.host) == PEHOST_EDITOR_PIXELS &&
+                pehost_editor_open(P.host) == 0)
+                P.ed_open = 1;
+        } else {
+            P.dead_reported = 1;
+            plug_status("this plug-in stopped responding and would not restart "
+                        "— reload it to try again");
+        }
+        return G_SOURCE_CONTINUE;
+    }
+
     /* A native editor is an X11 window of its own: nothing to pump and no
      * pixels to fetch, but it has to be kept over the visible part of the pane
      * as that scrolls, resizes, and comes and goes with the page. Scrolling in
@@ -1342,7 +1372,14 @@ static void zoom_update_ui(void)
     char txt[32];
     int  on = zoom_can();
 
-    if (!P.zoom_lbl) return;
+    /* Six pointers are touched below and the guard used to check one of them,
+     * so a call arriving after the pane went away wrote to five stale widgets
+     * before anyone noticed. They are cleared together in plugview_shutdown, so
+     * one test covers the lot -- but each is checked anyway, because this runs
+     * from an idle callback and being inert is the only safe thing for it to be
+     * when it arrives late. */
+    if (!P.zoom_lbl || !P.zoom_out || !P.zoom_in ||
+        !P.zoom_fit || !P.zoom_one || !P.zoom_note) return;
     snprintf(txt, sizeof txt, "%d%%", (int)(P.ed_zoom * 100.0 + 0.5));
     gtk_label_set_text(GTK_LABEL(P.zoom_lbl), txt);
     gtk_widget_set_sensitive(P.zoom_lbl, on);
@@ -1544,6 +1581,39 @@ static int gdk_to_vk(guint kv)
     }
 }
 
+/* Which computer keys the piano claims, as dwstudio answers it. See
+ * plugview_set_note_key. */
+static int (*note_key)(guint keyval);
+
+void plugview_set_note_key(int (*claims)(guint keyval)) { note_key = claims; }
+
+/* Keys over the editor go to the plug-in -- and a note key goes to the piano
+ * as well.
+ *
+ * Turning a knob in a plug-in's editor moves focus to it, and a controller
+ * that answered TRUE here stopped the key ever reaching the window, which is
+ * where the note keys live: z, x, c, v went dead the moment you touched a
+ * control, and stayed dead until the on-screen keyboard was clicked to take
+ * focus back. Tweak a sound and then play it is the ordinary way round to do
+ * things, so that is the case to keep working -- the same trade pestudio's
+ * event filter makes, and made for the same reason.
+ *
+ * The plug-in still sees the letter: it is forwarded before the note test, and
+ * the test only declines to swallow it. The cost is that typing into a text
+ * field inside an editor plays a note alongside -- a field inside a foreign
+ * window is not something this side can detect, Cardinal has a whole
+ * text-editor module -- which is the rarer half of the trade, and audible
+ * rather than destructive. Settings > Enter Key is the way in when a plug-in
+ * really does want twenty-five characters typed at it.
+ *
+ * Releases need nothing here. GTK's key-released signal carries no "handled"
+ * answer back, and a release is delivered to every controller between the
+ * focused widget and the one that took the press -- so a note started at the
+ * window is released even though focus has since moved into the editor, which
+ * is the case that matters: a note is held precisely so the hand is free to
+ * reach into the editor, and the key-up then arrives over the editor. (A press
+ * this handler does swallow keeps its release too, which is right, because no
+ * note was started for it.) */
 static gboolean on_ed_key_down(GtkEventControllerKey *c, guint kv, guint code,
                                GdkModifierType st, gpointer ud)
 {
@@ -1554,6 +1624,7 @@ static gboolean on_ed_key_down(GtkEventControllerKey *c, guint kv, guint code,
     in_plugin++;
     pehost_editor_key(P.host, gdk_to_vk(kv), 1, (int)ch);
     in_plugin--;
+    if (note_key && note_key(kv)) return FALSE;    /* on to the piano */
     return TRUE;
 }
 
@@ -1672,6 +1743,10 @@ static void set_header(void)
 {
     char txt[512];
 
+    /* Inert once the pane has gone, the way plug_status and zoom_update_ui
+     * are: this runs from load and unload paths, and one of those is reached
+     * during teardown. */
+    if (!P.header) return;
     if (!P.host) {
         gtk_label_set_text(GTK_LABEL(P.header), "no plug-in loaded");
         return;
@@ -1709,6 +1784,11 @@ static void unload_locked(void)
     P.host = NULL;
 }
 
+/* What the window wants re-sending after every load -- see
+ * plugview_set_load_hook. */
+static void (*load_hook)(void);
+void plugview_set_load_hook(void (*fn)(void)) { load_hook = fn; }
+
 static void load(const entry *e)
 {
     char msg[1024];
@@ -1743,6 +1823,7 @@ static void load(const entry *e)
     {
         int kind = pehost_editor_kind(P.host);
         int w = 0, h = 0;
+        P.dead_reported = 0;              /* a fresh plug-in gets a fresh verdict */
         if (kind == PEHOST_EDITOR_PIXELS && pehost_editor_open(P.host) == 0) {
             P.ed_open = 1;
             pehost_editor_size(P.host, &w, &h);
@@ -1814,6 +1895,10 @@ static void load(const entry *e)
         if (page && !strcmp(page, "editor"))
             native_editor_open(P.host, pehost_name(P.host));
     }
+
+    /* Last, so the window is told about a plug-in that is finished loading and
+     * not one that is halfway in. */
+    if (load_hook) load_hook();
 }
 
 /* Rescan every folder and show the result. What File > Load Folder and the
@@ -1955,6 +2040,90 @@ static void open_path(const char *path)
         gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), P.nvis - 1));
 }
 
+/* Opening an installer rather than a plug-in.
+ *
+ * The same thing the Qt window does, and for the same reason: half of what
+ * people have is a setup.exe, an .msi or a macOS .pkg, and none of it needs to
+ * be *run* -- the payload comes out without a Windows or a Mac to install
+ * into. tools/vst_install.py does the unpacking; this finds it the way the
+ * plug-in corpora are found, upwards from the binary. */
+static int installer_ext(const char *path)
+{
+    static const char *ext[] = { ".exe", ".msi", ".zip", ".7z", ".dmg", ".pkg" };
+    size_t i, n = strlen(path);
+    for (i = 0; i < sizeof ext / sizeof ext[0]; i++) {
+        size_t e = strlen(ext[i]);
+        if (n > e && !g_ascii_strcasecmp(path + n - e, ext[i])) return 1;
+    }
+    return 0;
+}
+
+static char *installer_tool(void)
+{
+    static const char *rel[] = { "tools/vst_install.py", "../tools/vst_install.py",
+                                 "../lib/vst-ace/vst_install.py",
+                                 "../share/vst-ace/vst_install.py" };
+    char exe[1024];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    int up;
+    if (n <= 0) return NULL;
+    exe[n] = 0;
+    for (up = 0; up < 6; up++) {
+        char *slash = strrchr(exe, '/');
+        size_t i;
+        if (!slash) break;
+        *slash = 0;
+        for (i = 0; i < sizeof rel / sizeof rel[0]; i++) {
+            char *cand = g_strdup_printf("%s/%s", exe, rel[i]);
+            if (g_file_test(cand, G_FILE_TEST_IS_REGULAR)) return cand;
+            g_free(cand);
+        }
+    }
+    return NULL;
+}
+
+/* Unpack, and hand back the first plug-in that came out. NULL when nothing
+ * did, with `why` saying what happened -- an installer that unpacks to nothing
+ * and an installer that could not be read are different problems. */
+static char *unpack_installer(const char *path, char *why, size_t whyn)
+{
+    char *tool = installer_tool(), *out = NULL, *stdout_s = NULL, *dest;
+    char *argv[6];
+    int status = 0;
+
+    if (!tool) {
+        g_strlcpy(why, "the installer unpacker (tools/vst_install.py) is not "
+                       "beside this program", whyn);
+        return NULL;
+    }
+    dest = g_strdup_printf("%s/.vst", g_get_home_dir());
+    argv[0] = (char *)"python3"; argv[1] = tool; argv[2] = (char *)path;
+    argv[3] = (char *)"--dest";  argv[4] = dest; argv[5] = NULL;
+    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL,
+                      &stdout_s, NULL, &status, NULL)) {
+        g_strlcpy(why, "python3 is needed to unpack an installer", whyn);
+        g_free(tool); g_free(dest);
+        return NULL;
+    }
+    /* The tool prints one indented path per plug-in, under a heading. */
+    if (stdout_s) {
+        char **lines = g_strsplit(stdout_s, "\n", -1);
+        int i, in_list = 0;
+        for (i = 0; lines[i] && !out; i++) {
+            if (g_str_has_prefix(lines[i], "installed ")) { in_list = 1; continue; }
+            if (!in_list || !g_str_has_prefix(lines[i], "    ")) { in_list = 0; continue; }
+            { char *rel = g_strstrip(g_strdup(lines[i]));
+              char *full = g_strdup_printf("%s/%s", dest, rel);
+              if (g_file_test(full, G_FILE_TEST_EXISTS)) out = full; else g_free(full);
+              g_free(rel); }
+        }
+        g_strfreev(lines);
+    }
+    if (!out) g_strlcpy(why, "nothing came out of it", whyn);
+    g_free(stdout_s); g_free(tool); g_free(dest);
+    return out;
+}
+
 static void on_vst_chosen(GObject *src, GAsyncResult *res, gpointer ud)
 {
     GError *err = NULL;
@@ -1965,7 +2134,17 @@ static void on_vst_chosen(GObject *src, GAsyncResult *res, gpointer ud)
     g_clear_error(&err);
     g_object_unref(src);                         /* the ref taken in open_vst */
     if (!f) return;                              /* cancelled */
-    if ((path = g_file_get_path(f))) { open_path(path); g_free(path); }
+    if ((path = g_file_get_path(f))) {
+        if (installer_ext(path)) {
+            char why[256] = "";
+            char *got = unpack_installer(path, why, sizeof why);
+            if (got) { open_path(got); g_free(got); }
+            else plug_status("%s", why[0] ? why : "nothing came out of it");
+        } else {
+            open_path(path);
+        }
+        g_free(path);
+    }
     g_object_unref(f);
 }
 
@@ -2520,18 +2699,50 @@ void plugview_install_missing_data(void)
 
 /* ------------------------------------------------------------ the audio API */
 
+/* The window's accelerators reach the pane through these. A list that has
+ * focus is a list the arrow keys walk, which is the whole of picking a plug-in
+ * without a mouse -- row-selected loads it as if it had been clicked. */
+/* The row, not the list.
+ *
+ * A GtkListBox is not focusable itself -- its rows are -- so grabbing focus on
+ * the box quietly does nothing and the arrow keys go on being handled by
+ * whatever had focus before, which looks exactly like the shortcut not being
+ * bound. Focus the selected row, or the first one when nothing is selected. */
+static void focus_row(GtkWidget *box)
+{
+    GtkListBoxRow *r;
+    if (!GTK_IS_LIST_BOX(box)) return;
+    r = gtk_list_box_get_selected_row(GTK_LIST_BOX(box));
+    if (!r) r = gtk_list_box_get_row_at_index(GTK_LIST_BOX(box), 0);
+    if (r) gtk_widget_grab_focus(GTK_WIDGET(r));
+}
+
+void plugview_focus_list(void)     { focus_row(P.list); }
+void plugview_focus_programs(void) { focus_row(P.proglist); }
+
+void plugview_toggle_editor(void)
+{
+    const char *page;
+    if (!GTK_IS_WIDGET(P.stack)) return;
+    page = gtk_stack_get_visible_child_name(GTK_STACK(P.stack));
+    gtk_stack_set_visible_child_name(GTK_STACK(P.stack),
+        page && !strcmp(page, "editor") ? "params" : "editor");
+}
+
 int plugview_active(void)
 { return atomic_load_explicit(&P.live, memory_order_acquire); }
 
-int plugview_render(float *out, int frames)
+int plugview_render_io(const float *in, float *out, int frames)
 {
     float pk = 0.0f;
     int   i, cur;
 
     if (!atomic_load_explicit(&P.live, memory_order_acquire) || !P.host) return 0;
-    /* NULL input: a synth ignores it, and an effect correctly renders silence
-     * rather than being fed a tone it was never sent. */
-    pehost_render_io(P.host, NULL, out, frames);
+    /* `in` is the captured signal, interleaved stereo, or NULL when there is
+     * no input open. A synth ignores it either way; an effect with nothing to
+     * process renders silence, which is why this window used to be silent for
+     * every effect in the corpus -- it passed NULL unconditionally. */
+    pehost_render_io(P.host, in, out, frames);
 
     /* Peak for the meter. Kept here rather than in the GTK thread because this
      * is the only place the samples exist, and "it loaded and the editor drew"
@@ -2545,6 +2756,32 @@ int plugview_render(float *out, int frames)
         atomic_store_explicit(&P.peak_milli, cur, memory_order_relaxed);
     return 1;
 }
+
+/* The old spelling, for callers with nothing to feed it. */
+int plugview_render(float *out, int frames)
+{ return plugview_render_io(NULL, out, frames); }
+
+/* Which input channels the fed signal reaches. A vocoder has a modulator and a
+ * carrier bus and wants the microphone on one of them; sending it to both puts
+ * the raw voice in the output beside the analysis. 0 means every channel. */
+void plugview_set_input_mask(unsigned mask)
+{ if (P.host) pehost_set_input_mask(P.host, mask); }
+
+int plugview_num_inputs(void)
+{ return P.host ? pehost_num_inputs(P.host) : 0; }
+
+/* Raw MIDI, straight through. in_plugin is not raised around it the way
+ * plugview_bend does: pehost_midi is a queue write the audio thread drains, so
+ * there is no call into the plug-in here to be re-entered. */
+void plugview_midi(int status, int d1, int d2)
+{ if (P.host) pehost_midi(P.host, status, d1, d2); }
+
+/* 4/4 because nothing upstream of this knows any better: a time signature
+ * arrives with a sequencer's song position, not with its clock, and a plug-in
+ * that cares reads the tempo. */
+void   plugview_set_tempo(double bpm) { if (P.host) pehost_set_tempo(P.host, bpm, 4, 4); }
+double plugview_tempo(void)   { return P.host ? pehost_tempo(P.host) : 0.0; }
+int    plugview_playing(void) { return P.host ? pehost_playing(P.host) : 0; }
 
 void plugview_note_on(int note, int vel)  { if (P.host) pehost_note_on(P.host, note, vel); }
 void plugview_note_off(int note)          { if (P.host) pehost_note_off(P.host, note); }
@@ -2632,10 +2869,27 @@ void plugview_shutdown(void)
      * outlives this call is inert rather than merely unlikely to run. */
     if (P.tick)  { g_source_remove(P.tick);  P.tick  = 0; }
     if (P.meter) { g_source_remove(P.meter); P.meter = 0; }
-    unload_locked();
-    native_editor_destroy();
+    /* Every widget pointer, and before the unload rather than after it.
+     *
+     * Clearing `status` and `editor` fixed the meter and left the zoom bar,
+     * which is its own six pointers and its own updater. Clearing all of them
+     * afterwards still left the same seven assertions, because the order is
+     * the whole of it: GTK emits `destroy` on the toplevel from its dispose,
+     * by which point the children are already gone, so this function runs with
+     * dead widgets and live pointers -- and unload_locked calls
+     * zoom_update_ui, which writes to six of them and is the backtrace under
+     * every one of those `GTK_IS_LABEL (self)' and `GTK_IS_WIDGET (widget)'
+     * lines. Nothing below this point may touch a widget, so nothing below it
+     * has a pointer to touch. A pointer that is not cleared here is one that
+     * outlives what it points at. */
+    P.dirlabel = P.list = P.proglist = P.paramlist = NULL;
+    P.paramsw = P.editorsw = P.editorpage = P.stack = P.header = NULL;
     P.status = NULL;
     P.editor = NULL;
+    P.zoom_out = P.zoom_in = P.zoom_fit = NULL;
+    P.zoom_one = P.zoom_lbl = P.zoom_note = NULL;
+    unload_locked();
+    native_editor_destroy();
 }
 
 /* ------------------------------------------------------------------ the pane */
