@@ -41,6 +41,9 @@ void  w32_set_input_pump(void (*fn)(void *), void *ud);
  * pass to effEditOpen or IPlugView::attached. Idempotent. */
 void *w32_create_host_window(int w, int h);
 
+/* The root of the window tree, made on first use. See win32gui.h. */
+void *w32_desktop_window(void);
+
 /* The window whose pixels represent the editor -- the plugin's own window once
  * it has made one, otherwise the container. NULL if there is no editor. */
 void *w32_root_window(void);

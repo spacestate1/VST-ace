@@ -46,6 +46,18 @@ int bridge_is_synth(const bridge *b);
  * with it, and everything after that quietly returns nothing -- a frozen
  * editor and silence, with no way for the window to say which. */
 int bridge_alive(const bridge *b);
+
+/* Start a dead helper again, with the plug-in reloaded and its program and
+ * parameters put back. Returns 1 when it is running again.
+ *
+ * From the thread that owns the plug-in, not the audio callback -- it forks and
+ * waits for a plug-in to initialise. Safe to call while audio runs: a dead
+ * bridge emits silence without touching anything this replaces.
+ *
+ * bridge_restarts is how many times that has happened, so a caller can stop
+ * after a plug-in that faults every time it is asked the same question. */
+int bridge_recover(bridge *b);
+int bridge_restarts(const bridge *b);
 void bridge_set_input_mask(bridge *b, unsigned mask);
 int bridge_unique_id(const bridge *b);
 

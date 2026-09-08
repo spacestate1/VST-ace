@@ -545,11 +545,92 @@ static void cf_runloop_add_timer(void *rl, void *t, void *mode)
 static void cf_runloop_timer_invalidate(void *t)
 { if (cf_timer_is_ours(t)) ((cf_timer *)t)->dead = 1; }
 
+/* Run-loop sources: the other half of what a run loop carries.
+ *
+ * A source is not a timer -- nothing fires it on a clock. Something signals it,
+ * and the next turn of the loop calls its `perform`. That is how a plug-in
+ * hands work from a thread of its own back to the main thread, and it is the
+ * only part of the run loop that a plug-in with a background worker needs.
+ *
+ * Not answering was worse than not implementing: Arturia's Jup-8 V4 creates a
+ * source during construction, adds it, and then waits for the loop to service
+ * it. With CFRunLoopSourceCreate returning nothing there was nothing to
+ * signal, and the wait never ended -- a hang rather than a crash, which is the
+ * harder of the two to read.
+ *
+ * The context is the caller's and is copied, not kept: version 0 is the only
+ * one Apple has ever defined, and `info` and `perform` are the two fields that
+ * matter here. */
+typedef struct {
+    void  (*perform)(void *info);
+    void   *info;
+    int     scheduled, signalled, dead;
+} cf_source;
+
+#define MAX_CF_SOURCES 64
+static cf_source g_cf_sources[MAX_CF_SOURCES];
+static int       g_ncf_sources;
+
+typedef struct {
+    long  version;
+    void *info;
+    void *retain, *release, *copy_description, *equal, *hash;
+    void *schedule, *cancel;
+    void (*perform)(void *info);
+} cf_source_ctx;
+
+static int cf_source_is_ours(const void *p)
+{ return p && (const cf_source *)p >= g_cf_sources
+           && (const cf_source *)p < g_cf_sources + MAX_CF_SOURCES; }
+
+static void *cf_runloop_source_create(void *alloc, long order, void *ctxv)
+{
+    const cf_source_ctx *ctx = ctxv;
+    cf_source *s;
+    (void)alloc; (void)order;
+    if (!ctx || g_ncf_sources >= MAX_CF_SOURCES) return NULL;
+    s = &g_cf_sources[g_ncf_sources++];
+    s->perform = ctx->perform;
+    s->info = ctx->info;
+    s->scheduled = s->signalled = s->dead = 0;
+    return s;
+}
+static void cf_runloop_add_source(void *rl, void *src, void *mode)
+{ (void)rl; (void)mode; if (cf_source_is_ours(src)) ((cf_source *)src)->scheduled = 1; }
+static void cf_runloop_remove_source(void *rl, void *src, void *mode)
+{ (void)rl; (void)mode; if (cf_source_is_ours(src)) ((cf_source *)src)->scheduled = 0; }
+static void cf_runloop_source_signal(void *src)
+{ if (cf_source_is_ours(src)) ((cf_source *)src)->signalled = 1; }
+static void cf_runloop_source_invalidate(void *src)
+{ if (cf_source_is_ours(src)) ((cf_source *)src)->dead = 1; }
+static unsigned char cf_runloop_source_is_valid(void *src)
+{ return (unsigned char)(cf_source_is_ours(src) && !((cf_source *)src)->dead); }
+/* Waking the loop is what a signaller does next, and there is no loop asleep
+ * here -- the pump comes round on its own. Accepting it is the whole job. */
+static void cf_runloop_wake_up(void *rl) { (void)rl; }
+
+/* Every source that has been signalled since the last turn, performed once.
+ * The flag is cleared before the callback runs, so a source that signals
+ * itself from inside its own perform is serviced on the next turn rather than
+ * looping here for ever. */
+void macshim_fire_cf_sources(void);
+void macshim_fire_cf_sources(void)
+{
+    int i;
+    for (i = 0; i < g_ncf_sources; i++) {
+        cf_source *s = &g_cf_sources[i];
+        if (s->dead || !s->scheduled || !s->signalled || !s->perform) continue;
+        s->signalled = 0;
+        s->perform(s->info);
+    }
+}
+
 /* One round of whatever the plugin scheduled. Called from macns_fire_timers, so
  * a CFRunLoopTimer and an NSTimer are driven by the same pump. */
 void macshim_fire_cf_timers(void)
 {
     int i;
+    macshim_fire_cf_sources();          /* the same turn of the loop */
     for (i = 0; i < g_ncf_timers; i++) {
         cf_timer *t = &g_cf_timers[i];
         if (t->dead || !t->scheduled || !t->cb) continue;
@@ -679,6 +760,13 @@ const macshim_entry macshim_foundation[] = {
     { "_CFRunLoopTimerCreate",     cf_runloop_timer_create },
     { "_CFRunLoopAddTimer",        cf_runloop_add_timer },
     { "_CFRunLoopTimerInvalidate", cf_runloop_timer_invalidate },
+    { "_CFRunLoopSourceCreate",    cf_runloop_source_create },
+    { "_CFRunLoopAddSource",       cf_runloop_add_source },
+    { "_CFRunLoopRemoveSource",    cf_runloop_remove_source },
+    { "_CFRunLoopSourceSignal",    cf_runloop_source_signal },
+    { "_CFRunLoopSourceInvalidate", cf_runloop_source_invalidate },
+    { "_CFRunLoopSourceIsValid",   cf_runloop_source_is_valid },
+    { "_CFRunLoopWakeUp",          cf_runloop_wake_up },
     { "_CFHTTPMessageCreateRequest",     cf_http_request_create },
     { "_CFReadStreamCreateForHTTPRequest", cf_read_stream_for_http },
     { "_CFReadStreamOpen",  cf_read_stream_open },

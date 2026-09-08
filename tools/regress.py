@@ -138,8 +138,12 @@ def check_dll_reachable(ctx):
     # Reached another way, on purpose, and each says so where it is defined:
     # DirectWrite has its own handle in GetProcAddress, and the Direct2D and
     # Direct3D libraries are deliberately not loadable so a plug-in takes the
-    # software path this host actually draws.
-    exempt = {"dwrite", "d2d1", "d3d11"}
+    # software path this host actually draws. dxgi is the same decision: a
+    # plug-in that asks for it by name must not find it, but one that imports
+    # CreateDXGIFactory from its import table has to be answered with something
+    # that fills the out-parameter, because the generic stub returns S_OK and
+    # leaves it holding an uninitialised pointer.
+    exempt = {"dwrite", "d2d1", "d3d11", "dxgi"}
 
     used = [trim(d) for d in re.findall(r'S\(\s*"([^"]+)"', tbl)]
     used += [trim(d) for d in re.findall(r'\{\s*"([^"]+\.dll)"\s*,', tbl)]

@@ -734,6 +734,31 @@ static void  oc_store_strong(id *loc, id v)
     *loc = v;
 }
 static id oc_alloc(objc_class *cls) { return ns_alloc(cls, "alloc"); }
+
+/* class_createInstance: +alloc without the message send.
+ *
+ * A plug-in that builds its classes at run time allocates through this rather
+ * than through the runtime's own +alloc, and with it missing nothing it made
+ * could be constructed at all -- which is where Arturia's Jup-8 V4 stopped on
+ * macOS, before any of its own code had run.
+ *
+ * The extra bytes a caller asks for are already covered: ns_alloc allocates
+ * the instance size plus a fixed slack, for the reason set out above it, and
+ * that slack is far larger than anything passed here. Asking for more than it
+ * is refused rather than quietly under-allocated. */
+static id oc_class_create_instance(objc_class *cls, size_t extra)
+{
+    if (extra > 256) return NULL;
+    return ns_alloc((id)cls, "alloc");
+}
+
+/* Declaring that a class conforms to a protocol. Nothing here keeps a protocol
+ * list -- conformsToProtocol: answers no for everything -- so this records
+ * nothing and says yes, which is what the caller needs to carry on building
+ * its class. A plug-in that then asks whether the conformance took gets the
+ * same answer it would have got before. */
+static signed char oc_class_add_protocol(objc_class *cls, void *proto)
+{ (void)cls; (void)proto; return 1; }
 static id oc_alloc_init(objc_class *cls) { return ns_alloc(cls, "alloc"); }
 static void oc_enumeration_mutation(id obj)
 { (void)obj; fprintf(stderr, "macho: collection mutated while enumerating\n"); }
@@ -1149,6 +1174,8 @@ const macshim_entry macshim_objc[] = {
     { "_objc_allocateClassPair",   oc_allocate_class_pair },
     { "_objc_registerClassPair",   oc_register_class_pair },
     { "_objc_disposeClassPair",    oc_dispose_class_pair },
+    { "_class_createInstance",     oc_class_create_instance },
+    { "_class_addProtocol",        oc_class_add_protocol },
     { "_class_addMethod",          oc_class_add_method },
     { "_class_addIvar",            oc_class_add_ivar },
     { "_class_getSuperclass",      oc_class_get_superclass },

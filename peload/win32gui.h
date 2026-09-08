@@ -155,6 +155,7 @@ typedef struct {
     char     text[128];
     int      ctl_check;            /* BM_SETCHECK, or the current selection */
     int      ctl_limit;            /* EM_LIMITTEXT, 0 = as much as text holds */
+    int      ctl_selall;           /* EM_SETSEL(0,-1): the next input replaces all */
     int      ctl_id;               /* CreateWindowEx's hMenu, for a child */
     char   (*items)[64];           /* combo box and list box contents */
     int      nitems;
@@ -278,6 +279,7 @@ static struct {
     uint32_t  keys[256];
     int       host;                /* the container we create for the plugin  */
     int       display;             /* the plugin's own window, what we present */
+    int       desktop;             /* the root window GetDesktopWindow names   */
     w32_host_hooks hooks;
     long n_paint, n_getdc, n_beginpaint, n_stretch, n_bitblt, n_timerproc;
     double last_input_ms;          /* when input last arrived, for the valve */
@@ -1328,9 +1330,14 @@ static MS W_LRESULT ctl_static_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPA
  * registration panel down until it reads a valid one out of it, which made an
  * unregistered plug-in indistinguishable from a broken one.
  *
- * A caret and a selection are not modelled: text is appended at the end and
- * backspace takes from the end, which is what entering a serial, a preset name
- * or a value needs. EM_SETSEL is accepted and ignored for the same reason. */
+ * A caret is not modelled: text is appended at the end and backspace takes
+ * from the end, which is what entering a serial, a preset name or a value
+ * needs. One piece of the selection is: EM_SETSEL(0,-1), the select-all a
+ * plug-in sends after putting a prompt in the box, because the next character
+ * typed replaces it. daHornet pre-fills its serial box with
+ * "Enter Serial-Number!", selects all, and the typed key then *is* the text;
+ * appending instead left the prompt glued to the front of the key, and the
+ * validator compared forty-five characters against twenty-five. */
 enum {
     EM_GETSEL = 0x00B0, EM_SETSEL = 0x00B1, EM_REPLACESEL = 0x00C2,
     EM_SETREADONLY = 0x00CF, EM_LIMITTEXT = 0x00C5, EM_SETMARGINS = 0x00D3,
@@ -1390,6 +1397,9 @@ static MS W_LRESULT ctl_edit_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARA
     case WM_PAINT: ctl_paint_edit(w, wi); w->has_update = 0; return 0;
     case WM_CHAR: {
         int ch = (int)(wp & 0xff);
+        if (w->ctl_selall) {            /* typing over a select-all replaces it */
+            w->text[0] = 0; n = 0; w->ctl_selall = 0;
+        }
         if (ch == 8) {                              /* backspace */
             if (n) { w->text[n - 1] = 0; ctl_edit_dirty(w); ctl_edit_notify(w, wi, EN_CHANGE); }
             return 0;
@@ -1407,7 +1417,8 @@ static MS W_LRESULT ctl_edit_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARA
          * front of. Backspace arrives here as well as through WM_CHAR on some
          * paths, and is handled there so it is not taken twice. */
         if (wp == 0x2E && n) {                      /* VK_DELETE */
-            w->text[n - 1] = 0;
+            if (w->ctl_selall) { w->text[0] = 0; n = 0; w->ctl_selall = 0; }
+            else w->text[n - 1] = 0;
             ctl_edit_dirty(w);
             ctl_edit_notify(w, wi, EN_CHANGE);
         }
@@ -1416,6 +1427,7 @@ static MS W_LRESULT ctl_edit_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARA
         w->ctl_limit = (int)wp;
         return 0;
     case EM_REPLACESEL:
+        if (w->ctl_selall) w->ctl_selall = 0;
         snprintf(w->text, sizeof w->text, "%s", lp ? (const char *)(uintptr_t)lp : "");
         ctl_edit_dirty(w);
         ctl_edit_notify(w, wi, EN_CHANGE);
@@ -1427,6 +1439,10 @@ static MS W_LRESULT ctl_edit_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARA
         if (lp) *(uint32_t *)(uintptr_t)lp = (uint32_t)n;
         return (W_LRESULT)((n << 16) | n);
     case EM_SETSEL:
+        /* wp is the start, lp the end; 0,-1 selects everything, which is the
+         * one selection a caller relies on being able to type over. */
+        w->ctl_selall = (wp == 0 && (lp == -1 || lp >= (W_LPARAM)n));
+        return 1;
     case EM_SETMARGINS:
     case EM_SETREADONLY:
         return 1;
@@ -1869,7 +1885,92 @@ static MS int32_t st_SetWindowTextW(void *h, const uint16_t *s) { (void)h;(void)
 static MS int32_t st_BringWindowToTop(void *h) { (void)h; return 1; }
 static MS uint32_t st_GetWindowThreadProcessId(void *h, uint32_t *pid)
 { (void)h; if (pid) *pid = (uint32_t)getpid(); return (uint32_t)(uintptr_t)pthread_self(); }
-static MS int32_t st_EnumWindows(void *fn, intptr_t p) { (void)fn;(void)p; return 1; }
+/* Enumerating windows.
+ *
+ * Both of these answered "nothing here", which for EnumChildWindows is a lie a
+ * plug-in acts on: five of the plug-ins in this corpus walk their own children
+ * that way -- to lay them out, to hide them, to find the one under the pointer
+ * -- and a walk that visits nothing quietly does none of it.
+ *
+ * The callback returns FALSE to stop, and the enumeration is depth-first in
+ * creation order, which is this layer's z-order. */
+typedef int32_t (MS *w32_enumwndproc)(void *hwnd, intptr_t param);
+
+static int w32_enum_children(int parent, w32_enumwndproc fn, intptr_t p)
+{
+    int i;
+    for (i = 1; i < W32_MAX_WND; i++) {
+        if (!W.wnd[i].used || W.wnd[i].parent != parent) continue;
+        if (!fn(w32_h(W32_HWND_BASE, i), p)) return 0;
+        if (!w32_enum_children(i, fn, p)) return 0;
+    }
+    return 1;
+}
+static MS int32_t st_EnumChildWindows(void *hwnd, void *fn, intptr_t p)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    if (!fn) return 0;
+    /* A null parent means the top level, which is the same place EnumWindows
+     * starts from. */
+    return w32_enum_children(w ? (int)(w - W.wnd) : 0, (w32_enumwndproc)fn, p);
+}
+static MS int32_t st_EnumWindows(void *fn, intptr_t p)
+{
+    if (!fn) return 0;
+    return w32_enum_children(0, (w32_enumwndproc)fn, p);
+}
+static MS int32_t st_EnumThreadWindows(uint32_t tid, void *fn, intptr_t p)
+{ (void)tid; return st_EnumWindows(fn, p); }
+
+/* Attaching one thread's input queue to another's. There is one input queue
+ * here and everything is already on it, so what the caller is asking for is the
+ * state it is already in -- and TRUE is the answer that says so. FALSE sent six
+ * plug-ins down a failure path over a call with nothing to do. */
+static MS int32_t st_AttachThreadInput(uint32_t from, uint32_t to, int32_t attach)
+{ (void)from; (void)to; (void)attach; return 1; }
+
+/* Re-parenting, which a plug-in does to move its editor under a host's window.
+ * Returns the previous parent, as Windows does. */
+static MS void *st_SetParent(void *hwnd, void *parent)
+{
+    w32_wnd *w = w32_wget(hwnd), *np;
+    void *prev;
+    if (!w) return NULL;
+    prev = w->parent ? w32_h(W32_HWND_BASE, w->parent) : NULL;
+    np = w32_wget(parent);
+    w->parent = np ? (int)(np - W.wnd) : 0;
+    return prev;
+}
+
+/* The window rectangle for a wanted client rectangle. Everything here is a
+ * child filling its parent, with no border, caption or menu -- the case Windows
+ * answers by leaving the rectangle alone. Returning FALSE, which is what a
+ * stand-in does, tells the caller the size it just computed is unusable. */
+static MS int32_t st_AdjustWindowRectEx(W32RECT *r, uint32_t style, int32_t menu,
+                                        uint32_t exstyle)
+{ (void)style; (void)menu; (void)exstyle; return r ? 1 : 0; }
+static MS int32_t st_AdjustWindowRect(W32RECT *r, uint32_t style, int32_t menu)
+{ return st_AdjustWindowRectEx(r, style, menu, 0); }
+
+/* One keyboard layout. A caller asks how many there are before asking for them,
+ * and zero is not a state a Windows machine is ever in. */
+static MS uint32_t st_GetKeyboardLayoutList(int32_t n, void **out)
+{
+    if (out && n > 0) out[0] = (void *)(uintptr_t)0x04090409;   /* en-US */
+    return 1;
+}
+
+/* Marking a region valid is the other half of InvalidateRgn, and this layer
+ * keeps one update rectangle per window: validating any region validates it. */
+static MS int32_t st_ValidateRgn(void *hwnd, void *rgn)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    (void)rgn;
+    if (!w) return 0;
+    w->has_update = 0;
+    memset(&w->update, 0, sizeof w->update);
+    return 1;
+}
 
 /* A non-negative index is a byte offset into the extra window bytes, and the
  * width is the caller's: SetWindowLong writes four bytes there, the Ptr form
@@ -2028,6 +2129,36 @@ static MS intptr_t st_SendMessageA(void *hwnd, uint32_t msg, uintptr_t wp, intpt
 }
 static MS intptr_t st_SendMessageW(void *h, uint32_t m, uintptr_t w, intptr_t l)
 { return st_SendMessageA(h, m, w, l); }
+
+/* GetWindowText asks the window, which is what Windows does -- the message
+ * lands on the same procedure SendMessage would reach, so a built-in control
+ * answers from its stored text and a plug-in window from its own handler.
+ * daHornet reads its serial box back with exactly this call; handing it a
+ * generated stub instead returned nothing, and the validator compared an
+ * empty string no matter what had been typed. */
+static MS int32_t st_GetWindowTextA(void *hwnd, char *out, int32_t n)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    if (!w || !out || n <= 0) return 0;
+    return (int32_t)w32_call(w, WM_GETTEXT, (uintptr_t)n, (intptr_t)out);
+}
+static MS int32_t st_GetWindowTextLengthA(void *hwnd)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    return w ? (int32_t)w32_call(w, WM_GETTEXTLENGTH, 0, 0) : 0;
+}
+static MS int32_t st_GetWindowTextW(void *hwnd, uint16_t *out, int32_t n)
+{
+    char buf[256];
+    int32_t got, i;
+    if (!out || n <= 0) return 0;
+    got = st_GetWindowTextA(hwnd, buf, (int32_t)sizeof buf < n ? (int32_t)sizeof buf : n);
+    for (i = 0; i < got && i + 1 < n; i++) out[i] = (unsigned char)buf[i];
+    out[i] = 0;
+    return i;
+}
+static MS int32_t st_GetWindowTextLengthW(void *hwnd)
+{ return st_GetWindowTextLengthA(hwnd); }
 
 static void w32_post(void *hwnd, uint32_t msg, uintptr_t wp, intptr_t lp)
 {
@@ -4747,19 +4878,37 @@ static MS void *st_AddFontMemResourceEx(void *p, uint32_t sz, void *r, uint32_t 
     return (void *)0x464F4E54;                  /* 'FONT' */
 }
 static MS int32_t st_RemoveFontMemResourceEx(void *h) { (void)h; return 1; }
+
+/* The family name to enumerate under.
+ *
+ * A plug-in that installed its own font gets that name back, which is how it
+ * discovers what to put in a LOGFONT for it. A plug-in that installed nothing
+ * used to get an empty enumeration -- no font families at all, which is not a
+ * state a Windows machine can be in, and a plug-in that builds its label
+ * drawing around a font it picked from that list then draws no labels. Chord
+ * Organ's panel came out with its knobs and its keyboard and not one word on
+ * it.
+ *
+ * There is exactly one face behind this layer, the FreeType one the text
+ * backend measures and rasterises with, and "Sans" is the name the rest of the
+ * file already gives it (see w32_font_face). Reporting it is both true and
+ * enough. */
+static const char *w32_enum_family(void)
+{ return g_font_family[0] ? g_font_family : "Sans"; }
 static MS int32_t st_EnumFontFamiliesExA(void *dc, void *lf, void *proc, intptr_t p, uint32_t f)
 {
     uint8_t elf[256], ntm[100];
-    PLOG("  [font] EnumFontFamiliesExA proc=%p family='%s'\n", proc, g_font_family);
+    const char *family = w32_enum_family();
+    PLOG("  [font] EnumFontFamiliesExA proc=%p family='%s'\n", proc, family);
     (void)dc; (void)lf; (void)f;
-    if (!proc || !g_font_family[0]) return 0;
+    if (!proc) return 0;
     memset(elf, 0, sizeof elf);
     memset(ntm, 0, sizeof ntm);
     *(int32_t *)(elf + 0)  = -12;
     *(int32_t *)(elf + 16) = 400;
     elf[23] = 1;
-    snprintf((char *)(elf + 28), 32, "%s", g_font_family);      /* LOGFONTA face */
-    snprintf((char *)(elf + 60), 64, "%s", g_font_family);      /* elfFullName   */
+    snprintf((char *)(elf + 28), 32, "%s", family);             /* LOGFONTA face */
+    snprintf((char *)(elf + 60), 64, "%s", family);             /* elfFullName   */
     *(int32_t *)(ntm + 0) = 12;
     *(int32_t *)(ntm + 4) = 10;
     return ((enumfontproc)proc)(elf, ntm, 0x0004, p);
@@ -4778,12 +4927,13 @@ static MS int32_t st_EnumFontsA(void *dc, const char *family, void *proc, intptr
 static MS int32_t st_EnumFontFamiliesExW(void *dc, void *lf, void *proc, intptr_t p, uint32_t f)
 {
     uint8_t elf[348], ntm[100];
+    const char *family = w32_enum_family();
     uint16_t *face;
     int i;
 
-    PLOG("  [font] EnumFontFamiliesExW proc=%p family='%s'\n", proc, g_font_family);
+    PLOG("  [font] EnumFontFamiliesExW proc=%p family='%s'\n", proc, family);
     (void)dc; (void)lf; (void)f;
-    if (!proc || !g_font_family[0]) return 0;
+    if (!proc) return 0;
 
     memset(elf, 0, sizeof elf);
     memset(ntm, 0, sizeof ntm);
@@ -4792,11 +4942,11 @@ static MS int32_t st_EnumFontFamiliesExW(void *dc, void *lf, void *proc, intptr_
     *(int32_t *)(elf + 16) = 400;
     elf[23] = 1;                       /* lfCharSet = DEFAULT_CHARSET */
     face = (uint16_t *)(elf + 28);
-    for (i = 0; g_font_family[i] && i < 31; i++) face[i] = (uint8_t)g_font_family[i];
+    for (i = 0; family[i] && i < 31; i++) face[i] = (uint8_t)family[i];
     face[i] = 0;
     /* elfFullName at +92, elfStyle at +220 */
     { uint16_t *full = (uint16_t *)(elf + 92);
-      for (i = 0; g_font_family[i] && i < 63; i++) full[i] = (uint8_t)g_font_family[i];
+      for (i = 0; family[i] && i < 63; i++) full[i] = (uint8_t)family[i];
       full[i] = 0; }
     { uint16_t *style = (uint16_t *)(elf + 220);
       const char *r = "Regular";
@@ -4828,6 +4978,41 @@ static MS int32_t st_GetTextExtentPoint32A(void *hdc, const char *s, int32_t n,
 static MS int32_t st_GetTextExtentPointA(void *hdc, const char *s, int32_t n,
                                          W32POINT *sz)
 { return st_GetTextExtentPoint32A(hdc, s, n, sz); }
+/* The wide spellings. Only the narrow ones existed, so a plug-in that measures
+ * its labels in UTF-16 -- and the layer's own text is UTF-16 -- was laying out
+ * against a width it had not measured. */
+static MS int32_t st_GetTextExtentPoint32W(void *hdc, const uint16_t *s, int32_t n,
+                                           W32POINT *sz)
+{
+    char b[512];
+    int i;
+    for (i = 0; i < (int)sizeof b - 1 && (n < 0 || i < n) && s && s[i]; i++)
+        b[i] = (char)(s[i] < 0x100 ? s[i] : '?');
+    b[i] = 0;
+    return st_GetTextExtentPoint32A(hdc, b, i, sz);
+}
+static MS int32_t st_GetTextExtentPointW(void *hdc, const uint16_t *s, int32_t n,
+                                         W32POINT *sz)
+{ return st_GetTextExtentPoint32W(hdc, s, n, sz); }
+
+/* No kerning pairs -- the documented answer for a font that has none, and the
+ * true one here: this rasteriser places glyphs by advance alone. */
+static MS uint32_t st_GetKerningPairsW(void *hdc, uint32_t n, void *pairs)
+{ (void)hdc; (void)n; (void)pairs; return 0; }
+static MS uint32_t st_GetKerningPairsA(void *hdc, uint32_t n, void *pairs)
+{ return st_GetKerningPairsW(hdc, n, pairs); }
+/* OUTLINETEXTMETRIC is the extended metrics of a TrueType face, and zero is
+ * what Windows answers for a font that is not one. Every caller falls back to
+ * GetTextMetrics, which this layer does fill in properly -- which makes a
+ * refusal better here than a half-filled structure. */
+static MS uint32_t st_GetOutlineTextMetricsW(void *hdc, uint32_t n, void *otm)
+{ (void)hdc; (void)n; (void)otm; return 0; }
+static MS uint32_t st_GetOutlineTextMetricsA(void *hdc, uint32_t n, void *otm)
+{ return st_GetOutlineTextMetricsW(hdc, n, otm); }
+/* The font mapper's flags: none to change, and the return is what was set
+ * before. */
+static MS uint32_t st_SetMapperFlags(void *hdc, uint32_t flags)
+{ (void)hdc; (void)flags; return 0; }
 
 /* Advance widths, one entry per character in [first, last].
  *
@@ -4962,6 +5147,128 @@ static MS void *st_SetFocus(void *hwnd)
     if (w) w32_call(w, WM_SETFOCUS, (W_WPARAM)(uintptr_t)prev, 0);
     return prev;
 }
+/* Who has the focus, who is active, and the rest of the window-tree queries.
+ *
+ * None of these existed, so every one of them fell through to a stub returning
+ * zero -- and for a function whose return value is a window handle, zero is not
+ * a harmless "nothing to report": it is a null pointer the caller walks. Chord
+ * Organ's editor takes what GetFocus gives it, steps to the object behind the
+ * handle and reads a field at offset 0x20, which is exactly where it faulted.
+ *
+ * NULL is a legal answer on Windows -- GetFocus returns it when no window in
+ * the calling thread has the focus -- but it is not the answer a plug-in editor
+ * ever gets there, because its own window has the focus for as long as anyone
+ * is working in it. The fallback here is the one keyboard input already uses
+ * (see w32_key): whatever holds the focus, else the plug-in's own window, else
+ * the container this host made for it. */
+static int w32_focus_target(void)
+{ return W.focus ? W.focus : (W.display ? W.display : W.host); }
+
+static MS void *st_GetFocus(void)
+{
+    int i = w32_focus_target();
+    return (i > 0 && i < W32_MAX_WND && W.wnd[i].used) ? w32_h(W32_HWND_BASE, i) : NULL;
+}
+/* The active window is the top-level one the focus is inside, and there is one
+ * of those: everything a plug-in makes is a child of the editor container. */
+static MS void *st_GetActiveWindow(void)
+{
+    int i = W.display ? W.display : W.host;
+    return (i > 0 && i < W32_MAX_WND && W.wnd[i].used) ? w32_h(W32_HWND_BASE, i) : NULL;
+}
+static MS void *st_GetForegroundWindow(void) { return st_GetActiveWindow(); }
+static MS void *st_SetActiveWindow(void *hwnd)
+{
+    /* There is one top-level window and it does not stop being the active one;
+     * what a caller wants back is the previous one, which is the same. */
+    void *prev = st_GetActiveWindow();
+    (void)hwnd;
+    return prev;
+}
+static MS int32_t st_SetForegroundWindow(void *hwnd) { (void)hwnd; return 1; }
+static MS void *st_GetLastActivePopup(void *hwnd) { return hwnd; }
+/* No menu bar and no shell, and NULL is what Windows documents for both when
+ * there is none -- an answer rather than an evasion. */
+static MS void *st_GetMenu(void *hwnd) { (void)hwnd; return NULL; }
+static MS void *st_GetShellWindow(void) { return NULL; }
+
+/* Walking the tree. Children are not kept in a list; they are found by their
+ * parent index, and index order is creation order, which is the z-order this
+ * layer has. */
+enum {
+    W_GW_HWNDFIRST = 0, W_GW_HWNDLAST = 1, W_GW_HWNDNEXT = 2,
+    W_GW_HWNDPREV  = 3, W_GW_OWNER    = 4, W_GW_CHILD    = 5
+};
+static MS void *st_GetWindow(void *hwnd, uint32_t cmd)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    int me, parent, i;
+
+    if (!w) return NULL;
+    me = (int)(w - W.wnd);
+    parent = w->parent;
+    switch (cmd) {
+    case W_GW_OWNER:
+        return (parent > 0 && W.wnd[parent].used) ? w32_h(W32_HWND_BASE, parent) : NULL;
+    case W_GW_CHILD:
+        for (i = 1; i < W32_MAX_WND; i++)
+            if (W.wnd[i].used && W.wnd[i].parent == me)
+                return w32_h(W32_HWND_BASE, i);
+        return NULL;
+    case W_GW_HWNDNEXT:
+        for (i = me + 1; i < W32_MAX_WND; i++)
+            if (W.wnd[i].used && W.wnd[i].parent == parent)
+                return w32_h(W32_HWND_BASE, i);
+        return NULL;
+    case W_GW_HWNDPREV:
+        for (i = me - 1; i >= 1; i--)
+            if (W.wnd[i].used && W.wnd[i].parent == parent)
+                return w32_h(W32_HWND_BASE, i);
+        return NULL;
+    case W_GW_HWNDFIRST:
+        for (i = 1; i < W32_MAX_WND; i++)
+            if (W.wnd[i].used && W.wnd[i].parent == parent)
+                return w32_h(W32_HWND_BASE, i);
+        return NULL;
+    case W_GW_HWNDLAST:
+        for (i = W32_MAX_WND - 1; i >= 1; i--)
+            if (W.wnd[i].used && W.wnd[i].parent == parent)
+                return w32_h(W32_HWND_BASE, i);
+        return NULL;
+    default:
+        return NULL;
+    }
+}
+static MS void *st_GetTopWindow(void *hwnd)
+{ return st_GetWindow(hwnd ? hwnd : st_GetActiveWindow(), W_GW_CHILD); }
+
+/* A control by its identifier -- the hMenu argument CreateWindowEx was given
+ * for a child, which this layer already keeps as ctl_id. A plug-in that builds
+ * its panel out of standard controls reaches every one of them through this
+ * and its message-sending pair. */
+static MS void *st_GetDlgItem(void *hwnd, int32_t id)
+{
+    w32_wnd *w = w32_wget(hwnd);
+    int me, i;
+    if (!w) return NULL;
+    me = (int)(w - W.wnd);
+    for (i = 1; i < W32_MAX_WND; i++)
+        if (W.wnd[i].used && W.wnd[i].parent == me && W.wnd[i].ctl_id == id)
+            return w32_h(W32_HWND_BASE, i);
+    return NULL;
+}
+static MS int32_t st_GetDlgCtrlID(void *hwnd)
+{ w32_wnd *w = w32_wget(hwnd); return w ? w->ctl_id : 0; }
+static MS intptr_t st_SendDlgItemMessageA(void *hwnd, int32_t id, uint32_t msg,
+                                          uintptr_t wp, intptr_t lp)
+{
+    void *item = st_GetDlgItem(hwnd, id);
+    return item ? st_SendMessageA(item, msg, wp, lp) : 0;
+}
+static MS intptr_t st_SendDlgItemMessageW(void *hwnd, int32_t id, uint32_t msg,
+                                          uintptr_t wp, intptr_t lp)
+{ return st_SendDlgItemMessageA(hwnd, id, msg, wp, lp); }
+
 static MS int32_t st_GetCursorPos(W32POINT *p)
 { w32_pump_input(); if (p) { p->x = W.mouse_x; p->y = W.mouse_y; } return 1; }
 static MS int32_t st_SetCursorPos(int32_t x, int32_t y) { W.mouse_x = x; W.mouse_y = y; return 1; }
@@ -5047,8 +5354,40 @@ static MS int32_t st_GetSystemMetrics(int32_t i)
     default: return 0;
     }
 }
+/* SystemParametersInfo, for the handful of queries an editor makes.
+ *
+ * The old body zeroed four bytes whatever was asked, which is right for the
+ * queries whose answer is one DWORD and wrong for every other: uiParam is the
+ * size of the caller's structure, and leaving the rest of it as whatever was on
+ * the stack is how a plug-in ends up drawing with a font height of several
+ * million. Zeroing all of it -- keeping the cbSize field the caller filled in,
+ * which is how NONCLIENTMETRICS says how big it is -- gives defaults instead of
+ * noise. The two queries with a real answer here get one. */
 static MS int32_t st_SystemParametersInfoW(uint32_t a, uint32_t b, void *p, uint32_t f)
-{ (void)a;(void)b;(void)f; if (p) memset(p, 0, 4); return 1; }
+{
+    (void)f;
+    if (!p) return 1;
+    switch (a) {
+    case 0x0030:                                    /* SPI_GETWORKAREA */
+        { W32RECT *r = (W32RECT *)p;
+          r->left = r->top = 0;
+          r->right = st_GetSystemMetrics(0); r->bottom = st_GetSystemMetrics(1);
+          return 1; }
+    case 0x0068:                                    /* SPI_GETWHEELSCROLLLINES */
+    case 0x006C:                                    /* SPI_GETWHEELSCROLLCHARS */
+        *(uint32_t *)p = 3;                         /* the Windows default */
+        return 1;
+    default:
+        if (b >= 4 && b <= 4096) {
+            uint32_t cbsize = *(uint32_t *)p;       /* the caller's own struct size */
+            memset(p, 0, b);
+            if (a == 0x0029 || a == 0x002A) *(uint32_t *)p = cbsize;  /* {GET,SET}NONCLIENTMETRICS */
+        } else memset(p, 0, 4);
+        return 1;
+    }
+}
+static MS int32_t st_SystemParametersInfoA(uint32_t a, uint32_t b, void *p, uint32_t f)
+{ return st_SystemParametersInfoW(a, b, p, f); }
 static MS int32_t st_MessageBoxA(void *h, const char *t, const char *c, uint32_t f)
 { (void)h;(void)f; fprintf(stderr, "[plugin] %s: %s\n", c ? c : "", t ? t : ""); return 1; }
 static MS int32_t st_MessageBoxW(void *h, const uint16_t *t, const uint16_t *c, uint32_t f)
@@ -5105,12 +5444,116 @@ static MS int32_t st_EmptyClipboard(void) { return 1; }
 static MS void *st_GetClipboardData(uint32_t f) { (void)f; return NULL; }
 static MS void *st_SetClipboardData(uint32_t f, void *h) { (void)f; return h; }
 static MS int32_t st_IsClipboardFormatAvailable(uint32_t f) { (void)f; return 0; }
-static MS void *st_CreatePopupMenu(void) { return (void *)0x4D454E55; }
+/* Menus: built, never shown, and consistent about it.
+ *
+ * A menu was one shared token handle and every call against it was accepted and
+ * ignored -- which is fine until a plug-in builds a menu and then asks about it.
+ * It appends five items and GetMenuItemCount says none, and the code that walks
+ * them to set a check mark or find the selected one does nothing, silently.
+ * Real handles and a count of what went in cost forty lines and make the
+ * answers agree with each other.
+ *
+ * Nothing is ever displayed: TrackPopupMenu returns "nothing chosen", which is
+ * what a user who dismissed the menu would have caused. */
+#define W32_MAX_MENU 32
+static struct { int used, items; } g_menus[W32_MAX_MENU];
+#define W32_HMENU_BASE 0x004D0000u              /* 'M' */
+
+static void *w32_menu_new(void)
+{
+    int i;
+    for (i = 1; i < W32_MAX_MENU; i++)
+        if (!g_menus[i].used) {
+            g_menus[i].used = 1;
+            g_menus[i].items = 0;
+            return (void *)(uintptr_t)(W32_HMENU_BASE | (unsigned)i);
+        }
+    return NULL;
+}
+static int w32_menu_idx(void *m)
+{
+    uintptr_t v = (uintptr_t)m;
+    int i = (int)(v & 0xFFFF);
+    if ((v & ~(uintptr_t)0xFFFF) != W32_HMENU_BASE) return 0;
+    return (i > 0 && i < W32_MAX_MENU && g_menus[i].used) ? i : 0;
+}
+static MS void *st_CreatePopupMenu(void) { return w32_menu_new(); }
+static MS void *st_CreateMenu(void) { return w32_menu_new(); }
 static MS int32_t st_AppendMenuA(void *m, uint32_t f, uintptr_t id, const char *s)
-{ (void)m;(void)f;(void)id;(void)s; return 1; }
+{
+    int i = w32_menu_idx(m);
+    (void)f; (void)id; (void)s;
+    if (!i) return 0;
+    g_menus[i].items++;
+    return 1;
+}
 static MS int32_t st_AppendMenuW(void *m, uint32_t f, uintptr_t id, const uint16_t *s)
-{ (void)m;(void)f;(void)id;(void)s; return 1; }
-static MS int32_t st_DestroyMenu(void *m) { (void)m; return 1; }
+{ (void)s; return st_AppendMenuA(m, f, id, NULL); }
+static MS int32_t st_InsertMenuItemA(void *m, uint32_t pos, int32_t bypos, const void *info)
+{ (void)pos; (void)bypos; (void)info; return st_AppendMenuA(m, 0, 0, NULL); }
+static MS int32_t st_InsertMenuItemW(void *m, uint32_t pos, int32_t bypos, const void *info)
+{ return st_InsertMenuItemA(m, pos, bypos, info); }
+static MS int32_t st_InsertMenuA(void *m, uint32_t pos, uint32_t f, uintptr_t id, const char *s)
+{ (void)pos; (void)s; return st_AppendMenuA(m, f, id, NULL); }
+static MS int32_t st_InsertMenuW(void *m, uint32_t pos, uint32_t f, uintptr_t id, const uint16_t *s)
+{ (void)pos; (void)s; return st_AppendMenuA(m, f, id, NULL); }
+/* -1 for a handle that is not a menu, which is what the documentation says and
+ * what a caller loops against. */
+static MS int32_t st_GetMenuItemCount(void *m)
+{ int i = w32_menu_idx(m); return i ? g_menus[i].items : -1; }
+static MS uint32_t st_GetMenuItemID(void *m, int32_t pos)
+{ (void)m; (void)pos; return 0xFFFFFFFFu; }     /* not a command item */
+/* The item exists in the count and nowhere else, so nothing can be reported
+ * about it. FALSE is the answer for an item that is not there. */
+static MS int32_t st_GetMenuItemInfoA(void *m, uint32_t item, int32_t bypos, void *info)
+{ (void)m; (void)item; (void)bypos; (void)info; return 0; }
+static MS int32_t st_GetMenuItemInfoW(void *m, uint32_t item, int32_t bypos, void *info)
+{ return st_GetMenuItemInfoA(m, item, bypos, info); }
+static MS int32_t st_SetMenuItemInfoA(void *m, uint32_t item, int32_t bypos, const void *info)
+{ (void)item; (void)bypos; (void)info; return w32_menu_idx(m) ? 1 : 0; }
+static MS int32_t st_SetMenuItemInfoW(void *m, uint32_t item, int32_t bypos, const void *info)
+{ return st_SetMenuItemInfoA(m, item, bypos, info); }
+static MS int32_t st_GetMenuInfo(void *m, void *info)
+{ (void)info; return w32_menu_idx(m) ? 1 : 0; }
+static MS int32_t st_SetMenuInfo(void *m, const void *info)
+{ (void)info; return w32_menu_idx(m) ? 1 : 0; }
+static MS int32_t st_SetMenu(void *hwnd, void *m)
+{ (void)hwnd; (void)m; return 1; }
+static MS int32_t st_DestroyMenu(void *m)
+{
+    int i = w32_menu_idx(m);
+    if (!i) return 0;
+    g_menus[i].used = 0;
+    return 1;
+}
+
+/* The caret does not blink here because there is no caret; 530 ms is the
+ * Windows default, and a caller that uses it as a timer period wants a number
+ * rather than zero -- which is "the caret does not blink" and, in some code,
+ * a divisor. */
+static MS uint32_t st_GetCaretBlinkTime(void) { return 530; }
+/* Bumped by nothing, because nothing changes the clipboard here -- but a caller
+ * comparing it against the last value it saw needs it not to be zero, which is
+ * the documented "you do not have access" answer. */
+static MS uint32_t st_GetClipboardSequenceNumber(void) { return 1; }
+/* No icons in this image as far as this goes: zero extracted, which is what a
+ * caller checks before using the array it passed. */
+static MS uint32_t st_PrivateExtractIconsW(const uint16_t *file, int32_t idx,
+                                           int32_t cx, int32_t cy, void **icons,
+                                           uint32_t *ids, uint32_t n, uint32_t flags)
+{
+    (void)file; (void)idx; (void)cx; (void)cy; (void)n; (void)flags;
+    if (icons) icons[0] = NULL;
+    if (ids) ids[0] = 0;
+    return 0;
+}
+static MS uint32_t st_PrivateExtractIconsA(const char *file, int32_t idx,
+                                           int32_t cx, int32_t cy, void **icons,
+                                           uint32_t *ids, uint32_t n, uint32_t flags)
+{
+    (void)file;
+    return st_PrivateExtractIconsW(NULL, idx, cx, cy, icons, ids, n, flags);
+}
 static MS int32_t st_TrackPopupMenu(void *m, uint32_t f, int32_t x, int32_t y,
                                    int32_t r, void *h, const void *rc)
 { (void)m;(void)f;(void)x;(void)y;(void)r;(void)h;(void)rc; return 0; }
@@ -5153,6 +5596,39 @@ void w32_set_input_pump(void (*fn)(void *), void *ud)
 
 /* The container an editor is parented to. Created on demand so a plugin that is
  * never shown pays nothing. */
+/* The desktop window.
+ *
+ * GetDesktopWindow returned NULL, and on Windows it cannot: it is the root of
+ * the window tree and it is always there. A plug-in takes the handle and hands
+ * it to something -- a monitor lookup, a rectangle query, a parent for a
+ * transient window -- and code written against Windows does not check it,
+ * because on Windows there is nothing to check. Chord Organ passes it straight
+ * into a lookup that returns nothing for a null handle and reads a field off
+ * the result, which faults at 0x20 the first time the editor is clicked.
+ *
+ * So there is a window: the size of the screen this host reports, at the
+ * origin, with no window procedure and nothing ever dispatched to it. Its class
+ * is the name Windows uses for the real one, since a plug-in that asks is
+ * asking about the desktop rather than about us. */
+void *w32_desktop_window(void)
+{
+    void *hwnd;
+    if (W.desktop && W.wnd[W.desktop].used)
+        return w32_h(W32_HWND_BASE, W.desktop);
+    {
+        W32WNDCLASSA c;
+        memset(&c, 0, sizeof c);
+        c.lpszClassName = "#32769";
+        c.lpfnWndProc = NULL;
+        st_RegisterClassA(&c);
+    }
+    hwnd = w32_create("#32769", NULL, 0, 0,
+                      st_GetSystemMetrics(0), st_GetSystemMetrics(1),
+                      NULL, NULL, 0, 0);
+    W.desktop = w32_i(W32_HWND_BASE, hwnd);
+    return hwnd;
+}
+
 void *w32_create_host_window(int w, int h)
 {
     void *hwnd;
@@ -5368,7 +5844,7 @@ void w32_reset(void)
     for (i = 1; i < W32_MAX_CLS; i++) W.cls[i].used = 0;
     W.qhead = W.qtail = 0;
     W.host = W.display = 0;
-    W.capture = W.focus = 0;
+    W.capture = W.focus = W.desktop = 0;
     dw_reset();
 }
 

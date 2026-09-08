@@ -9,6 +9,11 @@
 #include "pehost.h"
 #include "patch.h"
 #include "win32host.h"
+#include "hostfault.h"
+#include "hostprof.h"
+#ifdef PELOAD_LIVE
+#include "live.h"
+#endif
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -47,6 +52,11 @@ typedef struct {
     /* The host runs at 256; matching it here is what reproduces a plugin that
      * only misbehaves under the block size it will actually be given. */
     int         block;
+    /* Live mode: play the plug-in from a MIDI port instead of rendering a
+     * file. `sink` names where the audio goes; without one the graph decides. */
+    int         play;
+    const char *midi_from;
+    const char *sink;
     /* --click X,Y, repeatable. See the click loop in the editor capture. */
     struct { int x, y; } click[MAX_CLICKS];
     int         nclick;
@@ -194,6 +204,9 @@ static void usage(void)
        "                                   whether a control tracked the sweep\n"
        "              [--type TEXT]        type it into whatever the clicks focused\n"
         "              [--block N]          frames per block (default 512)\n"
+              "              [--play]             play live: MIDI in, audio out\n"
+              "              [--midi CLIENT:PORT] connect that MIDI port to it\n"
+              "              [--sink NAME]        send the audio to that sink\n"
         "\n"
         "A bank names the plugin it was written for, so `peload bank.json`\n"
         "opens that plugin with the patch already applied.\n");
@@ -235,6 +248,9 @@ static int parse_args(int argc, char **argv, opts *o)
                 o->click[o->nclick].x = cx; o->click[o->nclick].y = cy; o->nclick++;
             }
         }
+        else if (!strcmp(argv[i], "--play"))                     o->play = 1;
+        else if (!strcmp(argv[i], "--midi") && i + 1 < argc)     o->midi_from = argv[++i];
+        else if (!strcmp(argv[i], "--sink") && i + 1 < argc)     o->sink = argv[++i];
         else if (!strcmp(argv[i], "--block") && i + 1 < argc)    o->block = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--patch") && i + 1 < argc)    o->patch_in  = argv[++i];
         else if (!strcmp(argv[i], "--save-patch") && i + 1 < argc)
@@ -736,6 +752,10 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
 
 int main(int argc, char **argv)
 {
+    /* Before anything the plug-in can reach: a fault inside a shim should
+     * name the shim rather than leave a core file. */
+    hostfault_install();
+    hostprof_start();      /* PELOAD_PROFILE=1 */
     opts        o;
     patch_bank *bank = NULL;
     int         patch_ix = 0, rc;
@@ -789,6 +809,20 @@ int main(int argc, char **argv)
      * here. With one, the state worth saving is the one the gesture produced;
      * writing it first saved the values the user had just moved away from, and
      * said nothing about having done so. */
+    /* Live mode instead of a render: it does not finish on its own, so
+     * everything below it would never run. */
+    if (o.play) {
+#ifdef PELOAD_LIVE
+        int r = live_run(h, RATE, o.block > 0 ? o.block : 512, o.midi_from, o.sink);
+        pehost_close(h);
+        return r;
+#else
+        fprintf(stderr, "this build has no live mode: it needs libpipewire-0.3 "
+                        "and alsa at build time\n");
+        pehost_close(h);
+        return 2;
+#endif
+    }
     {
         const int gestured = o.shot && (o.nclick || o.has_drag);
         if (!gestured) save_patch_out(h, &o);
@@ -815,6 +849,7 @@ int main(int argc, char **argv)
      * Cardinal does -- long after the render is safely written. Exiting this
      * way keeps the status code meaningful instead of reporting a crash for
      * work that completed. */
+    hostprof_report();
     fflush(NULL);
     _exit(0);
 }

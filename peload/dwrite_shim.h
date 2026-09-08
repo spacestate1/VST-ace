@@ -1194,13 +1194,81 @@ static FT_Face    g_ftface;
 static void dw_font_changed(void)
 { if (g_ftface) { FT_Done_Face(g_ftface); g_ftface = NULL; } }
 
+/* A face to draw with when the plug-in did not bring one.
+ *
+ * Every text path in this tree -- GDI's TextOut, GDI+'s DrawString, the
+ * DirectWrite shim's glyph runs -- ends at dw_ftface(), and that returned NULL
+ * unless the plug-in had installed a font of its own through
+ * AddFontMemResourceEx. A plug-in that simply asks for the system font, which
+ * is most of them, therefore drew no text at all: not an error, not a warning,
+ * just a panel with its knobs and its keyboard and not one word on it. Chord
+ * Organ is one; so is anything else that calls CreateFontIndirect and expects
+ * the machine to have fonts on it.
+ *
+ * Windows always has a font. So does every machine this runs on, and the point
+ * is to find one without taking on fontconfig as a dependency for it: a short
+ * list of the paths the usual families live at on the distributions this
+ * packages for, and PELOAD_FONT to override when someone wants a particular
+ * one. Opened once and kept; the plug-in's own font still wins, because
+ * installing one drops the cached face and this is only consulted when there
+ * is nothing better. */
+static FT_Face dw_fallback_face(void)
+{
+    static const char *const paths[] = {
+        NULL,                                              /* PELOAD_FONT */
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",             /* Arch        */
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", /* Debian      */
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",          /* Fedora      */
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/liberation-fonts/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/gnu-free/FreeSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
+    };
+    static FT_Face face;
+    static int tried;
+    size_t i;
+
+    if (face || tried) return face;
+    tried = 1;
+    if (!g_ft && FT_Init_FreeType(&g_ft)) return NULL;
+    for (i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        const char *p = i ? paths[i] : getenv("PELOAD_FONT");
+        if (!p || !*p) continue;
+        if (FT_New_Face(g_ft, p, 0, &face) == 0 && face) {
+            PLOG("  [dwrite] no font from the plug-in; drawing with %s\n", p);
+            return face;
+        }
+        face = NULL;
+    }
+    fprintf(stderr, "  [dwrite] no usable font found on this machine -- text "
+                    "will not be drawn (set PELOAD_FONT to a .ttf to fix it)\n");
+    return NULL;
+}
+
+/* Every text path in this tree ends here, which makes it the one place worth
+ * saying "there is no font" from: a caller that gets NULL draws nothing and
+ * reports success, and without this the only sign is a panel with no words on
+ * it. See w32_gap_hit. */
 static FT_Face dw_ftface(void)
 {
     if (g_ftface) return g_ftface;
-    if (!g_font_bytes || !g_font_size) return NULL;
-    if (!g_ft && FT_Init_FreeType(&g_ft)) return NULL;
+    if (!g_font_bytes || !g_font_size) {
+        FT_Face f = dw_fallback_face();
+        if (!f) W32_GAP("text was drawn with no font available, so none appeared");
+        return f;
+    }
+    if (!g_ft && FT_Init_FreeType(&g_ft)) {
+        W32_GAP("FreeType would not start, so no text was drawn");
+        return NULL;
+    }
     if (FT_New_Memory_Face(g_ft, g_font_bytes, (FT_Long)g_font_size, 0, &g_ftface)) {
         g_ftface = NULL;
+        W32_GAP("the plug-in's own font would not open, so no text was drawn");
         return NULL;
     }
     PLOG("  [dwrite] FreeType opened '%s' (%ld glyphs, %d upem)\n",

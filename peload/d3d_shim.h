@@ -176,6 +176,33 @@ static dwprobe *dxgi_adapter(void)
     }
     return o;
 }
+/* Enumerating adapters, and why the answer has to be this exact one.
+ *
+ * A caller walks the adapters by asking for 0, 1, 2 ... and stops when it is
+ * told DXGI_ERROR_NOT_FOUND. That is the only thing it stops on: the loop in
+ * JUCE 8 is `while (factory->EnumAdapters(i++, &a) != DXGI_ERROR_NOT_FOUND)`,
+ * so the unimplemented-slot answer of E_NOTIMPL means it never leaves -- and it
+ * does not crash or slow down either, it simply spins on a core inside the
+ * plug-in's own editor construction, which looks like a plug-in that is taking
+ * a long time to open.
+ *
+ * There is no adapter here, so the true count is zero and the first call is
+ * already past the end. */
+#define DXGI_ERROR_NOT_FOUND 0x887A0002u
+static MS int32_t dxgi_EnumAdapters(void *self, uint32_t idx, void **out)
+{
+    (void)self; (void)idx;
+    if (out) *out = NULL;
+    return (int32_t)DXGI_ERROR_NOT_FOUND;
+}
+/* IsCurrent: whether the adapter list has changed since the factory was made.
+ * It has not, and it never will. */
+static MS int32_t dxgi_IsCurrent(void *self) { (void)self; return 1; }
+/* MakeWindowAssociation takes the Alt-Enter handling off DXGI's hands, which
+ * is exactly what a plug-in editor wants and costs nothing to agree to. */
+static MS int32_t dxgi_MakeWindowAssociation(void *self, void *hwnd, uint32_t flags)
+{ (void)self; (void)hwnd; (void)flags; return D3D_OK; }
+
 static dwprobe *dxgi_factory(void)
 {
     static dwprobe *o;
@@ -183,6 +210,11 @@ static dwprobe *dxgi_factory(void)
         dwp_set(o, 0,  (void *)dxgi_qi_self);
         dwp_set(o, 1,  (void *)d3d_addref);
         dwp_set(o, 2,  (void *)d3d_release);
+        dwp_set(o, 6,  (void *)dxgi_GetParent);
+        dwp_set(o, 7,  (void *)dxgi_EnumAdapters);          /* IDXGIFactory   */
+        dwp_set(o, 8,  (void *)dxgi_MakeWindowAssociation);
+        dwp_set(o, 12, (void *)dxgi_EnumAdapters);          /* ...1: same answer */
+        dwp_set(o, 13, (void *)dxgi_IsCurrent);
         dwp_set(o, 15, (void *)dxgi_CreateSwapChainForHwnd);
     }
     return o;
@@ -306,6 +338,43 @@ static dwprobe *d3d_device(void)
 
 /* D3D11CreateDevice(adapter, driverType, software, flags, featureLevels,
  *                   nLevels, sdkVersion, ppDevice, pFeatureLevel, ppContext) */
+/* CreateDXGIFactory, and why a plug-in that never asked for Direct3D needs it.
+ *
+ * JUCE 8 reaches its Direct2D renderer through DXGI: it makes a factory, then a
+ * device, then a swap chain, and only if the first of those fails does it fall
+ * back to the software path this host actually draws with. The factory it makes
+ * here is the one d3d_shim.h already models for exactly that chain.
+ *
+ * What it must not be is the generic stub. That returns zero -- which is S_OK
+ * -- without writing the out-parameter, so the caller reads an uninitialised
+ * pointer as a live COM object and calls through its vtable. ChowMultiTool's
+ * editor died on the first call after this one, with no sign of where. */
+#define DXGI_ERROR_UNSUPPORTED 0x887A0004u
+static MS int32_t st_CreateDXGIFactory(const uint8_t *iid, void **out)
+{
+    char b[64];
+    if (!out) return D3D_NOTIMPL;
+    /* Refused, deliberately, and with a status the caller has a path for.
+     *
+     * dxgi is in g_absentdlls for a reason a plug-in that loads it by name
+     * already benefits from: there is no Direct3D under this host, and the
+     * software renderer a plug-in falls back to is the one that draws here. A
+     * static import cannot be refused the same way -- it has to resolve to
+     * something -- so it resolves to this, which says the same thing.
+     *
+     * Handing back the factory d3d_shim.h models was tried and is worse: JUCE
+     * takes the whole Direct2D path from it, swap chain and all, and stops
+     * inside it. Refusing at the first step is what puts it on the path this
+     * host can finish. */
+    *out = dxgi_factory();
+    PLOG("  [d3d] CreateDXGIFactory(%s) -> %p\n", d3d_guid(iid, b, sizeof b), *out);
+    return *out ? D3D_OK : (int32_t)DXGI_ERROR_UNSUPPORTED;
+}
+static MS int32_t st_CreateDXGIFactory1(const uint8_t *iid, void **out)
+{ return st_CreateDXGIFactory(iid, out); }
+static MS int32_t st_CreateDXGIFactory2(uint32_t flags, const uint8_t *iid, void **out)
+{ (void)flags; return st_CreateDXGIFactory(iid, out); }
+
 static MS int32_t st_D3D11CreateDevice(void *adapter, int32_t driver, void *sw,
                                        uint32_t flags, const uint32_t *levels,
                                        uint32_t nlevels, uint32_t sdk,

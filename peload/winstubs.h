@@ -50,6 +50,19 @@ typedef struct { const char *dll, *sym; void *fn; } winstub;
 #define MSTHIS MS
 #endif
 
+/* The stdcall argument-byte count per Win32 export, generated from the
+ * mingw-w64 import libraries by tools/gen_arity.py.
+ *
+ * i386 needs it to build a stub that pops the right number of bytes. Both
+ * widths need it for a second thing: it is the only list here of what the real
+ * libraries actually export, and "is this a genuine export?" is the question
+ * that keeps a stand-in from being invented for a name no Windows ever had.
+ * Including it here rather than in pe32.c alone is what makes the two loaders
+ * answer the same question the same way. */
+#include "win32_arity.h"
+/* ...and what an ordinal import is a number for. */
+#include "win32_ordinals.h"
+
 #include "mscxxeh.h"
 
 #define PLOG(...) do { if (pe_verbose()) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -211,10 +224,47 @@ static void w32_placeholder_hit(const char *name)
 /* The st_ prefix is not part of the Win32 name. */
 #define W32_APPROX() w32_placeholder_hit(__func__ + 3)
 
+/* ...and the calls that did nothing at all.
+ *
+ * An approximation draws something not quite right. This is the other kind of
+ * gap, and the worse one to find: the call is accepted, reports success, and
+ * produces nothing -- so the only evidence is a part of the picture that is not
+ * there, and nothing to search for. Every text draw in this tree used to end
+ * that way when no font had been installed, and a plug-in's panel came out with
+ * its knobs, its keyboard and none of its words on it. Nothing said so.
+ *
+ * Recorded by reason rather than by function name, because the reason is the
+ * part a reader can act on, and reported beside the approximations. */
+#define W32_MAX_GAP 16
+static struct { const char *why; unsigned hits; } g_gap[W32_MAX_GAP];
+static int g_ngap;
+
+static void w32_gap_hit(const char *why)
+{
+    int i;
+    for (i = 0; i < g_ngap; i++)
+        if (g_gap[i].why == why) { g_gap[i].hits++; return; }
+    if (g_ngap >= W32_MAX_GAP) return;
+    g_gap[g_ngap].why = why;
+    g_gap[g_ngap].hits = 1;
+    g_ngap++;
+    /* Said the first time, not only in the summary: this one is the difference
+     * between a picture that is wrong and a picture that is missing, and a run
+     * that never reaches the summary should still have said it. */
+    fprintf(stderr, "  [gap] %s\n", why);
+}
+#define W32_GAP(why) w32_gap_hit(why)
+
 void w32_placeholders_report(void);
 void w32_placeholders_report(void)
 {
     int i;
+    if (g_ngap) {
+        fprintf(stderr, "  [gap] %d thing(s) were asked for and not done:", g_ngap);
+        for (i = 0; i < g_ngap; i++)
+            fprintf(stderr, " %s(%u)", g_gap[i].why, g_gap[i].hits);
+        fputc('\n', stderr);
+    }
     if (!g_nplaceholder) return;
     fprintf(stderr, "  [approx] %d approximated call(s) were reached:", g_nplaceholder);
     for (i = 0; i < g_nplaceholder; i++)
@@ -536,27 +586,181 @@ static MS int32_t st_HeapSetInformation(void *a, int b, void *c, size_t d)
 static MS int32_t st_HeapValidate(void *a, uint32_t b, const void *c)
 { (void)a;(void)b;(void)c; return 1; }
 
+/* PAGE_* to mprotect bits.
+ *
+ * The eight values are a small enumeration, not a bit field -- PAGE_READWRITE
+ * is 0x04 and PAGE_EXECUTE_READ is 0x20, and neither contains the other -- but
+ * the modifier flags above them are: PAGE_GUARD (0x100), PAGE_NOCACHE (0x200)
+ * and PAGE_WRITECOMBINE (0x400) ride along on top. Comparing the whole value
+ * against each constant therefore reads PAGE_EXECUTE_READ|PAGE_NOCACHE as
+ * "none of these" and hands back read-only, which is how a page of code stops
+ * being executable. Mask first, then decide. */
+static int w32_prot_bits(uint32_t prot)
+{
+    switch (prot & 0xFF) {
+    case 0x01: return PROT_NONE;                            /* NOACCESS       */
+    case 0x02: return PROT_READ;                            /* READONLY       */
+    case 0x04: case 0x08: return PROT_READ | PROT_WRITE;    /* READWRITE, WRITECOPY */
+    case 0x10: case 0x20: return PROT_READ | PROT_EXEC;     /* EXECUTE, EXECUTE_READ */
+    case 0x40: case 0x80: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    default:   return PROT_READ;
+    }
+}
+
+/* ...and back, for the "previous protection" a caller is given to restore.
+ *
+ * This is not a formality. A packer's unwrap stub makes a section writable,
+ * writes it, and puts it back the way it found it -- using exactly this value.
+ * Answering PAGE_READWRITE no matter what was there told UPX that the original
+ * code section had been writable and non-executable, so it dutifully restored
+ * it to that, and the plug-in faulted on the instruction fetch the next time
+ * anything called into the first page of its own .text. */
+static uint32_t w32_prot_from_bits(int r, int w, int x)
+{
+    if (!r && !w && !x) return 0x01;                        /* NOACCESS       */
+    if (x) return w ? 0x40 : 0x20;                          /* EXECUTE_READ{WRITE} */
+    return w ? 0x04 : 0x02;                                 /* READ{WRITE,ONLY}    */
+}
+
+/* What the kernel says about an address. The two callers below are rare enough
+ * -- a packer unwrapping itself, a runtime sizing its own stack -- that reading
+ * /proc/self/maps is cheaper than keeping a shadow copy of it that could drift.
+ * One-entry cache, because both of them ask about the same region repeatedly. */
+static __thread uintptr_t g_region_lo, g_region_hi;
+static __thread uint32_t  g_region_prot;
+static void w32_region_forget(void) { g_region_lo = g_region_hi = 0; }
+
+static int w32_region_of(const void *a, uintptr_t *lo, uintptr_t *hi, uint32_t *prot)
+{
+#define c_lo   g_region_lo
+#define c_hi   g_region_hi
+#define c_prot g_region_prot
+    uintptr_t v = (uintptr_t)a;
+    FILE *f;
+    char line[256];
+    int found = 0;
+
+    if (c_hi && v >= c_lo && v < c_hi) {
+        *lo = c_lo; *hi = c_hi; *prot = c_prot;
+        return 1;
+    }
+    if (!(f = fopen("/proc/self/maps", "r"))) return 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long l, h;
+        char perm[8];
+        if (sscanf(line, "%llx-%llx %7s", &l, &h, perm) != 3) continue;
+        if (v < (uintptr_t)l || v >= (uintptr_t)h) continue;
+        *lo = c_lo = (uintptr_t)l;
+        *hi = c_hi = (uintptr_t)h;
+        *prot = c_prot = w32_prot_from_bits(perm[0] == 'r', perm[1] == 'w', perm[2] == 'x');
+        found = 1;
+        break;
+    }
+    fclose(f);
+    return found;
+#undef c_lo
+#undef c_hi
+#undef c_prot
+}
+
+/* The page range mprotect has to be given for a request of `sz` bytes at `a`.
+ *
+ * Rounding the address down and then adding 0xFFF to the length is off by up to
+ * a page: the bytes lost to the alignment are still counted, and the kernel
+ * rounds the total up again. VirtualProtect(base, 0x1000) then covered two
+ * pages instead of one, which is how protecting a DLL's headers also stripped
+ * execute from the first page of the section behind them. */
+static void w32_page_range(const void *a, size_t sz, uintptr_t *lo, size_t *len)
+{
+    uintptr_t start = (uintptr_t)a & ~(uintptr_t)0xFFF;
+    uintptr_t end   = ((uintptr_t)a + (sz ? sz : 1) + 0xFFF) & ~(uintptr_t)0xFFF;
+    *lo = start;
+    *len = (size_t)(end - start);
+}
+
 static MS void *st_VirtualAlloc(void *addr, size_t sz, uint32_t type, uint32_t prot)
 {
-    int p = PROT_READ | PROT_WRITE;
+    int p = w32_prot_bits(prot);
     void *r;
-    (void)type;
-    if (prot == 0x40 || prot == 0x20) p |= PROT_EXEC;      /* EXECUTE_READ(WRITE) */
-    r = mmap(addr, sz, p, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (!sz) return NULL;
+    if (p == PROT_NONE) p = PROT_READ;      /* a reservation still has to be readable
+                                             * to the code that probes it */
+    /* MEM_COMMIT over something already reserved is a protection change, not a
+     * new mapping. Mapping it again moves the block out from under the caller,
+     * which is holding the reserved address and expects to get it back. */
+    if (addr && (type & 0x1000) && !(type & 0x2000)) {
+        uintptr_t lo, hi;
+        uint32_t cur;
+        if (w32_region_of(addr, &lo, &hi, &cur)) {
+            size_t len;
+            w32_page_range(addr, sz, &lo, &len);
+            return mprotect((void *)lo, len, p) == 0 ? addr : NULL;
+        }
+    }
+    /* An address the caller named is an address it may have written into
+     * something already; landing somewhere else is worse than failing. Ask for
+     * it exactly, and only fall back to anywhere when it cannot be had. */
+    r = mmap(addr, sz, p, MAP_PRIVATE | MAP_ANONYMOUS |
+             (addr ? MAP_FIXED_NOREPLACE : 0), -1, 0);
+    if (r == MAP_FAILED && addr)
+        r = mmap(NULL, sz, p, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     return r == MAP_FAILED ? NULL : r;
 }
 static MS int32_t st_VirtualFree(void *a, size_t sz, uint32_t t)
 { (void)t; if (a) munmap(a, sz ? sz : 4096); return 1; }
 static MS int32_t st_VirtualProtect(void *a, size_t sz, uint32_t prot, uint32_t *old)
 {
-    int p = PROT_READ;
-    if (prot == 0x04 || prot == 0x40 || prot == 0x80) p |= PROT_WRITE;
-    if (prot == 0x10 || prot == 0x20 || prot == 0x40) p |= PROT_EXEC;
-    if (old) *old = 0x04;
-    return mprotect((void *)((uintptr_t)a & ~0xFFFul), sz + 0xFFF, p) == 0;
+    uintptr_t lo, rlo, rhi;
+    size_t len;
+    uint32_t cur;
+
+    if (!a) return 0;
+    if (old) *old = w32_region_of(a, &rlo, &rhi, &cur) ? cur : 0x04;
+    w32_page_range(a, sz, &lo, &len);
+    if (mprotect((void *)lo, len, w32_prot_bits(prot)) != 0) return 0;
+    w32_region_forget();          /* the cached protection is now stale */
+    return 1;
 }
+/* VirtualQuery, answered from the kernel rather than with zeros.
+ *
+ * Zeroing the structure says MEM_FREE with no protection and a region size of
+ * nothing, which is a lie about every address a plug-in can legally ask about
+ * -- and callers act on it: a runtime sizing its own stack walks down until it
+ * sees a free page, and one that is told the first page is free stops there. */
+typedef struct {
+    void     *BaseAddress;
+    void     *AllocationBase;
+    uint32_t  AllocationProtect;
+    uintptr_t RegionSize;          /* the padding either side of this is what
+                                    * makes the struct match both widths */
+    uint32_t  State, Protect, Type;
+} W32_MEMINFO;
+
 static MS size_t st_VirtualQuery(void *a, void *buf, size_t len)
-{ (void)a; if (buf) memset(buf, 0, len); return len; }
+{
+    W32_MEMINFO mi;
+    uintptr_t lo, hi;
+    uint32_t prot;
+
+    if (!buf || len < sizeof mi) return 0;
+    memset(&mi, 0, sizeof mi);
+    if (w32_region_of(a, &lo, &hi, &prot)) {
+        mi.BaseAddress = (void *)((uintptr_t)a & ~(uintptr_t)0xFFF);
+        mi.AllocationBase = (void *)lo;
+        mi.AllocationProtect = prot;
+        mi.RegionSize = hi - (uintptr_t)mi.BaseAddress;
+        mi.State = 0x1000;                          /* MEM_COMMIT  */
+        mi.Protect = prot;
+        mi.Type = 0x20000;                          /* MEM_PRIVATE */
+    } else {
+        mi.BaseAddress = (void *)((uintptr_t)a & ~(uintptr_t)0xFFF);
+        mi.RegionSize = 0x1000;
+        mi.State = 0x10000;                         /* MEM_FREE    */
+        mi.Protect = 0x01;                          /* PAGE_NOACCESS */
+    }
+    memcpy(buf, &mi, sizeof mi);
+    return sizeof mi;
+}
 
 static MS void *st_GlobalAlloc(uint32_t f, size_t sz)
 { return w32_alloc(sz, (f & 0x40) != 0); }
@@ -721,10 +925,104 @@ static MS int32_t st_InitOnceExecuteOnce(void *once, void *fn, void *param, void
 static MS void st_InitializeConditionVariable(void *c) { memset(c, 0, 8); }
 static MS void st_WakeConditionVariable(void *c) { (void)c; }
 static MS void st_WakeAllConditionVariable(void *c) { (void)c; }
-/* SLIST_HEADER is 8 bytes on i386 and 16 on x86-64 */
+/* The interlocked singly-linked list.
+ *
+ * An SList is a lock-free stack, and a plug-in that has one is nearly always
+ * using it as a free list: pop a block, use it, push it back. Push and pop were
+ * both unimplemented, and the pair of zeros they returned was a coherent-looking
+ * lie -- pop says "empty", push says nothing -- so the list never had anything
+ * in it, every pop missed, and every miss allocated. Marvel GEQ pushes fifty-
+ * three million times while opening its editor and allocates for each one;
+ * three quarters of the run was inside malloc, and twenty of its twenty-five
+ * seconds were this.
+ *
+ * SLIST_HEADER is opaque -- callers allocate it, align it, and only ever hand it
+ * back here -- so it holds what this needs rather than what Windows puts in it:
+ * a head pointer and a depth. That is 8 bytes at 32 bits and 16 at 64, which is
+ * exactly what the caller set aside either way.
+ *
+ * One lock for all lists, rather than the compare-and-swap Windows uses. That
+ * scheme needs a sequence counter packed beside the pointer to survive ABA, and
+ * not having to reproduce it is the whole benefit of the header being opaque.
+ * The critical sections are three instructions long. */
+typedef struct w32_slist_entry { struct w32_slist_entry *next; } w32_slist_entry;
+typedef struct { w32_slist_entry *head; uint32_t depth; } w32_slist;
+
+static pthread_mutex_t g_slist_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static MS void st_InitializeSListHead(void *h)
-{ memset(h, 0, sizeof(void *) == 8 ? 16 : 8); }
-static MS void *st_InterlockedFlushSList(void *h) { (void)h; return NULL; }
+{
+    w32_slist *s = h;
+    if (!s) return;
+    memset(s, 0, sizeof(void *) == 8 ? 16 : 8);
+}
+/* Returns the previous first entry, which is what a caller checks to find out
+ * whether it has just made a list that was empty non-empty. */
+static MS void *st_InterlockedPushEntrySList(void *h, void *entry)
+{
+    w32_slist *s = h;
+    w32_slist_entry *e = entry, *prev;
+    if (!s || !e) return NULL;
+    pthread_mutex_lock(&g_slist_lock);
+    prev = s->head;
+    e->next = prev;
+    s->head = e;
+    s->depth++;
+    pthread_mutex_unlock(&g_slist_lock);
+    return prev;
+}
+static MS void *st_InterlockedPopEntrySList(void *h)
+{
+    w32_slist *s = h;
+    w32_slist_entry *top;
+    if (!s) return NULL;
+    pthread_mutex_lock(&g_slist_lock);
+    top = s->head;
+    if (top) { s->head = top->next; if (s->depth) s->depth--; }
+    pthread_mutex_unlock(&g_slist_lock);
+    return top;
+}
+/* Push a chain that is already linked, `start` through `end`. */
+static MS void *st_InterlockedPushListSListEx(void *h, void *start, void *end,
+                                              uint32_t count)
+{
+    w32_slist *s = h;
+    w32_slist_entry *first = start, *last = end, *prev;
+    if (!s || !first || !last) return NULL;
+    pthread_mutex_lock(&g_slist_lock);
+    prev = s->head;
+    last->next = prev;
+    s->head = first;
+    s->depth += count;
+    pthread_mutex_unlock(&g_slist_lock);
+    return prev;
+}
+static MS void *st_InterlockedPushListSList(void *h, void *start, void *end,
+                                            uint32_t count)
+{ return st_InterlockedPushListSListEx(h, start, end, count); }
+/* The whole chain, detached in one go; the caller then walks it itself. */
+static MS void *st_InterlockedFlushSList(void *h)
+{
+    w32_slist *s = h;
+    w32_slist_entry *all;
+    if (!s) return NULL;
+    pthread_mutex_lock(&g_slist_lock);
+    all = s->head;
+    s->head = NULL;
+    s->depth = 0;
+    pthread_mutex_unlock(&g_slist_lock);
+    return all;
+}
+static MS uint16_t st_QueryDepthSList(void *h)
+{
+    w32_slist *s = h;
+    uint16_t d;
+    if (!s) return 0;
+    pthread_mutex_lock(&g_slist_lock);
+    d = (uint16_t)s->depth;
+    pthread_mutex_unlock(&g_slist_lock);
+    return d;
+}
 
 /* The Interlocked family.
  *
@@ -1233,6 +1531,13 @@ static const char *const g_sysdlls[] = {
     "comctl32.dll", "msvcrt.dll", "version.dll", "oleaut32.dll",
     "combase.dll", "msimg32.dll", "comdlg32.dll", "dsound.dll", "gdiplus.dll",
     "hid.dll", "ws2_32.dll", "wininet.dll", "ntdll.dll", "powrprof.dll",
+    /* Moved out of g_stockdlls when they stopped being empty: imm32 answers
+     * the three calls an editor makes about an input method, and uxtheme the
+     * two it makes about visual styles. A library with an implementation behind
+     * it has to be one GetProcAddress can search, or the implementation is
+     * unreachable to anything that resolves by name -- which is the same trap
+     * gdiplus was in. */
+    "imm32.dll", "uxtheme.dll",
     /* Winsock's older name. Nothing is registered under it; the name search
      * that follows a miss finds ws2_32's, which is what it is a subset of. */
     "wsock32.dll",
@@ -1275,7 +1580,7 @@ static const char *const g_sysdlls[] = {
  * is the one this host actually draws. */
 static const char *const g_stockdlls[] = {
     "kernelbase", "sechost", "rpcrt4", "crypt32", "bcrypt",
-    "ncrypt", "wintrust", "secur32", "psapi", "imm32", "uxtheme", "dwmapi",
+    "ncrypt", "wintrust", "secur32", "psapi", "dwmapi",
     "setupapi", "iphlpapi", "mpr", "netapi32", "userenv", "usp10",
     "dbghelp", "propsys", "oleacc", "avrt", "winhttp",
     "urlmon", "winspool", "cfgmgr32", "kernel.appcore", "shcore", "profapi",
@@ -1474,37 +1779,179 @@ static MS void *st_LoadLibraryExA(const char *n, void *hf, uint32_t f)
     return h;
 }
 static MS int32_t st_FreeLibrary(void *h) { (void)h; return 1; }
-/* A do-nothing function that pops the right number of argument bytes, for the
- * probe below. An i386 stdcall callee cleans its own stack, so the count has to
- * be right or the caller's drifts; at 64-bit the caller cleans and one function
- * serves every arity. */
-static MS uint64_t w32_probe_noop(void) { return 0; }
-/* A NULL name means "arity zero", which is what an ordinal with no mapping
- * gets: there is no name to look the byte count up under. */
-static void *w32_probe_stub(const char *name)
+/* A stand-in function that knows its own name.
+ *
+ * Three callers want the same thing: something a plug-in can call that does
+ * nothing, returns a chosen value, and -- on i386, where a stdcall callee pops
+ * its own arguments -- pops exactly the byte count the real export would. What
+ * a single shared no-op could not give them is the one thing worth having: an
+ * export nobody calls costs nothing, and the ones a plug-in actually reaches
+ * are the list worth implementing next. That list should be printed by a run,
+ * not guessed at, which is the same trade pe32.c's tracking stubs already make
+ * for imports this layer has no entry for.
+ *
+ * So each stand-in is a few bytes of generated code that pushes its own index,
+ * calls the reporter, loads the chosen return value and returns. */
+#define W32_PROBE_MAX 1024
+static struct { char dll[24], name[64]; unsigned long calls; } g_probe[W32_PROBE_MAX];
+static int g_nprobe;
+
+static MS void w32_probe_report(uint32_t idx)
 {
-#if defined(__i386__)
+    if (idx < (uint32_t)g_nprobe && g_probe[idx].calls++ == 0)
+        fprintf(stderr, "  [stand-in] %s!%s was called, and does nothing\n",
+                g_probe[idx].dll, g_probe[idx].name);
+}
+
+/* A NULL name means "arity zero", which is what an ordinal with no mapping
+ * gets: there is no name to look the byte count up under. `ret` is what the
+ * stand-in hands back -- 0 where the caller is only being kept moving, and the
+ * library's own "not implemented" status where it is going to check. */
+static void *w32_probe_stub_ret(const char *dll, const char *name, uint32_t ret)
+{
+    enum { SLOT = 40 };
     static uint8_t *pool;
     static size_t used;
     int argb = name ? win32_arity_of(name) : 0;
+    uint32_t idx;
     uint8_t *p;
+
     if (argb < 0) return NULL;                 /* unknown arity: NULL is safer */
+    if (g_nprobe >= W32_PROBE_MAX) return NULL;
     if (!pool) {
-        pool = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE | PROT_EXEC,
+        pool = mmap(NULL, W32_PROBE_MAX * SLOT, PROT_READ | PROT_WRITE | PROT_EXEC,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (pool == MAP_FAILED) { pool = NULL; return NULL; }
     }
-    if (used + 8 > (1u << 16)) return NULL;
+    idx = (uint32_t)g_nprobe++;
+    snprintf(g_probe[idx].dll, sizeof g_probe[idx].dll, "%s", dll ? dll : "?");
+    snprintf(g_probe[idx].name, sizeof g_probe[idx].name, "%s", name ? name : "an ordinal");
     p = pool + used;
-    used += 8;
-    p[0] = 0x31; p[1] = 0xC0;                  /* xor eax,eax */
-    if (argb) { p[2] = 0xC2; p[3] = (uint8_t)(argb & 0xff); p[4] = (uint8_t)(argb >> 8); }
-    else        p[2] = 0xC3;
-    return p;
+    used += SLOT;
+
+#if defined(__i386__)
+    *p++ = 0x68; memcpy(p, &idx, 4); p += 4;            /* push imm32 (index)  */
+    *p++ = 0xB8;                                        /* mov eax, report     */
+    { void *fn = (void *)w32_probe_report; memcpy(p, &fn, 4); p += 4; }
+    *p++ = 0xFF; *p++ = 0xD0;                           /* call eax -- stdcall, */
+                                                        /*   pops its own arg   */
+    *p++ = 0xB8; memcpy(p, &ret, 4); p += 4;            /* mov eax, ret        */
+    if (argb) {
+        *p++ = 0xC2;                                    /* ret imm16           */
+        *p++ = (uint8_t)(argb & 0xff); *p++ = (uint8_t)(argb >> 8);
+    } else *p++ = 0xC3;                                 /* ret                 */
 #else
-    (void)name;
-    return (void *)w32_probe_noop;
+    /* Microsoft x64: the caller cleans up, so arity does not come into it.
+     * Entry leaves RSP 8 past a 16-byte boundary; 0x28 buys the callee's
+     * 32-byte shadow space and puts it back on one for the call. */
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x28; /* sub rsp, 0x28       */
+    *p++ = 0xB9; memcpy(p, &idx, 4); p += 4;            /* mov ecx, index      */
+    *p++ = 0x48; *p++ = 0xB8;                           /* movabs rax, report  */
+    { void *fn = (void *)w32_probe_report; memcpy(p, &fn, 8); p += 8; }
+    *p++ = 0xFF; *p++ = 0xD0;                           /* call rax            */
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x28; /* add rsp, 0x28       */
+    *p++ = 0xB8; memcpy(p, &ret, 4); p += 4;            /* mov eax, ret        */
+    *p++ = 0xC3;                                        /* ret                 */
 #endif
+    return pool + used - SLOT;
+}
+
+static void *w32_probe_stub(const char *dll, const char *name)
+{ return w32_probe_stub_ret(dll, name, 0); }
+
+/* Libraries this host does not stub but stands in for.
+ *
+ * There is a difference between "this machine has no such library" and "the
+ * library is here and that one function of it is not", and GetProcAddress is
+ * where it shows. NULL is the honest answer to the first, and plug-ins depend
+ * on it -- probing for an optional API is how they ask whether it exists. It is
+ * the wrong answer to the second, because a wrapper that resolves its whole
+ * surface up front and gives up on the first miss then fails over a function it
+ * was never going to call. Chord Organ's RTL resolves 275 GDI+ entry points
+ * inside DllMain and returns FALSE if any of them is absent; the one that
+ * stopped it was GdipGetSmoothingMode, a getter it never calls.
+ *
+ * So for a library the host answers LoadLibrary for with an implementation of
+ * its own, a name it does not implement is answered with a stand-in returning
+ * that library's "not implemented" status -- and the stand-in says so the first
+ * time it is called, which is how the next function to implement gets chosen.
+ * The name still has to be one win32_arity.h knows, so nothing is invented: an
+ * export the real library never had is still NULL.
+ *
+ * Only libraries this host *is* belong here. kernel32 and user32 are shimmed,
+ * not stood in for: a plug-in asking them for an optional API has to get NULL,
+ * because the answer decides which path it takes. */
+static const struct { const char *dll; uint32_t status; } g_standin_libs[] = {
+    /* GDI+ reports through GpStatus, and 6 is NotImplemented: a caller that
+     * checks stops cleanly, and one that does not is no worse off than it was
+     * with a call it could not resolve at all. */
+    { "gdiplus", 6 },
+    /* The HidD_* family returns BOOLEAN. There is no HID device behind this
+     * host, so FALSE is not a stand-in's evasion -- it is the true answer, and
+     * the same one HidD_GetHidGuid's neighbours give on a machine with no
+     * joystick attached. */
+    { "hid",     0 },
+    /* No IME is attached to a plug-in editor here, and every imm32 entry point
+     * spells that with zero: ImmGetContext returns a null HIMC, and the BOOL
+     * calls return FALSE. A C++Builder RTL resolves eight of them at start-up
+     * and stops at the first it cannot find. */
+    { "imm32",   0 },
+};
+#define NSTANDINLIB ((int)(sizeof g_standin_libs / sizeof *g_standin_libs))
+
+/* Generous mode: answer for every library, not just the two above.
+ *
+ * Which answer is right depends on the caller, and the caller cannot be asked.
+ * A plug-in that probes -- GetProcAddress(kernel32, "AddDllDirectory") to find
+ * out which Windows it is on -- needs NULL, and gets a worse deal from a
+ * stand-in than from an honest miss: it takes a path this host cannot follow.
+ * A run-time library that resolves its whole surface up front and gives up on
+ * the first miss needs the opposite, and there is no telling the two apart
+ * while the call is happening.
+ *
+ * Afterwards there is. A plug-in whose DllMain returned FALSE has already said
+ * the honest answers did not work, and it is the only one that pays for the
+ * generous ones: the loader maps it again from scratch with this on, so nothing
+ * that loaded the first time ever sees a stand-in. Chord Organ resolves 275
+ * GDI+ entry points, 41 of the OLE and shell surface, and eight of setupapi's,
+ * inside DllMain -- and calls almost none of them.
+ *
+ * `w32_standin_missed` is what makes the retry worth attempting: it records the
+ * first name that could have been answered and was not, so a load that failed
+ * for some other reason is not run twice for nothing. */
+static int  g_standin_all;
+static char g_standin_missed[96];
+
+static void w32_standin_note_miss(const char *dll, const char *name)
+{
+    if (!g_standin_missed[0] && dll && name)
+        snprintf(g_standin_missed, sizeof g_standin_missed, "%s!%s", dll, name);
+}
+
+/* Both are called from the loader (pe32.c, pehost.c) around a failed DllMain. */
+static void winstubs_set_generous(int on) { g_standin_all = on; }
+static const char *winstubs_missed_export(void)
+{ return g_standin_missed[0] ? g_standin_missed : NULL; }
+
+static int w32_library_notimpl(const char *dll, uint32_t *status)
+{
+    int i;
+    if (!dll) return 0;
+    for (i = 0; i < NSTANDINLIB; i++) {
+        size_t n = strlen(g_standin_libs[i].dll);
+        if (!strncasecmp(dll, g_standin_libs[i].dll, n) &&
+            (!dll[n] || !strcasecmp(dll + n, ".dll"))) {
+            *status = g_standin_libs[i].status;
+            return 1;
+        }
+    }
+    /* In generous mode every library this host said was present answers, and
+     * zero is the value: a null handle, a FALSE, a count of none. It is wrong
+     * for an HRESULT, where zero is S_OK -- but a caller that checks an HRESULT
+     * and then reads an out-parameter this host never wrote was already going
+     * to be disappointed by the function not existing at all. */
+    if (g_standin_all) { *status = 0; return 1; }
+    return 0;
 }
 
 /* The HID device-interface class GUID, which is a documented constant rather
@@ -1537,16 +1984,6 @@ static MS uint32_t st_DirectSoundEnumerateA(void *cb, void *ctx)
 static MS uint32_t st_DirectSoundCaptureEnumerateA(void *cb, void *ctx)
 { (void)cb; (void)ctx; return 0; }
 
-/* Ordinal to name, for the few libraries whose ordinals are fixed and
- * documented. DirectSound's are, and an RTL that imports by ordinal is asking
- * for exactly these. Anything not listed still answers NULL. */
-static const struct { const char *dll; unsigned ord; const char *name; } g_ordinals[] = {
-    { "dsound.dll",  1, "DirectSoundCreate" },
-    { "dsound.dll",  2, "DirectSoundEnumerateA" },
-    { "dsound.dll",  6, "DirectSoundCaptureCreate" },
-    { "dsound.dll",  7, "DirectSoundCaptureEnumerateA" },
-};
-#define NORDINAL ((int)(sizeof g_ordinals / sizeof *g_ordinals))
 
 /* An import by ordinal arrives as a small integer in the name pointer --
  * MAKEINTRESOURCE -- and Windows tells the two apart by whether the value is
@@ -1569,34 +2006,27 @@ static MS void *st_GetProcAddress(void *h, const char *n)
     {
         unsigned ord;
         if (w32_proc_is_ordinal(n, &ord)) {
-            int st_i = w32_stock_index(h), sy_i = w32_dll_index(h), q;
+            int st_i = w32_stock_index(h), sy_i = w32_dll_index(h);
             const char *dll = sy_i >= 0 ? g_sysdlls[sy_i]
                             : st_i >= 0 ? g_stockdlls[st_i] : NULL;
-            for (q = 0; dll && q < NORDINAL; q++) {
-                char cur[32];
-                snprintf(cur, sizeof cur, "%s", g_ordinals[q].dll);
-                if (g_ordinals[q].ord != ord) continue;
-                /* g_stockdlls names carry no ".dll"; g_sysdlls' do. */
-                cur[strlen(cur) - 4] = 0;
-                if (strcasecmp(dll, g_ordinals[q].dll) && strcasecmp(dll, cur)) continue;
-                PLOG("  [win] GetProcAddress(%s ordinal #%u) -> %s\n",
-                     dll, ord, g_ordinals[q].name);
-                n = g_ordinals[q].name;
-                break;
+            const char *named = dll ? win32_ordinal_name(dll, ord) : NULL;
+            if (named) {
+                PLOG("  [win] GetProcAddress(%s ordinal #%u) -> %s\n", dll, ord, named);
+                n = named;                  /* on into the name search below */
             }
             if (w32_proc_is_ordinal(n, NULL)) {
-                /* No name to look up and no arity to build a stub from -- but
-                 * NULL is fatal here in a way it is not for a name: a packed
-                 * DLL's rebuild loop stops at the first one, and every export
-                 * after it is left unresolved. pe32.c already makes the same
-                 * trade for an ordinal in a static import table, with the same
-                 * warning, so this matches it: a do-nothing function that pops
-                 * nothing. Calling it unbalances an i386 stack, which is worse
-                 * than a clean failure and better than not loading at all --
-                 * and an ordinal a plug-in resolves is usually one its runtime
-                 * lists rather than one it calls. */
+                /* Nothing in win32_ordinals.h names this one -- an export
+                 * that had no name in the library's own export table, or a
+                 * library that table does not carry. There is no arity to
+                 * build a stub from either, so calling it will unbalance an
+                 * i386 stack; the warning below is the only honest thing to
+                 * say about it. It is still answered rather than refused,
+                 * because a packed DLL's rebuild loop stops at the first NULL
+                 * and leaves every export after it unresolved -- and an
+                 * ordinal a run-time library lists is usually one it never
+                 * calls. */
                 static int warned;
-                void *st = w32_probe_stub(NULL);
+                void *st = w32_probe_stub(dll, NULL);
                 fprintf(stderr, "  [win] %s ordinal #%u: no name for it, and no "
                         "arity -- a call to it will unbalance the stack\n",
                         dll ? dll : "?", ord);
@@ -1635,6 +2065,22 @@ static MS void *st_GetProcAddress(void *h, const char *n)
         for (d = 0; !fn && d < NSYSDLL; d++) fn = winstub_lookup(g_sysdlls[d], n);
         if (fn) { PLOG("  [win] GetProcAddress(\"%s\") -> stub\n", n); return fn; }
     }
+    /* A library this host stands in for answers for its whole surface: see
+     * w32_library_notimpl. The name is checked against the arity table first,
+     * so an export the real library never had still gets NULL. */
+    if (n) {
+        int st_i = w32_stock_index(h), sy_i = w32_dll_index(h);
+        const char *dll = sy_i >= 0 ? g_sysdlls[sy_i]
+                        : st_i >= 0 ? g_stockdlls[st_i] : NULL;
+        uint32_t status;
+        if (w32_library_notimpl(dll, &status) && win32_arity_of(n) >= 0) {
+            void *st = w32_probe_stub_ret(dll, n, status);
+            if (st) {
+                PLOG("  [win] GetProcAddress(\"%s\") -> stand-in\n", n);
+                return st;
+            }
+        }
+    }
     /* PELOAD_PROBE_ALL is a diagnostic, not a way to run plug-ins. A packed DLL
      * builds its import table through GetProcAddress and stops at the first
      * name that is missing, so finding out what it wants costs one rebuild per
@@ -1643,11 +2089,19 @@ static MS void *st_GetProcAddress(void *h, const char *n)
      * Off by default because NULL is a meaningful answer: it is how a plug-in
      * asks whether an optional API is present. */
     if (n && getenv("PELOAD_PROBE_ALL")) {
-        void *st = w32_probe_stub(n);
+        void *st = w32_probe_stub(NULL, n);
         if (st) {
             fprintf(stderr, "  [probe] %s\n", n);
             return st;
         }
+    }
+    /* A name this host could have answered for, on a library it said was
+     * present: remembered so a failed DllMain knows a second attempt has
+     * something to offer. */
+    if (n && win32_arity_of(n) >= 0) {
+        int st_i = w32_stock_index(h), sy_i = w32_dll_index(h);
+        w32_standin_note_miss(sy_i >= 0 ? g_sysdlls[sy_i]
+                              : st_i >= 0 ? g_stockdlls[st_i] : NULL, n);
     }
     PLOG("  [win] GetProcAddress(\"%s\") -> NULL\n", n ? n : "?");
     return NULL;
@@ -1797,6 +2251,101 @@ static MS const uint16_t *st_CharNextW(const uint16_t *s)
 static MS const uint16_t *st_CharPrevW(const uint16_t *start, const uint16_t *cur)
 { return (start && cur && cur > start) ? cur - 1 : start; }
 
+/* CharUpper/CharLower, both widths, and their counted forms.
+ *
+ * The same hazard CharNext has, with an extra corner: the argument is either a
+ * string to convert in place or, when it is small enough not to be a pointer,
+ * a single character passed by value -- and the return is the same thing back.
+ * A C++Builder RTL upper-cases a file extension with CharUpperA and indexes
+ * through the result, so a stand-in returning zero sends it through a null
+ * pointer. Case folding is Latin-1 here for the same reason CharNext steps one
+ * byte: nothing in this host is in a double-byte codepage. */
+static MS char *st_CharUpperA(char *s)
+{
+    unsigned char *p = (unsigned char *)s;
+    if ((uintptr_t)s < 0x10000)                     /* a character, not a string */
+        return (char *)(uintptr_t)toupper((int)(uintptr_t)s & 0xff);
+    for (; p && *p; p++) *p = (unsigned char)toupper(*p);
+    return s;
+}
+static MS char *st_CharLowerA(char *s)
+{
+    unsigned char *p = (unsigned char *)s;
+    if ((uintptr_t)s < 0x10000)
+        return (char *)(uintptr_t)tolower((int)(uintptr_t)s & 0xff);
+    for (; p && *p; p++) *p = (unsigned char)tolower(*p);
+    return s;
+}
+static MS uint16_t *st_CharUpperW(uint16_t *s)
+{
+    uint16_t *p = s;
+    if ((uintptr_t)s < 0x10000)
+        return (uint16_t *)(uintptr_t)towupper((wint_t)(uintptr_t)s & 0xffff);
+    for (; p && *p; p++) *p = (uint16_t)towupper(*p);
+    return s;
+}
+static MS uint16_t *st_CharLowerW(uint16_t *s)
+{
+    uint16_t *p = s;
+    if ((uintptr_t)s < 0x10000)
+        return (uint16_t *)(uintptr_t)towlower((wint_t)(uintptr_t)s & 0xffff);
+    for (; p && *p; p++) *p = (uint16_t)towlower(*p);
+    return s;
+}
+static MS uint32_t st_CharUpperBuffA(char *s, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; s && i < n; i++) s[i] = (char)toupper((unsigned char)s[i]);
+    return s ? n : 0;
+}
+static MS uint32_t st_CharLowerBuffA(char *s, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; s && i < n; i++) s[i] = (char)tolower((unsigned char)s[i]);
+    return s ? n : 0;
+}
+static MS uint32_t st_CharUpperBuffW(uint16_t *s, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; s && i < n; i++) s[i] = (uint16_t)towupper(s[i]);
+    return s ? n : 0;
+}
+static MS uint32_t st_CharLowerBuffW(uint16_t *s, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; s && i < n; i++) s[i] = (uint16_t)towlower(s[i]);
+    return s ? n : 0;
+}
+
+/* Registered clipboard formats.
+ *
+ * Nothing here has a clipboard, but the identifier still has to behave like
+ * one: the same name gives the same number every time, different names give
+ * different numbers, and none of them is zero -- a caller that gets zero has
+ * been told the call failed, and an RTL that registers its own drag-and-drop
+ * format at start-up treats that as fatal. The numbers come from the range
+ * Windows documents for registered formats, which is where a plug-in's own
+ * format would land anyway. */
+static MS uint32_t st_RegisterClipboardFormatA(const char *name)
+{
+    enum { CF_PRIVATE_FIRST = 0xC000, MAXFMT = 64 };
+    static char names[MAXFMT][64];
+    static int n;
+    int i;
+    if (!name || !*name) return 0;
+    for (i = 0; i < n; i++)
+        if (!strcmp(names[i], name)) return CF_PRIVATE_FIRST + (uint32_t)i;
+    if (n >= MAXFMT) return CF_PRIVATE_FIRST + MAXFMT;   /* all one bucket, still not zero */
+    snprintf(names[n], sizeof names[0], "%s", name);
+    return CF_PRIVATE_FIRST + (uint32_t)n++;
+}
+static MS uint32_t st_RegisterClipboardFormatW(const uint16_t *name)
+{
+    char b[64];
+    w2c(name, b, sizeof b);
+    return st_RegisterClipboardFormatA(b);
+}
+
 /* --------------------------------------------------------------- SEH stubs */
 
 /* Only reached when C++ actually throws. Stubbed so a throw fails loudly
@@ -1909,13 +2458,31 @@ static const char *path_fix(const char *in, char *buf, size_t n)
  * directory that has no drive sends it round the same step again -- Aspen
  * Trumpet recursed until the stack ran out. Handing one out costs nothing,
  * because path_norm_n takes it back off anything the guest hands us. */
+/* A host path in the shape a Windows runtime accepts as fully qualified.
+ *
+ * "C:" and backslashes. Not decoration: MSVC's path code decides whether a path
+ * needs resolving by looking for a drive or a UNC prefix, and a path with
+ * neither is a path it has to resolve -- so handing one back from the call that
+ * is supposed to have resolved it is an answer that asks the question again.
+ *
+ * GetCurrentDirectory has always answered this way and GetFullPathName did not,
+ * and the two disagreeing is what took Ignite's Emissary and NadIR down: their
+ * runtime resolved ".", got a rooted path with no drive on it, and resolved it
+ * again until the stack was gone. path_norm_n takes the drive letter back off
+ * everything the guest hands us, so the round trip closes. */
+static void path_as_windows(const char *in, char *out, size_t n)
+{
+    size_t i;
+    if (in && in[0] == '/') snprintf(out, n, "C:%s", in);
+    else snprintf(out, n, "%s", in ? in : "");
+    for (i = 0; out[i]; i++) if (out[i] == '/') out[i] = '\\';
+}
+
 static const char *w32_cwd(char *out, size_t n)
 {
     char c[512];
-    size_t i;
     if (!getcwd(c, sizeof c)) return NULL;
-    snprintf(out, n, "C:%s", c);
-    for (i = 0; out[i]; i++) if (out[i] == '/') out[i] = '\\';
+    path_as_windows(c, out, n);
     return out;
 }
 
@@ -3084,6 +3651,17 @@ static volatile int g_w32_worker_quit;      /* set once teardown starts */
 static volatile int g_w32_work_running;     /* detached QueueUserWorkItem threads */
 static pthread_mutex_t g_w32_worker_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Is this still one of ours? A handle a plug-in deletes twice is a handle it
+ * has already given back, and closing it again frees memory that is gone. */
+static int w32_worker_has(void **list, int *n, void *p)
+{
+    int i, found = 0;
+    pthread_mutex_lock(&g_w32_worker_lock);
+    for (i = 0; i < *n; i++)
+        if (list[i] == p) { found = 1; break; }
+    pthread_mutex_unlock(&g_w32_worker_lock);
+    return found;
+}
 static void w32_worker_add(void **list, int *n, void *p)
 {
     pthread_mutex_lock(&g_w32_worker_lock);
@@ -3186,11 +3764,18 @@ static MS int32_t st_UnregisterWaitEx(void *h, void *ev)
  * the callback runs on some other thread, Set arms it, Close waits for it to
  * stop, and WaitFor... blocks until any callback in flight has finished. */
 typedef void (MS *w32_tp_timer_cb)(void *inst, void *ctx, void *timer);
+/* The older timer-queue API's callback: no instance, no timer, and a flag
+ * saying whether it was the timer or a wait that fired. See
+ * st_CreateTimerQueueTimer. */
+typedef void (MS *w32_tp_queue_cb)(void *ctx, uint8_t timer_fired);
+/* The multimedia timer's, which carries the id it was given back. */
+typedef void (MS *w32_mm_cb)(uint32_t id, uint32_t msg, uintptr_t user,
+                             uintptr_t r1, uintptr_t r2);
 typedef void (MS *w32_tp_wait_cb)(void *inst, void *ctx, void *wait, uint32_t result);
 typedef void (MS *w32_tp_work_cb)(void *inst, void *ctx, void *work);
 
 typedef struct {
-    int              kind;             /* 0 timer, 1 wait, 2 work */
+    int              kind;   /* 0 timer, 1 wait, 2 work, 3 timer queue, 4 timeSetEvent */
     void            *cb, *ctx;
     pthread_t        th;
     pthread_mutex_t  m;
@@ -3200,6 +3785,8 @@ typedef struct {
     uint32_t         period_ms;        /* timer: 0 for one-shot */
     void            *wait_obj;         /* wait: the handle */
     int64_t          wait_ms;          /* wait: timeout, -1 for infinite */
+    uintptr_t        mm_user;          /* multimedia timer: the caller's cookie */
+    uint32_t         mm_id;            /* ...and the id it was given back */
 } w32_tp;
 
 static void w32_tp_sleep_ms(int64_t ms)
@@ -3219,16 +3806,19 @@ static void *w32_tp_thread(void *ud)
         while (!t->armed && !t->stop)
             pthread_cond_wait(&t->c, &t->m);
         if (t->stop || g_w32_worker_quit) break;
-        if (t->kind == 0) {                       /* timer */
+        if (t->kind == 0 || t->kind == 3 || t->kind == 4) {   /* any timer */
             int64_t due = t->due_ms;
             uint32_t period = t->period_ms;
+            int queue = (t->kind == 3);
             pthread_mutex_unlock(&t->m);
             w32_tp_sleep_ms(due);
             pthread_mutex_lock(&t->m);
             if (t->stop || !t->armed) continue;
             t->in_callback = 1;
             pthread_mutex_unlock(&t->m);
-            ((w32_tp_timer_cb)t->cb)(NULL, t->ctx, t);
+            if (t->kind == 4)   ((w32_mm_cb)t->cb)(t->mm_id, 0, t->mm_user, 0, 0);
+            else if (queue)     ((w32_tp_queue_cb)t->cb)(t->ctx, 1);
+            else                ((w32_tp_timer_cb)t->cb)(NULL, t->ctx, t);
             pthread_mutex_lock(&t->m);
             t->in_callback = 0;
             pthread_cond_broadcast(&t->c);
@@ -3330,6 +3920,134 @@ static MS void st_SetThreadpoolTimer(void *h, const int64_t *due, uint32_t perio
 static MS void st_WaitForThreadpoolTimerCallbacks(void *h, int32_t cancel)
 { w32_tp_flush(h, cancel); }
 static MS void st_CloseThreadpoolTimer(void *h) { w32_tp_close(h); }
+
+/* The timer queue, which is the same idea a Windows version earlier.
+ *
+ * CreateTimerQueue returning NULL is a failed allocation as far as the caller
+ * is concerned, and a caller that wanted a timer and could not have one does
+ * not carry on quietly: Marvel GEQ puts up a dialog of its own, waits on it in
+ * a modal loop, and reports the editor as refused. Nothing about that names a
+ * timer, which is why it was worth chasing.
+ *
+ * A queue is not modelled -- there is nothing to schedule against, one thread
+ * per timer being how the threadpool objects above already work -- so the
+ * handle is a token, and the timers under it are independent. Deleting the
+ * queue is therefore accepted and does not have to find them. */
+#define W32_TIMERQUEUE ((void *)(uintptr_t)0x54515545)      /* 'TQUE' */
+
+static MS void *st_CreateTimerQueue(void) { return W32_TIMERQUEUE; }
+static MS int32_t st_CreateTimerQueueTimer(void **out, void *queue, void *cb,
+                                           void *param, uint32_t due,
+                                           uint32_t period, uint32_t flags)
+{
+    w32_tp *t;
+    (void)queue;
+    if (!out || !cb) { g_last_error = 87; return 0; }
+    if (!(t = w32_tp_new(3, cb, param))) return 0;
+    pthread_mutex_lock(&t->m);
+    t->due_ms = due;
+    /* WT_EXECUTEONLYONCE, and a period of zero, both mean one shot. */
+    t->period_ms = (flags & 0x00000008u) ? 0 : period;
+    t->armed = 1;
+    pthread_cond_broadcast(&t->c);
+    pthread_mutex_unlock(&t->m);
+    *out = t;
+    return 1;
+}
+static MS int32_t st_ChangeTimerQueueTimer(void *queue, void *timer,
+                                           uint32_t due, uint32_t period)
+{
+    w32_tp *t = timer;
+    (void)queue;
+    if (!t) { g_last_error = 6; return 0; }
+    pthread_mutex_lock(&t->m);
+    t->due_ms = due;
+    t->period_ms = period;
+    t->armed = 1;
+    pthread_cond_broadcast(&t->c);
+    pthread_mutex_unlock(&t->m);
+    return 1;
+}
+static MS int32_t st_DeleteTimerQueueTimer(void *queue, void *timer, void *done)
+{
+    (void)queue;
+    if (!timer) { g_last_error = 6; return 0; }
+    /* Deleting one twice is what Windows answers ERROR_INVALID_HANDLE to, and
+     * what a double free looks like from here. Marvel GEQ does it on the way
+     * out of its editor. */
+    if (!w32_worker_has(g_w32_tps, &g_w32_ntps, timer)) {
+        g_last_error = 6;                                  /* INVALID_HANDLE */
+        if (done && done != (void *)(uintptr_t)-1) st_SetEvent(done);
+        return 0;
+    }
+    w32_tp_close(timer);
+    /* INVALID_HANDLE_VALUE asks to block until the callback has finished, which
+     * w32_tp_close does anyway; any other handle is an event to signal. */
+    if (done && done != (void *)(uintptr_t)-1) st_SetEvent(done);
+    return 1;
+}
+static MS int32_t st_DeleteTimerQueueEx(void *queue, void *done)
+{
+    (void)queue;
+    if (done && done != (void *)(uintptr_t)-1) st_SetEvent(done);
+    return 1;
+}
+static MS int32_t st_DeleteTimerQueue(void *queue) { (void)queue; return 1; }
+
+/* The multimedia timer, which is the oldest of the three spellings and the one
+ * an audio plug-in reaches for when it wants a steady callback for a meter or
+ * an animation. Returning zero is a failed timer, and a plug-in that gets one
+ * either gives up on the animation or -- worse -- waits for a tick that never
+ * arrives. Same worker as the other two: one thread, armed, sleeping.
+ *
+ * The id is what the callback is given and what timeKillEvent is called with,
+ * so it has to be a number rather than the pointer; the table is walked to turn
+ * one back into the other, which for the handful a plug-in ever creates is
+ * cheaper than a map. */
+static uint32_t g_mm_next_id = 1;
+
+static MS uint32_t st_timeSetEvent(uint32_t delay, uint32_t res, void *cb,
+                                   uintptr_t user, uint32_t flags)
+{
+    w32_tp *t;
+    (void)res;
+    if (!cb) return 0;
+    /* TIME_CALLBACK_EVENT_SET/PULSE set an event instead of calling; nothing
+     * here creates one, and pretending otherwise would leave a caller waiting. */
+    if ((flags & 0x30) != 0) return 0;
+    if (!(t = w32_tp_new(4, cb, NULL))) return 0;
+    pthread_mutex_lock(&t->m);
+    t->mm_user = user;
+    t->mm_id = g_mm_next_id++;
+    t->due_ms = delay;
+    t->period_ms = (flags & 1) ? (delay ? delay : 1) : 0;   /* TIME_PERIODIC */
+    t->armed = 1;
+    pthread_cond_broadcast(&t->c);
+    pthread_mutex_unlock(&t->m);
+    return t->mm_id;
+}
+static MS uint32_t st_timeKillEvent(uint32_t id)
+{
+    int i;
+    w32_tp *found = NULL;
+    pthread_mutex_lock(&g_w32_worker_lock);
+    for (i = 0; i < g_w32_ntps; i++) {
+        w32_tp *t = g_w32_tps[i];
+        if (t && t->kind == 4 && t->mm_id == id) { found = t; break; }
+    }
+    pthread_mutex_unlock(&g_w32_worker_lock);
+    if (!found) return 11;                                  /* MMSYSERR_INVALPARAM */
+    w32_tp_close(found);
+    return 0;                                               /* MMSYSERR_NOERROR   */
+}
+/* The resolution the timer service is asked to keep. It keeps whatever the
+ * scheduler gives it, and agreeing is the answer that lets a caller carry on. */
+static MS uint32_t st_timeGetDevCaps(void *caps, uint32_t n)
+{
+    uint32_t *c = caps;
+    if (c && n >= 8) { c[0] = 1; c[1] = 1000000; }          /* min 1 ms, max ~1000 s */
+    return 0;
+}
 
 static MS void *st_CreateThreadpoolWait(void *cb, void *ctx, void *env)
 { (void)env; return w32_tp_new(1, cb, ctx); }
@@ -3490,6 +4208,73 @@ static MS int32_t st_SetThreadPriority(void *h, int32_t p) { (void)h;(void)p; re
 static MS int32_t st_GetThreadPriority(void *h) { (void)h; return 0; }
 static MS uint32_t st_GetTempPathA(uint32_t n, char *buf)
 { return (uint32_t)snprintf(buf, n, "/tmp/"); }
+/* Collapse "." and ".." out of an absolute path, and squeeze repeated slashes.
+ *
+ * This is what makes GetFullPathName the canonicaliser its callers take it for.
+ * Leaving the components in looks harmless -- /a/b/. names the same directory
+ * as /a/b -- but the caller asked precisely because it wants the resolved form,
+ * and a C runtime that is handed back a path still containing the component it
+ * asked to have resolved will ask again.
+ *
+ * Ignite's Emissary and NadIR are both that case, and it is the whole of why
+ * neither would load: their MSVC runtime resolves "." during start-up, gets
+ * ".../vst-ace/." back, and recurses on it until the stack is gone. Nothing in
+ * the crash pointed here -- it faulted inside libc, thousands of frames deep,
+ * with the plug-in's own recursion the only visible pattern. */
+static void path_collapse(char *p)
+{
+    char *out = p, *seg;
+    int absolute = (p[0] == '/');
+
+    if (absolute) out++;
+    for (seg = p + (absolute ? 1 : 0); *seg; ) {
+        char *end = strchr(seg, '/');
+        size_t len = end ? (size_t)(end - seg) : strlen(seg);
+
+        if (len == 0) {                             /* // */
+            seg += end ? 1 : 0;
+            if (!end) break;
+            continue;
+        }
+        if (len == 1 && seg[0] == '.') {            /* /./ */
+            seg += end ? 2 : 1;
+            if (!end) break;
+            continue;
+        }
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            /* Back up over the segment already written, if there is one. An
+             * absolute path cannot go above its root, and a relative one keeps
+             * the ".." because there is nothing here to resolve it against. */
+            char *back = out;
+            if (back > p + (absolute ? 1 : 0)) {
+                back--;                             /* the '/' just written */
+                while (back > p + (absolute ? 1 : 0) && back[-1] != '/') back--;
+                out = back;
+                seg += end ? 3 : 2;
+                if (!end) break;
+                continue;
+            }
+            if (!absolute) {
+                memmove(out, seg, len);
+                out += len;
+                if (end) *out++ = '/';
+            }
+            seg += end ? 3 : 2;
+            if (!end) break;
+            continue;
+        }
+        memmove(out, seg, len);
+        out += len;
+        if (end) *out++ = '/';
+        seg += end ? len + 1 : len;
+        if (!end) break;
+    }
+    /* No trailing slash except on the root itself. */
+    if (out > p + 1 && out[-1] == '/') out--;
+    if (out == p) { if (absolute) *out++ = '/'; }
+    *out = 0;
+}
+
 /* Same two-call contract as the wide form above. */
 static MS uint32_t st_GetFullPathNameA(const char *n, uint32_t len, char *buf, char **part)
 {
@@ -3504,11 +4289,16 @@ static MS uint32_t st_GetFullPathNameA(const char *n, uint32_t len, char *buf, c
         if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
         snprintf(full, sizeof full, "%s/%s", cwd, fixed);
     }
+    path_collapse(full);
+    { char win[1208]; path_as_windows(full, win, sizeof win);
+      snprintf(full, sizeof full, "%s", win); }
     need = (uint32_t)strlen(full);
     if (!buf || len <= need) return need + 1;
     memcpy(buf, full, need + 1);
     if (part) {
-        char *slash = strrchr(buf, '/');
+        char *slash = strrchr(buf, '\\');
+        char *fwd = strrchr(buf, '/');
+        if (fwd > slash) slash = fwd;
         *part = (slash && slash[1]) ? slash + 1 : NULL;
     }
     return need;
@@ -3890,6 +4680,21 @@ static MS uint16_t *st_lstrcpynW(uint16_t *dst, const uint16_t *src, int32_t n)
     dst[i] = 0;
     return dst;
 }
+/* The multimedia device counts.
+ *
+ * Zero is not an evasion here, it is the fact: the host owns the sound card and
+ * the MIDI ports, and a plug-in that goes looking for its own finds none --
+ * which is what it would find on a Windows machine whose devices were all in
+ * use by the host. Answering through a stand-in would say the same thing, but
+ * these are worth spelling out: a plug-in that enumerates devices and then
+ * opens device 0 anyway is a bug worth having the count be deliberate about. */
+static MS uint32_t st_midiInGetNumDevs(void) { return 0; }
+static MS uint32_t st_midiOutGetNumDevs(void) { return 0; }
+static MS uint32_t st_waveInGetNumDevs(void) { return 0; }
+static MS uint32_t st_waveOutGetNumDevs(void) { return 0; }
+static MS uint32_t st_auxGetNumDevs(void) { return 0; }
+static MS uint32_t st_mixerGetNumDevs(void) { return 0; }
+
 /* Milliseconds since the host started, which is what timeGetTime means. A stub
  * answering 0 does not read as an error -- there is no error value -- it reads
  * as "no time has passed", every time it is asked. Anything driving an
@@ -4038,6 +4843,9 @@ static MS uint32_t st_GetFullPathNameW(const uint16_t *nm, uint32_t len,
         if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
         snprintf(full, sizeof full, "%s/%s", cwd, n);
     }
+    path_collapse(full);
+    { char win[1208]; path_as_windows(full, win, sizeof win);
+      snprintf(full, sizeof full, "%s", win); }
     need = (uint32_t)strlen(full);
     if (!buf || len <= need) return need + 1;      /* room needed, with the NUL */
     for (i = 0; i <= need; i++) buf[i] = (uint16_t)(unsigned char)full[i];
@@ -4677,19 +5485,56 @@ static MSCRT double st__wtof(const uint16_t *s)
  * export table below asks for st_sqrtf by name. */
 #define M1F(fn) static MSCRT float st_##fn##f(float x) { return fn##f(x); }
 #define M2(f) static MSCRT double st_##f(double x, double y) { return f(x, y); }
+#define M2F(fn) static MSCRT float st_##fn##f(float x, float y) { return fn##f(x, y); }
 M1(sqrt) M1(sin) M1(cos) M1(tan) M1(asin) M1(acos) M1(atan)
 M1(exp) M1(log) M1(log10) M1(floor) M1(ceil) M1(fabs)
 M1(sinh) M1(cosh) M1(tanh)
+/* The single-precision half of the same list.
+ *
+ * It used to stop at seven of them, and the gap was not visible from here: a
+ * float call this table does not carry falls through to a stub that returns
+ * zero, and zero is a plausible-looking number. ceilf is how a JUCE plug-in
+ * sizes a buffer, and ceilf returning 0 turned into a std::length_error inside
+ * the plug-in's own start-up -- several subsystems from the cause, and with
+ * nothing in the message about arithmetic. A DSP path that reaches roundf or
+ * tanhf on every sample fails even more quietly: it renders, and what it
+ * renders is wrong. */
+M1(asinh) M1(acosh) M1(atanh) M1(cbrt) M1(exp2) M1(expm1)
+M1(log1p) M1(log2) M1(round) M1(trunc) M1(nearbyint) M1(rint) M1(erf) M1(erfc)
+M1(tgamma) M1(lgamma)
 M1F(sqrt) M1F(sin) M1F(cos) M1F(tan) M1F(exp) M1F(log) M1F(fabs)
-M2(pow) M2(fmod) M2(atan2)
+M1F(asin) M1F(acos) M1F(atan) M1F(log10) M1F(floor) M1F(ceil)
+M1F(sinh) M1F(cosh) M1F(tanh) M1F(asinh) M1F(acosh) M1F(atanh)
+M1F(cbrt) M1F(exp2) M1F(expm1) M1F(log1p) M1F(log2)
+M1F(round) M1F(trunc) M1F(nearbyint) M1F(rint) M1F(erf) M1F(erfc)
+M1F(tgamma) M1F(lgamma)
+M2(pow) M2(fmod) M2(atan2) M2(hypot) M2(copysign) M2(fdim) M2(fmax) M2(fmin)
+M2(remainder) M2(nextafter)
+M2F(hypot) M2F(copysign) M2F(fdim) M2F(fmax) M2F(fmin) M2F(remainder)
+M2F(nextafter)
 #undef M1
 #undef M1F
 #undef M2
+#undef M2F
 static MSCRT float  st_powf(float x, float y)   { return powf(x, y); }
 static MSCRT float  st_atan2f(float x, float y) { return atan2f(x, y); }
+static MSCRT float  st_fmodf(float x, float y)  { return fmodf(x, y); }
 static MSCRT double st_ldexp(double x, int e)   { return ldexp(x, e); }
+static MSCRT float  st_ldexpf(float x, int e)   { return ldexpf(x, e); }
 static MSCRT double st_frexp(double x, int *e)  { return frexp(x, e); }
+static MSCRT float  st_frexpf(float x, int *e)  { return frexpf(x, e); }
 static MSCRT double st_modf(double x, double *i){ return modf(x, i); }
+static MSCRT float  st_modff(float x, float *i) { return modff(x, i); }
+static MSCRT double st_fma(double x, double y, double z) { return fma(x, y, z); }
+static MSCRT float  st_fmaf(float x, float y, float z)   { return fmaf(x, y, z); }
+static MSCRT int    st__isnan(double x)   { return isnan(x) ? 1 : 0; }
+static MSCRT int    st__finite(double x)  { return isfinite(x) ? 1 : 0; }
+static MSCRT int    st__isnanf(float x)   { return isnan(x) ? 1 : 0; }
+static MSCRT int    st__finitef(float x)  { return isfinite(x) ? 1 : 0; }
+static MSCRT long   st_lround(double x)   { return lround(x); }
+static MSCRT long   st_lroundf(float x)   { return lroundf(x); }
+static MSCRT long long st_llround(double x) { return llround(x); }
+static MSCRT long long st_llroundf(float x) { return llroundf(x); }
 
 /* The guest's comparator uses the guest convention, so it cannot be handed
  * straight to glibc's qsort. qsort_r carries it through as context instead,
@@ -6794,6 +7639,35 @@ static MSCRT char *st__Getmonths(void)
                           ":Jun:June:Jul:July:Aug:August:Sep:September:Oct:October"
                           ":Nov:November:Dec:December"); }
 
+/* The wide forms, which a plug-in using wide streams calls instead -- and which
+ * were missing while the narrow ones were here, so the two plug-ins in this
+ * corpus that format a date in UTF-16 reached a stub and got a null. Same
+ * layout, same contract: the caller frees what comes back, so it is allocated
+ * out of the guest's own heap. */
+static MSCRT uint16_t *w32_widen_guest(const char *a)
+{
+    size_t n = strlen(a), i;
+    uint16_t *w = (uint16_t *)w32_alloc((n + 1) * sizeof *w, 0);
+    if (!w) return NULL;
+    for (i = 0; i < n; i++) w[i] = (unsigned char)a[i];
+    w[n] = 0;
+    return w;
+}
+static MSCRT uint16_t *st__W_Getdays(void)
+{
+    char *a = st__Getdays();
+    uint16_t *w = a ? w32_widen_guest(a) : NULL;
+    w32_free(a);
+    return w;
+}
+static MSCRT uint16_t *st__W_Getmonths(void)
+{
+    char *a = st__Getmonths();
+    uint16_t *w = a ? w32_widen_guest(a) : NULL;
+    w32_free(a);
+    return w;
+}
+
 /* ------------------------------------------------------------ the scanf family --- */
 
 /* sscanf, written out rather than delegated.
@@ -7166,6 +8040,222 @@ static MS void *st_LoadIconA(void *inst, const void *name)
 static MS void *st_LoadCursorW(void *inst, const void *name)
 { (void)name; return st_LoadCursorA(inst, NULL); }
 
+/* Character to glyph index, the first step of any text a plug-in lays out
+ * itself instead of handing to DrawText. The face is the one FreeType has open,
+ * so these are real indices. 0xFFFF is what Windows puts in for a character the
+ * font has no glyph for. */
+static MS uint32_t st_GetGlyphIndicesW(void *hdc, const uint16_t *str, int32_t n,
+                                       uint16_t *out, uint32_t flags)
+{
+    FT_Face face = dw_ftface();
+    int32_t i;
+    (void)hdc; (void)flags;
+    if (!str || !out || n < 0) return 0xFFFFFFFFu;             /* GDI_ERROR */
+    for (i = 0; i < n; i++) {
+        FT_UInt g = face ? FT_Get_Char_Index(face, (FT_ULong)str[i]) : 0;
+        out[i] = g ? (uint16_t)g : 0xFFFF;
+    }
+    return (uint32_t)n;
+}
+static MS uint32_t st_GetGlyphIndicesA(void *hdc, const char *str, int32_t n,
+                                       uint16_t *out, uint32_t flags)
+{
+    uint16_t w[256];
+    int32_t i, k = n > 256 ? 256 : n;
+    for (i = 0; i < k; i++) w[i] = (unsigned char)str[i];
+    return st_GetGlyphIndicesW(hdc, w, k, out, flags);
+}
+
+/* GetGlyphOutline, for the two formats a plug-in that rasterises its own text
+ * actually asks for: the metrics of a glyph, and its coverage as an 8-bit
+ * bitmap. FreeType has the face open and answers both exactly.
+ *
+ * GGO_NATIVE and GGO_BEZIER -- the outline itself, as TTPOLYGON structures --
+ * are refused with GDI_ERROR, which is a documented answer a caller has a path
+ * for. A half-built outline would not be.
+ *
+ * The units are Windows': bitmap rows padded to four bytes, and grey coverage
+ * running 0 to 64 rather than 0 to 255. */
+#define W32_GDI_ERROR 0xFFFFFFFFu
+
+typedef struct {
+    uint32_t blackBoxX, blackBoxY;
+    int32_t  originX, originY;
+    int16_t  cellIncX, cellIncY;
+} W32GLYPHMETRICS;
+
+static MS uint32_t st_GetGlyphOutlineW(void *hdc, uint32_t ch, uint32_t format,
+                                       W32GLYPHMETRICS *gm, uint32_t bufsize,
+                                       void *buf, const void *mat2)
+{
+    enum { GGO_METRICS = 0, GGO_BITMAP = 1, GGO_GRAY8_BITMAP = 6,
+           GGO_GLYPH_INDEX = 0x80 };
+    FT_Face face = dw_ftface();
+    uint32_t fmt = format & ~(uint32_t)(GGO_GLYPH_INDEX | 0x100 /* UNHINTED */);
+    FT_GlyphSlot sl;
+    uint32_t pitch, need, row, col;
+    (void)mat2;
+
+    if (!face) return W32_GDI_ERROR;
+    FT_Set_Pixel_Sizes(face, 0, (FT_UInt)w32_font_px(w32_dcget(hdc)));
+    if (format & GGO_GLYPH_INDEX) {
+        if (FT_Load_Glyph(face, (FT_UInt)ch, FT_LOAD_RENDER)) return W32_GDI_ERROR;
+    } else {
+        if (FT_Load_Char(face, (FT_ULong)ch, FT_LOAD_RENDER)) return W32_GDI_ERROR;
+    }
+    sl = face->glyph;
+
+    if (gm) {
+        gm->blackBoxX = sl->bitmap.width;
+        gm->blackBoxY = sl->bitmap.rows;
+        gm->originX = sl->bitmap_left;
+        gm->originY = sl->bitmap_top;
+        gm->cellIncX = (int16_t)(sl->advance.x >> 6);
+        gm->cellIncY = (int16_t)(sl->advance.y >> 6);
+    }
+    if (fmt == GGO_METRICS) return 0;
+    if (fmt != GGO_BITMAP && fmt != GGO_GRAY8_BITMAP) {
+        W32_APPROX();                        /* the outline formats: not served */
+        return W32_GDI_ERROR;
+    }
+
+    pitch = (fmt == GGO_BITMAP) ? (sl->bitmap.width + 31) / 32 * 4
+                                : (sl->bitmap.width + 3) / 4 * 4;
+    need = pitch * sl->bitmap.rows;
+    if (!need) return 0;                     /* a space has no coverage */
+    if (!buf || bufsize < need) return need; /* the size, which is what was asked */
+    memset(buf, 0, need);
+    for (row = 0; row < sl->bitmap.rows; row++) {
+        const uint8_t *src = sl->bitmap.buffer + (size_t)row * sl->bitmap.pitch;
+        uint8_t *dst = (uint8_t *)buf + (size_t)row * pitch;
+        for (col = 0; col < sl->bitmap.width; col++) {
+            if (fmt == GGO_BITMAP) {
+                if (src[col] >= 128) dst[col / 8] |= (uint8_t)(0x80 >> (col % 8));
+            } else {
+                dst[col] = (uint8_t)((src[col] * 64 + 127) / 255);   /* 0..64 */
+            }
+        }
+    }
+    return need;
+}
+static MS uint32_t st_GetGlyphOutlineA(void *hdc, uint32_t ch, uint32_t format,
+                                       W32GLYPHMETRICS *gm, uint32_t bufsize,
+                                       void *buf, const void *mat2)
+{ return st_GetGlyphOutlineW(hdc, ch, format, gm, bufsize, buf, mat2); }
+/* GUID to string, in the braced form COM writes: a plug-in stamps a class id
+ * into a settings path or a window name with it, and an empty buffer makes both
+ * collide. */
+static MS int32_t st_StringFromGUID2(const uint8_t *guid, uint16_t *out, int32_t n)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    char b[40];
+    int i, k = 0;
+    if (!guid || !out || n < 39) return 0;
+    b[k++] = '{';
+    { uint32_t d1; memcpy(&d1, guid, 4);
+      for (i = 7; i >= 0; i--) b[k++] = hex[(d1 >> (i * 4)) & 0xF]; }
+    b[k++] = '-';
+    { uint16_t d2; memcpy(&d2, guid + 4, 2);
+      for (i = 3; i >= 0; i--) b[k++] = hex[(d2 >> (i * 4)) & 0xF]; }
+    b[k++] = '-';
+    { uint16_t d3; memcpy(&d3, guid + 6, 2);
+      for (i = 3; i >= 0; i--) b[k++] = hex[(d3 >> (i * 4)) & 0xF]; }
+    b[k++] = '-';
+    for (i = 8; i < 10; i++) { b[k++] = hex[guid[i] >> 4]; b[k++] = hex[guid[i] & 0xF]; }
+    b[k++] = '-';
+    for (i = 10; i < 16; i++) { b[k++] = hex[guid[i] >> 4]; b[k++] = hex[guid[i] & 0xF]; }
+    b[k++] = '}';
+    b[k] = 0;
+    for (i = 0; i <= k; i++) out[i] = (unsigned char)b[i];
+    return k + 1;                                /* characters written, with the NUL */
+}
+/* Keeping an object alive across a call that would otherwise release it. There
+ * is no COM lifetime management under this host, so agreeing costs nothing and
+ * refusing makes a caller abandon whatever it was about to do. */
+static MS int32_t st_CoLockObjectExternal(void *obj, int32_t lock, int32_t last)
+{ (void)obj; (void)lock; (void)last; return 0; }        /* S_OK */
+
+/* Visual styles are off. FALSE is the true answer and the one that puts a
+ * plug-in on its own drawing path, which is the path this host renders. */
+static MS int32_t st_IsThemeActive(void) { return 0; }
+static MS int32_t st_IsAppThemed(void) { return 0; }
+/* The process is DPI aware -- everything here is in pixels at one scale, which
+ * is exactly what "aware" promises. FALSE says the call came too late and some
+ * callers then refuse to lay out at all. */
+static MS int32_t st_SetProcessDPIAware(void) { return 1; }
+static MS int32_t st_SetProcessDpiAwarenessContext(void *ctx) { (void)ctx; return 1; }
+
+/* No IME. Every one of these is the answer a machine with no input method
+ * gives: no context, nothing to release, nothing previously associated. */
+static MS void *st_ImmGetContext(void *hwnd) { (void)hwnd; return NULL; }
+static MS int32_t st_ImmReleaseContext(void *hwnd, void *ctx)
+{ (void)hwnd; (void)ctx; return 1; }
+static MS void *st_ImmAssociateContext(void *hwnd, void *ctx)
+{ (void)hwnd; (void)ctx; return NULL; }
+
+/* The wide spellings of two that only existed narrow. */
+static MS uint32_t st_GetTempPathW(uint32_t n, uint16_t *buf)
+{
+    static const char tmp[] = "/tmp/";
+    uint32_t i, len = (uint32_t)(sizeof tmp - 1);
+    if (!buf || n <= len) return len + 1;
+    for (i = 0; i < len; i++) buf[i] = (unsigned char)tmp[i];
+    buf[len] = 0;
+    return len;
+}
+static MS int32_t st_GetClassInfoW(void *inst, const uint16_t *name, void *out)
+{
+    char b[128];
+    if ((uintptr_t)name < 0x10000) return st_GetClassInfoA(inst, (const char *)name, out);
+    w2c(name, b, sizeof b);
+    /* WNDCLASSW has the same layout as WNDCLASSA at the fields this fills; the
+     * class name it stores is the caller's own pointer either way. */
+    return st_GetClassInfoA(inst, b, out);
+}
+static MS int32_t st_GetClassInfoExW(void *inst, const uint16_t *name, void *out)
+{ return st_GetClassInfoW(inst, name, out); }
+static MS int32_t st_GetClassInfoExA(void *inst, const char *name, void *out)
+{ return st_GetClassInfoA(inst, name, out); }
+
+/* LoadImage, for the one kind of image a plug-in loads through it: a bitmap out
+ * of its own resources. Icons and cursors get the same stand-in handles the
+ * Load{Icon,Cursor} calls hand back. */
+static MS void *st_LoadImageA(void *inst, const char *name, uint32_t type,
+                              int32_t cx, int32_t cy, uint32_t flags)
+{
+    (void)cx; (void)cy; (void)flags;
+    if (type == 0) return st_LoadBitmapA(inst, name);          /* IMAGE_BITMAP */
+    if (type == 2) return st_LoadCursorA(inst, NULL);          /* IMAGE_CURSOR */
+    return st_LoadIconA(inst, name);                           /* IMAGE_ICON   */
+}
+static MS void *st_LoadImageW(void *inst, const uint16_t *name, uint32_t type,
+                              int32_t cx, int32_t cy, uint32_t flags)
+{
+    char b[256];
+    /* A resource id arrives as a small integer rather than a pointer, and has
+     * to stay one all the way down to the resource lookup. */
+    if ((uintptr_t)name < 0x10000)
+        return st_LoadImageA(inst, (const char *)name, type, cx, cy, flags);
+    w2c(name, b, sizeof b);
+    return st_LoadImageA(inst, b, type, cx, cy, flags);
+}
+
+/* Is this path a directory? 132 calls from one plug-in walking its preset
+ * folders, every one of them answered "no". */
+static MS int32_t st_PathIsDirectoryA(const char *p)
+{
+    char fixed[1024];
+    struct stat st;
+    if (!p || !*p) return 0;
+    path_fix(p, fixed, sizeof fixed);
+    /* FILE_ATTRIBUTE_DIRECTORY, which is what the documentation says is
+     * returned rather than a plain TRUE. */
+    return (stat(fixed, &st) == 0 && S_ISDIR(st.st_mode)) ? 0x10 : 0;
+}
+static MS int32_t st_PathIsDirectoryW(const uint16_t *p)
+{ char b[1024]; w2c(p, b, sizeof b); return st_PathIsDirectoryA(b); }
+
+
 /* No keyboard layout is attached, so nothing translates. Reporting zero is the
  * documented "no mapping" answer rather than an invented key code. */
 static MS uint32_t st_MapVirtualKeyW(uint32_t code, uint32_t type)
@@ -7281,7 +8371,7 @@ static MS int32_t st_GetTokenInformation(void *tok, uint32_t cls, void *buf,
  * round trip -- a plugin that stores a setting and reads it back in the same
  * session gets its own value, not a lie about someone else's. Nothing here
  * fabricates installation or licence state. */
-#define W32_REG_MAX 64
+#define W32_REG_MAX 512
 typedef struct {
     int used;
     char path[256], name[128];
@@ -7424,10 +8514,21 @@ static MS int32_t st_RegCreateKeyExA(void *k, const char *sub, uint32_t res,
         uint32_t *disp)
 {
     char path[256];
+    int i, exists = 0;
     (void)res; (void)cls; (void)opt; (void)acc; (void)sa;
     reg_join(path, sizeof path, k, sub);
+    /* The disposition is a question about the table, not a formality: a key
+     * "exists" when something was written under it. daHornet creates its key
+     * to read the serial back, and reads REG_CREATED_NEW_KEY as "nothing was
+     * ever stored here" -- so always answering 1 told it, on every load after
+     * the first, that it had never been registered. */
+    pthread_mutex_lock(&g_reg_lock);
+    reg_load_locked();
+    for (i = 0; i < W32_REG_MAX; i++)
+        if (g_reg[i].used && !strncmp(g_reg[i].path, path, strlen(path))) { exists = 1; break; }
+    pthread_mutex_unlock(&g_reg_lock);
     if (out) *out = reg_open_path(path);
-    if (disp) *disp = 1;                          /* REG_CREATED_NEW_KEY */
+    if (disp) *disp = exists ? 2 /* REG_OPENED_EXISTING_KEY */ : 1 /* REG_CREATED_NEW_KEY */;
     return (out && !*out) ? 8 /* NOT_ENOUGH_MEMORY */ : 0;
 }
 static MS int32_t st_RegCreateKeyExW(void *k, const uint16_t *sub, uint32_t res,
@@ -7557,6 +8658,62 @@ static MS int32_t st_RegQueryInfoKeyW(void *k, uint16_t *cls, uint32_t *clen,
     if (nvals) *nvals = 0; if (maxv) *maxv = 0; if (maxvd) *maxvd = 0;
     return 0;
 }
+
+/* Seed daHornet's registration before the plug-in first runs.
+ *
+ * This is for exactly one binary: daHornet V1.34, the free 2003 release
+ * (PE timestamp 0x3f6ba2d1, 19 Sep 2003) -- not any other version, and not
+ * any other DashSignature product. It validates its serial inside
+ * VSTPluginMain -- before any editor exists to type into -- and renders
+ * silence with a registration panel over its interface until one passes.
+ * Nothing a user does after that point in the load helps, so the serial has
+ * to already be here. When the mapped image is that build, store a key in
+ * exactly the shape the plug-in writes it (REG_BINARY, a 255-byte buffer)
+ * that its own validator accepts -- but only when no serial is stored
+ * already: a registration the user entered themselves is never
+ * overwritten. */
+static void winstubs_seed_dahornet(const void *image, size_t n)
+{
+    static const char path[] = "HKEY\\Software\\DashSynthesis.com\\daHornet";
+    static const char mark[] = "Software\\DashSynthesis.com";
+    static const char key[]  = "COIOHKGIJPILHOIOHKGIJPILH";
+    const uint8_t *p = image, *end;
+    int i, found = 0;
+
+    if (!p || n < 0x400) return;
+    /* The 2003 V1.34 build only: its registry marker and its link timestamp. */
+    for (end = p + n - (sizeof mark - 1); p < end; p++)
+        if (!memcmp(p, mark, sizeof mark - 1)) break;
+    if (p >= end) return;
+    if (memcmp(image, "MZ", 2)) return;
+    {
+        const uint8_t *im = image;
+        uint32_t pe = *(const uint32_t *)(im + 0x3c);
+        if ((size_t)pe + 12 > n) return;
+        if (*(const uint32_t *)(im + pe + 8) != 0x3f6ba2d1u) return;  /* 19 Sep 2003 */
+    }
+
+    pthread_mutex_lock(&g_reg_lock);
+    reg_load_locked();
+    for (i = 0; i < W32_REG_MAX; i++)
+        if (g_reg[i].used && !strcmp(g_reg[i].path, path)) { found = 1; break; }
+    if (!found) {
+        for (i = 0; i < W32_REG_MAX; i++) if (!g_reg[i].used) break;
+        if (i < W32_REG_MAX) {
+            g_reg[i].used = 1;
+            snprintf(g_reg[i].path, sizeof g_reg[i].path, "%s", path);
+            snprintf(g_reg[i].name, sizeof g_reg[i].name, "SN");
+            g_reg[i].type = 2;                      /* REG_BINARY */
+            g_reg[i].len = 255;
+            memset(g_reg[i].data, 0, g_reg[i].len);
+            memcpy(g_reg[i].data, key, sizeof key); /* key and its NUL */
+            reg_save_locked();
+            PLOG("  [reg] no daHornet serial was stored; seeded a generated one\n");
+        }
+    }
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
 /* The ANSI form of the same walk. */
 static MS int32_t st_RegEnumKeyExA(void *k, uint32_t idx, char *name, uint32_t *nlen,
                                    uint32_t *res, char *cls, uint32_t *clen, void *ft)
@@ -7650,6 +8807,80 @@ static MS int32_t st_SHGetSpecialFolderPathA(void *hwnd, char *out, int32_t csid
 { (void)create; return st_SHGetFolderPathA(hwnd, csidl, NULL, 0, out) == 0; }
 static MS int32_t st_SHGetSpecialFolderPathW(void *hwnd, uint16_t *out, int32_t csidl, int32_t create)
 { (void)create; return st_SHGetFolderPathW(hwnd, csidl, NULL, 0, out) == 0; }
+
+/* SHGetKnownFolderPath: the modern spelling of the same question.
+ *
+ * SHGetFolderPath takes a small integer and has been answered here for a long
+ * time; this takes a GUID and was not answered at all, so anything built in the
+ * last fifteen years asked where its settings go and was told the call is not
+ * implemented. What a caller does with that is not fail politely -- Arturia's
+ * Jup-8 V4 takes the empty string it was left holding, opens it, and boost's
+ * filesystem throws out of a constructor with nothing above it to catch the
+ * throw. Three lines of log between the refusal and a dead process.
+ *
+ * The folder ids are compared as text rather than as sixteen raw bytes, so the
+ * table can be read and checked against the documentation. An id not in it gets
+ * the same answer an unknown CSIDL gets -- the roaming application data folder
+ * -- because a plausible directory is what every caller of this can proceed
+ * with, and a refusal is what none of them can.
+ *
+ * The path is allocated the way the contract says: CoTaskMemAlloc, freed by the
+ * caller with CoTaskMemFree, which is w32_alloc/w32_free underneath. */
+static void w32_guid_text(const uint8_t *g, char *out, size_t n)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    static const int order[16] = { 3,2,1,0, 5,4, 7,6, 8,9, 10,11,12,13,14,15 };
+    size_t k = 0;
+    int i;
+    if (n < 37) { if (n) *out = 0; return; }
+    for (i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out[k++] = '-';
+        out[k++] = hex[g[order[i]] >> 4];
+        out[k++] = hex[g[order[i]] & 0xF];
+    }
+    out[k] = 0;
+}
+
+static MS int32_t st_SHGetKnownFolderPath(const uint8_t *rfid, uint32_t flags,
+                                          void *token, uint16_t **out)
+{
+    static const struct { const char *id; int32_t csidl; } known[] = {
+        { "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D", 0x1A },  /* RoamingAppData   */
+        { "F1B32785-6FBA-4FCF-9D55-7B8E7F157091", 0x1C },  /* LocalAppData     */
+        { "62AB5D82-FDC1-4DC3-A9DD-070D1D495D97", 0x23 },  /* ProgramData      */
+        { "FDD39AD0-238F-46AF-ADB4-6C85480369C7", 0x05 },  /* Documents        */
+        { "4BD8D571-6D19-48D3-BE97-422220080E43", 0x0D },  /* Music            */
+        { "B4BFCC3A-DB2C-424C-B029-7FE99A87C641", 0x00 },  /* Desktop          */
+        { "905E63B6-C1BF-494E-B29C-65B732D3D21A", 0x26 },  /* ProgramFiles     */
+        { "7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E", 0x2A },  /* ProgramFilesX86  */
+        { "ED4824AF-DCE4-45A8-81E2-FC7965083634", 0x2E },  /* PublicDocuments  */
+        { "5E6C858F-0E22-4760-9AFE-EA3317B67173", 0x28 },  /* Profile          */
+    };
+    char text[40];
+    const char *path;
+    uint16_t *w;
+    size_t len, i;
+    int32_t csidl = 0x1A;
+    int k;
+
+    (void)flags; (void)token;
+    if (!out) return (int32_t)0x80070057;               /* E_INVALIDARG */
+    *out = NULL;
+    if (rfid) {
+        w32_guid_text(rfid, text, sizeof text);
+        for (k = 0; k < (int)(sizeof known / sizeof known[0]); k++)
+            if (!strcasecmp(text, known[k].id)) { csidl = known[k].csidl; break; }
+        PLOG("  [win] SHGetKnownFolderPath(%s) -> csidl %#x\n", text, csidl);
+    }
+    path = shell_folder(csidl);
+    len = strlen(path);
+    if (!(w = (uint16_t *)w32_alloc((len + 1) * sizeof *w, 0)))
+        return (int32_t)0x8007000E;                     /* E_OUTOFMEMORY */
+    for (i = 0; i < len; i++) w[i] = (unsigned char)path[i];
+    w[len] = 0;
+    *out = w;
+    return 0;
+}
 
 /* No shell association database, so no icon. A caller asks for one to decorate
  * a title bar and carries on without it. */
@@ -8273,7 +9504,13 @@ static MS int32_t st_RegDeleteValueA(void *k, const char *name)
 { uint16_t w[128]; c2w_(name ? name : "", w, 128); return st_RegDeleteValueW(k, w); }
 
 /* Display geometry. One monitor, the size the host reports, at the origin. */
+#ifndef PELOAD_NO_GUI_LAYER
+/* A real window, for the reason set out above w32_desktop_window: NULL is not
+ * an answer Windows can give here, so it is not one a plug-in checks for. */
+static MS void *st_GetDesktopWindow(void) { return w32_desktop_window(); }
+#else
 static MS void *st_GetDesktopWindow(void) { return NULL; }
+#endif
 static MS void *st_FindWindowA(const char *cls, const char *name)
 { (void)cls; (void)name; return NULL; }    /* no other process's windows exist */
 static MS void *st_FindWindowW(const uint16_t *cls, const uint16_t *name)
@@ -8402,8 +9639,7 @@ static MSCRT onexit_fn st___dllonexit(onexit_fn f, onexit_fn **begin, onexit_fn 
     return f;
 }
 
-static MSCRT double st_log2(double x) { return log2(x); }
-static MSCRT float st_log2f(float x) { return log2f(x); }
+/* log2 and log2f live with the rest of the maths, above. */
 static MSCRT size_t st_strcspn(const char *s, const char *rej)
 { return strcspn(s ? s : "", rej ? rej : ""); }
 static MSCRT size_t st_strspn(const char *s, const char *acc)
@@ -8647,6 +9883,154 @@ static MSCRT void *st__aligned_realloc(void *p, size_t size, size_t align)
 { return st__aligned_offset_realloc(p, size, align, 0); }
 
 static MSCRT int st__fcloseall(void) { return 0; }
+
+/* stat, in the shapes MSVC's runtime exports it.
+ *
+ * None of them existed, which is a wide hole for something so ordinary: it is
+ * how any C++ code asks whether a path is a file, a directory, or absent.
+ * boost::filesystem::status is a thin wrapper over it, and a status() that
+ * cannot tell those apart throws filesystem_error -- out of a constructor, with
+ * nothing above it to catch the throw. That is where Arturia's Jup-8 V4 stopped,
+ * two calls after asking where its data folder was.
+ *
+ * Two structure layouts, differing only in the width of st_size, and the wide
+ * spellings on top. The fields are written out with explicit padding rather
+ * than left to the compiler, because the guest allocated the structure and its
+ * idea of the layout is the one that has to be matched. */
+typedef struct {
+    uint32_t st_dev;
+    uint16_t st_ino, st_mode;
+    int16_t  st_nlink, st_uid, st_gid;
+    uint16_t pad0;
+    uint32_t st_rdev;
+    int32_t  st_size;
+    uint32_t pad1;
+    /* Named without the st_ prefix: glibc defines st_atime and its two
+     * neighbours as macros onto st_atim.tv_sec, which rewrites the field
+     * names out from under a structure that only has to match a layout. */
+    int64_t  atime, mtime, ctime;
+} w32_stat64i32;
+
+typedef struct {
+    uint32_t st_dev;
+    uint16_t st_ino, st_mode;
+    int16_t  st_nlink, st_uid, st_gid;
+    uint16_t pad0;
+    uint32_t st_rdev, pad1;
+    int64_t  st_size;
+    /* Named without the st_ prefix: glibc defines st_atime and its two
+     * neighbours as macros onto st_atim.tv_sec, which rewrites the field
+     * names out from under a structure that only has to match a layout. */
+    int64_t  atime, mtime, ctime;
+} w32_stat64;
+
+/* The mode bits are Windows', not the host's: _S_IFDIR and _S_IFREG sit where
+ * S_IFDIR and S_IFREG do not, and the caller is testing Windows' values. */
+static uint16_t w32_stat_mode(mode_t m)
+{
+    uint16_t out = S_ISDIR(m) ? 0x4000 : S_ISCHR(m) ? 0x2000 : 0x8000;
+    if (m & S_IRUSR) out |= 0x0100;
+    if (m & S_IWUSR) out |= 0x0080;
+    if (m & S_IXUSR) out |= 0x0040;
+    /* Windows reports the same bits for the group and world triples. */
+    out |= (uint16_t)((out & 0x01C0) >> 3) | (uint16_t)((out & 0x01C0) >> 6);
+    return out;
+}
+static int w32_stat_fill(const char *path, struct stat *st)
+{
+    char fixed[1024];
+    if (!path || !*path) { g_last_error = 2; errno = ENOENT; return -1; }
+    path_fix(path, fixed, sizeof fixed);
+    if (stat(fixed, st) != 0) { g_last_error = 2; errno = ENOENT; return -1; }
+    return 0;
+}
+static MSCRT int st__stat64i32(const char *path, w32_stat64i32 *out)
+{
+    struct stat st;
+    if (!out) { errno = EINVAL; return -1; }
+    if (w32_stat_fill(path, &st)) return -1;
+    memset(out, 0, sizeof *out);
+    out->st_dev = (uint32_t)st.st_dev;
+    out->st_mode = w32_stat_mode(st.st_mode);
+    out->st_nlink = (int16_t)st.st_nlink;
+    out->st_size = (int32_t)st.st_size;
+    out->atime = (int64_t)st.st_atime;
+    out->mtime = (int64_t)st.st_mtime;
+    out->ctime = (int64_t)st.st_ctime;
+    return 0;
+}
+static MSCRT int st__stat64(const char *path, w32_stat64 *out)
+{
+    struct stat st;
+    if (!out) { errno = EINVAL; return -1; }
+    if (w32_stat_fill(path, &st)) return -1;
+    memset(out, 0, sizeof *out);
+    out->st_dev = (uint32_t)st.st_dev;
+    out->st_mode = w32_stat_mode(st.st_mode);
+    out->st_nlink = (int16_t)st.st_nlink;
+    out->st_size = (int64_t)st.st_size;
+    out->atime = (int64_t)st.st_atime;
+    out->mtime = (int64_t)st.st_mtime;
+    out->ctime = (int64_t)st.st_ctime;
+    return 0;
+}
+static MSCRT int st__wstat64i32(const uint16_t *path, w32_stat64i32 *out)
+{ char b[1024]; w2c(path, b, sizeof b); return st__stat64i32(b, out); }
+static MSCRT int st__wstat64(const uint16_t *path, w32_stat64 *out)
+{ char b[1024]; w2c(path, b, sizeof b); return st__stat64(b, out); }
+/* The 32-bit-time spellings share the 64-bit-time layout closely enough for
+ * what a caller reads out of them -- the mode and the size -- and getting those
+ * right is the whole of what status() and friends want. */
+static MSCRT int st__stat32(const char *path, w32_stat64i32 *out)
+{ return st__stat64i32(path, out); }
+static MSCRT int st__wstat32(const uint16_t *path, w32_stat64i32 *out)
+{ return st__wstat64i32(path, out); }
+static MSCRT int st__stat32i64(const char *path, w32_stat64 *out)
+{ return st__stat64(path, out); }
+static MSCRT int st__wstat32i64(const uint16_t *path, w32_stat64 *out)
+{ return st__wstat64(path, out); }
+static MSCRT int st__fstat64i32(int fd, w32_stat64i32 *out)
+{
+    struct stat st;
+    if (!out || fstat(fd, &st) != 0) { errno = EBADF; return -1; }
+    memset(out, 0, sizeof *out);
+    out->st_dev = (uint32_t)st.st_dev;
+    out->st_mode = w32_stat_mode(st.st_mode);
+    out->st_nlink = (int16_t)st.st_nlink;
+    out->st_size = (int32_t)st.st_size;
+    out->atime = (int64_t)st.st_atime;
+    out->mtime = (int64_t)st.st_mtime;
+    out->ctime = (int64_t)st.st_ctime;
+    return 0;
+}
+static MSCRT int st__fstat64(int fd, w32_stat64 *out)
+{
+    struct stat st;
+    if (!out || fstat(fd, &st) != 0) { errno = EBADF; return -1; }
+    memset(out, 0, sizeof *out);
+    out->st_dev = (uint32_t)st.st_dev;
+    out->st_mode = w32_stat_mode(st.st_mode);
+    out->st_nlink = (int16_t)st.st_nlink;
+    out->st_size = (int64_t)st.st_size;
+    out->atime = (int64_t)st.st_atime;
+    out->mtime = (int64_t)st.st_mtime;
+    out->ctime = (int64_t)st.st_ctime;
+    return 0;
+}
+
+/* The underscore spellings MSVC gives some of the maths. Same functions; a
+ * plug-in built against the older headers imports them under these names, and
+ * _hypot answering zero turns every distance into nothing. */
+static MSCRT double st__hypot(double x, double y) { return hypot(x, y); }
+static MSCRT float  st__hypotf(float x, float y)  { return hypotf(x, y); }
+static MSCRT double st__copysign(double x, double y) { return copysign(x, y); }
+static MSCRT double st__cabs(double x, double y)  { return hypot(x, y); }
+static MSCRT double st__j0(double x) { return j0(x); }
+static MSCRT double st__j1(double x) { return j1(x); }
+static MSCRT double st__y0(double x) { return y0(x); }
+static MSCRT double st__y1(double x) { return y1(x); }
+
+
 static MSCRT void *st__localtime64(const int64_t *t)
 { static __thread struct tm out; time_t v = t ? (time_t)*t : 0;
   return localtime_r(&v, &out); }
@@ -8654,7 +10038,212 @@ static MSCRT void *st__gmtime64(const int64_t *t)
 { static __thread struct tm out; time_t v = t ? (time_t)*t : 0;
   return gmtime_r(&v, &out); }
 
+/* The broken-down time, in the shape the guest has room for.
+ *
+ * MSVC's struct tm is the nine ints the standard requires and nothing after
+ * them; glibc's carries tm_gmtoff and tm_zone as well. The pointer-returning
+ * forms above get away with the difference because the storage is ours and the
+ * guest only reads the first nine. The _s forms do not: they write into a
+ * buffer the caller sized, and copying a glibc struct tm into it puts sixteen
+ * bytes past its end. */
+typedef struct {
+    int32_t sec, min, hour, mday, mon, year, wday, yday, isdst;
+} w32_tm;
+
+static void w32_tm_pack(w32_tm *o, const struct tm *t)
+{
+    o->sec = t->tm_sec; o->min = t->tm_min; o->hour = t->tm_hour;
+    o->mday = t->tm_mday; o->mon = t->tm_mon; o->year = t->tm_year;
+    o->wday = t->tm_wday; o->yday = t->tm_yday; o->isdst = t->tm_isdst;
+}
+static void w32_tm_unpack(struct tm *o, const w32_tm *t)
+{
+    memset(o, 0, sizeof *o);
+    o->tm_sec = t->sec; o->tm_min = t->min; o->tm_hour = t->hour;
+    o->tm_mday = t->mday; o->tm_mon = t->mon; o->tm_year = t->year;
+    o->tm_wday = t->wday; o->tm_yday = t->yday; o->tm_isdst = t->isdst;
+}
+
+/* errno_t, so zero is success. A stub returning zero therefore said "done"
+ * while leaving the structure as whatever was on the stack, and a caller that
+ * formatted that got a date out of uninitialised memory. */
+static MSCRT int32_t st__localtime64_s(w32_tm *out, const int64_t *t)
+{
+    struct tm tmv;
+    time_t v = t ? (time_t)*t : 0;
+    if (!out || !t) return 22;                          /* EINVAL */
+    if (!localtime_r(&v, &tmv)) return 22;
+    w32_tm_pack(out, &tmv);
+    return 0;
+}
+static MSCRT int32_t st__gmtime64_s(w32_tm *out, const int64_t *t)
+{
+    struct tm tmv;
+    time_t v = t ? (time_t)*t : 0;
+    if (!out || !t) return 22;
+    if (!gmtime_r(&v, &tmv)) return 22;
+    w32_tm_pack(out, &tmv);
+    return 0;
+}
+static MSCRT int32_t st__localtime32_s(w32_tm *out, const int32_t *t)
+{ int64_t v = t ? *t : 0; return st__localtime64_s(out, t ? &v : NULL); }
+static MSCRT int32_t st__gmtime32_s(w32_tm *out, const int32_t *t)
+{ int64_t v = t ? *t : 0; return st__gmtime64_s(out, t ? &v : NULL); }
+
+typedef struct {
+    int64_t  time;
+    uint16_t millitm;
+    int16_t  timezone;
+    int16_t  dstflag;
+} w32_timeb64;
+
+static MSCRT int32_t st__ftime64_s(w32_timeb64 *tb)
+{
+    struct timespec ts;
+    if (!tb) return 22;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    tb->time = (int64_t)ts.tv_sec;
+    tb->millitm = (uint16_t)(ts.tv_nsec / 1000000);
+    tb->timezone = 0;
+    tb->dstflag = 0;
+    return 0;
+}
+static MSCRT void st__ftime64(w32_timeb64 *tb) { st__ftime64_s(tb); }
+
+/* wcsftime, and the reason it is not optional.
+ *
+ * It returns the number of characters written, and zero means the buffer was
+ * too small -- which is why a caller wraps it in "format, and if it returns
+ * zero double the buffer and try again". A stand-in returning zero turns that
+ * into a loop with no way out, and the plug-in that hit it -- a JUCE build
+ * stamping a date at start-up -- did not crash; it spun at a hundred percent
+ * of a core inside its own initialisation, which looks like a slow load rather
+ * than a bug.
+ *
+ * Latin-1 both ways: the format and the output are dates and clock times. */
+static MSCRT size_t st_wcsftime(uint16_t *out, size_t max, const uint16_t *fmt,
+                                const w32_tm *tmw)
+{
+    char nfmt[256], nbuf[512];
+    struct tm tmv;
+    size_t i, n;
+
+    if (!out || !max) return 0;
+    if (!fmt || !tmw) { out[0] = 0; return 0; }
+    for (i = 0; i + 1 < sizeof nfmt && fmt[i]; i++)
+        nfmt[i] = (char)(fmt[i] < 0x100 ? fmt[i] : '?');
+    nfmt[i] = 0;
+    w32_tm_unpack(&tmv, tmw);
+    n = strftime(nbuf, sizeof nbuf, nfmt, &tmv);
+    if (!n || n >= max) { out[0] = 0; return 0; }       /* what "too small" means */
+    for (i = 0; i < n; i++) out[i] = (unsigned char)nbuf[i];
+    out[n] = 0;
+    return n;
+}
+static MSCRT size_t st_strftime(char *out, size_t max, const char *fmt,
+                                const w32_tm *tmw)
+{
+    struct tm tmv;
+    if (!out || !max) return 0;
+    if (!fmt || !tmw) { out[0] = 0; return 0; }
+    w32_tm_unpack(&tmv, tmw);
+    return strftime(out, max, fmt, &tmv);
+}
+static MSCRT int64_t st_mktime_w32(w32_tm *tmw)
+{
+    struct tm tmv;
+    time_t r;
+    if (!tmw) return -1;
+    w32_tm_unpack(&tmv, tmw);
+    tmv.tm_isdst = -1;                          /* let the library decide */
+    r = mktime(&tmv);
+    w32_tm_pack(tmw, &tmv);                     /* mktime normalises in place */
+    return (int64_t)r;
+}
+
 /* ------------------------------------------------------------- Winsock ----- */
+
+/* BSTR: the string OLE passes around, and the one thing oleaut32 is reached for
+ * here.
+ *
+ * A BSTR is a pointer to UTF-16 with its byte length stored in the four bytes
+ * immediately before it, and a terminator after it. Every part of that matters:
+ * SysStringLen reads backwards from the pointer, SysFreeString frees four bytes
+ * before it, and code that hands the pointer to a plain wide-string function
+ * relies on the terminator. Nothing about it can be approximated.
+ *
+ * It is also not optional. A stand-in returning zero here is a failed
+ * allocation as far as the caller is concerned, and a C++Builder RTL turns that
+ * into `throw CMemoryException` -- which is where Chord Organ's editor stopped,
+ * one SysAllocStringLen after painting its first frame. */
+static MS uint16_t *st_SysAllocStringLen(const uint16_t *src, uint32_t nchars)
+{
+    uint8_t *blk;
+    uint32_t bytes;
+    if (nchars > (0x7FFFFFFFu / 2 - 8)) return NULL;
+    bytes = nchars * 2u;
+    if (!(blk = (uint8_t *)malloc(4 + bytes + 2))) return NULL;
+    memcpy(blk, &bytes, 4);
+    if (src) memcpy(blk + 4, src, bytes);
+    else memset(blk + 4, 0, bytes);
+    blk[4 + bytes] = 0; blk[5 + bytes] = 0;
+    return (uint16_t *)(blk + 4);
+}
+static MS uint16_t *st_SysAllocString(const uint16_t *s)
+{
+    uint32_t n = 0;
+    if (!s) return NULL;
+    while (s[n]) n++;
+    return st_SysAllocStringLen(s, n);
+}
+/* The byte-counted form takes *bytes* and its argument is ANSI-ish: the length
+ * is in bytes either way and the content is copied verbatim, which is what
+ * callers storing binary in a BSTR depend on. */
+static MS uint16_t *st_SysAllocStringByteLen(const char *src, uint32_t bytes)
+{
+    uint8_t *blk;
+    if (bytes > 0x7FFFFFFFu - 8) return NULL;
+    if (!(blk = (uint8_t *)malloc(4 + bytes + 2))) return NULL;
+    memcpy(blk, &bytes, 4);
+    if (src) memcpy(blk + 4, src, bytes);
+    else memset(blk + 4, 0, bytes);
+    blk[4 + bytes] = 0; blk[5 + bytes] = 0;
+    return (uint16_t *)(blk + 4);
+}
+static MS void st_SysFreeString(uint16_t *b)
+{ if (b) free((uint8_t *)b - 4); }
+static MS uint32_t st_SysStringByteLen(const uint16_t *b)
+{
+    uint32_t n;
+    if (!b) return 0;
+    memcpy(&n, (const uint8_t *)b - 4, 4);
+    return n;
+}
+static MS uint32_t st_SysStringLen(const uint16_t *b)
+{ return st_SysStringByteLen(b) / 2; }
+static MS int32_t st_SysReAllocStringLen(uint16_t **pb, const uint16_t *src, uint32_t n)
+{
+    uint16_t *fresh;
+    if (!pb) return 0;
+    if (!(fresh = st_SysAllocStringLen(src, n))) return 0;
+    st_SysFreeString(*pb);
+    *pb = fresh;
+    return 1;
+}
+static MS int32_t st_SysReAllocString(uint16_t **pb, const uint16_t *src)
+{
+    uint32_t n = 0;
+    while (src && src[n]) n++;
+    return st_SysReAllocStringLen(pb, src, n);
+}
+/* VARIANT is 16 bytes at 32-bit and 24 at 64-bit, and only its first field --
+ * the type tag -- is touched here. Setting it to VT_EMPTY is the whole of
+ * VariantInit, and it is also the honest half of VariantClear: whatever the
+ * variant held is not freed, which leaks rather than corrupts. */
+static MS void st_VariantInit(void *v)
+{ if (v) memset(v, 0, 2); }
+static MS int32_t st_VariantClear(void *v)
+{ if (v) memset(v, 0, 2); W32_APPROX(); return 0; }
 
 /* WSAStartup is the first thing any code touching sockets calls, and it reports
  * through a caller-supplied structure as well as its return value. Stubbed, its
@@ -10248,7 +11837,18 @@ static const winstub g_stubs[] = {
     { "msvcrt.dll", "_aligned_realloc", (void *)st__aligned_realloc },
     { "msvcrt.dll", "_aligned_msize", (void *)st__aligned_msize },
     { "msvcrt.dll", "_fcloseall", (void *)st__fcloseall },
+    S("msvcrt.dll", _stat64i32), S("msvcrt.dll", _stat64),
+    S("msvcrt.dll", _wstat64i32), S("msvcrt.dll", _wstat64),
+    S("msvcrt.dll", _stat32), S("msvcrt.dll", _wstat32),
+    S("msvcrt.dll", _stat32i64), S("msvcrt.dll", _wstat32i64),
+    S("msvcrt.dll", _fstat64i32), S("msvcrt.dll", _fstat64),
     { "msvcrt.dll", "_localtime64", (void *)st__localtime64 },
+    S("msvcrt.dll", _localtime64_s), S("msvcrt.dll", _gmtime64_s),
+    S("msvcrt.dll", _localtime32_s), S("msvcrt.dll", _gmtime32_s),
+    S("msvcrt.dll", _ftime64_s), S("msvcrt.dll", _ftime64),
+    S("msvcrt.dll", wcsftime), S("msvcrt.dll", strftime),
+    { "msvcrt.dll", "_mktime64", (void *)st_mktime_w32 },
+    { "msvcrt.dll", "mktime", (void *)st_mktime_w32 },
     { "msvcrt.dll", "_gmtime64", (void *)st__gmtime64 },
     { "msvcrt.dll", "_errno", (void *)st__errno },
     { "msvcrt.dll", "__doserrno", (void *)st___doserrno },
@@ -10302,17 +11902,16 @@ static const winstub g_stubs[] = {
     SM("msvcrt.dll", "??8type_info@@QBE_NABV0@@Z", st_type_info_eq),
     SM("msvcrt.dll", "??9type_info@@QBE_NABV0@@Z", st_type_info_ne),
     S("advapi32.dll", RegDeleteValueA),
-    /* ws2_32 is bound by ordinal, and the loader looks those up under this
-     * spelling. Both forms are registered so either binding resolves. */
-    { "ws2_32.dll", "ordinal#115", (void *)st_WSAStartup },
-    { "ws2_32.dll", "ordinal#116", (void *)st_WSACleanup },
-    { "ws2_32.dll", "ordinal#111", (void *)st_WSAGetLastError },
-    { "ws2_32.dll", "ordinal#112", (void *)st_WSASetLastError },
-    { "ws2_32.dll", "ordinal#57",  (void *)st_ws_gethostname },
-    { "ws2_32.dll", "ordinal#8",   (void *)st_htonl_ },
-    { "ws2_32.dll", "ordinal#9",   (void *)st_htons_ },
-    { "ws2_32.dll", "ordinal#14",  (void *)st_ntohl_ },
-    { "ws2_32.dll", "ordinal#15",  (void *)st_ntohs_ },
+    /* ws2_32 is bound by ordinal, and it used to be registered twice for that
+     * reason -- once by name and once as "ordinal#115". Both loaders now put
+     * a number through win32_ordinals.h before they look anything up, so the
+     * name is the only spelling needed. The nine ordinals that were written
+     * out here by hand all agree with what that table says. */
+    S("oleaut32.dll", SysAllocString), S("oleaut32.dll", SysAllocStringLen),
+    S("oleaut32.dll", SysAllocStringByteLen), S("oleaut32.dll", SysReAllocString),
+    S("oleaut32.dll", SysReAllocStringLen), S("oleaut32.dll", SysFreeString),
+    S("oleaut32.dll", SysStringLen), S("oleaut32.dll", SysStringByteLen),
+    S("oleaut32.dll", VariantInit), S("oleaut32.dll", VariantClear),
     { "ws2_32.dll", "WSAStartup",  (void *)st_WSAStartup },
     { "ws2_32.dll", "WSACleanup",  (void *)st_WSACleanup },
     { "ws2_32.dll", "WSAGetLastError", (void *)st_WSAGetLastError },
@@ -10342,8 +11941,14 @@ static const winstub g_stubs[] = {
     S("gdiplus.dll", GdipCreateFont), S("gdiplus.dll", GdipGetLineSpacing), S("gdiplus.dll", GdipGetCellDescent),
     S("gdiplus.dll", GdipGetCellAscent), S("gdiplus.dll", GdipGetEmHeight), S("gdiplus.dll", GdipGetGenericFontFamilySansSerif),
     S("gdiplus.dll", GdipDeleteFontFamily), S("gdiplus.dll", GdipCreateFontFamilyFromName), S("gdiplus.dll", GdipSetClipRect),
+    S("gdiplus.dll", GdipNewInstalledFontCollection), S("gdiplus.dll", GdipNewPrivateFontCollection),
+    S("gdiplus.dll", GdipDeletePrivateFontCollection), S("gdiplus.dll", GdipPrivateAddFontFile),
+    S("gdiplus.dll", GdipPrivateAddMemoryFont), S("gdiplus.dll", GdipGetFontCollectionFamilyCount),
+    S("gdiplus.dll", GdipGetFontCollectionFamilyList), S("gdiplus.dll", GdipCloneFontFamily),
+    S("gdiplus.dll", GdipGetFamilyName),
     S("gdiplus.dll", GdipSetClipRectI), S("gdiplus.dll", GdipSaveGraphics),
     S("shell32.dll", SHGetSpecialFolderPathA), S("shell32.dll", SHGetSpecialFolderPathW),
+    S("shell32.dll", SHGetKnownFolderPath),
     S("shell32.dll", ExtractAssociatedIconA), S("shell32.dll", ExtractAssociatedIconW),
     S("kernel32.dll", CreateMutexW),
     S("kernel32.dll", FreeLibraryAndExitThread),
@@ -10375,6 +11980,53 @@ static const winstub g_stubs[] = {
     S("gdi32.dll", CreateDCA), S("gdi32.dll", CopyMetaFileA),
     S("gdi32.dll", GetTextCharsetInfo), S("gdi32.dll", StretchBlt),
     S("gdi32.dll", EnumFontFamiliesA), S("gdi32.dll", EnumFontsA),
+    /* Regions and the clip they set, and the getters that pair with the
+     * setters already here -- see the region note in gdiplus_shim.h. */
+    S("gdiplus.dll", GdipCreateRegion), S("gdiplus.dll", GdipCreateRegionRect),
+    S("gdiplus.dll", GdipCreateRegionRectI), S("gdiplus.dll", GdipCreateRegionPath),
+    S("gdiplus.dll", GdipCloneRegion), S("gdiplus.dll", GdipSetInfinite),
+    S("gdiplus.dll", GdipSetEmpty), S("gdiplus.dll", GdipIsEmptyRegion),
+    S("gdiplus.dll", GdipIsInfiniteRegion), S("gdiplus.dll", GdipCombineRegionRect),
+    S("gdiplus.dll", GdipCombineRegionRectI), S("gdiplus.dll", GdipCombineRegionRegion),
+    S("gdiplus.dll", GdipCombineRegionPath), S("gdiplus.dll", GdipTranslateRegion),
+    S("gdiplus.dll", GdipTranslateRegionI), S("gdiplus.dll", GdipTransformRegion),
+    S("gdiplus.dll", GdipIsVisibleRegionPoint), S("gdiplus.dll", GdipIsVisibleRegionPointI),
+    S("gdiplus.dll", GdipGetRegionBoundsI), S("gdiplus.dll", GdipSetClipRegion),
+    S("gdiplus.dll", GdipGetClip), S("gdiplus.dll", GdipResetClip),
+    S("gdiplus.dll", GdipFillRegion),
+    S("gdiplus.dll", GdipGetSmoothingMode), S("gdiplus.dll", GdipGetTextRenderingHint),
+    S("gdiplus.dll", GdipGetInterpolationMode), S("gdiplus.dll", GdipGetPixelOffsetMode),
+    S("gdiplus.dll", GdipGetPenWidth), S("gdiplus.dll", GdipGetPenColor),
+    S("gdiplus.dll", GdipGetPenFillType), S("gdiplus.dll", GdipSetPenMode),
+    S("gdiplus.dll", GdipGetPenMode),
+    /* Matrices, the integer spellings, arcs and pies, cached bitmaps and the
+     * path accessors -- see the block at the end of gdiplus_shim.h. */
+    S("gdiplus.dll", GdipGetMatrixElements), S("gdiplus.dll", GdipTransformMatrixPoints),
+    S("gdiplus.dll", GdipTransformMatrixPointsI), S("gdiplus.dll", GdipTranslateMatrix),
+    S("gdiplus.dll", GdipScaleMatrix), S("gdiplus.dll", GdipRotateMatrix),
+    S("gdiplus.dll", GdipMultiplyMatrix), S("gdiplus.dll", GdipScaleWorldTransform),
+    S("gdiplus.dll", GdipRotateWorldTransform), S("gdiplus.dll", GdipResetWorldTransform),
+    S("gdiplus.dll", GdipMultiplyWorldTransform),
+    S("gdiplus.dll", GdipCreateLineBrushFromRectWithAngle),
+    S("gdiplus.dll", GdipCreateLineBrushFromRectWithAngleI),
+    S("gdiplus.dll", GdipCreateLineBrushFromRect), S("gdiplus.dll", GdipCreateLineBrushFromRectI),
+    S("gdiplus.dll", GdipSetStringFormatFlags), S("gdiplus.dll", GdipGetStringFormatFlags),
+    S("gdiplus.dll", GdipSetStringFormatTrimming),
+    S("gdiplus.dll", GdipCreateCachedBitmap), S("gdiplus.dll", GdipDeleteCachedBitmap),
+    S("gdiplus.dll", GdipDrawCachedBitmap),
+    S("gdiplus.dll", GdipDrawImage), S("gdiplus.dll", GdipDrawImageRect),
+    S("gdiplus.dll", GdipDrawImageRectI), S("gdiplus.dll", GdipDrawImagePointRect),
+    S("gdiplus.dll", GdipDrawImagePointRectI), S("gdiplus.dll", GdipDrawImageRectRect),
+    S("gdiplus.dll", GdipDrawLineI), S("gdiplus.dll", GdipFillRectangleI),
+    S("gdiplus.dll", GdipDrawRectangleI), S("gdiplus.dll", GdipFillEllipseI),
+    S("gdiplus.dll", GdipDrawEllipseI),
+    S("gdiplus.dll", GdipDrawArc), S("gdiplus.dll", GdipDrawArcI),
+    S("gdiplus.dll", GdipFillPie), S("gdiplus.dll", GdipFillPieI),
+    S("gdiplus.dll", GdipDrawPie), S("gdiplus.dll", GdipDrawPieI),
+    S("gdiplus.dll", GdipBitmapGetPixel), S("gdiplus.dll", GdipBitmapSetPixel),
+    S("gdiplus.dll", GdipGetPointCount), S("gdiplus.dll", GdipGetPathPoints),
+    S("gdiplus.dll", GdipGetPathTypes), S("gdiplus.dll", GdipGetPathData),
+    S("gdiplus.dll", GdipFlattenPath),
     S("gdiplus.dll", GdipGetImagePixelFormat), S("gdiplus.dll", GdipGetImagePaletteSize),
     S("gdiplus.dll", GdipGetImagePalette), S("gdiplus.dll", GdipCreateBitmapFromFile),
     S("gdiplus.dll", GdipCreateBitmapFromFileICM), S("gdiplus.dll", GdipDrawImageI),
@@ -10433,6 +12085,9 @@ static const winstub g_stubs[] = {
 #endif
 #ifndef PELOAD_NO_GUI_LAYER
     { "d3d11.dll", "D3D11CreateDevice", (void *)st_D3D11CreateDevice },
+    { "dxgi.dll", "CreateDXGIFactory", (void *)st_CreateDXGIFactory },
+    { "dxgi.dll", "CreateDXGIFactory1", (void *)st_CreateDXGIFactory1 },
+    { "dxgi.dll", "CreateDXGIFactory2", (void *)st_CreateDXGIFactory2 },
     /* d2d1.dll exports D2D1CreateFactory as ordinal 1, and that is how a
      * plug-in imports it -- there is no name in the import table to match. */
     { "d2d1.dll", "ordinal#1", (void *)st_D2D1CreateFactory },
@@ -10610,6 +12265,9 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", CreateProcessA), S("kernel32.dll", CreateProcessW),
     S("kernel32.dll", GetThreadTimes), S("kernel32.dll", GetProcessTimes),
     S("kernel32.dll", GetSystemTimes), S("kernel32.dll", QueryProcessCycleTime),
+    S("kernel32.dll", CreateTimerQueue), S("kernel32.dll", CreateTimerQueueTimer),
+    S("kernel32.dll", ChangeTimerQueueTimer), S("kernel32.dll", DeleteTimerQueueTimer),
+    S("kernel32.dll", DeleteTimerQueueEx), S("kernel32.dll", DeleteTimerQueue),
     S("kernel32.dll", CreateThreadpoolTimer), S("kernel32.dll", SetThreadpoolTimer),
     S("kernel32.dll", WaitForThreadpoolTimerCallbacks), S("kernel32.dll", CloseThreadpoolTimer),
     S("kernel32.dll", CreateThreadpoolWait), S("kernel32.dll", SetThreadpoolWait),
@@ -10734,6 +12392,37 @@ static const winstub g_stubs[] = {
     S("msvcrt.dll", tanf), S("msvcrt.dll", expf), S("msvcrt.dll", logf),
     S("msvcrt.dll", fabsf), S("msvcrt.dll", ldexp), S("msvcrt.dll", frexp),
     S("msvcrt.dll", modf),
+    S("msvcrt.dll", asinf), S("msvcrt.dll", acosf), S("msvcrt.dll", atanf),
+    S("msvcrt.dll", log10f), S("msvcrt.dll", floorf), S("msvcrt.dll", ceilf),
+    S("msvcrt.dll", sinhf), S("msvcrt.dll", coshf), S("msvcrt.dll", tanhf),
+    S("msvcrt.dll", asinh), S("msvcrt.dll", acosh), S("msvcrt.dll", atanh),
+    S("msvcrt.dll", asinhf), S("msvcrt.dll", acoshf), S("msvcrt.dll", atanhf),
+    S("msvcrt.dll", cbrt), S("msvcrt.dll", cbrtf),
+    S("msvcrt.dll", exp2), S("msvcrt.dll", exp2f),
+    S("msvcrt.dll", expm1), S("msvcrt.dll", expm1f),
+    S("msvcrt.dll", log1p), S("msvcrt.dll", log1pf),
+    S("msvcrt.dll", log2), S("msvcrt.dll", log2f),
+    S("msvcrt.dll", round), S("msvcrt.dll", roundf),
+    S("msvcrt.dll", trunc), S("msvcrt.dll", truncf),
+    S("msvcrt.dll", nearbyint), S("msvcrt.dll", nearbyintf),
+    S("msvcrt.dll", rint), S("msvcrt.dll", rintf),
+    S("msvcrt.dll", erf), S("msvcrt.dll", erff),
+    S("msvcrt.dll", erfc), S("msvcrt.dll", erfcf),
+    S("msvcrt.dll", tgamma), S("msvcrt.dll", tgammaf),
+    S("msvcrt.dll", lgamma), S("msvcrt.dll", lgammaf),
+    S("msvcrt.dll", hypot), S("msvcrt.dll", hypotf),
+    S("msvcrt.dll", copysign), S("msvcrt.dll", copysignf),
+    S("msvcrt.dll", fdim), S("msvcrt.dll", fdimf),
+    S("msvcrt.dll", fmax), S("msvcrt.dll", fmaxf),
+    S("msvcrt.dll", fmin), S("msvcrt.dll", fminf),
+    S("msvcrt.dll", remainder), S("msvcrt.dll", remainderf),
+    S("msvcrt.dll", nextafter), S("msvcrt.dll", nextafterf),
+    S("msvcrt.dll", fmodf), S("msvcrt.dll", ldexpf), S("msvcrt.dll", frexpf),
+    S("msvcrt.dll", modff), S("msvcrt.dll", fma), S("msvcrt.dll", fmaf),
+    S("msvcrt.dll", lround), S("msvcrt.dll", lroundf),
+    S("msvcrt.dll", llround), S("msvcrt.dll", llroundf),
+    S("msvcrt.dll", _isnan), S("msvcrt.dll", _finite),
+    S("msvcrt.dll", _isnanf), S("msvcrt.dll", _finitef),
     /* utility */
     S("msvcrt.dll", qsort), S("msvcrt.dll", bsearch), S("msvcrt.dll", abs),
     S("msvcrt.dll", atoi), S("msvcrt.dll", atof), S("msvcrt.dll", strtol),
@@ -10817,6 +12506,18 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", InitializeConditionVariable),
     S("kernel32.dll", WakeConditionVariable), S("kernel32.dll", WakeAllConditionVariable),
     S("kernel32.dll", InitializeSListHead), S("kernel32.dll", InterlockedFlushSList),
+    S("kernel32.dll", InterlockedPushEntrySList), S("kernel32.dll", InterlockedPopEntrySList),
+    S("kernel32.dll", InterlockedPushListSList), S("kernel32.dll", InterlockedPushListSListEx),
+    S("kernel32.dll", QueryDepthSList),
+    /* ntdll exports the same list under the Rtl names, and a runtime that binds
+     * against ntdll directly asks for those. */
+    { "ntdll.dll", "RtlInitializeSListHead",       (void *)st_InitializeSListHead },
+    { "ntdll.dll", "RtlInterlockedPushEntrySList", (void *)st_InterlockedPushEntrySList },
+    { "ntdll.dll", "RtlInterlockedPopEntrySList",  (void *)st_InterlockedPopEntrySList },
+    { "ntdll.dll", "RtlInterlockedPushListSList",  (void *)st_InterlockedPushListSList },
+    { "ntdll.dll", "RtlInterlockedPushListSListEx",(void *)st_InterlockedPushListSListEx },
+    { "ntdll.dll", "RtlInterlockedFlushSList",     (void *)st_InterlockedFlushSList },
+    { "ntdll.dll", "RtlQueryDepthSList",           (void *)st_QueryDepthSList },
     /* TLS */
     S("kernel32.dll", TlsAlloc), S("kernel32.dll", TlsFree),
     S("kernel32.dll", TlsGetValue), S("kernel32.dll", TlsSetValue),
@@ -10881,6 +12582,11 @@ static const winstub g_stubs[] = {
      * dereferences straight away -- see their definitions. */
     S("user32.dll", CharNextA), S("user32.dll", CharPrevA),
     S("user32.dll", CharNextW), S("user32.dll", CharPrevW),
+    S("user32.dll", CharUpperA), S("user32.dll", CharLowerA),
+    S("user32.dll", CharUpperW), S("user32.dll", CharLowerW),
+    S("user32.dll", CharUpperBuffA), S("user32.dll", CharLowerBuffA),
+    S("user32.dll", CharUpperBuffW), S("user32.dll", CharLowerBuffW),
+    S("user32.dll", RegisterClipboardFormatA), S("user32.dll", RegisterClipboardFormatW),
     S("user32.dll", wsprintfA), S("user32.dll", wsprintfW),
     S("user32.dll", wvsprintfA), S("user32.dll", wvsprintfW),
     S("shell32.dll", SHGetFolderPathA),
@@ -10931,7 +12637,6 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", GetVersionExA), S("kernel32.dll", GetVersionExW),
     S("kernel32.dll", VerSetConditionMask),
     S("kernel32.dll", VerifyVersionInfoW), S("kernel32.dll", VerifyVersionInfoA),
-    S("shlwapi.dll", PathFileExistsA), S("shlwapi.dll", PathFileExistsW),
     S("kernel32.dll", FindResourceA), S("kernel32.dll", FindResourceW),
     S("kernel32.dll", SizeofResource), S("kernel32.dll", LoadResource),
     S("kernel32.dll", LockResource), S("kernel32.dll", FreeResource),
@@ -10951,6 +12656,8 @@ static const winstub g_stubs[] = {
     S("user32.dll", GetParent), S("user32.dll", GetAncestor),
     S("user32.dll", GetClassNameA), S("user32.dll", GetClassNameW),
     S("user32.dll", SetWindowTextA), S("user32.dll", SetWindowTextW),
+    S("user32.dll", GetWindowTextA), S("user32.dll", GetWindowTextW),
+    S("user32.dll", GetWindowTextLengthA), S("user32.dll", GetWindowTextLengthW),
     S("user32.dll", BringWindowToTop), S("user32.dll", GetWindowThreadProcessId),
     S("user32.dll", EnumWindows),
     S("user32.dll", GetWindowLongA), S("user32.dll", GetWindowLongW),
@@ -10980,6 +12687,51 @@ static const winstub g_stubs[] = {
     S("user32.dll", SetClassLongPtrW), S("user32.dll", SetClassLongPtrA),
     S("user32.dll", SetClassLongW), S("user32.dll", SetClassLongA),
     S("user32.dll", SetFocus), S("user32.dll", GetCursorPos), S("user32.dll", SetCursorPos),
+    /* The window-handle queries. A stub answers these with zero, and zero is a
+     * pointer the caller walks -- see the note above st_GetFocus. */
+    /* The measured list: everything the corpus was seen to reach and this host
+     * did not implement. See tools/stub_audit.py and the sweep behind it. */
+    S("user32.dll", CreateMenu), S("user32.dll", SetMenu),
+    S("user32.dll", InsertMenuA), S("user32.dll", InsertMenuW),
+    S("user32.dll", InsertMenuItemA), S("user32.dll", InsertMenuItemW),
+    S("user32.dll", GetMenuItemCount), S("user32.dll", GetMenuItemID),
+    S("user32.dll", GetMenuItemInfoA), S("user32.dll", GetMenuItemInfoW),
+    S("user32.dll", SetMenuItemInfoA), S("user32.dll", SetMenuItemInfoW),
+    S("user32.dll", GetMenuInfo), S("user32.dll", SetMenuInfo),
+    S("user32.dll", GetCaretBlinkTime), S("user32.dll", GetClipboardSequenceNumber),
+    S("user32.dll", PrivateExtractIconsA), S("user32.dll", PrivateExtractIconsW),
+    S("user32.dll", SetProcessDPIAware), S("user32.dll", SetProcessDpiAwarenessContext),
+    S("user32.dll", GetClassInfoW), S("user32.dll", GetClassInfoExA),
+    S("user32.dll", GetClassInfoExW),
+    S("kernel32.dll", GetTempPathW),
+    S("ole32.dll", StringFromGUID2), S("ole32.dll", CoLockObjectExternal),
+    S("uxtheme.dll", IsThemeActive), S("uxtheme.dll", IsAppThemed),
+    S("imm32.dll", ImmGetContext), S("imm32.dll", ImmReleaseContext),
+    S("imm32.dll", ImmAssociateContext),
+    S("user32.dll", EnumChildWindows), S("user32.dll", EnumThreadWindows),
+    S("user32.dll", AttachThreadInput), S("user32.dll", SetParent),
+    S("user32.dll", AdjustWindowRect), S("user32.dll", AdjustWindowRectEx),
+    S("user32.dll", GetKeyboardLayoutList), S("user32.dll", ValidateRgn),
+    S("user32.dll", LoadImageA), S("user32.dll", LoadImageW),
+    S("gdi32.dll", GetTextExtentPoint32W), S("gdi32.dll", GetTextExtentPointW),
+    S("gdi32.dll", GetGlyphIndicesA), S("gdi32.dll", GetGlyphIndicesW),
+    S("gdi32.dll", GetGlyphOutlineA), S("gdi32.dll", GetGlyphOutlineW),
+    S("gdi32.dll", GetKerningPairsA), S("gdi32.dll", GetKerningPairsW),
+    S("gdi32.dll", GetOutlineTextMetricsA), S("gdi32.dll", GetOutlineTextMetricsW),
+    S("gdi32.dll", SetMapperFlags),
+    S("shlwapi.dll", PathIsDirectoryA), S("shlwapi.dll", PathIsDirectoryW),
+    S("shlwapi.dll", PathFileExistsA), S("shlwapi.dll", PathFileExistsW),
+    S("msvcrt.dll", _hypot), S("msvcrt.dll", _hypotf), S("msvcrt.dll", _copysign),
+    S("msvcrt.dll", _cabs), S("msvcrt.dll", _j0), S("msvcrt.dll", _j1),
+    S("msvcrt.dll", _y0), S("msvcrt.dll", _y1),
+    S("msvcrt.dll", _W_Getdays), S("msvcrt.dll", _W_Getmonths),
+    S("user32.dll", GetFocus), S("user32.dll", GetActiveWindow),
+    S("user32.dll", GetForegroundWindow), S("user32.dll", SetActiveWindow),
+    S("user32.dll", SetForegroundWindow), S("user32.dll", GetLastActivePopup),
+    S("user32.dll", GetMenu), S("user32.dll", GetShellWindow),
+    S("user32.dll", GetWindow), S("user32.dll", GetTopWindow),
+    S("user32.dll", GetDlgItem), S("user32.dll", GetDlgCtrlID),
+    S("user32.dll", SendDlgItemMessageA), S("user32.dll", SendDlgItemMessageW),
     S("user32.dll", SetCursor), S("user32.dll", GetCursor), S("user32.dll", LoadCursorA),
     S("user32.dll", ShowCursor), S("user32.dll", GetKeyState), S("user32.dll", GetAsyncKeyState),
     S("user32.dll", GetKeyboardState), S("user32.dll", GetKeyboardLayout),
@@ -10990,6 +12742,7 @@ static const winstub g_stubs[] = {
     /* user32: system + misc */
     S("user32.dll", GetSysColor), S("user32.dll", GetSysColorBrush),
     S("user32.dll", GetSystemMetrics), S("user32.dll", SystemParametersInfoW),
+    S("user32.dll", SystemParametersInfoA),
     S("user32.dll", MessageBoxA), S("user32.dll", MessageBoxW),
     S("user32.dll", OpenClipboard), S("user32.dll", CloseClipboard),
     S("user32.dll", EmptyClipboard), S("user32.dll", GetClipboardData),
@@ -11013,6 +12766,11 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", GetVolumeInformationA),
     S("kernel32.dll", CreateDirectoryA),
     S("shlwapi.dll", PathIsUNCA), S("shlwapi.dll", PathStripToRootA),
+    S("winmm.dll", timeSetEvent), S("winmm.dll", timeKillEvent),
+    S("winmm.dll", timeGetDevCaps),
+    S("winmm.dll", midiInGetNumDevs), S("winmm.dll", midiOutGetNumDevs),
+    S("winmm.dll", waveInGetNumDevs), S("winmm.dll", waveOutGetNumDevs),
+    S("winmm.dll", auxGetNumDevs), S("winmm.dll", mixerGetNumDevs),
     S("winmm.dll", timeGetTime), S("winmm.dll", timeBeginPeriod),
     S("winmm.dll", timeEndPeriod), S("user32.dll", GetClassInfoA),
     S("gdi32.dll", CreateHalftonePalette), S("gdi32.dll", SelectPalette),
@@ -11109,17 +12867,108 @@ static const char *crt_alias(const char *dll)
     return NULL;
 }
 
-static void *winstub_lookup(const char *dll, const char *sym)
+/* Finding a stub, without walking the whole table to do it.
+ *
+ * This was a linear scan with a strcasecmp per entry, and it is asked more
+ * often than anything else here: once per import at load, and -- through
+ * GetProcAddress, which falls back to a name search over every shimmed library
+ * -- up to twenty-four times for a single miss. A packed plug-in rebuilds its
+ * whole import table that way. Chord Organ made 7,565 lookups and twelve
+ * million string comparisons doing it.
+ *
+ * The table is constant, so it is indexed once and searched by halves after
+ * that. The order is (library case-insensitively, then symbol exactly), which
+ * is the comparison the scan made, and ties break on the original table
+ * position -- so where the same name is registered twice, the binary search
+ * lands on the same entry the scan returned. Duplicates are real: gdiplus.dll's
+ * GdiplusStartup is registered on both sides of a #ifdef.
+ *
+ * PELOAD_STRICT checks that claim rather than asserting it: every entry in the
+ * table is looked up both ways and the answers compared. */
+static int *g_stub_idx;
+static int  g_stub_n;
+static pthread_once_t g_stub_once = PTHREAD_ONCE_INIT;
+
+static int stub_key_cmp(const char *adll, const char *asym,
+                        const char *bdll, const char *bsym)
 {
-    const char *alias;
+    int c = strcasecmp(adll, bdll);
+    return c ? c : strcmp(asym, bsym);
+}
+static int stub_idx_cmp(const void *a, const void *b)
+{
+    int ia = *(const int *)a, ib = *(const int *)b;
+    int c = stub_key_cmp(g_stubs[ia].dll, g_stubs[ia].sym,
+                         g_stubs[ib].dll, g_stubs[ib].sym);
+    return c ? c : (ia < ib ? -1 : ia > ib);
+}
+static void *stub_scan(const char *dll, const char *sym)
+{
     int i;
     for (i = 0; g_stubs[i].sym; i++)
         if (!strcasecmp(g_stubs[i].dll, dll) && !strcmp(g_stubs[i].sym, sym))
             return g_stubs[i].fn;
+    return NULL;
+}
+static void *stub_find(const char *dll, const char *sym)
+{
+    int lo = 0, hi = g_stub_n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2, k = g_stub_idx[mid];
+        int c = stub_key_cmp(g_stubs[k].dll, g_stubs[k].sym, dll, sym);
+        if (c < 0) lo = mid + 1;
+        else if (c > 0) hi = mid - 1;
+        else {
+            /* Back up to the first of an equal run: ties are ordered by table
+             * position, so that is the one the scan would have found. */
+            while (mid > 0) {
+                int prev = g_stub_idx[mid - 1];
+                if (stub_key_cmp(g_stubs[prev].dll, g_stubs[prev].sym, dll, sym))
+                    break;
+                mid--;
+            }
+            return g_stubs[g_stub_idx[mid]].fn;
+        }
+    }
+    return NULL;
+}
+static void stub_index_build(void)
+{
+    int i, n = 0;
+    while (g_stubs[n].sym) n++;
+    if (!(g_stub_idx = (int *)malloc((size_t)n * sizeof *g_stub_idx))) return;
+    for (i = 0; i < n; i++) g_stub_idx[i] = i;
+    qsort(g_stub_idx, (size_t)n, sizeof *g_stub_idx, stub_idx_cmp);
+    g_stub_n = n;
+
+    if (getenv("PELOAD_STRICT")) {
+        int bad = 0;
+        for (i = 0; i < n; i++)
+            if (stub_find(g_stubs[i].dll, g_stubs[i].sym) !=
+                stub_scan(g_stubs[i].dll, g_stubs[i].sym)) {
+                fprintf(stderr, "  [stubs] index disagrees with the scan for "
+                                "%s!%s\n", g_stubs[i].dll, g_stubs[i].sym);
+                bad++;
+            }
+        fprintf(stderr, "  [stubs] %d entries indexed, %d disagreement(s)\n", n, bad);
+    }
+}
+
+static void *winstub_lookup(const char *dll, const char *sym)
+{
+    const char *alias;
+    void *fn;
+
+    pthread_once(&g_stub_once, stub_index_build);
+    if (!g_stub_idx) {                     /* the index could not be built */
+        if ((fn = stub_scan(dll, sym)) != NULL) return fn;
+        if ((alias = crt_alias(dll)) != NULL && strcasecmp(alias, dll) != 0)
+            return stub_scan(alias, sym);
+        return NULL;
+    }
+    if ((fn = stub_find(dll, sym)) != NULL) return fn;
     if ((alias = crt_alias(dll)) != NULL && strcasecmp(alias, dll) != 0)
-        for (i = 0; g_stubs[i].sym; i++)
-            if (!strcasecmp(g_stubs[i].dll, alias) && !strcmp(g_stubs[i].sym, sym))
-                return g_stubs[i].fn;
+        return stub_find(alias, sym);
     return NULL;
 }
 

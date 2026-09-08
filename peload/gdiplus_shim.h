@@ -36,7 +36,8 @@
  * one it is mistaken for. */
 enum {
     GPO_GRAPHICS = 0x47500001, GPO_PATH, GPO_PEN, GPO_BRUSH,
-    GPO_FONT, GPO_FAMILY, GPO_MATRIX, GPO_IMAGE, GPO_IMAGEATTR, GPO_STRINGFORMAT
+    GPO_FONT, GPO_FAMILY, GPO_MATRIX, GPO_IMAGE, GPO_IMAGEATTR, GPO_STRINGFORMAT,
+    GPO_REGION, GPO_CACHED
 };
 
 typedef struct { float m[6]; } gp_matrix;          /* a b c d e f, as GDI+ */
@@ -59,6 +60,23 @@ typedef struct {
     uint32_t argb2;                 /* the far end                          */
     float    x0, y0, x1, y1;        /* linear: the axis                     */
 } gp_brush;
+
+/* A region, as far as this layer needs one: a rectangle, or "everything".
+ *
+ * GDI+ regions are arbitrary areas -- unions and differences of paths -- and
+ * modelling that properly means a scanline set. What a plug-in editor does with
+ * one is narrower: it asks the graphics for its current clip, saves it, clips
+ * to a control's rectangle, draws, and puts the old one back. That is
+ * rectangles throughout, and it is also exactly what the clip on gp_graphics
+ * already is, so a region here is the same four numbers plus a flag for the
+ * unbounded case a fresh region starts in.
+ *
+ * A combine that cannot be expressed as one rectangle (a union of two
+ * disjoint ones, an exclusion) widens to the bounding box, which clips less
+ * than GDI+ would. Drawing slightly outside a clip is visible only where a
+ * plug-in relies on the clip to erase; drawing nothing at all, which is what
+ * these returning "not implemented" did, is visible everywhere. */
+typedef struct { int tag; int infinite; float x0, y0, x1, y1; } gp_region;
 
 typedef struct { int tag; char name[64]; } gp_family;
 typedef struct { int tag; float size; int style; gp_family *fam; } gp_font;
@@ -189,9 +207,9 @@ typedef uint32_t (*gp_shader)(void *ctx, int x, int y);
 
 static void gp_fill_shaded(gp_graphics *g, gp_path *p, gp_shader shade, void *ctx)
 {
-    int W, H, i, y, sub;
+    int W, H, i, y, sub, x0, x1;
     uint32_t *px = gp_pixels(g, &W, &H);
-    float *xs = NULL, minY = 1e30f, maxY = -1e30f;
+    float *xs = NULL, minY = 1e30f, maxY = -1e30f, minX = 1e30f, maxX = -1e30f;
     uint8_t *cov;
     int *wind;
 
@@ -205,17 +223,38 @@ static void gp_fill_shaded(gp_graphics *g, gp_path *p, gp_shader shade, void *ct
         gp_apply(&g->xf, p->pt[i * 2], p->pt[i * 2 + 1], &xs[i * 2], &xs[i * 2 + 1]);
         if (xs[i * 2 + 1] < minY) minY = xs[i * 2 + 1];
         if (xs[i * 2 + 1] > maxY) maxY = xs[i * 2 + 1];
+        if (xs[i * 2] < minX) minX = xs[i * 2];
+        if (xs[i * 2] > maxX) maxX = xs[i * 2];
     }
     if (minY < 0) minY = 0;
     if (maxY > (float)H) maxY = (float)H;
 
+    /* The columns this shape can touch, so the per-scanline work is the width
+     * of the shape rather than the width of the surface. A knob twenty pixels
+     * across on a four-hundred-pixel panel was clearing and walking the whole
+     * four hundred, four times, for every one of its rows.
+     *
+     * Exactly the same pixels come out. A crossing is a linear interpolation
+     * between two of the path's own points, so it cannot fall outside their x
+     * range; left of the first crossing the winding count is still zero, which
+     * is "outside" under either fill rule; and right of the last one it is zero
+     * again because every figure is closed, so the crossings cancel. The two
+     * clamps are where that reasoning would fail -- a crossing off the left edge
+     * lands on column 0, and one off the right lands on column W -- so a shape
+     * that runs past either edge widens the range back to it. */
+    x0 = (minX < 0.0f) ? 0 : (int)minX - 1;
+    x1 = (maxX >= (float)W) ? W - 1 : (int)maxX + 1;
+    if (x0 < 0) x0 = 0;
+    if (x1 > W - 1) x1 = W - 1;
+    if (x1 < x0) { free(xs); free(cov); free(wind); return; }
+
     for (y = (int)minY; y < (int)maxY + 1 && y < H; y++) {
         if (y < 0) continue;
-        memset(cov, 0, (size_t)W);
+        memset(cov + x0, 0, (size_t)(x1 - x0 + 1));
         for (sub = 0; sub < GP_SS; sub++) {
             float sy = (float)y + ((float)sub + 0.5f) / GP_SS;
             int start = 0, x;
-            memset(wind, 0, ((size_t)W + 1) * sizeof *wind);
+            memset(wind + x0, 0, (size_t)(x1 - x0 + 2) * sizeof *wind);
             /* Walk each figure's edges, wrapping the last point to the first:
              * GDI+ closes a figure for filling whether or not it was closed
              * explicitly. */
@@ -232,7 +271,12 @@ static void gp_fill_shaded(gp_graphics *g, gp_path *p, gp_shader shade, void *ct
                     if (sy < ay || sy >= by) continue;
                     {
                         float ix = ax + (bx - ax) * (sy - ay) / (by - ay);
-                        int xi = (int)floorf(ix + 0.5f);
+                        /* Truncation, not floorf. They differ only for a
+                         * negative result, and every negative result is clamped
+                         * to column 0 on the next line either way -- so the
+                         * clamped answer is identical and the libm call goes,
+                         * which was an eighth of the time spent drawing. */
+                        int xi = (int)(ix + 0.5f);
                         if (xi < 0) xi = 0;
                         if (xi > W) xi = W;
                         wind[xi] += dir;
@@ -241,7 +285,7 @@ static void gp_fill_shaded(gp_graphics *g, gp_path *p, gp_shader shade, void *ct
             }
             {   /* Accumulate the crossings into spans. */
                 int acc = 0, inside;
-                for (x = 0; x < W; x++) {
+                for (x = x0; x <= x1; x++) {
                     acc += wind[x];
                     inside = p->fillmode ? (acc != 0) : (acc & 1);
                     if (inside && cov[x] < 255)
@@ -249,7 +293,7 @@ static void gp_fill_shaded(gp_graphics *g, gp_path *p, gp_shader shade, void *ct
                 }
             }
         }
-        for (i = 0; i < W; i++) {
+        for (i = x0; i <= x1; i++) {
             if (!cov[i]) continue;
             if (g->has_clip &&
                 ((float)i < g->cx0 || (float)i >= g->cx1 ||
@@ -830,6 +874,78 @@ static MS int32_t st_GdipGetGenericFontFamilySansSerif(void **out)
 { return st_GdipCreateFontFamilyFromName(NULL, NULL, out); }
 static MS int32_t st_GdipDeleteFontFamily(void *f)
 { if (!gp_check(f, GPO_FAMILY)) return GP_INVALIDARG; free(f); return GP_OK; }
+
+/* The installed font collection.
+ *
+ * A plug-in that offers a font menu builds it from here: make the collection,
+ * ask how many families are in it, then ask for that many. There is one face
+ * behind this whole layer -- the FreeType face the DirectWrite shim measures
+ * with -- so the honest collection has one family in it, and a menu built from
+ * it has one entry that works rather than a list of names that do not.
+ *
+ * The collection handle is a fixed non-null token rather than an object: it
+ * carries no state, and a caller that never frees it (there is no API to free
+ * this one) then leaks nothing. Chord Organ calls all three inside its editor
+ * setup and reads the count back before allocating. */
+static const int32_t gp_installed_collection = GPO_FAMILY;
+
+static MS int32_t st_GdipNewInstalledFontCollection(void **out)
+{
+    if (!out) return GP_INVALIDARG;
+    *out = (void *)&gp_installed_collection;
+    return GP_OK;
+}
+static MS int32_t st_GdipNewPrivateFontCollection(void **out)
+{ return st_GdipNewInstalledFontCollection(out); }
+static MS int32_t st_GdipDeletePrivateFontCollection(void **out)
+{ (void)out; return GP_OK; }
+static MS int32_t st_GdipPrivateAddFontFile(void *coll, const uint16_t *file)
+{ (void)coll; (void)file; return GP_OK; }
+static MS int32_t st_GdipPrivateAddMemoryFont(void *coll, const void *mem, int32_t n)
+{ (void)coll; (void)mem; (void)n; return GP_OK; }
+
+static MS int32_t st_GdipGetFontCollectionFamilyCount(void *coll, int32_t *found)
+{
+    if (!coll || !found) return GP_INVALIDARG;
+    *found = 1;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetFontCollectionFamilyList(void *coll, int32_t sought,
+                                                     void **families, int32_t *found)
+{
+    static const uint16_t sans[] = { 'S','a','n','s',0 };
+    if (!coll || !families || !found) return GP_INVALIDARG;
+    *found = 0;
+    if (sought < 1) return GP_OK;
+    if (st_GdipCreateFontFamilyFromName(sans, NULL, &families[0]) != GP_OK)
+        return GP_OUTOFMEMORY;
+    *found = 1;
+    return GP_OK;
+}
+static MS int32_t st_GdipCloneFontFamily(void *fam, void **out)
+{
+    gp_family *f = (gp_family *)gp_check(fam, GPO_FAMILY), *c;
+    if (!f || !out) return GP_INVALIDARG;
+    if (!(c = (gp_family *)gp_new(sizeof *c, GPO_FAMILY))) return GP_OUTOFMEMORY;
+    memcpy(c->name, f->name, sizeof c->name);
+    *out = c;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetFamilyName(void *fam, uint16_t *name, uint16_t lang)
+{
+    gp_family *f = (gp_family *)gp_check(fam, GPO_FAMILY);
+    const char *src;
+    int i;
+    (void)lang;
+    if (!f || !name) return GP_INVALIDARG;
+    src = f->name[0] ? f->name : "Sans";
+    /* LF_FACESIZE is 32 including the terminator, and that is the buffer the
+     * caller passed: writing the whole 64-byte name into it overruns a stack
+     * structure in every caller that uses the documented size. */
+    for (i = 0; i < 31 && src[i]; i++) name[i] = (unsigned char)src[i];
+    name[i] = 0;
+    return GP_OK;
+}
 static MS int32_t st_GdipCreateFont(void *family, float size, int32_t style,
                                     int32_t unit, void **out)
 {
@@ -1292,25 +1408,294 @@ static MS int32_t st_GdipDrawImageI(void *graphics, void *image, int32_t x, int3
                                      NULL, NULL, NULL);
 }
 
-/* Regions are not modelled as objects; the clip is a rectangle on the
- * graphics. Bounds therefore report the clip, or an empty rectangle when none
- * is set, and deleting one is a no-op that must still succeed. */
-static MS int32_t st_GdipGetRegionBounds(void *region, void *graphics, void *rect)
+/* ---- regions ------------------------------------------------------------
+ *
+ * See gp_region. Everything here is rectangles; the combine modes are applied
+ * to the bounding box, which is where this stops being GDI+ and starts being
+ * enough of it. */
+#define GP_REGION_HUGE 1.0e7f
+
+static gp_region *gp_region_new(void)
 {
-    gp_graphics *g = gp_check(graphics, GPO_GRAPHICS);
-    W32_APPROX();                                /* the clip, not a region */
-    float *r = rect;
-    (void)region;
-    if (!r) return GP_INVALIDARG;
-    if (g && g->has_clip) {
-        r[0] = g->cx0; r[1] = g->cy0;
-        r[2] = g->cx1 - g->cx0; r[3] = g->cy1 - g->cy0;
+    gp_region *r = (gp_region *)gp_new(sizeof *r, GPO_REGION);
+    if (r) r->infinite = 1;
+    return r;
+}
+static void gp_region_rect(gp_region *r, float x, float y, float w, float h)
+{
+    r->infinite = 0;
+    r->x0 = w >= 0 ? x : x + w; r->x1 = w >= 0 ? x + w : x;
+    r->y0 = h >= 0 ? y : y + h; r->y1 = h >= 0 ? y + h : y;
+}
+/* The bounds of a region as a rectangle, unbounded included: an infinite region
+ * has no numbers of its own, and a caller asking for its bounds wants something
+ * it can clip with rather than nothing. */
+static void gp_region_box(const gp_region *r, float *x0, float *y0, float *x1, float *y1)
+{
+    if (r->infinite) {
+        *x0 = *y0 = -GP_REGION_HUGE; *x1 = *y1 = GP_REGION_HUGE;
     } else {
-        r[0] = r[1] = r[2] = r[3] = 0.0f;
+        *x0 = r->x0; *y0 = r->y0; *x1 = r->x1; *y1 = r->y1;
     }
+}
+
+static MS int32_t st_GdipCreateRegion(void **out)
+{
+    if (!out) return GP_INVALIDARG;
+    return (*out = gp_region_new()) ? GP_OK : GP_OUTOFMEMORY;
+}
+static MS int32_t st_GdipCreateRegionRect(const float *rect, void **out)
+{
+    gp_region *r;
+    if (!rect || !out) return GP_INVALIDARG;
+    if (!(r = gp_region_new())) return GP_OUTOFMEMORY;
+    gp_region_rect(r, rect[0], rect[1], rect[2], rect[3]);
+    *out = r;
     return GP_OK;
 }
-static MS int32_t st_GdipDeleteRegion(void *region) { (void)region; return GP_OK; }
+static MS int32_t st_GdipCreateRegionRectI(const int32_t *rect, void **out)
+{
+    float f[4];
+    if (!rect) return GP_INVALIDARG;
+    f[0] = (float)rect[0]; f[1] = (float)rect[1];
+    f[2] = (float)rect[2]; f[3] = (float)rect[3];
+    return st_GdipCreateRegionRect(f, out);
+}
+static MS int32_t st_GdipCreateRegionPath(void *path, void **out)
+{
+    float box[4] = { 0, 0, 0, 0 };
+    gp_region *r;
+    if (!out) return GP_INVALIDARG;
+    if (!(r = gp_region_new())) return GP_OUTOFMEMORY;
+    if (st_GdipGetPathWorldBounds(path, box, NULL, NULL) == GP_OK)
+        gp_region_rect(r, box[0], box[1], box[2], box[3]);
+    *out = r;
+    return GP_OK;
+}
+static MS int32_t st_GdipCloneRegion(void *region, void **out)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION), *c;
+    if (!r || !out) return GP_INVALIDARG;
+    if (!(c = (gp_region *)gp_new(sizeof *c, GPO_REGION))) return GP_OUTOFMEMORY;
+    *c = *r;
+    c->tag = GPO_REGION;
+    *out = c;
+    return GP_OK;
+}
+static MS int32_t st_GdipDeleteRegion(void *region)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    /* A caller that never made one through this layer still frees it, and
+     * failing that free is not worth the difference: succeed either way. */
+    if (r) free(r);
+    return GP_OK;
+}
+static MS int32_t st_GdipSetInfinite(void *region)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    if (!r) return GP_INVALIDARG;
+    r->infinite = 1;
+    return GP_OK;
+}
+static MS int32_t st_GdipSetEmpty(void *region)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    if (!r) return GP_INVALIDARG;
+    r->infinite = 0; r->x0 = r->y0 = r->x1 = r->y1 = 0.0f;
+    return GP_OK;
+}
+static MS int32_t st_GdipIsEmptyRegion(void *region, void *graphics, int32_t *out)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    (void)graphics;
+    if (!r || !out) return GP_INVALIDARG;
+    *out = !r->infinite && (r->x1 <= r->x0 || r->y1 <= r->y0);
+    return GP_OK;
+}
+static MS int32_t st_GdipIsInfiniteRegion(void *region, void *graphics, int32_t *out)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    (void)graphics;
+    if (!r || !out) return GP_INVALIDARG;
+    *out = r->infinite;
+    return GP_OK;
+}
+/* Combine modes: 0 Replace, 1 Intersect, 2 Union, 3 Xor, 4 Exclude,
+ * 5 Complement. Intersect is exact for rectangles; the rest widen. */
+static void gp_region_combine(gp_region *r, float x0, float y0, float x1, float y1,
+                              int32_t mode)
+{
+    float a0, b0, a1, b1;
+    switch (mode) {
+    case 0:                                       /* Replace */
+        r->infinite = 0; r->x0 = x0; r->y0 = y0; r->x1 = x1; r->y1 = y1;
+        return;
+    case 1:                                       /* Intersect */
+        if (r->infinite) { r->infinite = 0; r->x0 = x0; r->y0 = y0; r->x1 = x1; r->y1 = y1; return; }
+        r->x0 = r->x0 > x0 ? r->x0 : x0;
+        r->y0 = r->y0 > y0 ? r->y0 : y0;
+        r->x1 = r->x1 < x1 ? r->x1 : x1;
+        r->y1 = r->y1 < y1 ? r->y1 : y1;
+        if (r->x1 < r->x0) r->x1 = r->x0;
+        if (r->y1 < r->y0) r->y1 = r->y0;
+        return;
+    case 4: case 5:                               /* Exclude, Complement */
+        /* Neither is a rectangle. Leaving the region as it stands clips no
+         * more than before, which draws too much rather than nothing. */
+        W32_APPROX();
+        return;
+    default:                                      /* Union, Xor */
+        if (r->infinite) return;
+        gp_region_box(r, &a0, &b0, &a1, &b1);
+        r->x0 = a0 < x0 ? a0 : x0;
+        r->y0 = b0 < y0 ? b0 : y0;
+        r->x1 = a1 > x1 ? a1 : x1;
+        r->y1 = b1 > y1 ? b1 : y1;
+        if (mode == 3) W32_APPROX();              /* Xor is not a rectangle */
+        return;
+    }
+}
+static MS int32_t st_GdipCombineRegionRect(void *region, const float *rect, int32_t mode)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    if (!r || !rect) return GP_INVALIDARG;
+    gp_region_combine(r, rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3], mode);
+    return GP_OK;
+}
+static MS int32_t st_GdipCombineRegionRectI(void *region, const int32_t *rect, int32_t mode)
+{
+    float f[4];
+    if (!rect) return GP_INVALIDARG;
+    f[0] = (float)rect[0]; f[1] = (float)rect[1];
+    f[2] = (float)rect[2]; f[3] = (float)rect[3];
+    return st_GdipCombineRegionRect(region, f, mode);
+}
+static MS int32_t st_GdipCombineRegionRegion(void *region, void *other, int32_t mode)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    gp_region *o = (gp_region *)gp_check(other, GPO_REGION);
+    float x0, y0, x1, y1;
+    if (!r || !o) return GP_INVALIDARG;
+    if (o->infinite && mode == 1) return GP_OK;            /* intersect with all */
+    gp_region_box(o, &x0, &y0, &x1, &y1);
+    gp_region_combine(r, x0, y0, x1, y1, mode);
+    return GP_OK;
+}
+static MS int32_t st_GdipCombineRegionPath(void *region, void *path, int32_t mode)
+{
+    float box[4] = { 0, 0, 0, 0 };
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    if (!r) return GP_INVALIDARG;
+    if (st_GdipGetPathWorldBounds(path, box, NULL, NULL) != GP_OK) return GP_OK;
+    gp_region_combine(r, box[0], box[1], box[0] + box[2], box[1] + box[3], mode);
+    return GP_OK;
+}
+static MS int32_t st_GdipTranslateRegion(void *region, float dx, float dy)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    if (!r) return GP_INVALIDARG;
+    if (!r->infinite) { r->x0 += dx; r->x1 += dx; r->y0 += dy; r->y1 += dy; }
+    return GP_OK;
+}
+static MS int32_t st_GdipTranslateRegionI(void *region, int32_t dx, int32_t dy)
+{ return st_GdipTranslateRegion(region, (float)dx, (float)dy); }
+static MS int32_t st_GdipTransformRegion(void *region, void *matrix)
+{
+    /* Only the translation part, which is what a scrolled or offset control
+     * uses it for; a rotated region is not a rectangle. */
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    gp_matrix *m = (gp_matrix *)gp_check(matrix, GPO_MATRIX);
+    if (!r || !m) return GP_INVALIDARG;
+    W32_APPROX();
+    return st_GdipTranslateRegion(region, m->m[4], m->m[5]);
+}
+static MS int32_t st_GdipIsVisibleRegionPoint(void *region, float x, float y,
+                                              void *graphics, int32_t *out)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    (void)graphics;
+    if (!r || !out) return GP_INVALIDARG;
+    *out = r->infinite || (x >= r->x0 && x < r->x1 && y >= r->y0 && y < r->y1);
+    return GP_OK;
+}
+static MS int32_t st_GdipIsVisibleRegionPointI(void *region, int32_t x, int32_t y,
+                                               void *graphics, int32_t *out)
+{ return st_GdipIsVisibleRegionPoint(region, (float)x, (float)y, graphics, out); }
+
+static MS int32_t st_GdipGetRegionBounds(void *region, void *graphics, void *rect)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    gp_graphics *g = (gp_graphics *)gp_check(graphics, GPO_GRAPHICS);
+    float *out = (float *)rect;
+    float x0, y0, x1, y1;
+
+    if (!out) return GP_INVALIDARG;
+    if (r) {
+        gp_region_box(r, &x0, &y0, &x1, &y1);
+    } else if (g && g->has_clip) {           /* no region: report the clip */
+        x0 = g->cx0; y0 = g->cy0; x1 = g->cx1; y1 = g->cy1;
+    } else {
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        return GP_OK;
+    }
+    out[0] = x0; out[1] = y0; out[2] = x1 - x0; out[3] = y1 - y0;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetRegionBoundsI(void *region, void *graphics, int32_t *rect)
+{
+    float f[4];
+    int32_t st = st_GdipGetRegionBounds(region, graphics, f);
+    if (st == GP_OK && rect) {
+        rect[0] = (int32_t)f[0]; rect[1] = (int32_t)f[1];
+        rect[2] = (int32_t)f[2]; rect[3] = (int32_t)f[3];
+    }
+    return st;
+}
+
+/* The clip, which is where a region and a graphics meet. */
+static MS int32_t st_GdipSetClipRegion(void *graphics, void *region, int32_t combine)
+{
+    gp_graphics *g = (gp_graphics *)gp_check(graphics, GPO_GRAPHICS);
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    if (!g || !r) return GP_INVALIDARG;
+    if (r->infinite) { g->has_clip = 0; return GP_OK; }
+    /* The region is already in world coordinates the caller set up, so this
+     * goes through the same transform GdipSetClipRect applies. */
+    return st_GdipSetClipRect(graphics, r->x0, r->y0, r->x1 - r->x0, r->y1 - r->y0,
+                              combine);
+}
+static MS int32_t st_GdipGetClip(void *graphics, void *region)
+{
+    gp_graphics *g = (gp_graphics *)gp_check(graphics, GPO_GRAPHICS);
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    if (!g || !r) return GP_INVALIDARG;
+    if (!g->has_clip) { r->infinite = 1; return GP_OK; }
+    gp_region_rect(r, g->cx0, g->cy0, g->cx1 - g->cx0, g->cy1 - g->cy0);
+    return GP_OK;
+}
+static MS int32_t st_GdipResetClip(void *graphics)
+{
+    gp_graphics *g = (gp_graphics *)gp_check(graphics, GPO_GRAPHICS);
+    if (!g) return GP_INVALIDARG;
+    g->has_clip = 0;
+    return GP_OK;
+}
+static MS int32_t st_GdipFillRegion(void *graphics, void *brush, void *region)
+{
+    gp_region *r = (gp_region *)gp_check(region, GPO_REGION);
+    float x0, y0, x1, y1;
+    if (!r) return GP_INVALIDARG;
+    gp_region_box(r, &x0, &y0, &x1, &y1);
+    /* An infinite region fills the surface, not a ten-million-pixel rectangle
+     * the rasteriser would spend real time on. */
+    if (r->infinite) {
+        gp_graphics *g = (gp_graphics *)gp_check(graphics, GPO_GRAPHICS);
+        int w = 0, h = 0;
+        if (!g || !gp_pixels(g, &w, &h)) return GP_INVALIDARG;
+        x0 = y0 = 0.0f; x1 = (float)w; y1 = (float)h;
+    }
+    return st_GdipFillRectangle(graphics, brush, x0, y0, x1 - x0, y1 - y0);
+}
 
 /* A pen made from a brush takes the brush's colour, which for a solid brush is
  * exactly right and for a gradient is its starting colour. */
@@ -1320,6 +1705,70 @@ static MS int32_t st_GdipCreatePen2(void *brush, float width, int32_t unit, void
     gp_brush *b = gp_check(brush, GPO_BRUSH);
     return st_GdipCreatePen1(b ? b->argb : 0xFF000000u, width, unit, out);
 }
+/* Getters. Each of these returns something the caller already gave this layer,
+ * and each was a stand-in returning "not implemented" -- which a plug-in that
+ * reads a setting, changes it, draws and puts it back treats as a failed draw. */
+static MS int32_t st_GdipGetSmoothingMode(void *graphics, int32_t *out)
+{
+    gp_graphics *g = (gp_graphics *)gp_check(graphics, GPO_GRAPHICS);
+    if (!g || !out) return GP_INVALIDARG;
+    *out = g->smoothing;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetTextRenderingHint(void *graphics, int32_t *out)
+{
+    if (!gp_check(graphics, GPO_GRAPHICS) || !out) return GP_INVALIDARG;
+    *out = 0;                                   /* SystemDefault */
+    return GP_OK;
+}
+static MS int32_t st_GdipGetInterpolationMode(void *graphics, int32_t *out)
+{
+    if (!gp_check(graphics, GPO_GRAPHICS) || !out) return GP_INVALIDARG;
+    *out = 0;                                   /* Default */
+    return GP_OK;
+}
+static MS int32_t st_GdipGetPixelOffsetMode(void *graphics, int32_t *out)
+{
+    if (!gp_check(graphics, GPO_GRAPHICS) || !out) return GP_INVALIDARG;
+    *out = 0;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetPenWidth(void *pen, float *out)
+{
+    gp_pen *p = (gp_pen *)gp_check(pen, GPO_PEN);
+    if (!p || !out) return GP_INVALIDARG;
+    *out = p->width;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetPenColor(void *pen, uint32_t *out)
+{
+    gp_pen *p = (gp_pen *)gp_check(pen, GPO_PEN);
+    if (!p || !out) return GP_INVALIDARG;
+    *out = p->argb;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetPenFillType(void *pen, int32_t *out)
+{
+    if (!gp_check(pen, GPO_PEN) || !out) return GP_INVALIDARG;
+    *out = 0;                                   /* PenTypeSolidColor */
+    return GP_OK;
+}
+/* Pen alignment: centre or inset. This rasteriser strokes centred, which is
+ * the default, so accepting the call and drawing the same line is the whole of
+ * the difference -- half a pen width on an inset border. */
+static MS int32_t st_GdipSetPenMode(void *pen, int32_t mode)
+{
+    if (!gp_check(pen, GPO_PEN)) return GP_INVALIDARG;
+    if (mode) W32_APPROX();
+    return GP_OK;
+}
+static MS int32_t st_GdipGetPenMode(void *pen, int32_t *out)
+{
+    if (!gp_check(pen, GPO_PEN) || !out) return GP_INVALIDARG;
+    *out = 0;                                   /* PenAlignmentCenter */
+    return GP_OK;
+}
+
 static MS int32_t st_GdipSetPenEndCap(void *pen, int32_t cap)
 { gp_pen *p = gp_check(pen, GPO_PEN); if (p) p->cap = cap; return p ? GP_OK : GP_INVALIDARG; }
 static MS int32_t st_GdipSetPenStartCap(void *pen, int32_t cap)
@@ -1489,6 +1938,411 @@ static MS int32_t st_GdipAddPathString(void *path, const uint16_t *str, int32_t 
     }
     gp_text_extent(str, len, em, &w, &h);
     return st_GdipAddPathRectangle(path, layout[0], layout[1], w, h);
+}
+
+/* ---- the rest of the surface an editor reaches --------------------------
+ *
+ * Everything below was a stand-in until a plug-in was seen calling it. They are
+ * the integer spellings of calls already here, the matrix operations a control
+ * uses to place itself, and the cached bitmap a knob redraws itself from.
+ * Grouped rather than scattered because none of them is interesting on its own:
+ * each is the same drawing this file already does, reached by another name. */
+
+/* Matrices. The elements live immediately after the tag, which is how
+ * GdipGetWorldTransform already reads them. */
+static gp_matrix *gp_mat(void *m)
+{ return gp_check(m, GPO_MATRIX) ? (gp_matrix *)((int *)m + 1) : NULL; }
+
+static MS int32_t st_GdipGetMatrixElements(void *matrix, float *out)
+{
+    gp_matrix *m = gp_mat(matrix);
+    if (!m || !out) return GP_INVALIDARG;
+    memcpy(out, m->m, sizeof m->m);
+    return GP_OK;
+}
+static MS int32_t st_GdipTransformMatrixPoints(void *matrix, float *pts, int32_t n)
+{
+    gp_matrix *m = gp_mat(matrix);
+    int32_t i;
+    if (!m || !pts || n < 0) return GP_INVALIDARG;
+    for (i = 0; i < n; i++) {
+        float x, y;
+        gp_apply(m, pts[i * 2], pts[i * 2 + 1], &x, &y);
+        pts[i * 2] = x; pts[i * 2 + 1] = y;
+    }
+    return GP_OK;
+}
+static MS int32_t st_GdipTransformMatrixPointsI(void *matrix, int32_t *pts, int32_t n)
+{
+    gp_matrix *m = gp_mat(matrix);
+    int32_t i;
+    if (!m || !pts || n < 0) return GP_INVALIDARG;
+    for (i = 0; i < n; i++) {
+        float x, y;
+        gp_apply(m, (float)pts[i * 2], (float)pts[i * 2 + 1], &x, &y);
+        pts[i * 2] = (int32_t)x; pts[i * 2 + 1] = (int32_t)y;
+    }
+    return GP_OK;
+}
+/* order 0 is MatrixOrderPrepend, 1 is Append. Prepend is the default and the
+ * one a caller building a transform out of steps means. */
+static void gp_mat_mul(gp_matrix *dst, const gp_matrix *a, const gp_matrix *b)
+{
+    gp_matrix r;                       /* r = a then b, i.e. b * a */
+    r.m[0] = a->m[0] * b->m[0] + a->m[1] * b->m[2];
+    r.m[1] = a->m[0] * b->m[1] + a->m[1] * b->m[3];
+    r.m[2] = a->m[2] * b->m[0] + a->m[3] * b->m[2];
+    r.m[3] = a->m[2] * b->m[1] + a->m[3] * b->m[3];
+    r.m[4] = a->m[4] * b->m[0] + a->m[5] * b->m[2] + b->m[4];
+    r.m[5] = a->m[4] * b->m[1] + a->m[5] * b->m[3] + b->m[5];
+    *dst = r;
+}
+static void gp_mat_combine(gp_matrix *m, const gp_matrix *step, int32_t order)
+{
+    if (order) gp_mat_mul(m, m, step);            /* Append */
+    else       gp_mat_mul(m, step, m);            /* Prepend */
+}
+static void gp_mat_translate(gp_matrix *s, float dx, float dy)
+{ s->m[0] = 1; s->m[1] = 0; s->m[2] = 0; s->m[3] = 1; s->m[4] = dx; s->m[5] = dy; }
+static void gp_mat_scale(gp_matrix *s, float sx, float sy)
+{ s->m[0] = sx; s->m[1] = 0; s->m[2] = 0; s->m[3] = sy; s->m[4] = 0; s->m[5] = 0; }
+static void gp_mat_rotate(gp_matrix *s, float deg)
+{
+    float r = deg * 3.14159265358979f / 180.0f, c = cosf(r), n = sinf(r);
+    s->m[0] = c; s->m[1] = n; s->m[2] = -n; s->m[3] = c; s->m[4] = 0; s->m[5] = 0;
+}
+
+static MS int32_t st_GdipTranslateMatrix(void *matrix, float dx, float dy, int32_t order)
+{
+    gp_matrix *m = gp_mat(matrix), step;
+    if (!m) return GP_INVALIDARG;
+    gp_mat_translate(&step, dx, dy); gp_mat_combine(m, &step, order);
+    return GP_OK;
+}
+static MS int32_t st_GdipScaleMatrix(void *matrix, float sx, float sy, int32_t order)
+{
+    gp_matrix *m = gp_mat(matrix), step;
+    if (!m) return GP_INVALIDARG;
+    gp_mat_scale(&step, sx, sy); gp_mat_combine(m, &step, order);
+    return GP_OK;
+}
+static MS int32_t st_GdipRotateMatrix(void *matrix, float angle, int32_t order)
+{
+    gp_matrix *m = gp_mat(matrix), step;
+    if (!m) return GP_INVALIDARG;
+    gp_mat_rotate(&step, angle); gp_mat_combine(m, &step, order);
+    return GP_OK;
+}
+static MS int32_t st_GdipMultiplyMatrix(void *matrix, void *other, int32_t order)
+{
+    gp_matrix *m = gp_mat(matrix), *o = gp_mat(other);
+    if (!m || !o) return GP_INVALIDARG;
+    gp_mat_combine(m, o, order);
+    return GP_OK;
+}
+
+static MS int32_t st_GdipScaleWorldTransform(void *graphics, float sx, float sy, int32_t order)
+{
+    gp_graphics *g = gp_check(graphics, GPO_GRAPHICS);
+    gp_matrix step;
+    if (!g) return GP_INVALIDARG;
+    gp_mat_scale(&step, sx, sy); gp_mat_combine(&g->xf, &step, order);
+    return GP_OK;
+}
+static MS int32_t st_GdipRotateWorldTransform(void *graphics, float angle, int32_t order)
+{
+    gp_graphics *g = gp_check(graphics, GPO_GRAPHICS);
+    gp_matrix step;
+    if (!g) return GP_INVALIDARG;
+    gp_mat_rotate(&step, angle); gp_mat_combine(&g->xf, &step, order);
+    return GP_OK;
+}
+static MS int32_t st_GdipResetWorldTransform(void *graphics)
+{
+    gp_graphics *g = gp_check(graphics, GPO_GRAPHICS);
+    if (!g) return GP_INVALIDARG;
+    g->xf.m[0] = 1; g->xf.m[1] = 0; g->xf.m[2] = 0;
+    g->xf.m[3] = 1; g->xf.m[4] = 0; g->xf.m[5] = 0;
+    return GP_OK;
+}
+static MS int32_t st_GdipMultiplyWorldTransform(void *graphics, void *matrix, int32_t order)
+{
+    gp_graphics *g = gp_check(graphics, GPO_GRAPHICS);
+    gp_matrix *m = gp_mat(matrix);
+    if (!g || !m) return GP_INVALIDARG;
+    gp_mat_combine(&g->xf, m, order);
+    return GP_OK;
+}
+
+/* A gradient given as a rectangle and an angle, rather than two points: the
+ * axis runs across the rectangle in the direction of the angle, measured
+ * clockwise from the x axis the way GDI+ measures it. */
+static MS int32_t st_GdipCreateLineBrushFromRectWithAngle(const float *rect,
+        uint32_t c1, uint32_t c2, float angle, int32_t scalable, int32_t wrap, void **out)
+{
+    float r = angle * 3.14159265358979f / 180.0f;
+    float cx, cy, dx, dy, half, p1[2], p2[2];
+    (void)scalable;
+    if (!rect || !out) return GP_INVALIDARG;
+    cx = rect[0] + rect[2] / 2.0f;
+    cy = rect[1] + rect[3] / 2.0f;
+    dx = cosf(r); dy = sinf(r);
+    /* The extent of the rectangle along the axis, which is what makes a
+     * 45-degree gradient reach both corners rather than stopping short. */
+    half = (fabsf(dx) * rect[2] + fabsf(dy) * rect[3]) / 2.0f;
+    p1[0] = cx - dx * half; p1[1] = cy - dy * half;
+    p2[0] = cx + dx * half; p2[1] = cy + dy * half;
+    return st_GdipCreateLineBrush(p1, p2, c1, c2, wrap, out);
+}
+static MS int32_t st_GdipCreateLineBrushFromRectWithAngleI(const int32_t *rect,
+        uint32_t c1, uint32_t c2, float angle, int32_t scalable, int32_t wrap, void **out)
+{
+    float f[4];
+    if (!rect) return GP_INVALIDARG;
+    f[0] = (float)rect[0]; f[1] = (float)rect[1];
+    f[2] = (float)rect[2]; f[3] = (float)rect[3];
+    return st_GdipCreateLineBrushFromRectWithAngle(f, c1, c2, angle, scalable, wrap, out);
+}
+/* mode 0 horizontal, 1 vertical, 2 forward diagonal, 3 backward diagonal. */
+static MS int32_t st_GdipCreateLineBrushFromRect(const float *rect, uint32_t c1,
+                                                 uint32_t c2, int32_t mode,
+                                                 int32_t wrap, void **out)
+{
+    static const float deg[4] = { 0.0f, 90.0f, 45.0f, 135.0f };
+    return st_GdipCreateLineBrushFromRectWithAngle(
+        rect, c1, c2, deg[mode >= 0 && mode < 4 ? mode : 0], 0, wrap, out);
+}
+static MS int32_t st_GdipCreateLineBrushFromRectI(const int32_t *rect, uint32_t c1,
+                                                  uint32_t c2, int32_t mode,
+                                                  int32_t wrap, void **out)
+{
+    float f[4];
+    if (!rect) return GP_INVALIDARG;
+    f[0] = (float)rect[0]; f[1] = (float)rect[1];
+    f[2] = (float)rect[2]; f[3] = (float)rect[3];
+    return st_GdipCreateLineBrushFromRect(f, c1, c2, mode, wrap, out);
+}
+
+static MS int32_t st_GdipSetStringFormatFlags(void *fmt, int32_t flags)
+{
+    gp_stringformat *f = gp_check(fmt, GPO_STRINGFORMAT);
+    if (!f) return GP_INVALIDARG;
+    f->flags = flags;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetStringFormatFlags(void *fmt, int32_t *out)
+{
+    gp_stringformat *f = gp_check(fmt, GPO_STRINGFORMAT);
+    if (!f || !out) return GP_INVALIDARG;
+    *out = f->flags;
+    return GP_OK;
+}
+static MS int32_t st_GdipSetStringFormatTrimming(void *fmt, int32_t trim)
+{
+    gp_stringformat *f = gp_check(fmt, GPO_STRINGFORMAT);
+    if (!f) return GP_INVALIDARG;
+    f->trim = trim;
+    return GP_OK;
+}
+
+/* A cached bitmap is GDI+'s promise to keep a device-ready copy of an image.
+ * There is no device here, so it is the image -- borrowed, not copied, which
+ * is why deleting one does not touch it. A knob that builds one per frame then
+ * costs a small allocation rather than a screenful of pixels. */
+typedef struct { int tag; gp_image *img; } gp_cached;
+
+static MS int32_t st_GdipCreateCachedBitmap(void *image, void *graphics, void **out)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    gp_cached *c;
+    (void)graphics;
+    if (!im || !out) return GP_INVALIDARG;
+    if (!(c = gp_new(sizeof *c, GPO_IMAGE))) return GP_OUTOFMEMORY;
+    c->tag = GPO_CACHED;
+    c->img = im;
+    *out = c;
+    return GP_OK;
+}
+static MS int32_t st_GdipDeleteCachedBitmap(void *cached)
+{
+    gp_cached *c = gp_check(cached, GPO_CACHED);
+    if (!c) return GP_INVALIDARG;
+    free(c);
+    return GP_OK;
+}
+static MS int32_t st_GdipDrawCachedBitmap(void *graphics, void *cached, int32_t x, int32_t y)
+{
+    gp_cached *c = gp_check(cached, GPO_CACHED);
+    if (!c || !c->img) return GP_INVALIDARG;
+    return st_GdipDrawImageI(graphics, c->img, x, y);
+}
+
+/* The spellings of a draw this file already does. */
+static MS int32_t st_GdipDrawImage(void *graphics, void *image, float x, float y)
+{ return st_GdipDrawImageI(graphics, image, (int32_t)x, (int32_t)y); }
+static MS int32_t st_GdipDrawImageRect(void *graphics, void *image,
+                                       float x, float y, float w, float h)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    if (!im) return GP_INVALIDARG;
+    return st_GdipDrawImageRectRectI(graphics, image, (int32_t)x, (int32_t)y,
+                                     (int32_t)w, (int32_t)h, 0, 0, im->w, im->h,
+                                     2 /* UnitPixel */, NULL, NULL, NULL);
+}
+static MS int32_t st_GdipDrawImageRectI(void *graphics, void *image,
+                                        int32_t x, int32_t y, int32_t w, int32_t h)
+{ return st_GdipDrawImageRect(graphics, image, (float)x, (float)y, (float)w, (float)h); }
+static MS int32_t st_GdipDrawImagePointRectI(void *graphics, void *image,
+        int32_t x, int32_t y, int32_t sx, int32_t sy, int32_t sw, int32_t sh, int32_t unit)
+{
+    return st_GdipDrawImageRectRectI(graphics, image, x, y, sw, sh,
+                                     sx, sy, sw, sh, unit, NULL, NULL, NULL);
+}
+static MS int32_t st_GdipDrawImagePointRect(void *graphics, void *image,
+        float x, float y, float sx, float sy, float sw, float sh, int32_t unit)
+{
+    return st_GdipDrawImageRectRectI(graphics, image, (int32_t)x, (int32_t)y,
+                                     (int32_t)sw, (int32_t)sh, (int32_t)sx, (int32_t)sy,
+                                     (int32_t)sw, (int32_t)sh, unit, NULL, NULL, NULL);
+}
+static MS int32_t st_GdipDrawImageRectRect(void *graphics, void *image,
+        float dx, float dy, float dw, float dh, float sx, float sy, float sw, float sh,
+        int32_t unit, void *attr, void *cb, void *cbdata)
+{
+    return st_GdipDrawImageRectRectI(graphics, image, (int32_t)dx, (int32_t)dy,
+                                     (int32_t)dw, (int32_t)dh, (int32_t)sx, (int32_t)sy,
+                                     (int32_t)sw, (int32_t)sh, unit, attr, cb, cbdata);
+}
+
+static MS int32_t st_GdipDrawLineI(void *g, void *p, int32_t x1, int32_t y1,
+                                   int32_t x2, int32_t y2)
+{ return st_GdipDrawLine(g, p, (float)x1, (float)y1, (float)x2, (float)y2); }
+static MS int32_t st_GdipFillRectangleI(void *g, void *b, int32_t x, int32_t y,
+                                        int32_t w, int32_t h)
+{ return st_GdipFillRectangle(g, b, (float)x, (float)y, (float)w, (float)h); }
+static MS int32_t st_GdipDrawRectangleI(void *g, void *p, int32_t x, int32_t y,
+                                        int32_t w, int32_t h)
+{ return st_GdipDrawRectangle(g, p, (float)x, (float)y, (float)w, (float)h); }
+static MS int32_t st_GdipFillEllipseI(void *g, void *b, int32_t x, int32_t y,
+                                      int32_t w, int32_t h)
+{ return st_GdipFillEllipse(g, b, (float)x, (float)y, (float)w, (float)h); }
+static MS int32_t st_GdipDrawEllipseI(void *g, void *p, int32_t x, int32_t y,
+                                      int32_t w, int32_t h)
+{ return st_GdipDrawEllipse(g, p, (float)x, (float)y, (float)w, (float)h); }
+
+/* Arcs and pies, built as a path and then drawn the way any other path is. */
+static MS int32_t st_GdipDrawArc(void *graphics, void *pen, float x, float y,
+                                 float w, float h, float start, float sweep)
+{
+    void *path = NULL;
+    int32_t st;
+    if (st_GdipCreatePath(0, &path) != GP_OK) return GP_OUTOFMEMORY;
+    st_GdipAddPathArc(path, x, y, w, h, start, sweep);
+    st = st_GdipDrawPath(graphics, pen, path);
+    st_GdipDeletePath(path);
+    return st;
+}
+static MS int32_t st_GdipDrawArcI(void *g, void *p, int32_t x, int32_t y,
+                                  int32_t w, int32_t h, float start, float sweep)
+{ return st_GdipDrawArc(g, p, (float)x, (float)y, (float)w, (float)h, start, sweep); }
+
+static MS int32_t st_GdipFillPie(void *graphics, void *brush, float x, float y,
+                                 float w, float h, float start, float sweep)
+{
+    void *path = NULL;
+    int32_t st;
+    if (st_GdipCreatePath(0, &path) != GP_OK) return GP_OUTOFMEMORY;
+    /* A pie is the arc closed back through the centre, which is what
+     * ClosePathFigure does once the arc has been added after a move to it. */
+    st_GdipAddPathLine(path, x + w / 2.0f, y + h / 2.0f, x + w / 2.0f, y + h / 2.0f);
+    st_GdipAddPathArc(path, x, y, w, h, start, sweep);
+    st_GdipClosePathFigure(path);
+    st = st_GdipFillPath(graphics, brush, path);
+    st_GdipDeletePath(path);
+    return st;
+}
+static MS int32_t st_GdipFillPieI(void *g, void *b, int32_t x, int32_t y,
+                                  int32_t w, int32_t h, float start, float sweep)
+{ return st_GdipFillPie(g, b, (float)x, (float)y, (float)w, (float)h, start, sweep); }
+static MS int32_t st_GdipDrawPie(void *graphics, void *pen, float x, float y,
+                                 float w, float h, float start, float sweep)
+{
+    void *path = NULL;
+    int32_t st;
+    if (st_GdipCreatePath(0, &path) != GP_OK) return GP_OUTOFMEMORY;
+    st_GdipAddPathLine(path, x + w / 2.0f, y + h / 2.0f, x + w / 2.0f, y + h / 2.0f);
+    st_GdipAddPathArc(path, x, y, w, h, start, sweep);
+    st_GdipClosePathFigure(path);
+    st = st_GdipDrawPath(graphics, pen, path);
+    st_GdipDeletePath(path);
+    return st;
+}
+static MS int32_t st_GdipDrawPieI(void *g, void *p, int32_t x, int32_t y,
+                                  int32_t w, int32_t h, float start, float sweep)
+{ return st_GdipDrawPie(g, p, (float)x, (float)y, (float)w, (float)h, start, sweep); }
+
+/* One pixel at a time, which is how a plug-in reads a skin's colour key or
+ * writes a meter's tip. ARGB in and out, matching the buffer's own order. */
+static MS int32_t st_GdipBitmapGetPixel(void *image, int32_t x, int32_t y, uint32_t *out)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    if (!im || !im->px || !out) return GP_INVALIDARG;
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return GP_INVALIDARG;
+    *out = im->px[(size_t)y * im->w + x];
+    return GP_OK;
+}
+static MS int32_t st_GdipBitmapSetPixel(void *image, int32_t x, int32_t y, uint32_t argb)
+{
+    gp_image *im = gp_check(image, GPO_IMAGE);
+    if (!im || !im->px) return GP_INVALIDARG;
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return GP_INVALIDARG;
+    im->px[(size_t)y * im->w + x] = argb;
+    return GP_OK;
+}
+
+/* The number of points in a path, and the points themselves: a plug-in that
+ * builds a shape and then measures it asks for these, and a count of zero sends
+ * it down a path where it draws nothing. */
+static MS int32_t st_GdipGetPointCount(void *path, int32_t *out)
+{
+    gp_path *p = gp_check(path, GPO_PATH);
+    if (!p || !out) return GP_INVALIDARG;
+    *out = p->n;
+    return GP_OK;
+}
+static MS int32_t st_GdipGetPathPoints(void *path, float *pts, int32_t n)
+{
+    gp_path *p = gp_check(path, GPO_PATH);
+    if (!p || !pts || n < p->n) return GP_INVALIDARG;
+    memcpy(pts, p->pt, (size_t)p->n * 2 * sizeof(float));
+    return GP_OK;
+}
+static MS int32_t st_GdipGetPathTypes(void *path, uint8_t *types, int32_t n)
+{
+    gp_path *p = gp_check(path, GPO_PATH);
+    if (!p || !types || n < p->n) return GP_INVALIDARG;
+    memcpy(types, p->ty, (size_t)p->n);
+    return GP_OK;
+}
+/* PathData is the pair of the two above behind one pointer: { count, points,
+ * types }, with the caller owning the arrays it points at. */
+static MS int32_t st_GdipGetPathData(void *path, void *data)
+{
+    struct { int32_t count; float *points; uint8_t *types; } *d = data;
+    gp_path *p = gp_check(path, GPO_PATH);
+    if (!p || !d) return GP_INVALIDARG;
+    if (d->count < p->n) return GP_INVALIDARG;
+    d->count = p->n;
+    if (d->points) memcpy(d->points, p->pt, (size_t)p->n * 2 * sizeof(float));
+    if (d->types) memcpy(d->types, p->ty, (size_t)p->n);
+    return GP_OK;
+}
+/* This rasteriser flattens as it fills, so a path is already what Flatten
+ * would make of it. */
+static MS int32_t st_GdipFlattenPath(void *path, void *matrix, float flatness)
+{
+    (void)matrix; (void)flatness;
+    return gp_check(path, GPO_PATH) ? GP_OK : GP_INVALIDARG;
 }
 
 #endif /* PELOAD_GDIPLUS_SHIM_H */

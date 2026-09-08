@@ -957,9 +957,18 @@ static int resolve_imports(image *im)
             char ordbuf[32];
 
             if (*lookup & (1ull << 63)) {
-                snprintf(ordbuf, sizeof ordbuf, "ordinal#%llu",
-                         (unsigned long long)(*lookup & 0xFFFF));
-                sym = ordbuf;
+                /* Named through win32_ordinals.h, so an ordinal import reaches
+                 * the same stub a by-name import would. The 64-bit loader has
+                 * no arity problem to solve -- the caller cleans up here -- but
+                 * it has the same resolution problem, and both loaders
+                 * answering a number the same way is the point. */
+                const char *named = win32_ordinal_name(dll, (unsigned)(*lookup & 0xFFFF));
+                if (named) sym = named;
+                else {
+                    snprintf(ordbuf, sizeof ordbuf, "ordinal#%llu",
+                             (unsigned long long)(*lookup & 0xFFFF));
+                    sym = ordbuf;
+                }
             } else {
                 sym = (const char *)rva(im, (*lookup & 0x7FFFFFFF)) + 2;
             }
@@ -967,7 +976,7 @@ static int resolve_imports(image *im)
             /* A real implementation beats anything here, so it is asked first.
              * Ordinal imports are skipped: the C++ library is bound by name. */
             fn = NULL;
-            if (wants_real_image(dll) && !(*lookup & (1ull << 63))) {
+            if (wants_real_image(dll) && strncmp(sym, "ordinal#", 8)) {
                 pe_module *rm = real_module(dll);
                 if (rm) fn = pe_module_export(rm, sym);
             }
@@ -2409,35 +2418,67 @@ static pehost *open_inproc_pe(const char *path, double samplerate, int blocksize
     h->sr = samplerate;
     h->bs = blocksize;
 
-    if (map_image(&h->im, path)) {
-        explain_unmappable(path, g_err, sizeof g_err);
-        goto fail;
-    }
-    if (apply_relocs(&h->im) < 0) {
-        snprintf(g_err, sizeof g_err, "relocation failed");
-        goto fail;
-    }
-    winstubs_init(h->im.base,
-                  h->im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
-                    ? h->im.base + h->im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
-                    : NULL);
-    if (resolve_imports(&h->im) < 0) {
-        snprintf(g_err, sizeof g_err, "%s is needed and was not found -- put a "
-                                      "copy beside the plug-in, or name its "
-                                      "directory in PELOAD_DLL_PATH",
-                 g_missing_real);
-        goto fail;
-    }
-    protect_sections(&h->im);
-    setup_tls(&h->im);
+    /* Two attempts at most, the same as pe32.c: the first answers
+     * GetProcAddress honestly, and only a plug-in whose DllMain then says no --
+     * having been refused an export this host could have answered for -- is
+     * mapped again with every present library answering. See
+     * winstubs_set_generous. Both loaders do this, and identically, because a
+     * plug-in that loads at one width and not the other is the hardest kind of
+     * difference to find. */
+    for (int attempt = 0; ; attempt++) {
+        int dllmain_said_no = 0;
 
-    entry = h->im.opt->AddressOfEntryPoint ? rva(&h->im, h->im.opt->AddressOfEntryPoint) : NULL;
-    if (entry) {
-        MS int32_t (*dllmain)(void *, uint32_t, void *) = (MS int32_t (*)(void *, uint32_t, void *))entry;
-        if (!dllmain(h->im.base, 1, NULL)) {
-            snprintf(g_err, sizeof g_err, "DllMain failed");
+        if (map_image(&h->im, path)) {
+            explain_unmappable(path, g_err, sizeof g_err);
             goto fail;
         }
+        if (apply_relocs(&h->im) < 0) {
+            snprintf(g_err, sizeof g_err, "relocation failed");
+            goto fail;
+        }
+        winstubs_init(h->im.base,
+                      h->im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
+                        ? h->im.base + h->im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
+                        : NULL);
+        /* Before the entry point runs: the 2003 daHornet V1.34 checks its serial
+         * inside it. */
+        winstubs_seed_dahornet(h->im.base, h->im.opt->SizeOfImage);
+        if (resolve_imports(&h->im) < 0) {
+            snprintf(g_err, sizeof g_err, "%s is needed and was not found -- put a "
+                                          "copy beside the plug-in, or name its "
+                                          "directory in PELOAD_DLL_PATH",
+                     g_missing_real);
+            goto fail;
+        }
+        protect_sections(&h->im);
+        setup_tls(&h->im);
+
+        entry = h->im.opt->AddressOfEntryPoint ? rva(&h->im, h->im.opt->AddressOfEntryPoint) : NULL;
+        if (entry) {
+            MS int32_t (*dllmain)(void *, uint32_t, void *) = (MS int32_t (*)(void *, uint32_t, void *))entry;
+            dllmain_said_no = !dllmain(h->im.base, 1, NULL);
+        }
+        if (!dllmain_said_no) break;
+
+        if (attempt == 0 && winstubs_missed_export()) {
+            fprintf(stderr, "this plug-in would not initialise while %s was "
+                            "answered \"no such export\" -- loading it again with "
+                            "every present library answering\n",
+                    winstubs_missed_export());
+            /* A fresh map: the first attempt is not undoable, and a packed
+             * plug-in has already written over its own sections. */
+            munmap(h->im.base, h->im.size);
+            memset(&h->im, 0, sizeof h->im);
+            g_nimp = 0;
+            winstubs_reset_tls();
+#ifndef PELOAD_NO_GUI_LAYER
+            w32_reset();
+#endif
+            winstubs_set_generous(1);
+            continue;
+        }
+        snprintf(g_err, sizeof g_err, "DllMain failed");
+        goto fail;
     }
 
     if (!(vm = find_export(&h->im, "VSTPluginMain")) && !(vm = find_export(&h->im, "main"))) {
@@ -3330,6 +3371,16 @@ int pehost_alive(const pehost *h)
     return 1;                    /* in process: if it had died, so would we */
 }
 
+int pehost_recover(pehost *h)
+{
+    if (!h) return 0;
+    if (!h->br) return 1;        /* in process: there is nothing to bring back */
+    return bridge_recover(h->br);
+}
+
+int pehost_restarts(const pehost *h)
+{ return h && h->br ? bridge_restarts(h->br) : 0; }
+
 void pehost_note_on(pehost *h, int note, int vel)  { pehost_midi(h, 0x90, note, vel); }
 void pehost_note_off(pehost *h, int note)          { pehost_midi(h, 0x80, note, 0); }
 void pehost_all_notes_off(pehost *h)
@@ -4082,4 +4133,27 @@ void pehost_import_stats(int *implemented, int *stubbed, int *called)
     if (implemented) *implemented = g_nresolved;
     if (stubbed)     *stubbed     = g_nimp;
     if (called)      *called      = c;
+
+    /* Name them, busiest first.
+     *
+     * "4 stubs reached" is a number to worry about and not a thing to do. Which
+     * four, and how often, is the difference: an import called once at start-up
+     * costs nothing, and the same count against a million calls is a plug-in
+     * spinning on an answer it is not getting. Marvel GEQ reaches four, and one
+     * of them is most of why its editor takes twenty seconds to open. */
+    if (c) {
+        int shown = 0;
+        fprintf(stderr, "imports reached but not implemented, busiest first:\n");
+        for (;;) {
+            int best = -1;
+            for (i = 0; i < g_nimp; i++)
+                if (g_imp[i].calls && (best < 0 || g_imp[i].calls > g_imp[best].calls))
+                    best = i;
+            if (best < 0 || shown >= 10) break;
+            fprintf(stderr, "  %-28s %-24s %lu call(s)\n",
+                    g_imp[best].sym, g_imp[best].dll, g_imp[best].calls);
+            g_imp[best].calls = 0;                 /* so the next pass finds the next */
+            shown++;
+        }
+    }
 }

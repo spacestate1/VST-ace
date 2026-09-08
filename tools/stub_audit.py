@@ -1,119 +1,165 @@
 #!/usr/bin/env python3
-"""Which Win32 imports does the corpus ask for that this host only stubs?
+"""List the stubs that answer without doing anything, and say which kind.
 
-A stub returns a failure value and the caller takes its error path -- or, worse,
-reads the zero as success. This ranks what is missing by how many plug-ins want
-it, so the next thing to implement is the next line of output rather than
-whichever one a single plug-in happened to trip over.
+Every fault worth chasing in this host so far has been the same shape: a stub
+that is registered, returns successfully, and leaves the caller with nothing.
+Not a missing import -- those announce themselves -- but an implemented one
+whose body is `return 0`.
 
-    tools/stub_audit.py /path/to/corpus [more paths...]
+The three kinds, in the order they hurt:
+
+  handle      the return value is a pointer or a handle and the body returns
+              NULL. On Windows several of these can never be null, so nothing
+              checks them: GetDesktopWindow and GetFocus were both this, and
+              both crashed a plug-in at a fixed offset off address zero.
+
+  out-handle  a pointer-to-pointer argument the body never writes, while the
+              return says the call worked. The caller then calls through
+              whatever was on its stack. CreateDXGIFactory and GdipCreateRegion
+              were this, and both took a plug-in down a vtable that was never
+              filled in.
+
+  out-buffer  the same for a plain pointer, on a function whose name says it
+              produces something -- Get, Query, Create, Enum and their like.
+              _localtime64_s was this: a structure reported as filled and never
+              touched. A pointer passed to Free, Close or Set is an input and is
+              not counted.
+
+  silent      returns the value that means success and does nothing else. Safe
+              until a caller loops until the answer changes -- wcsftime
+              returning 0 for "buffer too small" is an endless loop -- or until
+              the missing effect is the whole point, as with a draw.
+
+This is a static reading, so it over-reports: a stub that genuinely has nothing
+to do is listed too, and the fourth column says whether the corpus has ever
+reached it. Judgement stays with the reader; what this removes is the searching.
+
+    python3 tools/stub_audit.py [--kind handle|out-handle|out-buffer|silent]
 """
-import os, re, struct, sys, collections
+import os, re, sys
+
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+HEADERS = ["peload/winstubs.h", "peload/win32gui.h", "peload/gdiplus_shim.h",
+           "peload/d3d_shim.h", "peload/dwrite_shim.h", "peload/msvcp_shim.h"]
+
+POINTER_RET = re.compile(r"\b(void|uint16_t|char|int32_t)\s*\*\s*$")
 
 
-def sections(d, pe):
-    nsec = struct.unpack_from('<H', d, pe + 6)[0]
-    optsz = struct.unpack_from('<H', d, pe + 20)[0]
-    pe64 = struct.unpack_from('<H', d, pe + 24)[0] == 0x20b
-    secs = []
-    so = pe + 24 + optsz
-    for i in range(nsec):
-        b = so + i * 40
-        vsz, va, rsz, ptr = struct.unpack_from('<IIII', d, b + 8)
-        secs.append((va, vsz, ptr, rsz))
-    return secs, pe64
+def read(path):
+    return open(os.path.join(ROOT, path), encoding="utf-8", errors="replace").read()
 
 
-def imports(path):
-    try:
-        d = open(path, 'rb').read()
-    except OSError:
-        return {}
-    if len(d) < 0x40 or d[:2] != b'MZ':
-        return {}
-    pe = struct.unpack_from('<I', d, 0x3c)[0]
-    if pe + 24 > len(d) or d[pe:pe + 4] != b'PE\0\0':
-        return {}
-    secs, pe64 = sections(d, pe)
-
-    def off(rva):
-        for va, vsz, ptr, rsz in secs:
-            if va <= rva < va + max(vsz, rsz):
-                return ptr + (rva - va)
-        return None
-
-    dd = pe + 24 + (112 if pe64 else 96)
-    imp = struct.unpack_from('<I', d, dd + 8)[0]
-    if not imp:
-        return {}
-    o = off(imp)
+def registered():
+    """The (dll, name) pairs in g_stubs."""
+    src = read("peload/winstubs.h")
+    tbl = src[src.index("static const winstub g_stubs[]"):]
+    tbl = tbl[:tbl.index("\n};")]
     out = {}
-    w = 8 if pe64 else 4
-    hi = 63 if pe64 else 31
-    while o is not None and o + 20 <= len(d):
-        oft, ts, fc, nm, fta = struct.unpack_from('<IIIII', d, o)
-        if not nm:
-            break
-        no = off(nm)
-        if no is None:
-            break
-        dll = d[no:d.index(b'\0', no)].decode('latin1').lower()
-        t = off(oft or fta)
-        names = []
-        while t is not None:
-            v = struct.unpack_from('<Q' if pe64 else '<I', d, t)[0]
-            if not v:
-                break
-            if v >> hi:
-                names.append('ordinal#%d' % (v & 0xffff))
-            else:
-                so_ = off(v & 0x7fffffff)
-                if so_ is not None:
-                    names.append(d[so_ + 2:d.index(b'\0', so_ + 2)].decode('latin1'))
-            t += w
-        out.setdefault(dll, []).extend(names)
-        o += 20
+    for dll, name in re.findall(r'S\(\s*"([^"]+)"\s*,\s*([A-Za-z0-9_]+)\s*\)', tbl):
+        out[name] = dll
+    for dll, name in re.findall(r'\{\s*"([^"]+)"\s*,\s*"([^"]+)"', tbl):
+        out.setdefault(name, dll)
     return out
 
 
-def implemented(root):
-    s = open(os.path.join(root, 'peload', 'winstubs.h')).read()
-    names = set(re.findall(r'\{\s*"[^"]+",\s*"([^"]+)"', s))
-    names |= set(re.findall(r'\bS[MW]?\(\s*"[^"]+"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)', s))
-    try:
-        g = open(os.path.join(root, 'peload', 'win32gui.h')).read()
-        names |= set(re.findall(r'\{\s*"[^"]+",\s*"([^"]+)"', g))
-        names |= set(re.findall(r'\bS[MW]?\(\s*"[^"]+"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)', g))
-    except OSError:
-        pass
-    return names
+def definitions():
+    """name -> (return type, parameter list, body) for every st_ function."""
+    defs = {}
+    sig = re.compile(
+        r"^static\s+(?:MS|MSCRT|MSTHIS)?\s*([A-Za-z_][A-Za-z0-9_ ]*?[ *])"
+        r"st_([A-Za-z0-9_]+)\s*\(([^)]*)\)\s*\{", re.M)
+    for h in HEADERS:
+        if not os.path.exists(os.path.join(ROOT, h)):
+            continue
+        src = read(h)
+        for m in sig.finditer(src):
+            ret, name, params = m.group(1).strip(), m.group(2), m.group(3)
+            # the body, to the matching brace
+            i, depth = m.end() - 1, 0
+            while i < len(src):
+                if src[i] == "{":
+                    depth += 1
+                elif src[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            defs[name] = (ret, params, src[m.end():i])
+    return defs
 
 
-def main():
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    have = implemented(root)
-    want = collections.Counter()
-    where = collections.defaultdict(set)
-    files = 0
-    for base in sys.argv[1:]:
-        for dirpath, _dirs, fnames in os.walk(base):
-            for f in fnames:
-                if not f.lower().endswith(('.dll', '.vst3', '.sem', '.exe')):
-                    continue
-                p = os.path.join(dirpath, f)
-                im = imports(p)
-                if im:
-                    files += 1
-                for dll, names in im.items():
-                    for n in names:
-                        want[(dll, n)] += 1
-                        where[(dll, n)].add(f)
-    missing = [(c, dll, n) for (dll, n), c in want.items() if n not in have]
-    missing.sort(key=lambda x: (-x[0], x[1], x[2]))
-    print("%d binaries scanned, %d distinct imports, %d not implemented\n"
-          % (files, len(want), len(missing)))
-    for c, dll, n in missing:
-        print("%3d  %-18s %s" % (c, dll, n))
+def classify(name, ret, params, body):
+    name_of = (name,)
+    """What kind of nothing this does, or None if it does something."""
+    stripped = re.sub(r"/\*.*?\*/", " ", body, flags=re.S)
+    stripped = re.sub(r"\(void\)\s*[A-Za-z0-9_]+\s*;", " ", stripped)
+    stripped = " ".join(stripped.split())
+
+    trivial = re.fullmatch(r"(return\s+(0|NULL|1|-1|S_OK)\s*;)?", stripped) is not None
+    if not trivial:
+        # a body that only ever returns a constant still counts
+        if not re.fullmatch(r"return\s+\(?[A-Za-z_0-9 ()]*\)?\s*(0|NULL|1)\s*;", stripped):
+            return None
+
+    if ret.rstrip().endswith("*"):
+        return "handle"
+
+    # A pointer argument the body never mentions except to discard it. Whether
+    # that matters depends on which way the pointer points, and the name of the
+    # call is the only evidence available here: Get and Create produce, Free and
+    # Close consume. A pointer-to-pointer is an output either way -- there is
+    # nothing else it could be.
+    produces = re.match(r"(Get|Query|Create|Enum|Open|Read|Alloc|Load|Make|Find|"
+                        r"Retrieve|Init|Lookup|Convert|Format|Copy|Duplicate|To|"
+                        r"_localtime|_gmtime|_ftime|_stat|_dupenv)", name_of[0])
+    for p in params.split(","):
+        p = p.strip()
+        if "*" not in p or p.startswith("const "):
+            continue
+        stars = p.count("*")
+        pname = p.split("*")[-1].strip().strip("[]")
+        if not pname or not pname.isidentifier():
+            continue
+        if re.search(r"\b%s\b" % re.escape(pname), body.replace("(void)%s" % pname, "")):
+            continue
+        if stars >= 2:
+            return "out-handle"
+        if produces:
+            return "out-buffer"
+    return "silent"
 
 
-main()
+def main(argv):
+    want = None
+    for i, a in enumerate(argv):
+        if a == "--kind" and i + 1 < len(argv):
+            want = argv[i + 1]
+
+    reg, defs = registered(), definitions()
+    rows = []
+    for name, dll in sorted(reg.items()):
+        if name not in defs:
+            continue
+        ret, params, body = defs[name]
+        kind = classify(name, ret, params, body)
+        if kind and (want is None or kind == want):
+            rows.append((kind, dll, name, ret.strip()))
+
+    order = {"handle": 0, "out-handle": 1, "out-buffer": 2, "silent": 3}
+    rows.sort(key=lambda r: (order[r[0]], r[1], r[2]))
+    print("%-10s %-22s %-34s %s" % ("kind", "library", "export", "returns"))
+    print("-" * 88)
+    for kind, dll, name, ret in rows:
+        print("%-10s %-22s %-34s %s" % (kind, dll, name, ret))
+    print("-" * 88)
+    for k in ("handle", "out-handle", "out-buffer", "silent"):
+        n = sum(1 for r in rows if r[0] == k)
+        if n:
+            print("%d %s" % (n, k))
+    print("%d of %d registered stubs answer without doing anything"
+          % (len(rows), len(reg)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -17,11 +17,15 @@ What it handles, and what it does not:
   .zip .7z      yes.
   .exe (Inno)   only with innoextract installed, which this calls when it is
                 there and names when it is not. 7z cannot read them.
+  .pkg .dmg     yes, and this is where the macOS plug-ins come from. A .pkg is
+                a xar holding one sub-package per format, each with a Payload
+                that is gzip'd cpio; expanding those gives the real
+                /Library/Audio/Plug-Ins layout, bundles and all.
 
 A DLL is only treated as a plug-in if it exports a VST entry point, which keeps
 an installer's own helper DLLs out of the results.
 """
-import argparse, os, re, shutil, struct, subprocess, sys, tempfile
+import argparse, os, re, shlex, shutil, struct, subprocess, sys, tempfile
 
 
 def pe_info(path):
@@ -104,6 +108,37 @@ def looks_like_plugin(path, exports):
     return bool(exports & VST_ENTRIES)
 
 
+def bundle_binary(path):
+    """The executable inside a plug-in bundle, or None if there is not one.
+
+    A macOS plug-in is a directory, not a file: Whatever.vst3/Contents/MacOS/
+    Whatever. Windows VST3 uses the same shape with a different leaf directory,
+    which is why Surge XT arrived as a bundle too. Either way the bundle is the
+    plug-in and has to be copied whole -- its resources sit beside the binary
+    and it will not run without them.
+    """
+    contents = os.path.join(path, 'Contents')
+    if not os.path.isdir(contents):
+        return None
+    for sub in ('MacOS', 'x86_64-win', 'x86-win', 'x86_64-linux'):
+        d = os.path.join(contents, sub)
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            q = os.path.join(d, f)
+            if not os.path.isfile(q):
+                continue
+            try:
+                magic = open(q, 'rb').read(4)
+            except OSError:
+                continue
+            # Mach-O in either byte order, a fat binary, or a PE.
+            if magic in (b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe',
+                         b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca') or magic[:2] == b'MZ':
+                return q
+    return None
+
+
 def have(prog):
     return shutil.which(prog) is not None
 
@@ -117,6 +152,10 @@ def installer_kind(path):
         return 'msi'
     if path.lower().endswith(('.zip', '.7z', '.rar', '.cab')):
         return 'archive'
+    if path.lower().endswith('.pkg') or head[:4] == b'xar!':
+        return 'pkg'
+    if path.lower().endswith('.dmg'):
+        return 'dmg'
     if b'Inno Setup' in head:
         return 'inno'
     if b'Nullsoft' in head or b'NSIS' in head:
@@ -172,8 +211,37 @@ def copy_companions(srcdir, outdir, already):
     return n
 
 
+def expand_payloads(tree):
+    """Turn a macOS package's Payload files into the files they hold.
+
+    Each sub-package in a .pkg carries one, and it is a cpio archive behind a
+    gzip -- occasionally neither, when the package was built uncompressed. The
+    result is the layout the installer would have written: Library/Audio/
+    Plug-Ins/VST3/Whatever.vst3, bundle directories intact.
+    """
+    n = 0
+    for root, _dirs, files in os.walk(tree):
+        for f in files:
+            if f != 'Payload':
+                continue
+            src = os.path.join(root, f)
+            out = os.path.join(root, '_payload')
+            os.makedirs(out, exist_ok=True)
+            try:
+                with open(src, 'rb') as fh:
+                    magic = fh.read(2)
+                cat = 'gzip -dc' if magic == b'\x1f\x8b' else 'cat'
+                r = subprocess.run('%s %s | cpio -idm --quiet' % (cat, shlex.quote(src)),
+                                   shell=True, cwd=out, capture_output=True)
+                if r.returncode == 0:
+                    n += 1
+            except OSError:
+                pass
+    return n
+
+
 def extract(path, into, kind):
-    """7z reads MSI, NSIS and the plain archives; Inno Setup needs its own."""
+    """7z reads MSI, NSIS, xar and the plain archives; Inno Setup needs its own."""
     if kind == 'inno':
         if not have('innoextract'):
             return False
@@ -182,7 +250,11 @@ def extract(path, into, kind):
         return r.returncode == 0
     r = subprocess.run(['7z', 'x', '-y', '-o' + into, path],
                        capture_output=True, text=True)
-    return r.returncode == 0
+    if r.returncode != 0:
+        return False
+    if kind in ('pkg', 'dmg'):
+        expand_payloads(into)
+    return True
 
 
 # How deep to chase an installer inside an installer. Two is enough for
@@ -262,7 +334,31 @@ def main():
             found = 0
             copied = set()
             plugin_dirs = []
-            for root, _dirs, files in os.walk(tmp):
+            for root, dirs, files in os.walk(tmp):
+                # A bundle is one plug-in rather than a directory of files:
+                # take it whole, and do not walk into it afterwards.
+                for d in list(dirs):
+                    if not d.lower().endswith(('.vst', '.vst3', '.component')):
+                        continue
+                    b = os.path.join(root, d)
+                    if not bundle_binary(b):
+                        continue
+                    dirs.remove(d)
+                    os.makedirs(out, exist_ok=True)
+                    dst = os.path.join(out, d)
+                    # A macOS bundle and a Windows build can want the same
+                    # name -- "Jup-8 V4.vst3" is both -- and one installer's
+                    # payload holds both. Whichever arrives second keeps its
+                    # platform in the name rather than being dropped.
+                    if os.path.exists(dst):
+                        stem, ext = os.path.splitext(d)
+                        dst = os.path.join(out, '%s-macos%s' % (stem, ext))
+                        if os.path.exists(dst):
+                            continue
+                    shutil.copytree(b, dst, symlinks=True)
+                    is64 = open(bundle_binary(b), 'rb').read(4) != b'\xce\xfa\xed\xfe'
+                    installed.append((dst, '64' if is64 else '32'))
+                    found += 1
                 for f in files:
                     p = os.path.join(root, f)
                     is_pe, is64, exports, orig = pe_info(p)
@@ -292,7 +388,7 @@ def main():
                     installed.append((dst, '64' if is64 else '32'))
                     found += 1
             if not found:
-                skipped.append((inst, 'no VST entry point in anything it contained'))
+                skipped.append((inst, 'no plug-in in anything it contained'))
             else:
                 # The plug-in's own directory, minus the PEs already placed:
                 # data folders, presets, skins, anything it shipped with.
@@ -317,9 +413,21 @@ def main():
     print('\nloading each one:')
     for p, width in installed:
         exe = os.path.join(a.peload, 'peload32' if width == '32' else 'peload')
-        r = subprocess.run([exe, p, '--render', '/tmp/_vi.wav', '--secs', '1',
-                            '--note', '60'], capture_output=True, text=True,
-                           timeout=180, errors='replace')
+        # A plug-in that hangs must not take the installer with it. This is
+        # the last step of an install that has already succeeded, so a load
+        # that never returns is a line in the report, not an exception out of
+        # the program -- which is what it was, and through the window it read
+        # as "nothing came out" for an install that had worked.
+        try:
+            r = subprocess.run([exe, p, '--render', '/tmp/_vi.wav', '--secs', '1',
+                                '--note', '60'], capture_output=True, text=True,
+                               timeout=180, errors='replace')
+        except subprocess.TimeoutExpired:
+            print('    HUNG %-38s no answer in 180 s' % os.path.basename(p)[:38])
+            continue
+        except OSError as e:
+            print('    FAIL %-38s %s' % (os.path.basename(p)[:38], e))
+            continue
         m = re.search(r'peak ([0-9.]+)', r.stdout)
         if m:
             print('    OK   %-38s peak %s' % (os.path.basename(p)[:38], m.group(1)))

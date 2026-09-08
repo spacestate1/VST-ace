@@ -96,6 +96,14 @@ target_link_libraries(peserve PRIVATE pehost)
 # CLI: inspect and render a plugin to WAV.
 add_executable(peload peload_cli.c)
 target_link_libraries(peload PRIVATE pehost)
+# --play needs a sound server and a sequencer. Both optional: without them the
+# CLI still renders to a file, which is what it did before live mode existed.
+if(PIPEWIRE_FOUND AND ALSA_FOUND)
+  target_compile_definitions(peload PRIVATE PELOAD_LIVE=1)
+  target_link_libraries(peload PRIVATE PkgConfig::PIPEWIRE PkgConfig::ALSA)
+else()
+  message(STATUS "peload --play skipped (needs libpipewire-0.3 and alsa)")
+endif()
 
 # Qt6 GUI: browse, load, tweak and play plugins live.
 find_package(Qt6 COMPONENTS Widgets QUIET)

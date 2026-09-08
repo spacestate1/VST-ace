@@ -32,6 +32,7 @@
 
 #include "bridge.h"
 #include "pehost.h"
+#include "hostsym.h"
 
 typedef struct {
     pehost     *h;
@@ -340,6 +341,17 @@ static void crash_report(int sig, siginfo_t *si, void *uc)
                  sig, pc, si ? si->si_addr : NULL);
     if (n > 0) { ssize_t w = write(2, line, (size_t)n); (void)w; }
 
+    /* If the pc is in this helper's own code, its name says far more than the
+     * offset does: a crash inside a shim is a bug here, and a crash inside the
+     * plug-in is a bug there. */
+    {
+        char sym[128];
+        if (hostsym((uintptr_t)pc, sym, sizeof sym)) {
+            n = snprintf(line, sizeof line, "peserve:   that is %s, in the host\n", sym);
+            if (n > 0) { ssize_t w = write(2, line, (size_t)n); (void)w; }
+        }
+    }
+
     /* Which mapping the pc is in, and how far into it -- enough to turn into an
      * RVA against the plugin image. */
     if ((fd = open("/proc/self/maps", O_RDONLY)) >= 0) {
@@ -371,6 +383,7 @@ static void crash_report(int sig, siginfo_t *si, void *uc)
 static void install_crash_report(void)
 {
     struct sigaction sa;
+    hostsym_init();               /* while there is still a working stack */
     int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     size_t i;
     memset(&sa, 0, sizeof sa);

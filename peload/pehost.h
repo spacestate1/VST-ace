@@ -221,6 +221,18 @@ void  pehost_midi(pehost *h, int status, int d1, int d2);
  * and audio that went quiet. */
 int   pehost_alive(const pehost *h);
 
+/* Bring a plug-in back after its helper died, with the program and parameter
+ * values it had put back. Returns 1 when it is running again -- and 1 with
+ * nothing done for a plug-in hosted in process, which cannot be in this state.
+ *
+ * From the same thread as every other call here, not the audio thread; safe to
+ * call while audio is running, because a plug-in in this state is producing
+ * silence and touching nothing. A front end should give up after a few:
+ * pehost_restarts says how many there have been, and a plug-in that faults on
+ * something it will meet again faults again on the next one. */
+int   pehost_recover(pehost *h);
+int   pehost_restarts(const pehost *h);
+
 /* Which input channels the signal fed to pehost_render_io reaches, as a bitmask
  * over channels (bit 0 = first input); 0 means all of them, which is the
  * default. A plug-in with a separate modulator and carrier input -- a vocoder --

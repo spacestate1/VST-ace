@@ -46,6 +46,9 @@
 /* Win32 uses stdcall; the VST2 function pointers are cdecl. On x86-64 both
  * collapse into one convention, which is why the 64-bit loader needs only one
  * macro. */
+#include "hostsym.h"
+#include "hostprof.h"
+
 #define WINAPI_  __attribute__((stdcall))
 #define VSTCALL_ __attribute__((cdecl))
 
@@ -256,6 +259,31 @@ static void loc(char *out, size_t n, uint32_t a)
         snprintf(out, n, "0x%08x %s", a, a < 0x10000 ? "<not mapped>" : "(host)");
 }
 
+/* The permissions of the page the fault touched.
+ *
+ * "image+0x1a40" alone does not say whether that address is unmapped, mapped
+ * without execute, or mapped and simply holding the wrong thing -- and those
+ * are three different bugs. /proc/self/maps answers it, and reading it here
+ * costs nothing: the process is about to exit anyway. */
+static void perms_of(char *out, size_t n, uint32_t a)
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[256];
+    *out = 0;
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo, hi;
+        char perm[8];
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perm) != 3) continue;
+        if (a >= lo && a < hi) {
+            snprintf(out, n, "%s in %08lx-%08lx", perm, lo, hi);
+            break;
+        }
+    }
+    fclose(f);
+    if (!*out) snprintf(out, n, "not mapped");
+}
+
 static void fault_handler(int sig, siginfo_t *si, void *uc)
 {
     static volatile int nested;
@@ -277,12 +305,56 @@ static void fault_handler(int sig, siginfo_t *si, void *uc)
     fprintf(stderr, "\n*** %s in guest code\n",
             sig == SIGSEGV ? "SIGSEGV" : sig == SIGILL ? "SIGILL" : "SIGFPE");
     loc(b, sizeof b, (uint32_t)(uintptr_t)si->si_addr);
-    fprintf(stderr, "    addr %s\n", b);
-    loc(b, sizeof b, eip); fprintf(stderr, "    eip  %s\n", b);
+    { char pb[64];
+      perms_of(pb, sizeof pb, (uint32_t)(uintptr_t)si->si_addr);
+      fprintf(stderr, "    addr %s  [%s]\n", b, pb); }
+    loc(b, sizeof b, eip);
+    { char pb[64];
+      perms_of(pb, sizeof pb, eip);
+      fprintf(stderr, "    eip  %s  [%s]\n", b, pb); }
     fprintf(stderr, "    esp  0x%08x   ebp 0x%08x\n", esp, ebp);
     if (!eip)
         fprintf(stderr, "    (eip 0 means a call or ret through a null/clobbered"
                         " address -- suspect a stub arity or a missing import)\n");
+    else if ((uint32_t)(uintptr_t)si->si_addr == eip)
+        fprintf(stderr, "    (the fault is the instruction fetch itself: control"
+                        " reached an address that cannot be executed)\n");
+
+    /* The instruction itself, and what came before it. Which register was null
+     * matters less than what was being done with it -- and the call a few bytes
+     * back is usually where the null came from. `ff 15 <address>` reads a
+     * function pointer out of the import table, and whatever that slot holds is
+     * one of this host's own stubs, which the symbol table can name. That is
+     * the difference between "a plug-in dereferenced null" and "GetFocus was
+     * answered with nothing and the plug-in walked it". */
+    {
+        char pb[64];
+        perms_of(pb, sizeof pb, eip);
+        if (strchr(pb, 'x')) {
+            const uint8_t *p = (const uint8_t *)(uintptr_t)eip;
+            int k;
+            fprintf(stderr, "    code");
+            for (k = -24; k < 0; k++) fprintf(stderr, " %02x", p[k]);
+            fprintf(stderr, " |");
+            for (k = 0; k < 16; k++) fprintf(stderr, " %02x", p[k]);
+            fprintf(stderr, "   (| is the faulting instruction)\n");
+
+            for (k = -24; k <= -6; k++) {
+                uint32_t slot, fn;
+                char sym[128];
+                if (p[k] != 0xFF || p[k + 1] != 0x15) continue;
+                memcpy(&slot, p + k + 2, 4);
+                if (slot < 0x1000) continue;
+                memcpy(&fn, (const void *)(uintptr_t)slot, 4);
+                if (hostsym((uintptr_t)fn, sym, sizeof sym))
+                    fprintf(stderr, "    the last call before it went through the "
+                                    "import table to %s\n", sym);
+                else
+                    fprintf(stderr, "    the last call before it went through the "
+                                    "import table to 0x%08x (not one of ours)\n", fn);
+            }
+        }
+    }
 
     fprintf(stderr, "    eax 0x%08x  ebx 0x%08x  ecx 0x%08x  edx 0x%08x\n"
                     "    esi 0x%08x  edi 0x%08x  fs 0x%04x  tid %ld\n",
@@ -324,6 +396,11 @@ static void fault_handler(int sig, siginfo_t *si, void *uc)
 static void faults_report(image32 *im)
 {
     struct sigaction sa;
+    /* Before the first fault, not during one: parsing an ELF file inside a
+     * signal handler is exactly the kind of thing that turns a diagnosable
+     * crash into a hang. */
+    hostsym_init();
+    hostprof_start();                    /* PELOAD_PROFILE=1 */
     g_im = im; g_img_lo = im->base; g_img_hi = im->base + im->size;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = fault_handler;
@@ -369,7 +446,13 @@ static void *make_stub(uint32_t idx)
 
     if (argb < 0) {
         argb = 0;
-        if (g_imp[idx].sym[0] != '#') {          /* ordinal imports have no name */
+        /* An ordinal win32_ordinals.h could not name still reaches here, and it
+         * is the one case where the warning is the whole story: there is no name
+         * to look an arity up under, so the stub pops nothing and the caller's
+         * stack is four bytes off per argument it passed. (This guard used to
+         * test sym[0] != '#', which never matched: the spelling is "ordinal#N",
+         * so every ordinal was reported as an unknown *name*.) */
+        if (strncmp(g_imp[idx].sym, "ordinal#", 8) != 0) {
             fprintf(stderr, "  [stub] %s!%s: unknown stdcall arity, assuming 0 --"
                             " a call to it will unbalance the stack\n",
                     g_imp[idx].dll, g_imp[idx].sym);
@@ -856,8 +939,17 @@ static int resolve_imports(image32 *im)
             char ordbuf[32];
 
             if (*lookup & 0x80000000u) {           /* by ordinal: 32-bit flag */
-                snprintf(ordbuf, sizeof ordbuf, "ordinal#%u", *lookup & 0xFFFF);
-                sym = ordbuf;
+                /* A number is not something the stub table, or the arity table
+                 * behind an i386 stub, can be asked about. Turn it into the name
+                 * the library exports it under first; only an ordinal
+                 * win32_ordinals.h has never heard of keeps the "ordinal#N"
+                 * spelling, and that one is reported rather than guessed at. */
+                const char *named = win32_ordinal_name(dll, *lookup & 0xFFFF);
+                if (named) sym = named;
+                else {
+                    snprintf(ordbuf, sizeof ordbuf, "ordinal#%u", *lookup & 0xFFFF);
+                    sym = ordbuf;
+                }
             } else {
                 sym = (const char *)rva(im, *lookup & 0x7FFFFFFF) + 2;
             }
@@ -1075,46 +1167,81 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    atexit(hostprof_report);
     if (teb_install()) {
         fprintf(stderr, "cannot install fake TEB\n");
         if (serve_fd >= 0) serve_report_fail(serve_fd, "cannot install fake TEB");
         return 1;
     }
-    if (map_image(&im, path)) {
-        if (serve_fd >= 0) serve_report_fail(serve_fd, "cannot map plug-in image");
-        return 1;
-    }
-    /* Only here, and not in the runtime side-load above: GetModuleFileName has
-     * to keep answering with the plug-in even after a runtime DLL is mapped
-     * beside it. A plug-in that loads its own data from its own directory --
-     * SynthEdit reads its .sem modules that way -- has no other way to find
-     * out where it is. */
-    winstubs_set_image_path(path);
-    /* And how to load a DLL that is not one of the shimmed system ones. */
-    winstubs_set_loader(pe32_load_dll, pe32_dll_symbol);
-    if (apply_relocs(&im) < 0) {
-        if (serve_fd >= 0) serve_report_fail(serve_fd, "relocation failed");
-        return 1;
-    }
-    faults_report(&im);
-    winstubs_init(im.base, im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
-                            ? im.base + im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
-                            : NULL);
-    resolve_imports(&im);
-    protect_sections(&im);
-    setup_tls(&im);
+    /* Two attempts at most.
+     *
+     * The first answers GetProcAddress honestly, because a plug-in that probes
+     * for an optional API needs a NULL it can believe. If that attempt gets as
+     * far as DllMain and DllMain says no, and something was refused along the
+     * way that this host could have answered for, the image is thrown away and
+     * mapped again with every present library answering (winstubs_set_generous).
+     * A plug-in that loads the first time never reaches the second pass, so
+     * nothing that already worked can be changed by it. */
+    for (int attempt = 0; ; attempt++) {
+        int dllmain_said_no = 0;
 
-    entry = im.opt->AddressOfEntryPoint ? rva(&im, im.opt->AddressOfEntryPoint) : NULL;
-    if (entry) {
-        int32_t WINAPI_ (*dllmain)(void *, uint32_t, void *) =
-            (int32_t WINAPI_ (*)(void *, uint32_t, void *))entry;
-        int32_t r = dllmain(im.base, 1, NULL);
-        PLOG("DllMain returned %d\n", r);
-        if (!r) {
-            fprintf(stderr, "DllMain failed\n");
-            if (serve_fd >= 0) serve_report_fail(serve_fd, "DllMain failed");
+        if (map_image(&im, path)) {
+            if (serve_fd >= 0) serve_report_fail(serve_fd, "cannot map plug-in image");
             return 1;
         }
+        /* Only here, and not in the runtime side-load above: GetModuleFileName has
+         * to keep answering with the plug-in even after a runtime DLL is mapped
+         * beside it. A plug-in that loads its own data from its own directory --
+         * SynthEdit reads its .sem modules that way -- has no other way to find
+         * out where it is. */
+        winstubs_set_image_path(path);
+        /* And how to load a DLL that is not one of the shimmed system ones. */
+        winstubs_set_loader(pe32_load_dll, pe32_dll_symbol);
+        if (apply_relocs(&im) < 0) {
+            if (serve_fd >= 0) serve_report_fail(serve_fd, "relocation failed");
+            return 1;
+        }
+        faults_report(&im);
+        winstubs_init(im.base, im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
+                                ? im.base + im.opt->DataDirectory[DIR_RESOURCE].VirtualAddress
+                                : NULL);
+        /* Before the entry point runs: the 2003 daHornet V1.34 checks its serial
+         * inside it. */
+        winstubs_seed_dahornet(im.base, im.opt->SizeOfImage);
+        resolve_imports(&im);
+        protect_sections(&im);
+        setup_tls(&im);
+
+        entry = im.opt->AddressOfEntryPoint ? rva(&im, im.opt->AddressOfEntryPoint) : NULL;
+        if (entry) {
+            int32_t WINAPI_ (*dllmain)(void *, uint32_t, void *) =
+                (int32_t WINAPI_ (*)(void *, uint32_t, void *))entry;
+            int32_t r = dllmain(im.base, 1, NULL);
+            PLOG("DllMain returned %d\n", r);
+            dllmain_said_no = !r;
+        }
+        if (!dllmain_said_no) break;
+
+        if (attempt == 0 && winstubs_missed_export()) {
+            fprintf(stderr, "this plug-in would not initialise while %s was "
+                            "answered \"no such export\" -- loading it again with "
+                            "every present library answering\n",
+                    winstubs_missed_export());
+            /* A fresh map, because the first attempt is not undoable: this one
+             * unpacked itself over its own sections. */
+            munmap(im.base, im.size);
+            memset(&im, 0, sizeof im);
+            g_nimp = 0;
+            winstubs_reset_tls();
+#ifndef PELOAD_NO_GUI_LAYER
+            w32_reset();
+#endif
+            winstubs_set_generous(1);
+            continue;
+        }
+        fprintf(stderr, "DllMain failed\n");
+        if (serve_fd >= 0) serve_report_fail(serve_fd, "DllMain failed");
+        return 1;
     }
 
     if (!(vm = find_export(&im, "VSTPluginMain")) && !(vm = find_export(&im, "main"))) {
