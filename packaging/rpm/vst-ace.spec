@@ -21,7 +21,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 
 Name:           vst-ace
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Run Windows, macOS and Linux audio plug-ins natively, without Wine
 
@@ -177,6 +177,32 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %{_mandir}/man1/dwstudio.1*
 
 %changelog
+* Sun Sep 07 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.0-1
+- Send MIDI as well as receive it. Both windows carry an out port that was
+  created and never written to; everything played locally now goes out of it,
+  thru echoes what arrives, and a sequencer's clock drives the transport, so a
+  tracker at the other end can play these and be played by them.
+- Reach the plug-in with raw MIDI: wheels, pedals, aftertouch and song position
+  arrive unchanged, where before only notes, bend and all-notes-off did.
+- Give dwstudio the inputs pestudio had -- an audio device chooser, an "is
+  anything arriving" line, the input-channel mask, and the same four effect
+  input sources -- so the two windows answer the same questions the same way.
+- Drive either window from the keyboard: shortcuts for the plug-in list, the
+  programs, the editor, rescan, thru, panic and the volume, all on the menus
+  they belong to.
+- Drop the Engines/Plug-ins switcher: hosting plug-ins is what this is for, and
+  the built-in engines stay as what sounds when nothing is loaded.
+- Play the computer keyboard while a plug-in's editor has focus, instead of the
+  keys going dead the moment a knob is touched.
+- Report a fault instead of dying quietly: the failing address is named from the
+  symbol table or the import table, the instruction bytes are dumped, a guest
+  stack overflow is recognised as one, and a sampling profiler says which stub a
+  slow load is sitting in.
+- Resolve 7223 ordinal imports by number, and answer the Win32, GDI+ and CRT
+  calls the corpus was measured making rather than the ones its import tables
+  list.
+- Recover a dead 32-bit bridge or out-of-process host rather than leaving a
+  window that has quietly stopped working.
 * Tue Sep 02 2026 Connor McRann <cmcrann@protonmail.com> - 0.2.0-1
 - Host macOS VST3 plug-ins, which never loaded before: the bundle search only
   knew the Windows and Linux layouts, and there was no path that took a Mach-O
