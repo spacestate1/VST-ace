@@ -1,0 +1,187 @@
+# The Arch recipe. packaging/build-arch.sh stages a source tarball beside this
+# file, rewrites the pkgver below and runs makepkg -- the same shape as the
+# other two: a placeholder version in the recipe, the real one supplied at
+# build time, so the number the package is named after and the number its About
+# box reports are the same one.
+#
+# Building from a staged tarball rather than from the tree in place is
+# deliberate. It is the only thing that checks the tarball is self-sufficient,
+# and that has failed before: macfont.h and png_in.h were #included by the
+# build and had never been committed, so for two releases only a working copy
+# could compile.
+#
+# For the AUR the source line becomes the released tarball with a real
+# checksum, and nothing else here changes:
+#
+#   source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+#   sha256sums=('<sha256 of that tarball>')
+
+pkgname=vst-ace
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="Run Windows, macOS and Linux audio plug-ins natively, without Wine"
+arch=('x86_64')
+url="https://github.com/spacestate1/VST-ace"
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'gtk4' 'qt6-base' 'alsa-lib' 'libpipewire'
+         'libx11' 'cairo' 'freetype2')
+makedepends=('cmake' 'pkgconf' 'desktop-file-utils')
+optdepends=(
+    'xorg-xwayland: editors embed through an X11 window id, so both windows ask for the X11 backend under Wayland'
+    'lib32-glibc: 32-bit Windows VST2 plug-ins, via the peload32 helper'
+    'lib32-freetype2: text in a 32-bit plug-in editor'
+    'lib32-libx11: a 32-bit plug-in editor window'
+    'lib32-pipewire: audio out from a standalone peload32 --play'
+    'lib32-alsa-lib: MIDI in to a standalone peload32 --play'
+)
+
+# LTO off, the same as debian/rules and the .spec.
+#
+# peload_cxx_throw_c and peload_ms_badjmp are reached only from top-level asm()
+# blocks, so a whole-program pass sees nothing calling them and drops both --
+# which is how this first showed up elsewhere, as two undefined references
+# while linking peserve. A `used` attribute would fix that much and not the
+# rest: the host hands function addresses to guest code, which then calls them
+# from PE, Mach-O and PEF images LTO never sees. Anything it concluded from
+# "nothing calls this" would be wrong in the same way, and the next symptom
+# need not be as loud as a link error.
+options=(!lto)
+
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_pkglibdir=/usr/lib/$pkgname
+_pkgdatadir=/usr/share/$pkgname
+
+build() {
+    cd "$pkgname-$pkgver"
+
+    # What the About boxes are compiled with. VSTACE_GIT comes in from
+    # build-arch.sh, because the staged tree has no .git to ask -- see the note
+    # at the top of peload/CMakeLists.txt.
+    export VSTACE_VERSION="$pkgver"
+    export VSTACE_GIT="${VSTACE_GIT:-}"
+
+    # Three build systems in one tree: c/ is a plain Makefile, and peload/ and
+    # gui/ are separate CMake projects (gui/ pulls peload/ in as a subdirectory
+    # for the host library). Each is driven explicitly.
+    #
+    # CFLAGS and LDFLAGS are left to reach make through the environment, where
+    # makepkg has already put them, rather than being passed on the command
+    # line: c/Makefile takes them with ?= and then appends
+    # -Wno-format-truncation with +=, and a command-line assignment would win
+    # over that += and lose the warning suppression. debian/rules relies on the
+    # same thing.
+    #
+    # `va` is compiled knowing where it was installed, which is what lets it
+    # find its helpers with no source tree above it -- see locate_tree() in
+    # c/src/dw.c.
+    make -C c \
+        DW_PKGDEFS="-DDW_PKGLIBDIR=\\\"$_pkglibdir\\\" -DDW_PKGDATADIR=\\\"$_pkgdatadir\\\""
+
+    cmake -B obj-peload -S peload \
+        -DCMAKE_BUILD_TYPE=None \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_C_FLAGS="$CFLAGS $CPPFLAGS" \
+        -DCMAKE_CXX_FLAGS="$CXXFLAGS $CPPFLAGS" \
+        -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS"
+    cmake --build obj-peload
+
+    cmake -B obj-gui -S gui \
+        -DCMAKE_BUILD_TYPE=None \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_C_FLAGS="$CFLAGS $CPPFLAGS" \
+        -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS"
+    cmake --build obj-gui --target dwstudio
+
+    # pestudio and dwstudio are skipped rather than failed when their toolkit
+    # is missing, so without this a package built without Qt6 or GTK4 would
+    # ship quietly incomplete. Insist on them here, where the missing
+    # dependency is still the obvious explanation.
+    test -x obj-peload/peload
+    test -x obj-peload/peserve
+    test -x obj-peload/pestudio
+    test -x obj-gui/dwstudio
+
+    # peload32 is not insisted on. Unlike Debian, where the i386 libraries are
+    # ordinary build-dependencies, this one needs multilib enabled in
+    # /etc/pacman.conf -- so it is built when lib32-glibc and lib32-freetype2
+    # are there and skipped when they are not, which is what peload/
+    # CMakeLists.txt already decides. package() ships it only if it exists, and
+    # says which it did.
+    if [ -x obj-peload/peload32 ]; then
+        echo "  -> peload32 built -- 32-bit Windows VST2 plug-ins will load"
+    else
+        echo "  -> peload32 skipped -- enable multilib and install lib32-glibc"
+        echo "     and lib32-freetype2 for 32-bit Windows VST2 support"
+    fi
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    # The tests proper need plug-in binaries, which are not ours to ship and
+    # are not in the tarball. What can be checked without them is that the two
+    # desktop entries are valid -- they have been wrong before, naming the
+    # launcher by a name it no longer had, which failed to start either window
+    # from the desktop menu and was found by a user rather than by a build.
+    desktop-file-validate packaging/pestudio.desktop
+    desktop-file-validate packaging/dwstudio.desktop
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    # The real programs go together in one private directory because that is
+    # where each of them looks for the others: the bridge finds peserve and
+    # peload32 beside the running executable, and /proc/self/exe resolves the
+    # symlinks below back here.
+    install -Dm755 obj-peload/peload   "$pkgdir$_pkglibdir/peload"
+    install -Dm755 obj-peload/peserve  "$pkgdir$_pkglibdir/peserve"
+    install -Dm755 obj-peload/pestudio "$pkgdir$_pkglibdir/pestudio"
+    install -Dm755 obj-gui/dwstudio    "$pkgdir$_pkglibdir/dwstudio"
+    install -Dm755 c/build/va          "$pkgdir/usr/bin/va"
+
+    # An i386 binary in an x86_64 package, deliberately -- namcap will say so.
+    # A 64-bit process cannot map a 32-bit plug-in, so 32-bit Windows VST2s are
+    # hosted in this helper out of process. It is never executed unless a
+    # 32-bit plug-in is opened, and the host checks it can actually run before
+    # trying, so the lib32 packages stay optdepends rather than depends.
+    if [ -x obj-peload/peload32 ]; then
+        install -Dm755 obj-peload/peload32 "$pkgdir$_pkglibdir/peload32"
+    fi
+
+    # Where real Microsoft runtime DLLs go. Empty, because the redistributable
+    # is not ours to ship; owned by the package, because the host searches next
+    # to its own binaries and the user should not have to read pehost.c to
+    # learn that. makepkg keeps empty directories by default (the `emptydirs`
+    # option); a stripped-down makepkg.conf that turns it off would drop
+    # runtime32/ and leave nowhere obvious to put the i386 DLLs.
+    install -d "$pkgdir$_pkglibdir/runtime"
+    install -d "$pkgdir$_pkglibdir/runtime32"
+    install -Dm644 packaging/runtime-README "$pkgdir$_pkglibdir/runtime/README"
+
+    # The three that are worth having on $PATH, as symlinks rather than copies:
+    # the helper lookup above depends on the real programs staying together.
+    for p in peload pestudio dwstudio; do
+        ln -sf "../lib/$pkgname/$p" "$pkgdir/usr/bin/$p"
+    done
+
+    # The patch banks. Only the .json banks -- the generators beside them in
+    # the tree are for producing more, and need the plug-in corpus to run.
+    install -d "$pkgdir$_pkgdatadir/patches"
+    ( cd patches && find . -name '*.json' -type f \
+        -exec install -Dm644 '{}' "$pkgdir$_pkgdatadir/patches/"'{}' \; )
+
+    install -Dm644 packaging/pestudio.desktop \
+        "$pkgdir/usr/share/applications/pestudio.desktop"
+    install -Dm644 packaging/dwstudio.desktop \
+        "$pkgdir/usr/share/applications/dwstudio.desktop"
+
+    for m in va peload pestudio dwstudio; do
+        install -Dm644 "packaging/$m.1" "$pkgdir/usr/share/man/man1/$m.1"
+    done
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md  "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 PLUGINS.md "$pkgdir/usr/share/doc/$pkgname/PLUGINS.md"
+}

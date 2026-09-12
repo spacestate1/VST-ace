@@ -1,0 +1,68 @@
+# What never goes into a staged source tree, for rsync --exclude-from.
+#
+# One list, three build scripts. It used to be three copies of the same
+# --exclude arguments, which is how runtime32/ came to be staged: the list was
+# written when only runtime/ existed, and the two DLLs that arrived later were
+# copied into every source tarball this tree produced. A single file is what
+# stops the next directory from doing the same.
+#
+# rsync reads these with the same meaning as --exclude: a leading slash anchors
+# the pattern to the top of the transfer, a trailing slash matches directories
+# only, and lines starting with # are comments.
+
+# Version control, and the agent's own directory -- which holds worktrees, each
+# a second copy of this tree.
+.git
+.claude/
+
+# Build output, in all three build systems' idea of where it goes.
+build/
+obj-*/
+*.o
+*.d
+# The launcher, built from c/src/dw.c and installed at the top of the tree.
+/va
+
+# Built packages. They are the output of these scripts, not an input to them.
+release/
+
+# A top-level debian/ is what dpkg-buildpackage looks for, and build-deb.sh
+# creates it by copying packaging/debian into place. Anchored, so that
+# packaging/debian itself stays in the tarball: the recipe is part of the
+# source, and a tarball that dropped it could not rebuild the .deb it came
+# from.
+/debian/
+
+__pycache__/
+
+# Editor caches. clangd's index is the one that turns up here, under whichever
+# directory the language server was started in.
+.cache/
+
+# Not ours to redistribute: the Microsoft runtime DLLs pehost looks for at run
+# time, in both widths. The packages ship these directories empty and say what
+# goes in them -- see packaging/runtime-README.
+/runtime*/
+
+# Derived from binaries and regenerable: Ghidra's database, the decompiler and
+# disassembly dumps, and rendered audio.
+/project/
+/out/
+/renders/
+
+# A vendored LLVM libc++ package, also not ours to redistribute.
+thirdparty/
+
+# Scratch left behind by a run: the guest HOME skeleton peload creates for
+# Native Instruments plug-ins, which carries the local username in its path,
+# and the empty sound folders beside it. A run leaves them wherever it was
+# started from, so all three places are named -- anchored, every one of them.
+# Bare home/ and FM8/ would do the same job today and silently drop the first
+# real directory anyone gives either name to, which is the failure this file
+# exists to stop.
+/home/
+/peload/home/
+/patches/home/
+/FM8/
+/peload/FM8/
+/patches/FM8/

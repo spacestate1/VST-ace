@@ -177,7 +177,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %{_mandir}/man1/dwstudio.1*
 
 %changelog
-* Sun Sep 07 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.0-1
+* Mon Sep 07 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.0-1
 - Send MIDI as well as receive it. Both windows carry an out port that was
   created and never written to; everything played locally now goes out of it,
   thru echoes what arrives, and a sequencer's clock drives the transport, so a
@@ -203,7 +203,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
   list.
 - Recover a dead 32-bit bridge or out-of-process host rather than leaving a
   window that has quietly stopped working.
-* Tue Sep 02 2026 Connor McRann <cmcrann@protonmail.com> - 0.2.0-1
+* Wed Sep 02 2026 Connor McRann <cmcrann@protonmail.com> - 0.2.0-1
 - Host macOS VST3 plug-ins, which never loaded before: the bundle search only
   knew the Windows and Linux layouts, and there was no path that took a Mach-O
   image. All 18 in the test corpus render and drive their own editors.

@@ -1,0 +1,20 @@
+<!-- The AppImage's icon.
+     The installed .desktop files ask for `audio-card` from the icon theme,
+     which is right for a package: the desktop already has one, in whatever
+     style the user has chosen. An AppImage has no theme to ask. It carries its
+     own icon or it shows a blank square, so this is the one place the project
+     needs a picture of its own: a plug going into a socket, and the sound
+     coming out of it.
+     (No double hyphen anywhere in here. XML forbids one inside a comment, and
+     rsvg refuses to parse the file rather than warning about it.) -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="52" fill="#23282e"/>
+  <g fill="#e8c07a">
+    <rect x="92"  y="32" width="20" height="50" rx="10"/>
+    <rect x="144" y="32" width="20" height="50" rx="10"/>
+    <rect x="68"  y="78" width="120" height="36" rx="14"/>
+  </g>
+  <path d="M40 170 Q62 122 84 170 T128 170 T172 170 T216 170"
+        fill="none" stroke="#7fb3a0" stroke-width="16"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

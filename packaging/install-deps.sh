@@ -76,7 +76,9 @@ apt)
           libgtk-4-dev qt6-base-dev
           libasound2-dev libpipewire-0.3-dev
           libx11-dev libcairo2-dev libfreetype-dev)
-    PACKAGING=(debhelper devscripts dpkg-dev fakeroot lintian rsync)
+    # curl for build-appimage.sh, which fetches linuxdeploy and
+    # appimagetool itself: they are not distribution packages anywhere.
+    PACKAGING=(debhelper devscripts dpkg-dev fakeroot lintian rsync curl)
     # Ubuntu and Debian carry only a small i386 set, and it has to be asked
     # for. This list is also what packaging/debian/control build-depends on to
     # get peload32 -- keep the two in step, or dpkg-checkbuilddeps stops the
@@ -91,7 +93,10 @@ dnf|yum)
           gtk4-devel qt6-qtbase-devel
           alsa-lib-devel pipewire-devel
           libX11-devel cairo-devel freetype-devel)
-    PACKAGING=(rpm-build rpmdevtools rsync)
+    # desktop-file-utils because the spec BuildRequires it and runs
+    # desktop-file-validate in %check -- without it rpmbuild stops after the
+    # build, at the last step before the package.
+    PACKAGING=(rpm-build rpmdevtools rsync desktop-file-utils curl)
     I386=(glibc-devel.i686 libstdc++-devel.i686 freetype-devel.i686
           libX11-devel.i686 alsa-lib-devel.i686 pipewire-devel.i686)
     INSTALL=($SUDO "$MGR" install -y "${PKGS[@]}")
@@ -101,7 +106,16 @@ pacman)
           gtk4 qt6-base
           alsa-lib pipewire
           libx11 cairo freetype2)
-    PACKAGING=(rsync dpkg rpm-tools)
+    # makepkg and fakeroot come with base-devel, which is in PKGS already.
+    # desktop-file-utils is what the PKGBUILD's check() runs; namcap is
+    # optional and says what an Arch reviewer would. dpkg and rpm-tools read a
+    # foreign package here -- they cannot build one that would run elsewhere,
+    # since it would link against Arch's own glibc, Qt and GTK.
+    # curl is what build-appimage.sh downloads appimagetool with. pacman
+    # depends on it, so it is always already here -- named anyway, so that
+    # the list says what the scripts need rather than what the package
+    # manager happens to have dragged in.
+    PACKAGING=(rsync desktop-file-utils namcap dpkg rpm-tools curl)
     # multilib has to be enabled in /etc/pacman.conf for these.
     I386=(lib32-glibc lib32-gcc-libs lib32-freetype2 lib32-libx11
           lib32-alsa-lib lib32-pipewire)
@@ -112,7 +126,10 @@ zypper)
           gtk4-devel qt6-base-devel
           alsa-devel pipewire-devel
           libX11-devel cairo-devel freetype2-devel)
-    PACKAGING=(rpm-build rsync)
+    # Same spec as Fedora, so the same two extras: desktop-file-utils for the
+    # desktop-file-validate the spec BuildRequires and runs in %check, and
+    # curl for build-appimage.sh.
+    PACKAGING=(rpm-build rsync desktop-file-utils curl)
     I386=(glibc-devel-32bit freetype2-devel-32bit libX11-devel-32bit
           alsa-devel-32bit)
     INSTALL=($SUDO zypper install -y "${PKGS[@]}")

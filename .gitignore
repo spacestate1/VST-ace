@@ -58,4 +58,3 @@ obj-*/
 # https://github.com/spacestate1/VST-ace/releases -- and packaging/build-deb.sh
 # says so when it finishes.
 release/
-runtime32/

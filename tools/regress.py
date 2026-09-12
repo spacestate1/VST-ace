@@ -28,7 +28,7 @@ A check that needs something this machine does not have -- a -m32 toolchain,
 mingw-w64's i686 import libraries, desktop-file-utils -- reports SKIP and says
 why, rather than passing quietly. Exit status is the number of failures.
 """
-import os, re, shutil, subprocess, sys, tempfile
+import datetime, os, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -492,17 +492,26 @@ message(STATUS "OK")
 # --------------------------------------------------------------- the packaging
 
 def check_shell_syntax(ctx):
-    """The packaging scripts still parse."""
+    """The packaging scripts still parse.
+
+    The PKGBUILD goes through with them: makepkg sources it as bash, so a
+    syntax error there is the same class of mistake and shows up at the same
+    place -- except that makepkg finds it after the staging and the tarball,
+    rather than before.
+    """
     bad = []
-    for name in sorted(os.listdir(rel("packaging"))):
-        if not name.endswith(".sh"):
-            continue
-        r = run(["bash", "-n", rel("packaging", name)])
+    paths = [rel("packaging", n) for n in sorted(os.listdir(rel("packaging")))
+             if n.endswith(".sh")]
+    if os.path.exists(rel("packaging", "arch", "PKGBUILD")):
+        paths.append(rel("packaging", "arch", "PKGBUILD"))
+    for path in paths:
+        r = run(["bash", "-n", path])
         if r.returncode != 0:
-            bad.append("%s: %s" % (name, r.stderr.strip().splitlines()[-1]))
+            bad.append("%s: %s" % (os.path.basename(path),
+                                   r.stderr.strip().splitlines()[-1]))
     if bad:
         return FAIL, "; ".join(bad)
-    return PASS, "all packaging/*.sh parse"
+    return PASS, "%d packaging scripts parse" % len(paths)
 
 
 # The trees the build compiles from. A source file here that git does not know
@@ -533,34 +542,138 @@ def check_sources_tracked(ctx):
     return PASS, "no untracked sources under " + ", ".join(SOURCE_DIRS)
 
 
-# build-deb.sh copies packaging/debian into place as debian/ once the pristine
-# tarball is captured, so it alone excludes that name. Everything else is the
-# same tree staged for the same reason, and must be excluded the same way.
-STAGING_EXCLUDE_ALLOWED = {"debian/"}
+# Every script that stages a copy of this tree to build a package from. The
+# count is deliberately not written out in words here: it was "three" for one
+# release after build-appimage.sh became the fourth, which is the drift this
+# whole check exists to catch.
+STAGING_SCRIPTS = ("build-deb.sh", "build-rpm.sh", "build-arch.sh",
+                   "build-appimage.sh")
 
+# The shared list they all read, and the patterns in it that are not a matter
+# of tidiness: each of these is something this tree holds and may not hand on.
+# Each entry is a thing that may not ship and the spellings of the exclude
+# that cover it: any one set being present in full satisfies it. /runtime*/
+# and the pair /runtime/ + /runtime32/ are the same instruction to rsync and
+# the second is arguably the safer one, so pinning the check to a single
+# string would fail a tightening of the list rather than a break in it.
+STAGING_MUST_EXCLUDE = (
+    ("Microsoft's runtime DLLs, in both widths",
+     ({"/runtime*/"}, {"/runtime/", "/runtime32/"})),
+    ("a vendored LLVM libc++ package",
+     ({"thirdparty/"}, {"/peload/thirdparty/"})),
+    ("the repository itself", ({".git"}, {".git/"}, {"/.git/"})),
+    ("the packages these scripts produce", ({"release/"}, {"/release/"})),
+)
 
-def rsync_excludes(name):
-    src = open(rel("packaging", name), encoding="utf-8").read()
-    return set(re.findall(r"--exclude='([^']*)'", src))
+# What a staged tree may never contain, whatever the list says -- checked
+# against what rsync actually does rather than against the patterns.
+STAGING_FORBIDDEN = (
+    (lambda n: n.endswith(".dll"), "a Windows DLL"),
+    (lambda n: "thirdparty/" in n, "vendored third-party source"),
+    (lambda n: n.startswith(".git/") or n == ".git", "the git repository"),
+    (lambda n: n.startswith("release/"), "a built package"),
+    (lambda n: "/.peload/" in n or n.startswith("home/"), "the guest HOME skeleton"),
+)
+
+# What it must contain: the recipes are part of the source. A tarball that
+# dropped one could not rebuild the package it came out of.
+STAGING_REQUIRED = ("packaging/debian/rules", "packaging/rpm/vst-ace.spec",
+                    "packaging/arch/PKGBUILD", "packaging/source-excludes.txt")
 
 
 def check_staging_excludes(ctx):
-    """The two packaging scripts stage the source tree the same way.
+    """Every packaging script stages the tree from the one shared exclude list.
 
-    Would have caught: renaming the launcher from dw to va fixed
-    build-deb.sh's --exclude='/dw' and left build-rpm.sh's behind, so every
-    .rpm source tarball shipped the built launcher inside it -- the same bug,
-    on the other script, after it had already been found once.
+    Would have caught: runtime32/, added a release after the exclude list was
+    written, staged into every source tarball this tree produced. The list said
+    --exclude='/runtime/' in three separate copies, all of them written when
+    only runtime/ existed, and the DLLs beside it are the one thing here that
+    is explicitly not ours to redistribute.
+
+    Would also have caught the bug this replaces: the launcher renamed from dw
+    to va fixed build-deb.sh's --exclude='/dw' and left build-rpm.sh's behind.
+    Comparing the two lists to each other catches that one and not the first;
+    having one list catches both.
     """
-    deb, rpm = rsync_excludes("build-deb.sh"), rsync_excludes("build-rpm.sh")
-    parts = []
-    for label, only in (("build-deb.sh", deb - rpm - STAGING_EXCLUDE_ALLOWED),
-                        ("build-rpm.sh", rpm - deb - STAGING_EXCLUDE_ALLOWED)):
-        if only:
-            parts.append("only %s: %s" % (label, ", ".join(sorted(only))))
-    if parts:
-        return FAIL, "; ".join(parts)
-    return PASS, "%d staging excludes, both scripts agree" % len(deb & rpm)
+    listing = rel("packaging", "source-excludes.txt")
+    if not os.path.exists(listing):
+        return FAIL, "no packaging/source-excludes.txt"
+    patterns = {l.strip() for l in open(listing, encoding="utf-8")
+                if l.strip() and not l.lstrip().startswith("#")}
+
+    problems = []
+    for name in STAGING_SCRIPTS:
+        path = rel("packaging", name)
+        if not os.path.exists(path):
+            problems.append("%s missing" % name)
+            continue
+        src = open(path, encoding="utf-8").read()
+        if "--exclude-from=" not in src:
+            problems.append("%s does not stage from source-excludes.txt" % name)
+        # A script that grew an exclude of its own is the drift starting again.
+        own = set(re.findall(r"--exclude='([^']*)'", src))
+        if own:
+            problems.append("%s carries its own --exclude: %s"
+                            % (name, ", ".join(sorted(own))))
+
+    for why, spellings in STAGING_MUST_EXCLUDE:
+        if not any(alt <= patterns for alt in spellings):
+            wanted = " or ".join(" + ".join(sorted(alt)) for alt in spellings)
+            problems.append("source-excludes.txt does not exclude %s (wanted "
+                            "%s)" % (why, wanted))
+
+    if problems:
+        return FAIL, "; ".join(problems)
+    return PASS, ("%d patterns, %d scripts, one list"
+                  % (len(patterns), len(STAGING_SCRIPTS)))
+
+
+def check_staging_tree(ctx):
+    """What rsync would actually stage, rather than what the list says.
+
+    Would have caught: the same runtime32/ leak, and by the route that matters
+    -- an anchored /runtime/ reads as if it covers the pair, and only asking
+    rsync says otherwise. It is also what notices a pattern that stops matching
+    because a directory moved, which reading the list cannot.
+    """
+    if not shutil.which("rsync"):
+        return SKIP, "rsync not installed"
+    listing = rel("packaging", "source-excludes.txt")
+    if not os.path.exists(listing):
+        return FAIL, "no packaging/source-excludes.txt"
+
+    dest = os.path.join(ctx["tmp"], "staged") + "/"
+    r = run(["rsync", "-an", "--out-format=%n", "--exclude-from", listing,
+             ROOT + "/", dest])
+    if r.returncode != 0:
+        return FAIL, "rsync failed: " + r.stderr.strip()
+    staged = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+
+    problems = []
+    for name in staged:
+        for matches, what in STAGING_FORBIDDEN:
+            if matches(name):
+                problems.append("%s would be staged (%s)" % (name, what))
+                break
+    have = set(staged)
+    for want in STAGING_REQUIRED:
+        # Absent from the staged tree for either of two reasons, and they are
+        # not the same finding. Guarding on os.path.exists made the second one
+        # silent, so deleting a recipe passed the check that exists to say a
+        # tarball can still rebuild the package it came out of.
+        if want in have:
+            continue
+        if os.path.exists(rel(*want.split("/"))):
+            problems.append("%s would not be staged" % want)
+        else:
+            problems.append("%s is not in the tree at all" % want)
+
+    if problems:
+        shown = sorted(set(problems))
+        more = len(shown) - 4
+        return FAIL, "; ".join(shown[:4]) + (" (and %d more)" % more
+                                             if more > 0 else "")
+    return PASS, "%d paths staged, nothing that may not ship" % len(staged)
 
 
 def apt_i386_from_install_deps():
@@ -673,21 +786,220 @@ def check_rpm_spec(ctx):
 def installed_programs():
     """The program names each recipe puts on $PATH.
 
-    debian/rules installs va directly and symlinks the rest in a loop; the spec
-    lists them under %{_bindir} in %files. Both are returned separately because
-    the same .desktop file is installed by both, so it has to name something
-    each of them provides.
+    Each recipe says it a different way: debian/rules installs va directly and
+    symlinks the rest in a loop, the spec lists them under %{_bindir} in
+    %files, and the PKGBUILD installs into $pkgdir/usr/bin and symlinks in the
+    same shape of loop. They are kept apart because the same .desktop file is
+    installed by all three, so it has to name something every one of them
+    provides.
+
+    A recipe that is not in the tree maps to None rather than being left out
+    of the answer: a caller that quietly checked two of three would go silent
+    on exactly the change that removed one.
     """
-    rules = open(rel("packaging", "debian", "rules"), encoding="utf-8").read()
-    deb = set(re.findall(r"\$\(DESTDIR\)/usr/bin/(\w[\w.+-]*)", rules))
-    for group in re.findall(r"for p in ([a-z0-9 ]+); do", rules):
-        deb.update(group.split())
+    def loop_and_direct(parts, direct):
+        """A recipe that installs one program by name and symlinks the rest."""
+        path = rel(*parts)
+        if not os.path.exists(path):
+            return None
+        text = open(path, encoding="utf-8").read()
+        got = set(re.findall(direct, text))
+        for group in re.findall(r"for p in ([a-z0-9 ]+); do", text):
+            got.update(group.split())
+        return got
+
+    out = {"the .deb": loop_and_direct(("packaging", "debian", "rules"),
+                                       r"\$\(DESTDIR\)/usr/bin/(\w[\w.+-]*)"),
+           "the Arch package": loop_and_direct(("packaging", "arch", "PKGBUILD"),
+                                               r'\$pkgdir/usr/bin/(\w[\w.+-]*)"')}
 
     spec_path = rel("packaging", "rpm", "vst-ace.spec")
-    spec = open(spec_path, encoding="utf-8").read() if os.path.exists(spec_path) else ""
-    files = spec[spec.index("%files"):] if "%files" in spec else ""
-    rpm = set(re.findall(r"^%\{_bindir\}/(\S+)", files, re.M))
-    return deb, rpm
+    if not os.path.exists(spec_path):
+        out["the .rpm"] = None
+    else:
+        spec = open(spec_path, encoding="utf-8").read()
+        files = spec[spec.index("%files"):] if "%files" in spec else ""
+        out["the .rpm"] = set(re.findall(r"^%\{_bindir\}/(\S+)", files, re.M))
+
+    return out
+
+
+def check_rpm_changelog_dates(ctx):
+    """Every %changelog date names the weekday it actually fell on.
+
+    Would have caught: two entries dated "Sun Sep 07 2026" and "Tue Sep 02
+    2026", neither of which is the right weekday. rpmbuild prints "bogus date
+    in %changelog" for each and builds anyway, so the only place it shows is a
+    warning at the end of a long build -- and rpm sorts entries by that date,
+    so one it cannot parse loses its ordering.
+    """
+    path = rel("packaging", "rpm", "vst-ace.spec")
+    if not os.path.exists(path):
+        return SKIP, "no packaging/rpm/vst-ace.spec"
+    s = open(path, encoding="utf-8").read()
+    entries = re.findall(r"^\* (\w{3}) (\w{3}) (\d{2}) (\d{4}) ", s, re.M)
+    if not entries:
+        return SKIP, "no dated %changelog entries"
+
+    bad = []
+    for day, mon, dom, year in entries:
+        try:
+            when = datetime.datetime.strptime("%s %s %s" % (mon, dom, year),
+                                              "%b %d %Y")
+        except ValueError:
+            bad.append("%s %s %s %s: not a date" % (day, mon, dom, year))
+            continue
+        real = when.strftime("%a")
+        if real != day:
+            bad.append("%s %s %s %s was a %s" % (day, mon, dom, year, real))
+    if bad:
+        return FAIL, "; ".join(bad)
+    return PASS, "%d changelog entries, every weekday right" % len(entries)
+
+
+# What the Arch recipe has to say, and why each one matters.
+PKGBUILD_REQUIRED = ("pkgname=", "pkgver=", "pkgrel=", "pkgdesc=", "arch=",
+                     "url=", "license=", "depends=", "source=", "sha256sums=",
+                     "build()", "package()")
+
+
+def check_arch_pkgbuild(ctx):
+    """The Arch recipe carries what the other two carry.
+
+    Would have caught: the .rpm and .deb both turn LTO off, for a reason that
+    is not distribution-specific -- the asm-only entry points get dropped and
+    peserve fails to link. A third recipe written without options=(!lto) hits
+    the same wall on the first machine whose makepkg.conf enables it, which is
+    not this one, and the error names a symbol rather than the setting.
+    """
+    path = rel("packaging", "arch", "PKGBUILD")
+    if not os.path.exists(path):
+        return SKIP, "no packaging/arch/PKGBUILD"
+    s = open(path, encoding="utf-8").read()
+    problems = []
+
+    for want in PKGBUILD_REQUIRED:
+        if not re.search(r"^%s" % re.escape(want), s, re.M):
+            problems.append("no %s" % want.rstrip("=("))
+
+    if not re.search(r"^options=\([^)]*!lto", s, re.M):
+        problems.append("LTO not disabled; the asm-only entry points get "
+                        "dropped and peserve fails to link")
+
+    # The placeholder, and the script that rewrites it. build-arch.sh supplies
+    # the real version the same way build-rpm.sh rewrites Version: -- a
+    # PKGBUILD that carried a real number here would name one version and
+    # compile another into the About box the moment the two drifted.
+    m = re.search(r"^pkgver=(\S+)", s, re.M)
+    if m and m.group(1) != "0.0.0":
+        problems.append("pkgver is %s, not the 0.0.0 placeholder "
+                        "build-arch.sh rewrites" % m.group(1))
+    script = rel("packaging", "build-arch.sh")
+    if os.path.exists(script):
+        if "s|^pkgver=" not in open(script, encoding="utf-8").read():
+            problems.append("build-arch.sh does not rewrite pkgver")
+    else:
+        problems.append("no packaging/build-arch.sh")
+
+    # Arch wants the licence text in the package when it is not one of the
+    # common ones pacman already ships, and MIT is not.
+    if "/usr/share/licenses/" not in s:
+        problems.append("LICENSE not installed under /usr/share/licenses")
+
+    # The helpers that are found beside the running executable rather than on
+    # $PATH. A recipe that shipped only what $PATH needs would give a package
+    # whose 32-bit bridge and out-of-process host are simply absent.
+    for helper in ("peserve", "runtime32"):
+        if helper not in s:
+            problems.append("does not install %s" % helper)
+
+    if problems:
+        return FAIL, "; ".join(problems)
+    return PASS, "fields, !lto, the pkgver placeholder and the helpers"
+
+
+def check_appimage(ctx):
+    """The AppImage recipe's four pieces still agree with each other.
+
+    Would have caught: an AppImage whose desktop file kept Icon=audio-card,
+    which is right in a package and empty in an AppImage -- there is no icon
+    theme inside one, so the file gets a blank square in every launcher that
+    shows it, and nothing fails while it happens.
+
+    The argv[0] dispatch is checked with it. Reaching the command line inside
+    an AppImage means symlinking the file to one of the program names, so a
+    program renamed on one side of that case statement and not the other gives
+    a symlink that silently opens a window instead.
+    """
+    d = rel("packaging", "appimage")
+    if not os.path.isdir(d):
+        return SKIP, "no packaging/appimage"
+    script = rel("packaging", "build-appimage.sh")
+    if not os.path.exists(script):
+        return FAIL, "packaging/appimage exists with no build-appimage.sh"
+
+    problems = []
+    for name in ("AppRun", "vst-ace.desktop", "vst-ace.png", "vst-ace.svg"):
+        if not os.path.exists(os.path.join(d, name)):
+            problems.append("no %s" % name)
+    if problems:
+        return FAIL, "; ".join(problems)
+
+    apprun = open(os.path.join(d, "AppRun"), encoding="utf-8").read()
+    desktop = open(os.path.join(d, "vst-ace.desktop"), encoding="utf-8").read()
+    build = open(script, encoding="utf-8").read()
+
+    if not os.access(os.path.join(d, "AppRun"), os.X_OK):
+        problems.append("AppRun is not executable")
+
+    # The icon has to be a file in the AppDir, not a theme name.
+    m = re.search(r"^Icon=(\S+)", desktop, re.M)
+    icon = m.group(1) if m else ""
+    if not icon:
+        problems.append("desktop file names no Icon")
+    elif not os.path.exists(os.path.join(d, icon + ".png")):
+        problems.append("Icon=%s, and there is no %s.png to be it" % (icon, icon))
+
+    # Exec has to be what AppRun ends up running, and what the build installs
+    # into usr/bin.
+    for key in ("Exec", "TryExec"):
+        m = re.search(r"^%s=(\S+)" % key, desktop, re.M)
+        if m and m.group(1) != "va":
+            problems.append("%s=%s, but AppRun runs va" % (key, m.group(1)))
+
+    # Every name the argv[0] case accepts must be a program the build script
+    # actually puts in usr/lib/vst-ace.
+    # Every label in the case, in whatever order and however many branches it
+    # is split across: the shell does not care which comes first and neither
+    # should this.
+    m = re.search(r'case "\$self" in(.*?)\besac\b', apprun, re.S)
+    dispatched = set()
+    for label in re.finditer(r"^\s*([\w|]+)\)\s*$", m.group(1) if m else "",
+                             re.M):
+        dispatched.update(label.group(1).split("|"))
+    installed = set(re.findall(r'/usr/lib/vst-ace/(\w+)"', build))
+    stray = dispatched - installed
+    if not dispatched:
+        problems.append("no argv[0] dispatch found in AppRun")
+    elif "peload" not in dispatched:
+        problems.append("AppRun's argv[0] dispatch does not accept peload, "
+                        "which is the name the documented symlink uses")
+    elif stray:
+        problems.append("AppRun dispatches to %s, which build-appimage.sh does "
+                        "not install" % ", ".join(sorted(stray)))
+
+    # The one thing that makes the whole arrangement work.
+    dw = open(rel("c", "src", "dw.c"), encoding="utf-8").read()
+    if "locate_tree" not in dw:
+        problems.append("dw.c has no locate_tree")
+    elif "../lib/vst-ace" not in dw:
+        problems.append("dw.c does not look for its helpers relative to itself; "
+                        "an AppImage mounts where no compiled-in path can reach")
+
+    if problems:
+        return FAIL, "; ".join(problems)
+    return PASS, ("icon, Exec, %d dispatched names and the relative helper "
+                  "lookup" % len(dispatched))
 
 
 def check_desktop_exec(ctx):
@@ -699,11 +1011,17 @@ def check_desktop_exec(ctx):
     and desktop-file-validate passed the files, because it checks their syntax
     and not whether the program named in them is there.
     """
-    deb, rpm = installed_programs()
-    if not deb or not rpm:
-        return SKIP, "could not read the program list out of both recipes"
+    recipes = installed_programs()
 
-    problems = []
+    # Deleting packaging/arch/PKGBUILD used to take this check, the PKGBUILD
+    # check and the staging assertion quiet at the same time, on a suite that
+    # still reported a clean run. A recipe that is not there is the finding.
+    problems = ["%s: no recipe in packaging/ to read the program list from"
+                % recipe for recipe, have in sorted(recipes.items())
+                if have is None]
+    problems += ["%s: its recipe names no programs" % recipe
+                 for recipe, have in sorted(recipes.items()) if have == set()]
+
     for name in sorted(os.listdir(rel("packaging"))):
         if not name.endswith(".desktop"):
             continue
@@ -714,13 +1032,14 @@ def check_desktop_exec(ctx):
                 continue
             # The program is argv[0]; the rest is arguments and field codes.
             prog = m.group(1)
-            for recipe, have in (("the .deb", deb), ("the .rpm", rpm)):
-                if prog not in have:
+            for recipe, have in sorted(recipes.items()):
+                if have and prog not in have:
                     problems.append("%s: %s=%s, which %s does not install"
                                     % (name, key, prog, recipe))
     if problems:
         return FAIL, "; ".join(problems)
-    return PASS, "every Exec names a program on $PATH in both packages"
+    return PASS, ("every Exec names a program on $PATH in all %d packages"
+                  % len(recipes))
 
 
 def check_version_consistent(ctx):
@@ -774,7 +1093,8 @@ def check_desktop_files(ctx):
     if not shutil.which("desktop-file-validate"):
         return SKIP, "desktop-file-utils not installed"
     bad = []
-    for name in ("pestudio.desktop", "dwstudio.desktop"):
+    for name in ("pestudio.desktop", "dwstudio.desktop",
+                 os.path.join("appimage", "vst-ace.desktop")):
         p = rel("packaging", name)
         if not os.path.exists(p):
             bad.append("%s missing" % name)
@@ -784,22 +1104,24 @@ def check_desktop_files(ctx):
             bad.append("%s: %s" % (name, r.stdout.strip().splitlines()[0]))
     if bad:
         return FAIL, "; ".join(bad)
-    return PASS, "both .desktop files validate"
+    return PASS, "every .desktop file validates"
 
 
 def check_man_pages(ctx):
     """Every program the packages put on $PATH has a man page beside it.
 
-    Both recipes install the same four by name, so a fifth program added to one
-    of them without a page is a lintian complaint waiting to happen.
+    All three recipes install the same four by name, so a fifth program added to
+    one of them without a page is a lintian complaint waiting to happen.
     """
-    rules = open(rel("packaging", "debian", "rules"), encoding="utf-8").read()
-    spec_path = rel("packaging", "rpm", "vst-ace.spec")
-    spec = open(spec_path, encoding="utf-8").read() if os.path.exists(spec_path) else ""
-    wanted = set(re.findall(r"for m in ([a-z0-9 ]+); do", rules + spec))
+    text = open(rel("packaging", "debian", "rules"), encoding="utf-8").read()
+    for extra in (("rpm", "vst-ace.spec"), ("arch", "PKGBUILD")):
+        path = rel("packaging", *extra)
+        if os.path.exists(path):
+            text += open(path, encoding="utf-8").read()
+    wanted = set(re.findall(r"for m in ([a-z0-9 ]+); do", text))
     names = sorted({n for group in wanted for n in group.split()})
     if not names:
-        return SKIP, "no man page loop found in either recipe"
+        return SKIP, "no man page loop found in any of the recipes"
     missing = [n for n in names if not os.path.exists(rel("packaging", n + ".1"))]
     if missing:
         return FAIL, "no page for " + ", ".join(missing)
@@ -972,9 +1294,13 @@ CHECKS = [
     ("shell-syntax",       check_shell_syntax),
     ("sources-tracked",    check_sources_tracked),
     ("staging-excludes",   check_staging_excludes),
+    ("staging-tree",       check_staging_tree),
     ("i386-deps-match",    check_i386_deps_match),
     ("rules-staging-dirs", check_rules_staging_dirs),
     ("rpm-spec",           check_rpm_spec),
+    ("rpm-changelog",      check_rpm_changelog_dates),
+    ("arch-pkgbuild",      check_arch_pkgbuild),
+    ("appimage",           check_appimage),
     ("version-consistent", check_version_consistent),
     ("desktop-files",      check_desktop_files),
     ("desktop-exec",       check_desktop_exec),

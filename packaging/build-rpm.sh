@@ -49,21 +49,7 @@ echo "=== Fedora build: vst-ace $VERSION ==="
 mkdir -p "$WORK_DIR"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 SRC_TOP="vst-ace-$VERSION"
 mkdir -p "$WORK_DIR/$SRC_TOP"
-rsync -a \
-    --exclude='.git' \
-    --exclude='.claude/' \
-    --exclude='build/' \
-    --exclude='obj-*/' \
-    --exclude='release/' \
-    --exclude='__pycache__/' \
-    --exclude='*.o' \
-    --exclude='*.d' \
-    --exclude='/va' \
-    --exclude='/out/' \
-    --exclude='/project/' \
-    --exclude='/renders/' \
-    --exclude='/runtime/' \
-    --exclude='thirdparty/' \
+rsync -a --exclude-from="$SCRIPT_DIR/source-excludes.txt" \
     "$REPO_ROOT/" "$WORK_DIR/$SRC_TOP/"
 
 ( cd "$WORK_DIR" && tar czf "SOURCES/$SRC_TOP.tar.gz" "$SRC_TOP" )

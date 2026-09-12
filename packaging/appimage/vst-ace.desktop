@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=vst-ace
+GenericName=Plug-in host
+Comment=Run Windows, macOS and Linux audio plug-ins natively, without Wine
+# No path, and no field code. The AppImage runtime rewrites Exec when the file
+# is integrated into a menu, and va takes a subcommand rather than a file --
+# `va pe <dir>` opens a folder, so a %F here would hand a path to argv[1] and
+# get "unknown command" for it.
+Exec=va
+TryExec=va
+# The packages ask the icon theme for audio-card, which is right when there is
+# a theme to ask. An AppImage carries its own; see vst-ace.svg.
+Icon=vst-ace
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=VST;VST3;audio;plugin;synthesizer;DW-8000;
+StartupNotify=true

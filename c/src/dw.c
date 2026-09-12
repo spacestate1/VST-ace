@@ -62,7 +62,8 @@
 /* Where everything lives, worked out once at startup. */
 static char g_re[PATH_MAX];      /* .../vst/re, or the installed data dir  */
 static char g_vst[PATH_MAX];     /* .../vst -- the plug-in corpus above it */
-static int  g_installed;         /* found at DW_PKGLIBDIR, not in a tree   */
+static char g_lib[PATH_MAX];     /* where the helper programs are, installed */
+static int  g_installed;         /* found beside us, not in a tree         */
 
 static int is_dir(const char *p)
 { struct stat st; return !stat(p, &st) && S_ISDIR(st.st_mode); }
@@ -93,6 +94,23 @@ static void corpus_root(char *out, size_t n)
     }
 }
 
+/* Record an installed copy: the helpers in `lib`, the data dir at `data`.
+ *
+ * The data dir is the prefix's other half and it is allowed to be missing:
+ * without it the patch banks are simply not there, which costs `va list` its
+ * bank and nothing else. `data` is NULL for the compiled-in layout, where the
+ * answer is DW_PKGDATADIR and there is nothing relative to work out. */
+static void installed_at(const char *lib, const char *data)
+{
+    g_installed = 1;
+    snprintf(g_lib, sizeof g_lib, "%s", lib);
+    if (data && is_dir(data))
+        snprintf(g_re, sizeof g_re, "%s", data);
+    else
+        snprintf(g_re, sizeof g_re, "%s", DW_PKGDATADIR);
+    corpus_root(g_vst, sizeof g_vst);
+}
+
 /* Find the tree from the executable rather than the working directory -- the
  * point of a single binary is that it runs from anywhere, including a copy on
  * $PATH. Walking up looking for peload/pehost.c finds `re` whether this was
@@ -100,13 +118,16 @@ static void corpus_root(char *out, size_t n)
  * for the top of the tree the way a bare `c/` test would. */
 static int locate_tree(void)
 {
-    char  exe[PATH_MAX];
+    char  exe[PATH_MAX], self[PATH_MAX], dir[PATH_MAX];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     char *slash;
-    int   up;
+    int   up, i;
 
     if (n <= 0) { fprintf(stderr, "va: cannot read /proc/self/exe\n"); return -1; }
     exe[n] = 0;
+    /* The loop below chops `exe` up a component at a time; the installed-copy
+     * probe after it needs the path whole, and so does the error message. */
+    snprintf(self, sizeof self, "%s", exe);
 
     for (up = 0; up < 8; up++) {
         char probe[PATH_MAX];
@@ -127,20 +148,66 @@ static int locate_tree(void)
     }
     /* No source tree above us. The other possibility is an installed copy,
      * where the helpers sit together in one directory and there is nothing to
-     * build -- so this is a check for the helpers, not for sources. */
+     * build -- so this is a check for the helpers, not for sources.
+     *
+     * A package puts va in /usr/bin and its helpers in /usr/lib/vst-ace --
+     * lib64 on Fedora -- so ../lib/vst-ace from our own directory finds them
+     * wherever the prefix as a whole has been moved to. That is exactly what
+     * an AppImage is: the same layout under a mount point that does not exist
+     * until the file is run and so cannot be compiled into anything. The data
+     * dir for both is the prefix's other half, ../share/vst-ace.
+     *
+     * A developer's own build reaches none of these probes: it is built in the
+     * tree, and the walk above finds the tree first. */
+    {
+        static const char *const rel[] = { "../lib/vst-ace", "../lib64/vst-ace",
+                                           NULL };
+        char probe[PATH_MAX], lib[PATH_MAX], data[PATH_MAX];
+
+        snprintf(dir, sizeof dir, "%s", self);
+        if ((slash = strrchr(dir, '/'))) *slash = 0;
+        for (i = 0; rel[i]; i++) {
+            snprintf(probe, sizeof probe, "%s/%s/peload", dir, rel[i]);
+            if (!is_file(probe)) continue;
+            snprintf(lib,  sizeof lib,  "%s/%s", dir, rel[i]);
+            snprintf(data, sizeof data, "%s/../share/vst-ace", dir);
+            installed_at(lib, data);
+            return 0;
+        }
+    }
+
+    /* Then the path compiled in, for a layout the two relative ones do not
+     * describe: a prefix whose libdir is neither lib nor lib64 -- Debian's
+     * multiarch /usr/lib/x86_64-linux-gnu is the common one. This has to come
+     * before the flat probe below, because every package installs a
+     * /usr/bin/peload symlink and the flat probe would find that instead and
+     * call /usr/bin the helper directory. */
     if (DW_PKGLIBDIR[0]) {
         char probe[PATH_MAX];
         snprintf(probe, sizeof probe, "%s/peload", DW_PKGLIBDIR);
         if (is_file(probe)) {
-            g_installed = 1;
-            snprintf(g_re, sizeof g_re, "%s", DW_PKGDATADIR);
-            corpus_root(g_vst, sizeof g_vst);
+            installed_at(DW_PKGLIBDIR, NULL);
+            return 0;
+        }
+    }
+
+    /* Last, the flat case: va sitting beside its helpers in one directory,
+     * which is what an unpacked tarball looks like. Its share/vst-ace is
+     * below that directory rather than beside it, there being no bin/ in the
+     * middle to climb out of. */
+    {
+        char probe[PATH_MAX], data[PATH_MAX];
+
+        snprintf(probe, sizeof probe, "%s/peload", dir);
+        if (is_file(probe)) {
+            snprintf(data, sizeof data, "%s/share/vst-ace", dir);
+            installed_at(dir, data);
             return 0;
         }
     }
 
     fprintf(stderr, "va: cannot find the tree from %s -- expected a peload/ "
-                    "directory above it\n", exe);
+                    "directory above it, or the helpers beside it\n", self);
     return -1;
 }
 
@@ -421,10 +488,10 @@ static int exec_tool(const char *srcdir, const char *target, int argc,
          * broken install rather than a missing dependency, so say so
          * differently -- the advice below would send someone looking at cmake
          * output that does not exist. */
-        snprintf(path, sizeof path, "%s/%s", DW_PKGLIBDIR, target);
+        snprintf(path, sizeof path, "%s/%s", g_lib, target);
         if (!is_file(path)) {
             fprintf(stderr, "va: %s is missing from %s -- this is an installed "
-                            "copy and it should be there\n", target, DW_PKGLIBDIR);
+                            "copy and it should be there\n", target, g_lib);
             return 1;
         }
     } else {
@@ -521,7 +588,7 @@ static int have_gui(guikind k)
      * package or it was not, and asking pkg-config about a -dev package that a
      * user's machine has no reason to carry would only ever say no. */
     if (g_installed) {
-        snprintf(p, sizeof p, "%s/%s", DW_PKGLIBDIR,
+        snprintf(p, sizeof p, "%s/%s", g_lib,
                  k == GUI_QT ? "pestudio" : "dwstudio");
         return is_file(p);
     }

@@ -1,0 +1,81 @@
+#!/bin/sh
+#
+# The AppImage's entry point.
+#
+# linuxdeploy writes its own AppRun when it is not given one, and that AppRun
+# does two things: it sources the environment hooks its plugins left behind --
+# where Qt is told about the bundled platform plugin and GTK about the bundled
+# schemas -- and it runs the desktop file's Exec. This one does the same, plus
+# the argv[0] dispatch below, which the generated one has no way to know about.
+#
+# sh rather than bash: the AppImage is meant to run on a machine that was not
+# asked what it has.
+
+APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+export APPDIR
+
+# The plugins' environment, if any ran. Sourced rather than executed: they set
+# variables for this process.
+for hook in "$APPDIR"/apprun-hooks/*.sh; do
+    [ -r "$hook" ] && . "$hook"
+done
+
+# Qt's plugins, which pestudio cannot find on its own from where it lives.
+#
+# linuxdeploy's Qt plugin deploys the platform plugin to usr/plugins and writes
+# usr/bin/qt.conf to point at it. Qt reads qt.conf from the directory of the
+# running executable, and the running executable here is
+# usr/lib/vst-ace/pestudio rather than usr/bin/pestudio -- the helpers have to
+# stay together, because that is how each of them finds the others. So it never
+# sees that file, finds no xcb platform plugin, and calls abort() before it has
+# printed anything to say why. Naming the directory outright is what an
+# AppImage whose programs are not in usr/bin has to do for itself.
+if [ -d "$APPDIR/usr/plugins" ]; then
+    export QT_PLUGIN_PATH="$APPDIR/usr/plugins"
+fi
+
+# Called through a symlink named after one of the programs, be that program.
+#
+# An AppImage is normally one application behind one name, and this one holds
+# five: two windows, the loader, the out-of-process host and the i386 helper.
+# Renaming or symlinking the file is the AppImage convention for reaching the
+# others, so `ln -s vst-ace.AppImage peload && ./peload plug.dll --render out.wav`
+# works the way the installed packages' /usr/bin/peload does. ARGV0 is what the
+# runtime puts the invoked name in; $0 is the mounted AppRun itself.
+self=$(basename "${ARGV0:-$0}")
+case "$self" in
+    pestudio)
+        # What c/src/dw.c does with setenv(..., 0) before it launches this:
+        # ask for xcb unless the caller has already said otherwise. Plug-in
+        # editors embed through an X11 window id, so a Qt that picked the
+        # Wayland plugin can open the window and never an editor in it.
+        # dwstudio sets GDK_BACKEND for itself; pestudio does not, and coming
+        # in through this symlink is the one route that skips dw.c.
+        [ -n "${QT_QPA_PLATFORM:-}" ] || QT_QPA_PLATFORM=xcb
+        export QT_QPA_PLATFORM
+        exec "$APPDIR/usr/lib/vst-ace/pestudio" "$@"
+        ;;
+    peload32)
+        # Only in an AppImage built on a host that had a 32-bit toolchain.
+        # Without the check this is exec: not found and exit 127, which says
+        # nothing about why.
+        if [ ! -x "$APPDIR/usr/lib/vst-ace/peload32" ]; then
+            echo "peload32 is not in this AppImage: it was built without a" >&2
+            echo "32-bit toolchain, so 32-bit Windows VST2 plug-ins will not" >&2
+            echo "load. Everything 64-bit works. An AppImage built on a host" >&2
+            echo "with multilib carries it." >&2
+            exit 1
+        fi
+        exec "$APPDIR/usr/lib/vst-ace/peload32" "$@"
+        ;;
+    peload|peserve|dwstudio)
+        exec "$APPDIR/usr/lib/vst-ace/$self" "$@"
+        ;;
+esac
+
+# Everything else is va, which finds the rest beside itself: it is at
+# usr/bin/va with the helpers at usr/lib/vst-ace, and locate_tree() in
+# c/src/dw.c looks ../lib/vst-ace from its own directory before it looks at any
+# path compiled in. That is what makes a mount point nobody knew at build time
+# work at all.
+exec "$APPDIR/usr/bin/va" "$@"

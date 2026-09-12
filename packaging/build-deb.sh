@@ -55,22 +55,7 @@ echo "=== Debian/Ubuntu build: vst-ace $VERSION ==="
 # <pkg>-<version>. Stage both.
 SRC_TOP="vst-ace-$VERSION"
 mkdir -p "$WORK_DIR/$SRC_TOP"
-rsync -a \
-    --exclude='.git' \
-    --exclude='.claude/' \
-    --exclude='build/' \
-    --exclude='obj-*/' \
-    --exclude='release/' \
-    --exclude='debian/' \
-    --exclude='__pycache__/' \
-    --exclude='*.o' \
-    --exclude='*.d' \
-    --exclude='/va' \
-    --exclude='/out/' \
-    --exclude='/project/' \
-    --exclude='/renders/' \
-    --exclude='/runtime/' \
-    --exclude='thirdparty/' \
+rsync -a --exclude-from="$SCRIPT_DIR/source-excludes.txt" \
     "$REPO_ROOT/" "$WORK_DIR/$SRC_TOP/"
 
 # The pristine tarball, captured before debian/ goes in.
