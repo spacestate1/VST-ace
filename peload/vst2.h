@@ -39,6 +39,20 @@ struct AEffect {
     char      future[56];
 };
 
+/* AEffect.flags. Only the ones this host acts on are named.
+ *
+ * effFlagsProgramChunks is the one that decides how a plug-in's settings are
+ * saved: with it set, the parameter values are not the whole state and the
+ * plug-in hands over an opaque block instead -- wavetables, sequences, sample
+ * references, anything it does not express as a parameter. Saving parameters
+ * alone for one of these restores a different sound. */
+enum {
+    effFlagsHasEditor      = 1 << 0,
+    effFlagsCanReplacing   = 1 << 4,
+    effFlagsProgramChunks  = 1 << 5,
+    effFlagsIsSynth        = 1 << 8
+};
+
 /* effect opcodes (host -> plugin) */
 enum {
     effOpen = 0, effClose, effSetProgram, effGetProgram, effSetProgramName,

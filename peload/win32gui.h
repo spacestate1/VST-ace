@@ -280,6 +280,7 @@ static struct {
     int       host;                /* the container we create for the plugin  */
     int       display;             /* the plugin's own window, what we present */
     int       desktop;             /* the root window GetDesktopWindow names   */
+    int       track_leave;         /* window awaiting WM_MOUSELEAVE, or 0     */
     w32_host_hooks hooks;
     long n_paint, n_getdc, n_beginpaint, n_stretch, n_bitblt, n_timerproc;
     double last_input_ms;          /* when input last arrived, for the valve */
@@ -5318,7 +5319,39 @@ static MS int32_t st_ToAscii(uint32_t vk, uint32_t sc, const uint8_t *ks, uint16
 }
 static MS int16_t st_VkKeyScanExA(char c, void *layout)
 { (void)layout; return (int16_t)(unsigned char)toupper((unsigned char)c); }
-static MS int32_t st_TrackMouseEvent(void *e) { (void)e; return 1; }
+/* TRACKMOUSEEVENT, as the caller lays it out. */
+typedef struct { uint32_t cbSize, dwFlags; void *hwndTrack; uint32_t dwHoverTime; }
+    W32TRACKMOUSE;
+#define TME_HOVER  0x00000001u
+#define TME_LEAVE  0x00000002u
+#define TME_CANCEL 0x80000000u
+
+/* Ask to be told when the pointer leaves a window.
+ *
+ * This returned 1 and did nothing, which is the worst of the three answers
+ * available. A plug-in calls it on the first WM_MOUSEMOVE into a control,
+ * paints the control in its hover colour, and waits for the WM_MOUSELEAVE
+ * that says to paint it back -- so with nothing ever sent, every knob and
+ * button the pointer crossed stayed lit until something else repainted it.
+ * Returning 0 instead would at least have been honest, but the message is
+ * cheap to deliver: w32_mouse already works out which window the pointer is
+ * over, so the leave is that value changing. Tracking is one-shot on Windows
+ * and one-shot here. */
+static MS int32_t st_TrackMouseEvent(void *e)
+{
+    W32TRACKMOUSE *t = e;
+    int idx;
+
+    if (!t) return 0;
+    idx = w32_i(W32_HWND_BASE, t->hwndTrack);
+    if (idx <= 0 || idx >= W32_MAX_WND || !W.wnd[idx].used) return 0;
+    if (t->dwFlags & TME_CANCEL) {
+        if (W.track_leave == idx) W.track_leave = 0;
+        return 1;
+    }
+    if (t->dwFlags & TME_LEAVE) W.track_leave = idx;
+    return 1;
+}
 static MS uint32_t st_GetDoubleClickTime(void) { return 400; }
 static MS int32_t st_ClientToScreen(void *hwnd, W32POINT *p)
 {
@@ -5343,7 +5376,37 @@ static MS int32_t st_MapWindowPoints(void *from, void *to, W32POINT *p, uint32_t
     }
     return 1;
 }
-static MS uint32_t st_GetSysColor(int32_t i) { (void)i; return 0x00C0C0C0; }
+/* The system colours, as COLORREF -- 0x00BBGGRR, so the bytes read backwards
+ * from an HTML colour.
+ *
+ * Every index used to answer the same mid-grey. That is fine for the handful
+ * of plug-ins that only ever ask for COLOR_BTNFACE, and invisible for any
+ * that draws COLOR_WINDOWTEXT on COLOR_WINDOW: grey on the same grey. The
+ * values below are the Windows defaults, which is what a plug-in that asks
+ * for them is expecting to be handed. */
+static MS uint32_t st_GetSysColor(int32_t i)
+{
+    static const uint32_t c[] = {
+        0x00C8C8C8, /*  0 SCROLLBAR             */ 0x00000000, /*  1 DESKTOP   */
+        0x00D1B499, /*  2 ACTIVECAPTION         */ 0x00DBCDBF, /*  3 INACTIVECAPTION */
+        0x00F0F0F0, /*  4 MENU                  */ 0x00FFFFFF, /*  5 WINDOW    */
+        0x00646464, /*  6 WINDOWFRAME           */ 0x00000000, /*  7 MENUTEXT  */
+        0x00000000, /*  8 WINDOWTEXT            */ 0x00000000, /*  9 CAPTIONTEXT */
+        0x00B4B4B4, /* 10 ACTIVEBORDER          */ 0x00FCF7F4, /* 11 INACTIVEBORDER */
+        0x00ABABAB, /* 12 APPWORKSPACE          */ 0x00D77800, /* 13 HIGHLIGHT */
+        0x00FFFFFF, /* 14 HIGHLIGHTTEXT         */ 0x00F0F0F0, /* 15 BTNFACE   */
+        0x00A0A0A0, /* 16 BTNSHADOW             */ 0x006D6D6D, /* 17 GRAYTEXT  */
+        0x00000000, /* 18 BTNTEXT               */ 0x00544E43, /* 19 INACTIVECAPTIONTEXT */
+        0x00FFFFFF, /* 20 BTNHIGHLIGHT          */ 0x00696969, /* 21 3DDKSHADOW */
+        0x00E3E3E3, /* 22 3DLIGHT               */ 0x00000000, /* 23 INFOTEXT  */
+        0x00E1FFFF, /* 24 INFOBK                */ 0x00C0C0C0, /* 25 unused    */
+        0x000066CC, /* 26 HOTLIGHT              */ 0x00EAD1B9, /* 27 GRADIENTACTIVECAPTION */
+        0x00F2E4D7, /* 28 GRADIENTINACTIVECAPTION */ 0x00D77800, /* 29 MENUHILIGHT */
+        0x00F0F0F0  /* 30 MENUBAR               */
+    };
+    if (i >= 0 && (size_t)i < sizeof c / sizeof *c) return c[i];
+    return 0x00F0F0F0;
+}
 static MS void *st_GetSysColorBrush(int32_t i) { (void)i; return st_GetStockObject(0); }
 static MS int32_t st_GetSystemMetrics(int32_t i)
 {
@@ -5921,6 +5984,14 @@ void w32_mouse(int x, int y, int msg, int buttons, int wheel)
         }
     }
     if (!target || !W.wnd[target].used) return;
+    /* The pointer is over `target` now. If some other window asked to hear
+     * about the pointer leaving it, this is that moment -- and the tracking
+     * ends with the message, as it does on Windows. */
+    if (W.track_leave && W.track_leave != target) {
+        int left = W.track_leave;
+        W.track_leave = 0;
+        if (W.wnd[left].used) w32_call(&W.wnd[left], WM_MOUSELEAVE, 0, 0);
+    }
     w = &W.wnd[target];
     PLOG("  [w32] mouse msg 0x%x at %d,%d -> wnd #%d cls='%s' local %d,%d%s\n",
          (unsigned)msg, x, y, target, w->cls, cx, cy,

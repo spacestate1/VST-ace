@@ -505,7 +505,48 @@ static void *make_stub(uint32_t idx)
 
 /* ----------------------------------------------------------------- loading */
 
-static void *rva(image32 *im, uint32_t r) { return im->base + r; }
+/* Turning a number out of the file into a pointer into the image. The same
+ * discipline as pehost.c's, and here for the same reason: the 64-bit loader
+ * and this one had drifted into carrying the same unchecked rva() and the
+ * same wild relocation walk, so a malformed DLL crashed whichever host it was
+ * handed to. map_image checks every size it reads; these are what let
+ * everything after it do the same.
+ *
+ * `r > im->size` before `len > im->size - r` so the arithmetic cannot
+ * underflow, where the obvious `r + len > im->size` wraps for a large r. */
+static void *rva_n(image32 *im, uint64_t r, uint64_t len)
+{
+    if (r > im->size || len > (uint64_t)im->size - r) return NULL;
+    return (uint8_t *)im->base + r;
+}
+
+/* A NUL-terminated string at an RVA, or NULL if it reaches the end of the
+ * image without one. */
+static const char *rva_str(image32 *im, uint64_t r)
+{
+    const char *s = rva_n(im, r, 1);
+    if (!s) return NULL;
+    return memchr(s, 0, (size_t)(im->size - r)) ? s : NULL;
+}
+
+/* The same for an absolute address: the TLS directory is written in linked
+ * addresses that apply_relocs patched, and checking them against the image is
+ * what makes them pointers rather than numbers out of a file. */
+static void *va_n(image32 *im, uint64_t va, uint64_t len)
+{
+    uint64_t base = (uint64_t)(uintptr_t)im->base;
+    if (va < base) return NULL;
+    return rva_n(im, va - base, len);
+}
+
+/* True while `len` bytes at `p` are still inside the image -- for the walks
+ * that run to a zero entry, which a truncated file is the case that lost. */
+static int in_image(image32 *im, const void *p, uint64_t len)
+{
+    const uint8_t *b = im->base, *q = p;
+    if (q < b || q > b + im->size) return 0;
+    return len <= (uint64_t)(b + im->size - q);
+}
 
 static int map_image(image32 *im, const char *path)
 {
@@ -632,21 +673,43 @@ static int apply_relocs(image32 *im)
                 (unsigned long long)im->opt->ImageBase);
         return -1;
     }
-    p = rva(im, d.VirtualAddress); end = p + d.Size;
-    while (p < end) {
+    if (!(p = rva_n(im, d.VirtualAddress, d.Size))) {
+        fprintf(stderr, "the relocation directory (rva 0x%x, %u bytes) lies "
+                        "outside the image\n", d.VirtualAddress, d.Size);
+        return -1;
+    }
+    end = p + d.Size;
+    while (p + sizeof(RELOC_BLK) <= end) {
         RELOC_BLK *b = (RELOC_BLK *)p;
         uint16_t *e = (uint16_t *)(p + sizeof *b);
-        int cnt, i;
+        uint32_t cnt, i;
         if (!b->SizeOfBlock) break;
-        cnt = (int)((b->SizeOfBlock - sizeof *b) / 2);
+        /* SizeOfBlock is a uint32_t and sizeof is a size_t, so a value under
+         * 8 underflows the subtraction below to near 2^64 before it is
+         * divided. Nothing but the narrowing to int was stopping that. */
+        if (b->SizeOfBlock < sizeof *b ||
+            (uint64_t)(end - p) < b->SizeOfBlock) {
+            fprintf(stderr, "relocation block for rva 0x%x has an implausible "
+                            "size of %u bytes -- truncated download?\n",
+                    b->VirtualAddress, b->SizeOfBlock);
+            return -1;
+        }
+        cnt = (uint32_t)((b->SizeOfBlock - sizeof *b) / 2);
         for (i = 0; i < cnt; i++) {
-            int type = e[i] >> 12, off = e[i] & 0xFFF;
+            unsigned type = e[i] >> 12, off = e[i] & 0xFFF;
             if (type == 3) {                       /* HIGHLOW: the i386 form */
-                uint32_t *t = (uint32_t *)rva(im, b->VirtualAddress + off);
+                uint32_t *t = rva_n(im, (uint64_t)b->VirtualAddress + off,
+                                    sizeof *t);
+                if (!t) {
+                    fprintf(stderr, "relocation target rva 0x%llx is outside "
+                                    "the image\n",
+                            (unsigned long long)b->VirtualAddress + off);
+                    return -1;
+                }
                 *t += (uint32_t)delta;
                 n++;
             } else if (type != 0) {
-                fprintf(stderr, "unhandled reloc type %d\n", type);
+                fprintf(stderr, "unhandled reloc type %u\n", type);
             }
         }
         p += b->SizeOfBlock;
@@ -662,6 +725,17 @@ static int protect_sections(image32 *im)
         int prot = PROT_READ;
         if (s->Characteristics & 0x80000000u) prot |= PROT_WRITE;
         if (s->Characteristics & 0x20000000u) prot |= PROT_EXEC;
+        /* VirtualSize is the section field map_image does not check: it
+         * checks VirtualAddress against SizeOfRawData and skips a section
+         * with no raw data at all. A range reaching into the next mapping
+         * would change that mapping's protection, PROT_EXEC included. */
+        if (!rva_n(im, s->VirtualAddress,
+                   ((uint64_t)s->VirtualSize + 0xFFF) & ~(uint64_t)0xFFF)) {
+            fprintf(stderr, "section %d (rva 0x%x, %u bytes) lies outside the "
+                            "image, not protected\n",
+                    i, s->VirtualAddress, s->VirtualSize);
+            continue;
+        }
         if (mprotect(im->base + s->VirtualAddress,
                      (s->VirtualSize + 0xFFF) & ~0xFFFu, prot))
             perror("mprotect");
@@ -787,14 +861,17 @@ static int image_is_wine_build(image32 *im)
     IMP_DESC *desc;
 
     if (!d.VirtualAddress) return 0;
-    for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
-        uint32_t *lookup = rva(im, desc->OriginalFirstThunk ? desc->OriginalFirstThunk
-                                                            : desc->FirstThunk);
-        for (; *lookup; lookup++) {
+    if (!(desc = rva_n(im, d.VirtualAddress, sizeof *desc))) return 0;
+    for (; in_image(im, desc, sizeof *desc) && desc->Name; desc++) {
+        uint32_t *lookup = rva_n(im, desc->OriginalFirstThunk
+                                     ? desc->OriginalFirstThunk
+                                     : desc->FirstThunk, sizeof *lookup);
+        if (!lookup) continue;
+        for (; in_image(im, lookup, sizeof *lookup) && *lookup; lookup++) {
             const char *sym;
             if (*lookup & 0x80000000u) continue;          /* by ordinal */
-            sym = (const char *)rva(im, *lookup & 0x7FFFFFFF) + 2;
-            if (!strncmp(sym, "__wine_", 7)) return 1;
+            sym = rva_str(im, (*lookup & 0x7FFFFFFF) + 2);
+            if (sym && !strncmp(sym, "__wine_", 7)) return 1;
         }
     }
     return 0;
@@ -928,12 +1005,29 @@ static int resolve_imports(image32 *im)
     int resolved = 0, stubbed = 0, fromreal = 0;
 
     if (!d.VirtualAddress) return 0;
-    for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
-        const char *dll = rva(im, desc->Name);
-        uint32_t *lookup = rva(im, desc->OriginalFirstThunk ? desc->OriginalFirstThunk
-                                                            : desc->FirstThunk);
-        uint32_t *iat = rva(im, desc->FirstThunk);
-        for (; *lookup; lookup++, iat++) {
+    if (!(desc = rva_n(im, d.VirtualAddress, sizeof *desc))) {
+        fprintf(stderr, "the import directory (rva 0x%x) lies outside the "
+                        "image\n", d.VirtualAddress);
+        return -1;
+    }
+    /* Both walks end at a zero entry, which a truncated file is the case that
+     * lost -- so the image is the other bound, tested before every step. The
+     * inner loop writes to *iat as it goes, so running off the end corrupted
+     * as it read. */
+    for (; in_image(im, desc, sizeof *desc) && desc->Name; desc++) {
+        const char *dll = rva_str(im, desc->Name);
+        uint32_t *lookup = rva_n(im, desc->OriginalFirstThunk
+                                     ? desc->OriginalFirstThunk
+                                     : desc->FirstThunk, sizeof *lookup);
+        uint32_t *iat = rva_n(im, desc->FirstThunk, sizeof *iat);
+
+        if (!dll || !lookup || !iat) {
+            fprintf(stderr, "an import descriptor points outside the image, "
+                            "skipped -- truncated download?\n");
+            continue;
+        }
+        for (; in_image(im, lookup, sizeof *lookup) &&
+               in_image(im, iat, sizeof *iat) && *lookup; lookup++, iat++) {
             const char *sym;
             void *fn;
             char ordbuf[32];
@@ -951,7 +1045,13 @@ static int resolve_imports(image32 *im)
                     sym = ordbuf;
                 }
             } else {
-                sym = (const char *)rva(im, *lookup & 0x7FFFFFFF) + 2;
+                /* A hint/name table entry: two bytes of hint, then the name. */
+                sym = rva_str(im, (*lookup & 0x7FFFFFFF) + 2);
+                if (!sym) {
+                    fprintf(stderr, "%s: an import name lies outside the "
+                                    "image\n", dll);
+                    sym = "<name outside the image>";
+                }
             }
             fn = winstub_lookup(dll, sym);
             if (fn) resolved++;
@@ -998,23 +1098,64 @@ static int setup_tls(image32 *im)
     uint32_t *cb;
 
     if (!d.VirtualAddress) return 0;
-    t = rva(im, d.VirtualAddress);
-    g_tls_tmpl  = (const uint8_t *)(uintptr_t)t->StartAddressOfRawData;
-    g_tls_raw   = t->EndAddressOfRawData - t->StartAddressOfRawData;
-    g_tls_total = g_tls_raw + t->SizeOfZeroFill;
+    if (!(t = rva_n(im, d.VirtualAddress, sizeof *t))) {
+        fprintf(stderr, "tls: the directory (rva 0x%x) lies outside the image, "
+                        "skipped\n", d.VirtualAddress);
+        return 0;
+    }
+    /* Three absolute addresses and a length, all out of the file: the
+     * template was memcpy'd from wherever it pointed, the index written
+     * through, every callback called. Each is checked and skipped on its own,
+     * because a wrong one is not survivable and a missing one is not worth
+     * refusing the plug-in over. */
+    g_tls_tmpl  = NULL;
+    g_tls_raw   = 0;
+    g_tls_total = 0;
     g_tls_index = 0;
-    *(uint32_t *)(uintptr_t)t->AddressOfIndex = g_tls_index;
+
+    if (t->EndAddressOfRawData < t->StartAddressOfRawData)
+        fprintf(stderr, "tls: raw data ends before it starts, no template\n");
+    else {
+        uint32_t raw = t->EndAddressOfRawData - t->StartAddressOfRawData;
+        const uint8_t *tmpl = va_n(im, t->StartAddressOfRawData, raw);
+        if (!tmpl)
+            fprintf(stderr, "tls: the %u-byte template at 0x%x is outside the "
+                            "image, not copied\n",
+                    raw, t->StartAddressOfRawData);
+        else {
+            g_tls_tmpl  = tmpl;
+            g_tls_raw   = raw;
+            g_tls_total = raw + t->SizeOfZeroFill;
+        }
+    }
+
+    {
+        uint32_t *idx = va_n(im, t->AddressOfIndex, sizeof *idx);
+        if (idx) *idx = g_tls_index;
+        else fprintf(stderr, "tls: the index slot at 0x%x is outside the "
+                             "image, not written\n", t->AddressOfIndex);
+    }
     tls_bind_current_thread();
     PLOG("tls: %u bytes (%u raw), slot %u\n", g_tls_total, g_tls_raw, g_tls_index);
 
     if (t->AddressOfCallBacks) {
-        int n = 0;
-        for (cb = (uint32_t *)(uintptr_t)t->AddressOfCallBacks; *cb; cb++) {
+        int n = 0, skipped = 0;
+        cb = va_n(im, t->AddressOfCallBacks, sizeof *cb);
+        if (!cb)
+            fprintf(stderr, "tls: the callback list at 0x%x is outside the "
+                            "image, none run\n", t->AddressOfCallBacks);
+        for (; cb && in_image(im, cb, sizeof *cb) && *cb; cb++) {
             void WINAPI_ (*f)(void *, uint32_t, void *) =
                 (void WINAPI_ (*)(void *, uint32_t, void *))(uintptr_t)*cb;
+            /* A function pointer out of a file: calling one that is not in
+             * the image is a jump to whatever is at that address. */
+            if (!va_n(im, *cb, 1)) { skipped++; continue; }
             f(im->base, 1, NULL);
             n++;
         }
+        if (skipped)
+            fprintf(stderr, "tls: %d callback(s) outside the image, not "
+                            "called\n", skipped);
         PLOG("tls: ran %d callback(s)\n", n);
     }
     return 0;
@@ -1024,16 +1165,30 @@ static void *find_export(image32 *im, const char *want)
 {
     DATA_DIR d = im->opt->DataDirectory[DIR_EXPORT];
     EXP_DIR *e;
-    uint32_t *names, *funcs, i;
+    uint32_t *names, *funcs, i, nnames, nfuncs;
     uint16_t *ords;
 
     if (!d.VirtualAddress) return NULL;
-    e = rva(im, d.VirtualAddress);
-    names = rva(im, e->AddressOfNames);
-    funcs = rva(im, e->AddressOfFunctions);
-    ords  = rva(im, e->AddressOfNameOrdinals);
-    for (i = 0; i < e->NumberOfNames; i++)
-        if (!strcmp((const char *)rva(im, names[i]), want)) return rva(im, funcs[ords[i]]);
+    /* Three parallel arrays, a count for each, and an ordinal indexing one of
+     * them -- all of it out of the file. Bounding the arrays by their counts
+     * and each name by the image turns a damaged export directory into "no
+     * such export" rather than a strcmp() off the end of the mapping. */
+    if (!(e = rva_n(im, d.VirtualAddress, sizeof *e))) return NULL;
+    nnames = e->NumberOfNames;
+    nfuncs = e->NumberOfFunctions;
+    names = rva_n(im, e->AddressOfNames,        (uint64_t)nnames * sizeof *names);
+    funcs = rva_n(im, e->AddressOfFunctions,    (uint64_t)nfuncs * sizeof *funcs);
+    ords  = rva_n(im, e->AddressOfNameOrdinals, (uint64_t)nnames * sizeof *ords);
+    if (!names || !funcs || !ords) {
+        fprintf(stderr, "the export directory points outside the image\n");
+        return NULL;
+    }
+    for (i = 0; i < nnames; i++) {
+        const char *nm = rva_str(im, names[i]);
+        if (!nm || strcmp(nm, want)) continue;
+        if (ords[i] >= nfuncs) return NULL;
+        return rva_n(im, funcs[ords[i]], 1);
+    }
     return NULL;
 }
 
@@ -1212,7 +1367,13 @@ int main(int argc, char **argv)
         protect_sections(&im);
         setup_tls(&im);
 
-        entry = im.opt->AddressOfEntryPoint ? rva(&im, im.opt->AddressOfEntryPoint) : NULL;
+        /* Checked like everything else out of the file: an entry point past
+         * the end of the image is a call to whatever is at that address. */
+        entry = im.opt->AddressOfEntryPoint
+                ? rva_n(&im, im.opt->AddressOfEntryPoint, 1) : NULL;
+        if (im.opt->AddressOfEntryPoint && !entry)
+            fprintf(stderr, "the entry point (rva 0x%x) is outside the image, "
+                            "DllMain not called\n", im.opt->AddressOfEntryPoint);
         if (entry) {
             int32_t WINAPI_ (*dllmain)(void *, uint32_t, void *) =
                 (int32_t WINAPI_ (*)(void *, uint32_t, void *))entry;

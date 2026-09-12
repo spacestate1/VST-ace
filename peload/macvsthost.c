@@ -30,6 +30,156 @@
 #include "machoload.h"
 #include "macshim.h"
 #include "macvsthost.h"
+#include "pehost.h"
+
+#ifdef PEHOST_HAVE_X11
+#include <X11/Xlib.h>
+
+/* The embedder half of XEmbed.
+ *
+ * Embedding is a protocol with two sides and this host only ever performed
+ * one of them: it handed the plug-in a window id and assumed a picture would
+ * appear in it. For most plug-ins one side is enough, because they map their
+ * own window and draw. For a plug-in that speaks XEmbed properly it is not:
+ * it creates its window *unmapped*, announces itself with an _XEMBED_INFO
+ * property, and waits for the embedder to send XEMBED_EMBEDDED_NOTIFY before
+ * it does anything at all. Nothing here ever sent one, so it waited for ever.
+ *
+ * From the outside that is the worst kind of bug. The host reports "embedded
+ * as a child of window 0x... (712x350)", the plug-in agrees about the size,
+ * the parameters are all there, and the pane is empty.
+ *
+ * So do the embedder's job: notify, activate, focus, and map. All four are
+ * harmless to a plug-in that was not waiting for them -- an unsolicited
+ * _XEMBED message to a window that does not handle it is discarded, and
+ * mapping a mapped window is not a change. That is what makes this safe to
+ * do for every native plug-in rather than only the ones known to need it.
+ *
+ * A separate connection, because this runs on whichever thread opened the
+ * editor; closed again immediately. */
+#define XEMBED_EMBEDDED_NOTIFY  0
+#define XEMBED_WINDOW_ACTIVATE  1
+#define XEMBED_FOCUS_IN         4
+#define XEMBED_FOCUS_CURRENT    0
+
+static void xembed_send(Display *d, Window child, long msg, long detail,
+                        long data1, long data2)
+{
+    XEvent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.xclient.type         = ClientMessage;
+    ev.xclient.window       = child;
+    ev.xclient.message_type = XInternAtom(d, "_XEMBED", False);
+    ev.xclient.format       = 32;
+    ev.xclient.data.l[0]    = CurrentTime;
+    ev.xclient.data.l[1]    = msg;
+    ev.xclient.data.l[2]    = detail;
+    ev.xclient.data.l[3]    = data1;
+    ev.xclient.data.l[4]    = data2;
+    XSendEvent(d, child, False, NoEventMask, &ev);
+}
+
+static void x11_embed_children(unsigned long parent)
+{
+    Display *d;
+    Window   root, up, *kids = NULL;
+    unsigned nkids = 0, i;
+
+    if (!parent || !(d = XOpenDisplay(NULL))) return;
+    if (XQueryTree(d, (Window)parent, &root, &up, &kids, &nkids) && kids) {
+        XWindowAttributes pa;
+        int pw = 0, ph = 0;
+        if (XGetWindowAttributes(d, (Window)parent, &pa)) {
+            pw = pa.width; ph = pa.height;
+        }
+        for (i = 0; i < nkids; i++) {
+            /* Tell it it has been embedded, and in what. A plug-in waiting on
+             * this starts building its interface here. */
+            xembed_send(d, kids[i], XEMBED_EMBEDDED_NOTIFY, 0, (long)parent, 0);
+            xembed_send(d, kids[i], XEMBED_WINDOW_ACTIVATE, 0, 0, 0);
+            xembed_send(d, kids[i], XEMBED_FOCUS_IN, XEMBED_FOCUS_CURRENT, 0, 0);
+            /* Only rescue a degenerate child. A toolkit that has not been
+             * told its size yet creates a 1x1 window, which is mapped and
+             * invisible and looks exactly like not mapped. Anything larger is
+             * the plug-in's own idea of its size and is left alone -- stretching
+             * a 712x350 editor to fill a 900x550 pane draws its interface in
+             * the corner of a window it never agreed to. */
+            {
+                XWindowAttributes ca;
+                if (pw > 0 && ph > 0 && XGetWindowAttributes(d, kids[i], &ca) &&
+                    ca.width <= 1 && ca.height <= 1)
+                    XResizeWindow(d, kids[i], (unsigned)pw, (unsigned)ph);
+            }
+            XMapWindow(d, kids[i]);
+        }
+        XFree(kids);
+    }
+    XMapSubwindows(d, (Window)parent);
+    XFlush(d);
+    XCloseDisplay(d);
+}
+
+static void x11_map_children(unsigned long parent) { x11_embed_children(parent); }
+
+/* The same service for the other backends. VST3 on X11 is not XEmbed -- the
+ * plug-in creates a child of the window it is given and the host drives it
+ * through IPlugFrame -- but "created the window and left it unmapped" is a
+ * hazard of embedding rather than of any one format, and the messages are
+ * ignored by anything not listening for them. One call, every editor type.
+ *
+ * It lives here because this is the file with Xlib in it; pehost.c calls it
+ * after whichever attach succeeded. */
+void pehost_x11_embed(unsigned long xid) { x11_embed_children(xid); }
+
+/* Resize whatever the plug-in put in our window.
+ *
+ * VST2 has no "the host resized you" opcode -- effEditGetRect only asks. What
+ * an X11 editor does have is its own window, and a toolkit reflows when that
+ * window changes size and it gets the ConfigureNotify. So the resize is the
+ * message: make the child the size the host wants and let it lay itself out.
+ *
+ * A plug-in that ignores it draws its old layout in a larger window, which is
+ * no worse than the alternative of not offering the resize at all. */
+static void x11_resize_children(unsigned long parent, int w, int h)
+{
+    Display *d;
+    Window   root, up, *kids = NULL;
+    unsigned nkids = 0, i;
+
+    if (!parent || w <= 0 || h <= 0 || !(d = XOpenDisplay(NULL))) return;
+    if (XQueryTree(d, (Window)parent, &root, &up, &kids, &nkids) && kids) {
+        for (i = 0; i < nkids; i++)
+            XResizeWindow(d, kids[i], (unsigned)w, (unsigned)h);
+        XFree(kids);
+    }
+    XFlush(d);
+    XCloseDisplay(d);
+}
+
+/* The size of the window the plug-in actually made, or 0 if it made none. */
+static int x11_child_size(unsigned long parent, int *w, int *h)
+{
+    Display *d;
+    Window   root, up, *kids = NULL;
+    unsigned nkids = 0;
+    int      got = 0;
+
+    if (!parent || !(d = XOpenDisplay(NULL))) return 0;
+    if (XQueryTree(d, (Window)parent, &root, &up, &kids, &nkids) && kids) {
+        XWindowAttributes a;
+        if (nkids && XGetWindowAttributes(d, kids[0], &a) &&
+            a.width > 1 && a.height > 1) {
+            *w = a.width; *h = a.height; got = 1;
+        }
+        XFree(kids);
+    }
+    XCloseDisplay(d);
+    return got;
+}
+
+#else
+static void x11_map_children(unsigned long parent) { (void)parent; }
+#endif
 #include "vst2.h"
 
 #define EVQ 512
@@ -40,6 +190,8 @@ struct macvst {
     macho   *img;         /* Mach-O bundle, or NULL for a native ELF */
     void    *dl;          /* dlopen handle, for a native ELF */
     int      editor_open;
+    unsigned long xid;        /* the window the editor was embedded in */
+    int      map_left;        /* map its children for this many more idles */
     AEffect *fx;
     double   sr;
     int      bs;
@@ -81,14 +233,22 @@ static intptr_t host_cb(AEffect *fx, int32_t op, int32_t idx, intptr_t val,
                         void *ptr, float opt)
 {
     macvst *h = fx ? (macvst *)fx->user : NULL;
-    (void)idx; (void)val; (void)opt;
+    (void)opt;
     switch (op) {
     case 1:  return 2400;                       /* audioMasterVersion       */
     case 16: return (intptr_t)(h ? h->sr : 48000);
     case 17: return h ? h->bs : 512;
     case 23: return 1;                          /* GetCurrentProcessLevel   */
     case 32: return 1;                          /* GetAutomationState       */
-    case 13: return 1;                          /* SizeWindow               */
+    case 13: return 1;                          /* audioMasterIOChanged     */
+    case 15:                                    /* audioMasterSizeWindow    */
+        /* The plug-in asking for its editor window to be a different size.
+         * Opcode 13 was labelled SizeWindow here and answered 1, so the plug-in
+         * was told its request had been granted and nothing moved -- which is
+         * what "the editor does not fit and cannot be changed" is from the
+         * outside. 15 is SizeWindow; 13 is IOChanged. index is the width,
+         * value the height. */
+        return pehost_editor_resize_request(idx, (int)val);
     case 33: case 34:
         if (ptr) snprintf(ptr, 64, "peload");
         return 1;
@@ -345,6 +505,55 @@ void macvst_set_program(macvst *h, int i)
 int macvst_get_program(macvst *h)
 { return h && h->fx ? (int)h->fx->dispatcher(h->fx, effGetProgram, 0, 0, NULL, 0.0f) : 0; }
 
+/* The plug-in's opaque state. Same shape as the Windows side in pehost.c --
+ * this driver serves both the macOS VST2s and the native Linux ones, so they
+ * gain it together. */
+/* Whether a native editor will lay itself out again at another size.
+ *
+ * The answer is no, and it is not a limitation of this host: VST2 has no
+ * opcode for "the host resized you", so the only way to ask is to resize the
+ * plug-in's window and hope its toolkit reflows on the ConfigureNotify.
+ * TripleCheese does not -- asked for 1350x825 it draws its 900x550 layout in
+ * the corner and leaves the rest blank, which is a worse answer than a
+ * disabled button because it looks like it worked.
+ *
+ * A plug-in that does scale drives it from its own interface and tells the
+ * host through audioMasterSizeWindow, which is handled. So this stays 0 and
+ * the front end says why the zoom is unavailable. */
+int macvst_editor_can_resize(macvst *h)
+{ (void)h; return 0; }
+
+void macvst_editor_resize(macvst *h, int w, int ht)
+{
+    if (!macvst_editor_can_resize(h) || w <= 0 || ht <= 0) return;
+    x11_resize_children(h->xid, w, ht);
+    /* Idle once so the toolkit acts on the ConfigureNotify before anything
+     * asks how big it now is. */
+    h->fx->dispatcher(h->fx, effEditIdle, 0, 0, NULL, 0.0f);
+}
+
+int macvst_has_state(const macvst *h)
+{ return h && h->fx && (h->fx->flags & effFlagsProgramChunks) != 0; }
+
+int macvst_get_state(macvst *h, int preset, const void **data)
+{
+    void *ptr = NULL;
+    intptr_t n;
+    if (data) *data = NULL;
+    if (!macvst_has_state(h) || !data) return 0;
+    n = h->fx->dispatcher(h->fx, effGetChunk, preset ? 1 : 0, 0, &ptr, 0.0f);
+    if (n <= 0 || !ptr) return 0;
+    *data = ptr;
+    return (int)n;
+}
+
+int macvst_set_state(macvst *h, int preset, const void *data, int len)
+{
+    if (!macvst_has_state(h) || !data || len <= 0) return 0;
+    return h->fx->dispatcher(h->fx, effSetChunk, preset ? 1 : 0, (intptr_t)len,
+                             (void *)(uintptr_t)data, 0.0f) >= 0;
+}
+
 float macvst_get_param(macvst *h, int i)
 { return (h && h->fx && i >= 0 && i < h->fx->numParams) ? h->fx->getParameter(h->fx, i) : 0.0f; }
 void macvst_set_param(macvst *h, int i, float v)
@@ -449,6 +658,27 @@ void macvst_editor_size(macvst *h, int *w, int *hh)
     if (w) *w = 0;
     if (hh) *hh = 0;
     if (!h || !h->fx) return;
+
+    /* Once the editor exists, the window it built is the truth.
+     *
+     * effEditGetRect is the only answer available before that, and it is not
+     * always the same answer: u-he's TripleCheese reports 712x350 and then
+     * creates a 900x550 window, so a host that sized its pane from the rect
+     * cropped the interface -- the right-hand oscillator and the bottom row
+     * simply were not there, with no scrollbar and nothing to say why.
+     *
+     * Asking X what the plug-in actually made costs one round trip when the
+     * editor is opened and cannot disagree with what is on screen. The rect
+     * remains the answer before the editor exists, and for anything that made
+     * no window of its own. */
+    if (macvst_is_native(h) && h->editor_open && h->xid) {
+        int cw = 0, ch = 0;
+        if (x11_child_size(h->xid, &cw, &ch)) {
+            if (w)  *w  = cw;
+            if (hh) *hh = ch;
+            return;
+        }
+    }
     h->fx->dispatcher(h->fx, effEditGetRect, 0, 0, &r, 0.0f);
     if (!r) return;
     if (w)  *w  = r->right - r->left;
@@ -542,6 +772,9 @@ int macvst_editor_attach(macvst *h, unsigned long xid)
         return -1;
     h->fx->dispatcher(h->fx, effEditTop, 0, 0, NULL, 0.0f);
     h->editor_open = 1;
+    /* Only for a native plug-in: a Mach-O one draws through the Cocoa shim
+     * into a bitmap and has no X window of its own to map. */
+    if (macvst_is_native(h)) { h->map_left = 8; x11_map_children(xid); h->xid = xid; }
     return 0;
 }
 
@@ -549,6 +782,9 @@ void macvst_editor_pump(macvst *h)
 {
     if (!h || !h->fx || !h->editor_open) return;
     h->fx->dispatcher(h->fx, effEditIdle, 0, 0, NULL, 0.0f);
+    /* Again for the first few idles: a plug-in that builds its interface after
+     * effEditOpen returns has not created the window yet when attach maps. */
+    if (h->map_left > 0) { h->map_left--; x11_map_children(h->xid); }
     /* The Cocoa shim's timers and redraw belong to a Mach-O plugin. A native
      * Linux editor runs its own event handling against the real X server, and
      * only wants the idle call. */

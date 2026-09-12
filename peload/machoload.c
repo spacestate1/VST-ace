@@ -433,8 +433,24 @@ static void *resolve(macho *m, const char *sym, int weak)
 
 static uint8_t *seg_addr(macho *m, int idx, uint64_t off)
 {
+    uint64_t at;
+
     if (idx < 0 || idx >= m->nseg) return NULL;
-    return m->base + (m->seg[idx]->vmaddr + off);
+    at = m->seg[idx]->vmaddr + off;
+    /* The offset as well as the segment. `off` is a running total accumulated
+     * from ULEB128 values in the rebase and bind opcode streams -- file data,
+     * stepped forward by every DO_REBASE and DO_BIND -- so it is checked here
+     * on each use rather than once where the stream starts.
+     *
+     * Everything that writes through this stores an eight-byte pointer. An
+     * offset that walked off the end used to write outside the image, and what
+     * sits next to an anonymous mapping in this process includes the dynamic
+     * linker's own structures: the fault that caused surfaced much later and
+     * somewhere else entirely, inside dlsym, resolving an unrelated symbol
+     * through a link map that no longer parsed. */
+    if (at < off || at > m->span || m->span - at < sizeof(uint64_t))
+        return NULL;
+    return m->base + at;
 }
 
 static int map_image(macho *m)
@@ -536,14 +552,16 @@ static int do_rebase(macho *m)
             count = (op == REBASE_OPCODE_DO_REBASE_IMM_TIMES) ? imm : uleb(&p, end);
             for (i = 0; i < count; i++) {
                 uint64_t *slot = (uint64_t *)seg_addr(m, seg, off);
-                if (!slot) return fail("rebase: bad segment %d", seg);
+                if (!slot) return fail("rebase: segment %d offset 0x%llx is outside the image",
+                                    seg, (unsigned long long)off);
                 if (type == 1) *slot += m->slide;
                 off += 8;
             }
             break;
         case REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB: {
             uint64_t *slot = (uint64_t *)seg_addr(m, seg, off);
-            if (!slot) return fail("rebase: bad segment %d", seg);
+            if (!slot) return fail("rebase: segment %d offset 0x%llx is outside the image",
+                                    seg, (unsigned long long)off);
             if (type == 1) *slot += m->slide;
             off += 8 + uleb(&p, end);
             break;
@@ -552,7 +570,8 @@ static int do_rebase(macho *m)
             count = uleb(&p, end); skip = uleb(&p, end);
             for (i = 0; i < count; i++) {
                 uint64_t *slot = (uint64_t *)seg_addr(m, seg, off);
-                if (!slot) return fail("rebase: bad segment %d", seg);
+                if (!slot) return fail("rebase: segment %d offset 0x%llx is outside the image",
+                                    seg, (unsigned long long)off);
                 if (type == 1) *slot += m->slide;
                 off += 8 + skip;
             }
@@ -660,6 +679,21 @@ static int do_bind(macho *m)
 
 /* ------------------------------------------------------ classic binding */
 
+/* A writable slot inside the mapped image, or NULL.
+ *
+ * Section addresses, section sizes and relocation offsets are all file data,
+ * and both writers below turned them into pointers by adding them to m->base.
+ * A section whose addr or size is wrong then writes wherever the number says
+ * -- and what is next to an anonymous mapping is whatever the kernel put
+ * there, which in this process includes the dynamic linker's own structures.
+ * The symptom is not a crash here: it is a fault inside dlsym long afterwards,
+ * looking up an unrelated symbol through a link map that no longer parses. */
+static void *img_slot(macho *m, uint64_t off, uint64_t len)
+{
+    if (off > m->span || len > (uint64_t)m->span - off) return NULL;
+    return m->base + off;
+}
+
 /* Walk every symbol-pointer section and fill each slot from the indirect symbol
  * table: section->reserved1 is that section's first index, so slot i of the
  * section corresponds to indirect[reserved1 + i], which indexes the symbol table.
@@ -679,14 +713,30 @@ static int bind_symbol_pointers(macho *m)
     for (i = 0; i < m->nseg; i++) {
         segment_command_64 *sg = m->seg[i];
         const section_64 *sec = (const section_64 *)((const uint8_t *)sg + sizeof *sg);
-        uint32_t k;
-        for (k = 0; k < sg->nsects; k++) {
+        uint32_t k, nsects = sg->nsects;
+        /* nsects is file data too, and the headers it counts have to fit in
+         * the load command that declares them. */
+        if (sg->cmdsize < sizeof *sg ||
+            nsects > (sg->cmdsize - sizeof *sg) / sizeof *sec) {
+            fail("segment %.16s claims %u sections, more than its %u bytes hold",
+                 sg->segname, nsects, sg->cmdsize);
+            nsects = (uint32_t)((sg->cmdsize > sizeof *sg)
+                                ? (sg->cmdsize - sizeof *sg) / sizeof *sec : 0);
+        }
+        for (k = 0; k < nsects; k++) {
             uint32_t type = sec[k].flags & 0xff;
             uint64_t *slot;
             uint32_t n, j;
             if (type != S_NON_LAZY_SYMBOL_POINTERS && type != S_LAZY_SYMBOL_POINTERS)
                 continue;
-            slot = (uint64_t *)(m->base + sec[k].addr);
+            slot = img_slot(m, sec[k].addr, sec[k].size);
+            if (!slot) {
+                fprintf(stderr, "  [macho] section %.16s (addr 0x%llx, %llu bytes) "
+                                "lies outside the image, not bound\n",
+                        sec[k].sectname, (unsigned long long)sec[k].addr,
+                        (unsigned long long)sec[k].size);
+                continue;
+            }
             n = (uint32_t)(sec[k].size / 8);
             for (j = 0; j < n; j++) {
                 uint32_t idx = sec[k].reserved1 + j;
@@ -743,7 +793,8 @@ static int apply_relocs(macho *m)
             uint64_t *at;
             if (!RELOC_EXTERN(&r[i]) || sy >= m->symtab->nsyms) continue;
             if (syms[sy].n_strx >= m->symtab->strsize) continue;
-            at = (uint64_t *)(m->base + first + (uint64_t)(uint32_t)r[i].r_address);
+            at = img_slot(m, first + (uint64_t)(uint32_t)r[i].r_address, sizeof *at);
+            if (!at) continue;
             *at = (uint64_t)(uintptr_t)resolve(m, strs + syms[sy].n_strx,
                                               (syms[sy].n_desc & 0x40) != 0);
         }
@@ -754,7 +805,8 @@ static int apply_relocs(macho *m)
         for (i = 0; i < m->dysym->nlocrel; i++) {
             uint64_t *at;
             if (RELOC_EXTERN(&r[i]) || RELOC_LENGTH(&r[i]) != 3) continue;  /* 8-byte only */
-            at = (uint64_t *)(m->base + first + (uint64_t)(uint32_t)r[i].r_address);
+            at = img_slot(m, first + (uint64_t)(uint32_t)r[i].r_address, sizeof *at);
+            if (!at) continue;
             *at += m->slide;
         }
         MLOG("  [macho] %u local relocation(s), base 0x%llx\n",
@@ -903,7 +955,15 @@ static int resolve_bundle(macho *m, const char *path, char *out, size_t n)
 static const mach_header_64 *pick_slice(macho *m)
 {
     const fat_header *fh = (const fat_header *)m->file;
-    uint32_t magic = *(const uint32_t *)m->file;
+    uint32_t magic;
+
+    /* The magic is read before anything else is known about the file, so its
+     * four bytes are the first thing that has to be there. */
+    if (m->filelen < sizeof(mach_header_64)) {
+        fail("%zu bytes is too small for a Mach-O header", m->filelen);
+        return NULL;
+    }
+    magic = *(const uint32_t *)m->file;
 
     if (magic == MH_MAGIC_64) {
         m->slice = m->file;
@@ -989,19 +1049,46 @@ macho *macho_open(const char *path)
         macho_close(m); return NULL;
     }
 
+    /* Each branch below casts to a structure larger than the eight-byte
+     * header the command was bounds-checked as -- a segment_command_64 is
+     * seventy-two -- so each says how much it actually needs to read. */
+#define LC_NEED(type) do {                                                    \
+        if (lc->cmdsize < sizeof(type)) {                                     \
+            fail("load command %u declares itself 0x%x but is %u bytes, too " \
+                 "small to read", i, lc->cmd, lc->cmdsize);                   \
+            macho_close(m); return NULL;                                      \
+        }                                                                     \
+    } while (0)
+
     lc = (const load_command *)((const uint8_t *)m->mh + sizeof *m->mh);
     for (i = 0; i < m->mh->ncmds; i++) {
-        if ((const uint8_t *)lc + sizeof *lc > m->slice + m->slicelen) break;
+        const uint8_t *end = m->slice + m->slicelen;
+        /* The header, then the command's own size, then whatever the branch
+         * reads. cmdsize is file data like everything else here, so it is
+         * checked before it is used to step -- it used to be dereferenced
+         * after the pointer had already moved by it, which is a read from
+         * wherever a bad size landed. */
+        if ((const uint8_t *)lc + sizeof *lc > end) break;
+        if (lc->cmdsize < sizeof *lc ||
+            (uint64_t)(end - (const uint8_t *)lc) < lc->cmdsize) {
+            fail("load command %u has an implausible size of %u bytes -- "
+                 "truncated file?", i, lc->cmdsize);
+            macho_close(m); return NULL;
+        }
         switch (lc->cmd) {
         case LC_SEGMENT_64:
+            LC_NEED(segment_command_64);
             if (m->nseg < MAX_SEG) m->seg[m->nseg++] = (segment_command_64 *)lc;
             break;
         case LC_DYLD_INFO:
         case LC_DYLD_INFO_ONLY:
+            LC_NEED(dyld_info_command);
             m->dyld = (dyld_info_command *)lc; break;
         case LC_SYMTAB:
+            LC_NEED(symtab_command);
             m->symtab = (symtab_command *)lc; break;
         case LC_DYSYMTAB:
+            LC_NEED(dysymtab_command);
             m->dysym = (dysymtab_command *)lc; break;
         case LC_DYLD_CHAINED_FIXUPS:
             fail("this image uses chained fixups, which are not implemented yet");
@@ -1009,8 +1096,8 @@ macho *macho_open(const char *path)
         default: break;
         }
         lc = (const load_command *)((const uint8_t *)lc + lc->cmdsize);
-        if (!((const load_command *)lc)->cmdsize) break;
     }
+#undef LC_NEED
     if (!m->nseg) { fail("no LC_SEGMENT_64"); macho_close(m); return NULL; }
 
     if (map_image(m)) { macho_close(m); return NULL; }

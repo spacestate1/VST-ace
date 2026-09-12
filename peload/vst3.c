@@ -1835,9 +1835,11 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
 
     events.vt = &g_el_vt;  events.n = 0;
     changes.vt = &g_pc_vt; changes.n = 0;
-    /* Always supply the output collections. They are optional in the spec but
-     * DPF-based plugins assert on a null outputParameterChanges, and a host that
-     * never reads them still has to provide somewhere to write. */
+    /* All four collections are supplied on every block, empty or not. They are
+     * optional in the spec and not in practice -- DPF-based plug-ins assert on
+     * a null outputParameterChanges, and Geonkick faults on a null input one.
+     * A host that never reads the output ones still has to provide somewhere
+     * to write. */
     outchanges.vt = &g_pc_vt; outchanges.n = 0;
     outevents.vt = &g_el_vt;  outevents.n = 0;
 
@@ -1937,10 +1939,17 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
     pd.numOutputs = h->nOutBus;
     pd.inputs  = h->nInBus ? h->inbus : NULL;
     pd.outputs = h->outbus;
-    pd.inputParameterChanges  = changes.n ? (void *)&changes : NULL;
+    /* The input collections go in whether or not they hold anything, for the
+     * same reason the output ones already did. The spec allows null and
+     * plug-ins do not: Geonkick reports no parameters at all, so with a null
+     * passed for an empty list it dereferenced it on the first block and took
+     * the host down -- in pestudio, in the middle of browsing. Every real host
+     * hands over an empty list instead, and a plug-in that asks one for its
+     * count gets zero and iterates nothing. */
+    pd.inputParameterChanges  = (void *)&changes;
     pd.outputParameterChanges = (void *)&outchanges;
-    pd.inputEvents  = events.n ? (void *)&events : NULL;
-    pd.outputEvents = (void *)&outevents;
+    pd.inputEvents            = (void *)&events;
+    pd.outputEvents           = (void *)&outevents;
 
     {   /* A transport that is always rolling at 120bpm from the top of a bar.
          * There is no real one to report -- this host renders and plays rather

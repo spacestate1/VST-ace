@@ -493,7 +493,58 @@ static void *make_stub(uint32_t idx)
 
 /* ----------------------------------------------------------------- loading */
 
-static void *rva(image *im, uint64_t r) { return im->base + r; }
+/* Turning a number out of the file into a pointer into the image.
+ *
+ * map_image checks every size it reads and says so in its own comment. Nothing
+ * after it did: the relocation, import, export and TLS directories were all
+ * turned into pointers by adding an RVA to the base and hoping, and an RVA
+ * that survived a truncated download points wherever it likes. A reloc target
+ * 1 GB past a 8 KB image is an eight-byte write into whatever is mapped there,
+ * and an unbounded export walk is a strcmp against a wild pointer -- both
+ * reproducible, and both a SIGSEGV in the host rather than a refused plug-in.
+ *
+ * So there is no unchecked form of this any more. rva_n() answers NULL unless
+ * the whole of [r, r+len) is inside the image; every caller handles NULL.
+ *
+ * The arithmetic is written to be overflow-proof in the direction it matters:
+ * `len > im->size - r` after `r > im->size` never underflows, where the
+ * obvious `r + len > im->size` wraps for a large r and lets it through. */
+static void *rva_n(image *im, uint64_t r, uint64_t len)
+{
+    if (r > im->size || len > (uint64_t)im->size - r) return NULL;
+    return (uint8_t *)im->base + r;
+}
+
+/* A NUL-terminated string at an RVA, or NULL if it runs off the end of the
+ * image without one -- which is what stops strcmp() reading past the image on
+ * a name table that lost its terminator. */
+static const char *rva_str(image *im, uint64_t r)
+{
+    const char *s = rva_n(im, r, 1);
+    if (!s) return NULL;
+    return memchr(s, 0, (size_t)(im->size - r)) ? s : NULL;
+}
+
+/* The same, for an absolute address rather than an RVA. The TLS directory is
+ * written in absolute addresses that the linker filled in and apply_relocs
+ * patched; checking them against the image is what makes them pointers rather
+ * than numbers. An image with a TLS directory and no relocations reaches here
+ * still naming its linked base, which is somewhere else entirely. */
+static void *va_n(image *im, uint64_t va, uint64_t len)
+{
+    uint64_t base = (uint64_t)(uintptr_t)im->base;
+    if (va < base) return NULL;
+    return rva_n(im, va - base, len);
+}
+
+/* For walking a pointer forward through the image: true while `len` bytes at
+ * `p` are still inside it. */
+static int in_image(image *im, const void *p, uint64_t len)
+{
+    const uint8_t *b = im->base, *q = p;
+    if (q < b || q > b + im->size) return 0;
+    return len <= (uint64_t)(b + im->size - q);
+}
 
 /* The directory the current image came from. A plugin that needs a runtime DLL
  * has usually been shipped alongside one. */
@@ -658,20 +709,44 @@ static int apply_relocs(image *im)
                 (unsigned long long)im->opt->ImageBase);
         return -1;
     }
-    p = rva(im, d.VirtualAddress); end = p + d.Size;
-    while (p < end) {
+    if (!(p = rva_n(im, d.VirtualAddress, d.Size))) {
+        fprintf(stderr, "the relocation directory (rva 0x%x, %u bytes) lies "
+                        "outside the image\n", d.VirtualAddress, d.Size);
+        return -1;
+    }
+    end = p + d.Size;
+    while (p + sizeof(RELOC_BLK) <= end) {
         RELOC_BLK *b = (RELOC_BLK *)p;
         uint16_t *e = (uint16_t *)(p + sizeof *b);
-        int cnt, i;
+        uint32_t cnt, i;
         if (!b->SizeOfBlock) break;
-        cnt = (b->SizeOfBlock - sizeof *b) / 2;
+        /* Both ends of the block. SizeOfBlock is a uint32_t and sizeof is a
+         * size_t, so the subtraction below is done in size_t: a SizeOfBlock
+         * under 8 used to underflow to near 2^64, and the only thing that
+         * saved it was the narrowing to int landing on a small negative
+         * number. That is luck, not a check. */
+        if (b->SizeOfBlock < sizeof *b ||
+            (uint64_t)(end - p) < b->SizeOfBlock) {
+            fprintf(stderr, "relocation block for rva 0x%x has an implausible "
+                            "size of %u bytes -- truncated download?\n",
+                    b->VirtualAddress, b->SizeOfBlock);
+            return -1;
+        }
+        cnt = (uint32_t)((b->SizeOfBlock - sizeof *b) / 2);
         for (i = 0; i < cnt; i++) {
-            int type = e[i] >> 12, off = e[i] & 0xFFF;
+            unsigned type = e[i] >> 12, off = e[i] & 0xFFF;
             if (type == 10) {                      /* DIR64 */
-                uint64_t *t = (uint64_t *)rva(im, b->VirtualAddress + off);
+                uint64_t *t = rva_n(im, (uint64_t)b->VirtualAddress + off,
+                                    sizeof *t);
+                if (!t) {
+                    fprintf(stderr, "relocation target rva 0x%llx is outside "
+                                    "the image\n",
+                            (unsigned long long)b->VirtualAddress + off);
+                    return -1;
+                }
                 *t += delta; n++;
             } else if (type != 0) {
-                fprintf(stderr, "unhandled reloc type %d\n", type);
+                fprintf(stderr, "unhandled reloc type %u\n", type);
             }
         }
         p += b->SizeOfBlock;
@@ -684,11 +759,24 @@ static int protect_sections(image *im)
     int i;
     for (i = 0; i < im->nsec; i++) {
         SEC_HDR *s = &im->sec[i];
+        uint64_t len = ((uint64_t)s->VirtualSize + 0xFFF) & ~(uint64_t)0xFFF;
         int prot = PROT_READ;
         if (s->Characteristics & 0x80000000u) prot |= PROT_WRITE;   /* WRITE */
         if (s->Characteristics & 0x20000000u) prot |= PROT_EXEC;    /* EXECUTE */
-        if (mprotect(im->base + s->VirtualAddress,
-                     (s->VirtualSize + 0xFFF) & ~0xFFFul, prot))
+        /* VirtualSize is the one section field map_image does not check: it
+         * checks VirtualAddress against SizeOfRawData, and skips that for a
+         * section with no raw data at all -- a .bss reaches here unexamined.
+         * Handing an unchecked length to mprotect is not a harmless miss.
+         * Past the end of the image it returns ENOMEM, but a range that
+         * reaches into the next mapping changes that mapping's protection
+         * instead, and a section is entitled to ask for PROT_EXEC. */
+        if (!rva_n(im, s->VirtualAddress, len)) {
+            fprintf(stderr, "section %d (rva 0x%x, %u bytes) lies outside the "
+                            "image, not protected\n",
+                    i, s->VirtualAddress, s->VirtualSize);
+            continue;
+        }
+        if (mprotect((uint8_t *)im->base + s->VirtualAddress, (size_t)len, prot))
             perror("mprotect");
     }
     return 0;
@@ -946,12 +1034,29 @@ static int resolve_imports(image *im)
     g_missing_real[0] = 0;
 
     if (!d.VirtualAddress) return 0;
-    for (desc = rva(im, d.VirtualAddress); desc->Name; desc++) {
-        const char *dll = rva(im, desc->Name);
-        uint64_t *lookup = rva(im, desc->OriginalFirstThunk ? desc->OriginalFirstThunk
-                                                            : desc->FirstThunk);
-        uint64_t *iat = rva(im, desc->FirstThunk);
-        for (; *lookup; lookup++, iat++) {
+    if (!(desc = rva_n(im, d.VirtualAddress, sizeof *desc))) {
+        fprintf(stderr, "the import directory (rva 0x%x) lies outside the "
+                        "image\n", d.VirtualAddress);
+        return -1;
+    }
+    /* Both walks below end at a zero entry, and a truncated file is exactly
+     * the one that has lost it -- so the image is the other bound, tested
+     * before each step rather than trusted once. The inner loop writes to
+     * *iat as it goes, so an unbounded walk here corrupted as it read. */
+    for (; in_image(im, desc, sizeof *desc) && desc->Name; desc++) {
+        const char *dll = rva_str(im, desc->Name);
+        uint64_t *lookup = rva_n(im, desc->OriginalFirstThunk
+                                     ? desc->OriginalFirstThunk
+                                     : desc->FirstThunk, sizeof *lookup);
+        uint64_t *iat = rva_n(im, desc->FirstThunk, sizeof *iat);
+
+        if (!dll || !lookup || !iat) {
+            fprintf(stderr, "an import descriptor points outside the image, "
+                            "skipped -- truncated download?\n");
+            continue;
+        }
+        for (; in_image(im, lookup, sizeof *lookup) &&
+               in_image(im, iat, sizeof *iat) && *lookup; lookup++, iat++) {
             const char *sym;
             void *fn;
             char ordbuf[32];
@@ -970,7 +1075,13 @@ static int resolve_imports(image *im)
                     sym = ordbuf;
                 }
             } else {
-                sym = (const char *)rva(im, (*lookup & 0x7FFFFFFF)) + 2;
+                /* A hint/name table entry: two bytes of hint, then the name. */
+                sym = rva_str(im, (*lookup & 0x7FFFFFFF) + 2);
+                if (!sym) {
+                    fprintf(stderr, "%s: an import name lies outside the "
+                                    "image\n", dll);
+                    sym = "<name outside the image>";
+                }
             }
 
             /* A real implementation beats anything here, so it is asked first.
@@ -1021,13 +1132,51 @@ static int setup_tls(image *im)
     uint64_t *cb;
 
     if (!d.VirtualAddress) return 0;
-    t = rva(im, d.VirtualAddress);
+    if (!(t = rva_n(im, d.VirtualAddress, sizeof *t))) {
+        fprintf(stderr, "tls: the directory (rva 0x%x) lies outside the image, "
+                        "skipped\n", d.VirtualAddress);
+        return 0;
+    }
 
-    g_tls_tmpl  = (const uint8_t *)(uintptr_t)t->StartAddressOfRawData;
-    g_tls_raw   = (size_t)(t->EndAddressOfRawData - t->StartAddressOfRawData);
-    g_tls_total = g_tls_raw + t->SizeOfZeroFill;
+    /* Three absolute addresses and a length, all of them out of the file, and
+     * all three used to be taken at face value: the template was memcpy'd from
+     * wherever StartAddressOfRawData pointed, the index written through, and
+     * every callback called. None of that survives a wrong number, and none of
+     * it is worth refusing a plug-in over -- so each is checked and skipped by
+     * itself, and the load continues without it.
+     *
+     * These are addresses rather than RVAs because the linker wrote them and
+     * apply_relocs patched them. An image with a TLS directory and no
+     * relocations arrives here still naming its linked base. */
+    g_tls_tmpl  = NULL;
+    g_tls_raw   = 0;
+    g_tls_total = 0;
     g_tls_index = 0;                       /* single module, so slot 0 is ours */
-    *(uint32_t *)(uintptr_t)t->AddressOfIndex = g_tls_index;
+
+    if (t->EndAddressOfRawData < t->StartAddressOfRawData)
+        fprintf(stderr, "tls: raw data ends before it starts, no template\n");
+    else {
+        uint64_t raw = t->EndAddressOfRawData - t->StartAddressOfRawData;
+        const uint8_t *tmpl = va_n(im, t->StartAddressOfRawData, raw);
+        if (!tmpl)
+            fprintf(stderr, "tls: the %llu-byte template at 0x%llx is outside "
+                            "the image, not copied\n",
+                    (unsigned long long)raw,
+                    (unsigned long long)t->StartAddressOfRawData);
+        else {
+            g_tls_tmpl  = tmpl;
+            g_tls_raw   = (size_t)raw;
+            g_tls_total = (size_t)(raw + t->SizeOfZeroFill);
+        }
+    }
+
+    {
+        uint32_t *idx = va_n(im, t->AddressOfIndex, sizeof *idx);
+        if (idx) *idx = g_tls_index;
+        else fprintf(stderr, "tls: the index slot at 0x%llx is outside the "
+                             "image, not written\n",
+                     (unsigned long long)t->AddressOfIndex);
+    }
 
     tls_bind_current_thread();
     if (pe_verbose())
@@ -1035,13 +1184,25 @@ static int setup_tls(image *im)
                 g_tls_total, g_tls_raw, g_tls_index);
 
     if (t->AddressOfCallBacks) {
-        int n = 0;
-        for (cb = (uint64_t *)(uintptr_t)t->AddressOfCallBacks; *cb; cb++) {
+        int n = 0, skipped = 0;
+        cb = va_n(im, t->AddressOfCallBacks, sizeof *cb);
+        if (!cb)
+            fprintf(stderr, "tls: the callback list at 0x%llx is outside the "
+                            "image, none run\n",
+                    (unsigned long long)t->AddressOfCallBacks);
+        for (; cb && in_image(im, cb, sizeof *cb) && *cb; cb++) {
             MS void (*f)(void *, uint32_t, void *) =
                 (MS void (*)(void *, uint32_t, void *))(uintptr_t)*cb;
+            /* A function pointer out of a file. Calling one that does not
+             * land in the image is the difference between a refused plug-in
+             * and jumping to whatever happens to be at that address. */
+            if (!va_n(im, *cb, 1)) { skipped++; continue; }
             f(im->base, 1 /* DLL_PROCESS_ATTACH */, NULL);
             n++;
         }
+        if (skipped)
+            fprintf(stderr, "tls: %d callback(s) outside the image, not "
+                            "called\n", skipped);
         if (pe_verbose()) fprintf(stderr, "tls: ran %d callback(s)\n", n);
     }
     return 0;
@@ -1053,16 +1214,30 @@ static void *find_export(image *im, const char *want)
     EXP_DIR *e;
     uint32_t *names, *funcs;
     uint16_t *ords;
-    uint32_t i;
+    uint32_t i, nnames, nfuncs;
 
     if (!d.VirtualAddress) return NULL;
-    e = rva(im, d.VirtualAddress);
-    names = rva(im, e->AddressOfNames);
-    funcs = rva(im, e->AddressOfFunctions);
-    ords  = rva(im, e->AddressOfNameOrdinals);
-    for (i = 0; i < e->NumberOfNames; i++) {
-        const char *nm = rva(im, names[i]);
-        if (!strcmp(nm, want)) return rva(im, funcs[ords[i]]);
+    /* Three parallel arrays, a count for each, and an ordinal used to index
+     * one of them -- every value out of the file, and none of it checked. A
+     * NumberOfNames of four billion against a name pointer that need not be
+     * in the image at all is a strcmp() that walks off the end. Bounding the
+     * arrays by their own counts and each name by the image is what turns a
+     * damaged export directory into "no such export". */
+    if (!(e = rva_n(im, d.VirtualAddress, sizeof *e))) return NULL;
+    nnames = e->NumberOfNames;
+    nfuncs = e->NumberOfFunctions;
+    names = rva_n(im, e->AddressOfNames,        (uint64_t)nnames * sizeof *names);
+    funcs = rva_n(im, e->AddressOfFunctions,    (uint64_t)nfuncs * sizeof *funcs);
+    ords  = rva_n(im, e->AddressOfNameOrdinals, (uint64_t)nnames * sizeof *ords);
+    if (!names || !funcs || !ords) {
+        fprintf(stderr, "the export directory points outside the image\n");
+        return NULL;
+    }
+    for (i = 0; i < nnames; i++) {
+        const char *nm = rva_str(im, names[i]);
+        if (!nm || strcmp(nm, want)) continue;
+        if (ords[i] >= nfuncs) return NULL;
+        return rva_n(im, funcs[ords[i]], 1);
     }
     return NULL;
 }
@@ -1073,11 +1248,17 @@ static void list_exports(image *im)
     EXP_DIR *e;
     uint32_t *names, i;
     if (!d.VirtualAddress) { fprintf(stderr, "no exports\n"); return; }
-    e = rva(im, d.VirtualAddress);
-    names = rva(im, e->AddressOfNames);
+    if (!(e = rva_n(im, d.VirtualAddress, sizeof *e)) ||
+        !(names = rva_n(im, e->AddressOfNames,
+                        (uint64_t)e->NumberOfNames * sizeof *names))) {
+        fprintf(stderr, "the export directory points outside the image\n");
+        return;
+    }
     fprintf(stderr, "exports (%u):", e->NumberOfNames);
-    for (i = 0; i < e->NumberOfNames; i++)
-        fprintf(stderr, " %s", (const char *)rva(im, names[i]));
+    for (i = 0; i < e->NumberOfNames; i++) {
+        const char *nm = rva_str(im, names[i]);
+        fprintf(stderr, " %s", nm ? nm : "<outside the image>");
+    }
     fprintf(stderr, "\n");
 }
 
@@ -1555,9 +1736,45 @@ int pehost_isolation(void)
 {
     if (g_isolate < 0) {
         const char *e = getenv("PEHOST_ISOLATE");
+        /* Unset is no longer "off": see should_isolate() below. This answers
+         * only the forced-on case, which is what callers asking "is everything
+         * isolated" mean by it. */
         g_isolate = (e && *e != '0') ? 1 : 0;
     }
     return g_isolate && bridge_isolation_available();
+}
+
+/* ------------------------------------------------- automatic containment --
+
+ * A plug-in that faults in this process takes the process with it, and the
+ * moment that hurts is the one where it is least expected: browsing a folder
+ * of plug-ins, where the first sight of a bad one loses the session. Running
+ * it in a helper costs a process and an IPC hop and turns that into a line of
+ * text, so that is the default.
+ *
+ * It is not a trade-off in practice. Across a 349-plug-in corpus the helper
+ * renders identical audio and captures editors at identical size, adds about
+ * 30 ms to a load, and three plug-ins that abort inside this process -- ADLplug
+ * and OPNplug among them -- work perfectly in a helper.
+ *
+ * There was a register here that promoted plug-ins to in-process once they had
+ * proved themselves. It is gone, because what it proved was never quite the
+ * question: surviving one run is not surviving the next, and surviving in a
+ * helper says nothing at all about surviving here. It promoted ADLplug twice
+ * on that reasoning and turned a working plug-in into a dead host both times.
+ * A default that is always safe and occasionally slower is the better trade.
+ *
+ * PEHOST_ISOLATE=0 restores the old always-in-process behaviour for anyone who
+ * wants it; =1 is the default and forces the helper.
+ */
+
+/* Whether this particular plug-in should be hosted in a helper. */
+static int should_isolate(const char *path)
+{
+    const char *e = getenv("PEHOST_ISOLATE");
+    (void)path;
+    if (e && *e == '0') return 0;                  /* explicitly off */
+    return bridge_isolation_available();           /* otherwise, if we can */
 }
 
 int pehost_is_bridged(const char *path)
@@ -1666,7 +1883,14 @@ int pe_module_load(const char *path, pe_module *m, char *err, int errlen)
     setup_tls(&im);
     tTls = pe_now();
 
-    entry = im.opt->AddressOfEntryPoint ? rva(&im, im.opt->AddressOfEntryPoint) : NULL;
+    /* DllMain, if there is one. Checked like everything else out of the
+     * file: an entry point RVA past the end of the image is a call to
+     * whatever is at that address. */
+    entry = im.opt->AddressOfEntryPoint
+            ? rva_n(&im, im.opt->AddressOfEntryPoint, 1) : NULL;
+    if (im.opt->AddressOfEntryPoint && !entry)
+        fprintf(stderr, "the entry point (rva 0x%x) is outside the image, "
+                        "DllMain not called\n", im.opt->AddressOfEntryPoint);
     if (entry) {
         MS int32_t (*dllmain)(void *, uint32_t, void *) =
             (MS int32_t (*)(void *, uint32_t, void *))entry;
@@ -1740,6 +1964,13 @@ void *pe_module_export(const pe_module *m, const char *name)
     im.opt = (OPT_HDR64 *)((uint8_t *)im.fh + sizeof *im.fh);
     im.sec = (SEC_HDR *)((uint8_t *)im.opt + im.fh->SizeOfOptionalHeader);
     im.nsec = im.fh->NumberOfSections;
+    /* The size as well: this image is assembled by hand from a module that is
+     * already mapped, and find_export bounds-checks against it. Leaving it
+     * zero -- which the memset above does -- makes every lookup here answer
+     * "not found", and quietly: a VST3 loses GetPluginFactory, and every
+     * import that would have been served by a real runtime DLL falls back to
+     * a stub instead. SizeOfImage is what map_image used to map it. */
+    im.size = im.opt->SizeOfImage;
     return find_export(&im, name);
 }
 
@@ -1845,6 +2076,25 @@ int pehost_thread_init(void)
     return g_teb ? 0 : teb_install();
 }
 
+/* Where to send a plug-in's request to resize its own editor. The front end
+ * owns the window it was embedded in, so only it can answer. */
+static void (*g_editor_resize_cb)(void *ud, int w, int h);
+static void  *g_editor_resize_ud;
+
+void pehost_set_editor_resize_cb(void (*fn)(void *, int, int), void *ud)
+{ g_editor_resize_cb = fn; g_editor_resize_ud = ud; }
+
+/* Raised by whichever driver received the plug-in's request. The Windows VST2
+ * path reaches it from host_callback below; the System V one -- macOS VST2 and
+ * native Linux VST2 alike -- from macvsthost.c, which has its own callback and
+ * had the same opcode mislabelled in the same way. */
+int pehost_editor_resize_request(int w, int h)
+{
+    if (!g_editor_resize_cb || w <= 0 || h <= 0) return 0;
+    g_editor_resize_cb(g_editor_resize_ud, w, h);
+    return 1;
+}
+
 /* The transport handed back from audioMasterGetTime. File scope because the
  * plugin keeps the pointer after the callback returns. */
 static VstTimeInfo g_transport;
@@ -1923,7 +2173,18 @@ static MS intptr_t host_callback(AEffect *fx, int32_t op, int32_t idx,
         vst_time_set_full(&g_transport, g_play_pos, g_cb_rate,
                           g_tempo, g_tsig_n, g_tsig_d, g_playing);
         return (intptr_t)&g_transport;
-    case 13: return 0;              /* audioMasterSizeWindow    */
+    case 13: return 0;              /* audioMasterIOChanged     */
+    case 15:                        /* audioMasterSizeWindow    */
+        /* The plug-in asking the host to make its editor window a different
+         * size. This was mislabelled as opcode 13 and so never reached: 15 is
+         * SizeWindow and 13 is IOChanged, and with 15 falling through to the
+         * default the request was answered "no" every time.
+         *
+         * That is the whole of a complaint that looks like a host bug from the
+         * outside -- a plug-in whose interface scales, or that opens at one
+         * size and wants another, drawn cropped into whatever it was given and
+         * no way to change it. index is the width, value the height. */
+        return pehost_editor_resize_request(idx, (int)val);
     case 16: return (intptr_t)g_cb_rate;   /* audioMasterGetSampleRate */
     case 17: return g_cb_block;            /* audioMasterGetBlockSize  */
     case 23: return 1;              /* audioMasterGetCurrentProcessLevel */
@@ -2269,7 +2530,7 @@ pehost *pehost_open(const char *path, double samplerate, int blocksize)
     /* i386 is excluded because it has its own helper below and must use it.
      * Native ELF plugins are excluded because isolating them would cost them
      * their editor -- see pehost_is_native_elf. */
-    if (pehost_isolation() && !pehost_is_i386(path) && !pehost_is_native_elf(path)) {
+    if (should_isolate(path) && !pehost_is_i386(path) && !pehost_is_native_elf(path)) {
         bridge *br = bridge_open_helper(path, samplerate, blocksize, "peserve");
         if (!br) { snprintf(g_err, sizeof g_err, "%s", bridge_last_error()); return NULL; }
         if (!(h = calloc(1, sizeof *h))) { bridge_close(br); return NULL; }
@@ -2453,7 +2714,12 @@ static pehost *open_inproc_pe(const char *path, double samplerate, int blocksize
         protect_sections(&h->im);
         setup_tls(&h->im);
 
-        entry = h->im.opt->AddressOfEntryPoint ? rva(&h->im, h->im.opt->AddressOfEntryPoint) : NULL;
+        entry = h->im.opt->AddressOfEntryPoint
+                ? rva_n(&h->im, h->im.opt->AddressOfEntryPoint, 1) : NULL;
+        if (h->im.opt->AddressOfEntryPoint && !entry)
+            fprintf(stderr, "the entry point (rva 0x%x) is outside the image, "
+                            "DllMain not called\n",
+                    h->im.opt->AddressOfEntryPoint);
         if (entry) {
             MS int32_t (*dllmain)(void *, uint32_t, void *) = (MS int32_t (*)(void *, uint32_t, void *))entry;
             dllmain_said_no = !dllmain(h->im.base, 1, NULL);
@@ -3136,6 +3402,67 @@ void pehost_set_program(pehost *h, int idx)
     h->program = idx;
     h->fx->dispatcher(h->fx, effSetProgram, 0, idx, NULL, 0.0f);
 }
+/* The plug-in's own opaque state -- what VST2 calls a chunk.
+ *
+ * Parameters are not the whole story for a plug-in that sets
+ * effFlagsProgramChunks: a wavetable it loaded, a step sequence, the path to a
+ * sample, anything it does not express as a parameter lives here and nowhere
+ * else. Saving parameters alone for one of those and calling it a preset
+ * restores a different sound, quietly -- which is the shape of bug a musician
+ * finds a week later, in a session that no longer sounds like the mix.
+ *
+ * The buffer handed back belongs to the plug-in and stays valid only until the
+ * next call into it, so a caller that wants to keep it copies it. `preset`
+ * asks for the current program rather than the whole bank.
+ *
+ * Call these where the other non-render calls are called: not from the audio
+ * thread, and not while one is in flight. */
+int pehost_get_state(pehost *h, int preset, const void **data)
+{
+    void *p = NULL;
+    intptr_t n;
+
+    if (data) *data = NULL;
+    if (!h || !data) return 0;
+    /* macOS VST2 and native Linux VST2 share the System V driver. */
+    if (h->mv) return macvst_get_state(h->mv, preset, data);
+    if (!h->fx) return 0;                    /* the other backends: see below */
+    if (!(h->fx->flags & effFlagsProgramChunks)) return 0;
+    /* Queued parameter and program writes first, or the chunk describes the
+     * state before them. */
+    pehost_flush_params(h);
+    n = h->fx->dispatcher(h->fx, effGetChunk, preset ? 1 : 0, 0, &p, 0.0f);
+    if (n <= 0 || !p) return 0;
+    *data = p;
+    return (int)n;
+}
+
+int pehost_set_state(pehost *h, int preset, const void *data, int len)
+{
+    if (!h || !data || len <= 0) return 0;
+    if (h->mv) return macvst_set_state(h->mv, preset, data, len);
+    if (!h->fx) return 0;
+    if (!(h->fx->flags & effFlagsProgramChunks)) return 0;
+    /* effSetChunk takes the length in `value` and the bytes in `ptr`. The cast
+     * drops const because the VST2 signature has no const to give it; no
+     * plug-in in this corpus writes through it. */
+    if (h->fx->dispatcher(h->fx, effSetChunk, preset ? 1 : 0, (intptr_t)len,
+                          (void *)(uintptr_t)data, 0.0f) < 0)
+        return 0;
+    /* A chunk can move every parameter and the current program with it, so
+     * anything cached here is now stale. */
+    h->program = (int)h->fx->dispatcher(h->fx, effGetProgram, 0, 0, NULL, 0.0f);
+    return 1;
+}
+
+/* Whether this plug-in has state beyond its parameters at all. A caller that
+ * gets 0 here has the whole picture from the parameter values. */
+int pehost_has_state(const pehost *h)
+{
+    if (h && h->mv) return macvst_has_state(h->mv);
+    return h && h->fx && (h->fx->flags & effFlagsProgramChunks) != 0;
+}
+
 int pehost_get_program(pehost *h) {
     if (h && h->cl) return (int)pefvst_dispatch(h->cl, PV_GET_PROGRAM, 0, 0, 0, 0.0f);
     if (h && h->mv) return macvst_get_program(h->mv);
@@ -4094,12 +4421,21 @@ void pehost_editor_size(pehost *h, int *w, int *height)
     }
 }
 int pehost_editor_can_resize(pehost *h)
-{ return (h && !h->br && h->is_v3) ? v3_editor_can_resize(h->v3) : 0; }
+{
+    if (h && h->mv) return macvst_editor_can_resize(h->mv);
+    return (h && !h->br && h->is_v3) ? v3_editor_can_resize(h->v3) : 0;
+}
 int pehost_editor_attach(pehost *h, unsigned long xid)
 {
+    int r;
+    /* macvst does its own embedding, and repeats it over the first few idles
+     * for a plug-in that builds its window late. */
     if (h && h->mv && macvst_is_native(h->mv))
         return macvst_editor_attach(h->mv, xid);
-    return (h && !h->br && h->is_v3) ? v3_editor_attach(h->v3, xid) : -1;
+    r = (h && !h->br && h->is_v3) ? v3_editor_attach(h->v3, xid) : -1;
+    /* Everything else that parents into an X window gets the same finish. */
+    if (r == 0) pehost_x11_embed(xid);
+    return r;
 }
 void pehost_editor_detach(pehost *h)
 {
@@ -4109,7 +4445,10 @@ void pehost_editor_detach(pehost *h)
     if (h && h->is_v3) v3_editor_detach(h->v3);
 }
 void pehost_editor_resized(pehost *h, int w, int height)
-{ if (h && !h->br && h->is_v3) v3_editor_resized(h->v3, w, height); }
+{
+    if (h && h->mv) { macvst_editor_resize(h->mv, w, height); return; }
+    if (h && !h->br && h->is_v3) v3_editor_resized(h->v3, w, height);
+}
 
 void pehost_import_stats(int *implemented, int *stubbed, int *called)
 {

@@ -167,6 +167,21 @@ void  pehost_program_name(pehost *h, int idx, char *buf, int n);
 void  pehost_set_program(pehost *h, int idx);
 int   pehost_get_program(pehost *h);
 
+/* The plug-in's opaque state, for plug-ins whose parameters are not the whole
+ * of it (effFlagsProgramChunks). pehost_has_state() says whether there is any.
+ *
+ * pehost_get_state returns the length and points *data at the plug-in's own
+ * buffer, which is valid only until the next call into that plug-in -- copy it
+ * to keep it. `preset` asks for the current program rather than the bank.
+ * Both return 0 when the plug-in has no chunk state, and for a plug-in hosted
+ * over the bridge or through the VST3, AU or Classic paths, which do not carry
+ * this yet.
+ *
+ * Call from the same thread as the other non-render entry points. */
+int   pehost_has_state(const pehost *h);
+int   pehost_get_state(pehost *h, int preset, const void **data);
+int   pehost_set_state(pehost *h, int preset, const void *data, int len);
+
 void  pehost_param_name(pehost *h, int i, char *buf, int n);
 void  pehost_param_label(pehost *h, int i, char *buf, int n);
 void  pehost_param_display(pehost *h, int i, char *buf, int n);
@@ -310,8 +325,22 @@ int  pehost_has_editor(pehost *h);
 void pehost_editor_size(pehost *h, int *w, int *height);
 int  pehost_editor_can_resize(pehost *h);
 int  pehost_editor_attach(pehost *h, unsigned long x11_window);
+/* Finish the embedding on the X side: tell whatever the plug-in created that
+ * it has been embedded, and map it. Called for you by pehost_editor_attach;
+ * exposed because a front end that parents an editor by some other route
+ * needs the same thing done. A no-op in a build without Xlib. */
+void pehost_x11_embed(unsigned long x11_window);
 void pehost_editor_detach(pehost *h);
 void pehost_editor_resized(pehost *h, int w, int height);
+
+/* The other direction: a VST2 plug-in asking the host to resize the window its
+ * editor sits in (audioMasterSizeWindow). A front end that embeds an editor
+ * sets this and resizes the container; without it the plug-in is drawn at
+ * whatever size it was first given, cropped if it wanted more, and the user
+ * has no way to change it. The VST3 equivalent is v3_runloop_hooks.resize. */
+void pehost_set_editor_resize_cb(void (*fn)(void *ud, int w, int h), void *ud);
+/* Raise that request. Returns 1 if a front end took it. */
+int  pehost_editor_resize_request(int w, int h);
 
 /* Diagnostics: how many imported symbols were implemented vs stubbed, and how
  * many stubs the plugin actually reached. */

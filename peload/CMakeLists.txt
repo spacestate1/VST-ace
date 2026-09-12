@@ -88,6 +88,33 @@ target_include_directories(pehost PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # librt for shm_open on the bridge's shared region
 target_link_libraries(pehost PUBLIC Threads::Threads m dl rt PkgConfig::FREETYPE)
 
+# Xlib, for one job: mapping a native plug-in's editor window once it has been
+# embedded. Optional -- without it a native Linux editor relies on the plug-in
+# mapping itself, which is what it used to do. See macvst_editor_attach.
+pkg_check_modules(X11 IMPORTED_TARGET x11)
+if(X11_FOUND)
+  target_compile_definitions(pehost PUBLIC PEHOST_HAVE_X11=1)
+  target_link_libraries(pehost PUBLIC PkgConfig::X11)
+else()
+  message(STATUS "pehost: no libx11 -- native plug-in editors may not appear")
+endif()
+
+# The DAW bridge: this same host, as a Linux VST2 .so.
+#
+# Every DAW on Linux already loads a Linux VST2, and none of them will ever
+# load a .dll. Installed under a plug-in's own name beside it, this puts any
+# plug-in these hosts can open on a track -- see the top of vstbridge.c.
+#
+# pehost is static and linked into a shared object here, so its objects have
+# to be position-independent; the two VST3 object libraries go in with it.
+set_property(TARGET pehost     PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET vst3_sysv  PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET vst3_msabi PROPERTY POSITION_INDEPENDENT_CODE ON)
+add_library(vstace_bridge MODULE vstbridge.c)
+set_target_properties(vstace_bridge PROPERTIES OUTPUT_NAME "vst-ace-bridge"
+                                               PREFIX "lib")
+target_link_libraries(vstace_bridge PRIVATE pehost)
+
 # The isolation helper: hosts one plugin for another process, so a plugin that
 # faults costs a helper instead of the host. Same protocol as peload32 --serve.
 add_executable(peserve peserve.c)

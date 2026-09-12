@@ -1426,10 +1426,36 @@ public:
         fprintf(stderr, "editor: embedded as a child of window 0x%lx (%dx%d)\n",
                 (unsigned long)winId(), w, ht);
         host_ = h;
+        /* Idle it.
+         *
+         * An embedded editor draws itself into its own X window, so nothing on
+         * this side is in the drawing path and it is tempting to conclude that
+         * nothing on this side is needed at all. That is what was concluded,
+         * and it is wrong: a VST2 plug-in runs its own event handling out of
+         * effEditIdle, so with no idle it never reads the X events X is
+         * delivering to it and never advances anything it animates. The editor
+         * appears, correctly drawn, and is inert -- knobs do not move under the
+         * pointer, meters and LFOs do not run.
+         *
+         * Only the pixel editors were pumped, because there the pump is
+         * obviously load-bearing: it is what produces the frame. Here the
+         * missing frame is the plug-in's own, so the omission was invisible.
+         *
+         * 60 Hz, and stopped the moment the editor goes away. */
+        if (!idle_) {
+            idle_ = new QTimer(this);
+            connect(idle_, &QTimer::timeout, this, [this] {
+                if (!host_ || g_inPlugin) return;
+                PluginCall guard;
+                pehost_editor_pump(host_);
+            });
+        }
+        idle_->start(16);
         return true;
     }
     void detach()
     {
+        if (idle_) idle_->stop();
         if (host_) { pehost_editor_detach(host_); host_ = nullptr; }
         natW_ = natH_ = 0;
         clearWatches();
@@ -1501,6 +1527,15 @@ private:
             e->resize(w, h);
         };
         v3_set_runloop_hooks(&hk);
+        /* The VST2 equivalent of hk.resize. Same destination: a plug-in that
+         * asks for a size gets it, whichever format it asked in. */
+        pehost_set_editor_resize_cb([](void *ud, int w, int h) {
+            auto *e = static_cast<EditorHost *>(ud);
+            if (w <= 0 || h <= 0) return;
+            e->natW_ = w; e->natH_ = h;
+            e->setMinimumSize(1, 1);
+            e->resize(w, h);
+        }, this);
     }
 
     /* Retiring rather than deleting, because a plugin routinely unregisters
@@ -1567,6 +1602,7 @@ private:
     pehost *host_ = nullptr;
     QMultiHash<void *, QSocketNotifier *> fds_;
     QMultiHash<void *, QTimer *>          timers_;
+    QTimer                               *idle_ = nullptr;  /* effEditIdle */
 public:
     /* What the plug-in laid itself out at, which is what a zoom is a multiple
      * of. Public because the run-loop resize hook is a plain lambda. */
@@ -2269,6 +2305,18 @@ public:
             zoomFit();
         });
         connect(zoom1to1_, &QPushButton::clicked,  this, [this] { fitAuto_ = false; setZoom(1.0); });
+        /* From the keyboard as well. The editor takes the pointer while it is
+         * open -- it is the plug-in's own window and the clicks are its -- so
+         * reaching the zoom controls meant aiming at a small button beside a
+         * large interface. These are the bindings every other viewer uses. */
+        zoomFit_->setShortcut(QKeySequence("Ctrl+0"));
+        zoom1to1_->setShortcut(QKeySequence("Ctrl+1"));
+        {
+            auto *zi = new QShortcut(QKeySequence::ZoomIn, this);
+            auto *zo = new QShortcut(QKeySequence::ZoomOut, this);
+            connect(zi, &QShortcut::activated, this, [this] { zoomStep(+1); });
+            connect(zo, &QShortcut::activated, this, [this] { zoomStep(-1); });
+        }
         connect(pixelEditor_, &PixelEditor::zoomStep, this, &Window::zoomStep);
         connect(recBtn_, &QPushButton::clicked, this, &Window::toggleRecord);
         connect(panic, &QPushButton::clicked, this, [this] {
@@ -2694,7 +2742,9 @@ private slots:
          * keyboard look broken when it is only unassigned. */
         if (!paths_.isEmpty() && pluginList_->currentRow() < 0) {
             int want = -1;
+            bool namedOnCommandLine = false;
             if (!startPlugin_.isEmpty()) {
+                namedOnCommandLine = true;
                 /* Named on the command line, so it wins over both the first
                  * entry and the crash guard -- asking for a plugin by name is
                  * explicit enough to mean "try it anyway". Consumed here so a
@@ -2723,6 +2773,15 @@ private slots:
                 if (want >= paths_.size()) want = -1;
             }
             if (want >= 0) pluginList_->setCurrentRow(want);
+            /* And show its editor, for the same reason File > Open does: a
+             * plug-in asked for by name is the whole point of the run, not one
+             * row of a list being browsed. Without this the window opens on the
+             * parameter list and the editor is never instantiated, which is
+             * indistinguishable from an editor that failed. */
+            if (want >= 0 && namedOnCommandLine && tabs_->isTabEnabled(1)) {
+                tabs_->setCurrentIndex(1);
+                if (tabs_->currentIndex() == 1) openEditor();
+            }
         }
     }
 
@@ -3031,7 +3090,20 @@ private slots:
          * grew to its own, so it appeared cropped with scrollbars, and the Fit
          * button was disabled because the window believed there was no editor
          * to fit. Failing that, the framebuffer's own dimensions -- whatever
-         * the plug-in is actually drawing into is the truth. */
+         * the plug-in is actually drawing into is the truth.
+         *
+         * Asked again always, not only when the first answer was nothing. A
+         * wrong answer is as bad as no answer and harder to see: u-he's
+         * TripleCheese reports 712x350 before its editor exists and then
+         * builds a 900x550 window, so the pane was sized to the smaller
+         * number and showed the top-left corner of the interface with the
+         * rest simply absent. 712x350 is not zero, so the re-ask below never
+         * ran and the pane never caught up. */
+        if (gui) {
+            int rw = 0, rh = 0;
+            pehost_editor_size(h, &rw, &rh);
+            if (rw > 0 && rh > 0) { w = rw; ht = rh; }
+        }
         if (gui && (w <= 0 || ht <= 0)) {
             pehost_editor_size(h, &w, &ht);
             if (w <= 0 || ht <= 0) {
@@ -3119,9 +3191,27 @@ private slots:
      * explicit request and will enlarge. */
     void zoomFit(bool onlyShrink = false)
     {
-        if (!editorCanZoom() || editorW_ <= 0 || editorH_ <= 0) return;
+        if (editorW_ <= 0 || editorH_ <= 0) return;
         const QSize v = editorScroll_->viewport()->size();
         if (v.width() < 16 || v.height() < 16) return;   /* not laid out -- retry */
+        /* An editor that will not scale can still be fitted -- by moving the
+         * window rather than the plug-in.
+         *
+         * Scaling is one of two ways to stop an editor being cropped and the
+         * only one that needs the plug-in's cooperation. The other is to make
+         * the window the size the editor already is, which needs nobody's
+         * permission and is what Fit should mean for a fixed-size editor
+         * instead of doing nothing at all. */
+        if (!editorCanZoom()) {
+            const int dw = editorW_ - v.width(), dh = editorH_ - v.height();
+            if (onlyShrink && dw <= 0 && dh <= 0) return;
+            QWidget *top = window();
+            if (top && (dw || dh))
+                top->resize(qMax(320, top->width()  + dw),
+                            qMax(240, top->height() + dh));
+            fitPending_ = false;
+            return;
+        }
         const double z = qMin(double(v.width())  / editorW_,
                               double(v.height()) / editorH_);
         fitPending_ = false;                             /* measured something real */
@@ -3148,7 +3238,9 @@ private slots:
         const bool on = editorCanZoom();
         zoomOut_->setEnabled(on && zoom_ > kZoomMin);
         zoomIn_->setEnabled(on && zoom_ < kZoomMax);
-        zoomFit_->setEnabled(on);
+        /* Fit is offered whenever there is an editor: for one that cannot
+         * scale it resizes the window instead, which is still a fit. */
+        zoomFit_->setEnabled(editorOpened_ && editorW_ > 0);
         zoom1to1_->setEnabled(on && zoom_ != 1.0);
         zoomLabel_->setEnabled(on);
         zoomLabel_->setText(QString("%1%").arg(int(zoom_ * 100.0 + 0.5)));
@@ -3161,7 +3253,8 @@ private slots:
         else if (!editorOpened_ || editorW_ <= 0)
             zoomNote_->setText("no editor open");
         else if (editorKind_ == PEHOST_EDITOR_X11)
-            zoomNote_->setText("this plug-in draws its own window and will not resize it");
+            zoomNote_->setText("this plug-in draws its own window at a fixed size -- "
+                               "Fit resizes the window to it");
         else
             zoomNote_->setText(QString());
     }
@@ -4794,6 +4887,20 @@ private:
             pluginList_->setCurrentRow(ix);
         }
         loadRow(ix);
+        /* Opening one plug-in by name is not browsing.
+         *
+         * loadRow leaves the editor unopened unless you were already looking
+         * at one, which is right for walking a list -- an editor costs a
+         * window and a GL context, and nobody wants one per plug-in scrolled
+         * past. It is wrong here: File > Open VST, or a plug-in named on the
+         * command line, is a request for that plug-in and nothing else, and
+         * answering it with the parameter list and an Editor tab the user has
+         * to know to click reads exactly like an editor that failed to load.
+         * That is what it was reported as. */
+        if (eng_.host() && editorKind_ != PEHOST_EDITOR_NONE) {
+            tabs_->setCurrentIndex(1);
+            if (tabs_->currentIndex() == 1) openEditor();
+        }
         return eng_.host() != nullptr;
     }
 

@@ -42,6 +42,9 @@ typedef struct {
     int         selftest;         /* --msvcp-selftest */
     const char *patch_in;         /* --patch, or a .json given positionally */
     const char *patch_out;        /* --save-patch */
+    int         ed_w, ed_h;       /* --editor-size WxH */
+    const char *state_out;        /* --save-state */
+    const char *state_in;         /* --load-state */
     const char *pick;             /* --pick */
     const char *as_name;          /* --as */
     int         detect;           /* --detect */
@@ -195,6 +198,8 @@ static void usage(void)
         "                                    linux-vst3, linux-vst2, mac-vst2, mac-vst3,\n"
         "                                    mac-au, classic-mac)\n"
         "              [--save-patch out.json]  write the current state\n"
+        "              [--save-state out.bin]   the plug-in's own opaque state\n"
+        "              [--load-state in.bin]    read that back\n"
         "              [--editor out.ppm]   open the GUI and capture it\n"
         "              [--live N]           hold the note and run the audio for N\n"
         "                                   seconds first, so an animated editor\n"
@@ -255,6 +260,16 @@ static int parse_args(int argc, char **argv, opts *o)
         else if (!strcmp(argv[i], "--patch") && i + 1 < argc)    o->patch_in  = argv[++i];
         else if (!strcmp(argv[i], "--save-patch") && i + 1 < argc)
                                                                  o->patch_out = argv[++i];
+        else if (!strcmp(argv[i], "--editor-size") && i + 1 < argc) {
+            /* Ask the editor to be a size other than its own, to see whether
+             * it lays itself out again or merely sits in a bigger window. */
+            if (sscanf(argv[++i], "%dx%d", &o->ed_w, &o->ed_h) != 2)
+                o->ed_w = o->ed_h = 0;
+        }
+        else if (!strcmp(argv[i], "--save-state") && i + 1 < argc)
+                                                                 o->state_out = argv[++i];
+        else if (!strcmp(argv[i], "--load-state") && i + 1 < argc)
+                                                                 o->state_in = argv[++i];
         else if (!strcmp(argv[i], "--pick") && i + 1 < argc)     o->pick = argv[++i];
         else if (!strcmp(argv[i], "--list-patches"))             o->list_patches  = 1;
         else if (!strcmp(argv[i], "--list-programs"))            o->list_programs = 1;
@@ -452,6 +467,59 @@ static void fill_test_signal(float *src, int frames, int at)
     }
 }
 
+/* --load-state: the plug-in's own opaque block, as saved below.
+ *
+ * A patch bank carries parameter values, which is everything for most plug-ins
+ * and not everything for any plug-in that sets effFlagsProgramChunks. This is
+ * the rest of it, byte for byte as the plug-in handed it over. */
+static void load_state_in(pehost *h, const opts *o)
+{
+    FILE *f;
+    long  len;
+    void *buf;
+
+    if (!o->state_in) return;
+    if (!(f = fopen(o->state_in, "rb"))) { perror(o->state_in); return; }
+    fseek(f, 0, SEEK_END); len = ftell(f); fseek(f, 0, SEEK_SET);
+    if (len <= 0) { fclose(f); fprintf(stderr, "%s is empty\n", o->state_in); return; }
+    if (!(buf = malloc((size_t)len))) { fclose(f); return; }
+    if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
+        fprintf(stderr, "%s: short read\n", o->state_in);
+        free(buf); fclose(f); return;
+    }
+    fclose(f);
+    if (pehost_set_state(h, 0, buf, (int)len))
+        printf("loaded %ld bytes of plug-in state from %s\n", len, o->state_in);
+    else
+        fprintf(stderr, "%s: this plug-in does not take an opaque state block "
+                        "(no effFlagsProgramChunks), so nothing was loaded\n",
+                o->state_in);
+    free(buf);
+}
+
+/* --save-state, the counterpart. */
+static void save_state_out(pehost *h, const opts *o)
+{
+    const void *data = NULL;
+    int len;
+    FILE *f;
+
+    if (!o->state_out) return;
+    if (!pehost_has_state(h)) {
+        fprintf(stderr, "save-state: this plug-in keeps no state beyond its "
+                        "parameters -- use --save-patch\n");
+        return;
+    }
+    if (!(len = pehost_get_state(h, 0, &data)) || !data) {
+        fprintf(stderr, "save-state: the plug-in returned no state\n");
+        return;
+    }
+    if (!(f = fopen(o->state_out, "wb"))) { perror(o->state_out); return; }
+    if (fwrite(data, 1, (size_t)len, f) != (size_t)len) perror(o->state_out);
+    else printf("wrote %s (%d bytes of plug-in state)\n", o->state_out, len);
+    fclose(f);
+}
+
 /* --save-patch, wherever the caller decided the state is worth taking. */
 static void save_patch_out(pehost *h, const opts *o)
 {
@@ -461,6 +529,12 @@ static void save_patch_out(pehost *h, const opts *o)
         fprintf(stderr, "save-patch: %s\n", err);
     else
         printf("\nwrote %s (%d parameters)\n", o->patch_out, pehost_num_params(h));
+    /* Worth saying: a patch beside a plug-in that has chunk state is a partial
+     * record of it, and silence about that is how a restored session comes
+     * back sounding different. */
+    if (pehost_has_state(h) && !o->state_out)
+        fprintf(stderr, "note: this plug-in also keeps state its parameters do "
+                        "not describe -- --save-state writes that too\n");
 }
 
 static int render_to_wav(pehost *h, const opts *o)
@@ -500,6 +574,200 @@ static int render_to_wav(pehost *h, const opts *o)
     return 0;
 }
 
+#ifdef PEHOST_HAVE_X11
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <poll.h>
+#include <time.h>          /* clock_gettime, for the run loop's timers */
+#include "vst3.h"
+
+/* A run loop, for the editors that need one.
+ *
+ * A VST2 editor draws when it is idled, which is why capturing one needs
+ * nothing but a window and effEditIdle. A VST3 editor does not: it hands the
+ * host file descriptors and timers through IRunLoop and waits to be told when
+ * they are ready. Give it no run loop and it never draws a pixel -- which is
+ * what capturing Surge XT, Odin 2 and OB-Xf produced before this: a window of
+ * exactly the right size, containing nothing.
+ *
+ * pestudio has one of these built out of Qt's event loop. This is the same
+ * contract in thirty lines, so that the editor path can be exercised without
+ * a GUI toolkit -- which is the difference between these editors being
+ * testable and not. */
+#define RL_MAX 16
+static struct { void *handler; int fd; } g_rl_fd[RL_MAX];
+static struct { void *handler; unsigned long long ms, due; } g_rl_tm[RL_MAX];
+static int g_rl_nfd, g_rl_ntm;
+
+static unsigned long long rl_now_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000ull + (unsigned long long)(t.tv_nsec / 1000000);
+}
+static void rl_add_fd(void *ud, void *handler, int fd)
+{ (void)ud; if (g_rl_nfd < RL_MAX) { g_rl_fd[g_rl_nfd].handler = handler;
+                                     g_rl_fd[g_rl_nfd].fd = fd; g_rl_nfd++; } }
+static void rl_del_fd(void *ud, void *handler)
+{
+    int i; (void)ud;
+    for (i = 0; i < g_rl_nfd; i++)
+        if (g_rl_fd[i].handler == handler) g_rl_fd[i] = g_rl_fd[--g_rl_nfd];
+}
+static void rl_add_timer(void *ud, void *handler, unsigned long long ms)
+{
+    (void)ud;
+    if (g_rl_ntm >= RL_MAX) return;
+    if (ms < 1) ms = 1;
+    g_rl_tm[g_rl_ntm].handler = handler;
+    g_rl_tm[g_rl_ntm].ms = ms;
+    g_rl_tm[g_rl_ntm].due = rl_now_ms() + ms;
+    g_rl_ntm++;
+}
+static void rl_del_timer(void *ud, void *handler)
+{
+    int i; (void)ud;
+    for (i = 0; i < g_rl_ntm; i++)
+        if (g_rl_tm[i].handler == handler) g_rl_tm[i] = g_rl_tm[--g_rl_ntm];
+}
+static void rl_install(void)
+{
+    v3_runloop_hooks hk;
+    memset(&hk, 0, sizeof hk);
+    hk.ud = NULL;
+    hk.add_fd = rl_add_fd;   hk.del_fd = rl_del_fd;
+    hk.add_timer = rl_add_timer; hk.del_timer = rl_del_timer;
+    g_rl_nfd = g_rl_ntm = 0;
+    v3_set_runloop_hooks(&hk);
+}
+/* One turn: anything readable, then anything due. */
+static void rl_turn(int wait_ms)
+{
+    struct pollfd pfd[RL_MAX];
+    unsigned long long now;
+    int i, np = 0, r;
+
+    for (i = 0; i < g_rl_nfd; i++) {
+        pfd[np].fd = g_rl_fd[i].fd; pfd[np].events = POLLIN; pfd[np].revents = 0; np++;
+    }
+    r = poll(pfd, (nfds_t)np, wait_ms);
+    if (r > 0)
+        for (i = 0; i < np && i < g_rl_nfd; i++)
+            if (pfd[i].revents) v3_runloop_fd(g_rl_fd[i].handler, g_rl_fd[i].fd);
+    now = rl_now_ms();
+    for (i = 0; i < g_rl_ntm; i++)
+        if (now >= g_rl_tm[i].due) {
+            g_rl_tm[i].due = now + g_rl_tm[i].ms;
+            v3_runloop_timer(g_rl_tm[i].handler);
+        }
+}
+
+/* Capture a native plug-in's editor by giving it a window to live in.
+ *
+ * A Windows or macOS editor is drawn by this host into a buffer, so capturing
+ * one is reading that buffer. A native Linux plug-in draws with X itself and
+ * needs a real window, which is why this used to print "X11 embed (needs a
+ * window)" and stop -- leaving the one class of editor that cannot be checked
+ * without a desktop also the one that could not be checked at all.
+ *
+ * So make the window. Override-redirect, so no window manager adopts it,
+ * takes focus from whatever the user is doing, or gives it a taskbar entry;
+ * mapped because the plug-in has to be able to draw into something real, and
+ * torn down immediately afterwards. */
+static void capture_editor_x11(pehost *h, const char *shot, int want_w, int want_h)
+{
+    Display *d = XOpenDisplay(NULL);
+    XSetWindowAttributes at;
+    XImage *im;
+    Window  win;
+    FILE   *f;
+    int     w = 0, ht = 0, x, y, i;
+
+    if (!d) {
+        printf("  no X display (DISPLAY/XAUTHORITY); cannot host the editor\n");
+        return;
+    }
+    pehost_editor_size(h, &w, &ht);
+    if (w <= 0 || ht <= 0) { w = 800; ht = 600; }
+    printf("  reported size %dx%d\n", w, ht);
+
+    memset(&at, 0, sizeof at);
+    at.override_redirect = True;
+    at.background_pixel  = 0x202020;
+    win = XCreateWindow(d, DefaultRootWindow(d), 0, 0, (unsigned)w, (unsigned)ht,
+                        0, CopyFromParent, InputOutput, CopyFromParent,
+                        CWOverrideRedirect | CWBackPixel, &at);
+    XStoreName(d, win, "peload editor");
+    XMapRaised(d, win);
+    XSync(d, False);
+
+    rl_install();
+    if (pehost_editor_attach(h, (unsigned long)win) != 0) {
+        printf("  the plug-in refused the window\n");
+        XDestroyWindow(d, win); XCloseDisplay(d); return;
+    }
+    /* Let it build and draw: idles for a VST2, the run loop for a VST3. */
+    for (i = 0; i < 30; i++) { pehost_editor_pump(h); rl_turn(5); XSync(d, False); usleep(20000); }
+
+    /* Ask again, now the editor exists. A plug-in that reported one size
+     * before opening and then built a window of another -- TripleCheese says
+     * 712x350 and makes 900x550 -- would otherwise be captured cropped, which
+     * is exactly how it looked in a host that believed the first answer. */
+    {
+        int rw = 0, rh = 0;
+        pehost_editor_size(h, &rw, &rh);
+        if (rw > 0 && rh > 0 && (rw != w || rh != ht)) {
+            printf("  the editor built itself %dx%d; resizing to match\n", rw, rh);
+            w = rw; ht = rh;
+            XResizeWindow(d, win, (unsigned)w, (unsigned)ht);
+            XSync(d, False);
+        }
+    }
+    /* And then to whatever was asked for, if anything was. */
+    if (want_w > 0 && want_h > 0 && (want_w != w || want_h != ht)) {
+        if (!pehost_editor_can_resize(h)) {
+            printf("  this editor says it cannot be resized; asking anyway\n");
+        }
+        printf("  asking the editor for %dx%d\n", want_w, want_h);
+        w = want_w; ht = want_h;
+        XResizeWindow(d, win, (unsigned)w, (unsigned)ht);
+        XSync(d, False);
+        pehost_editor_resized(h, w, ht);
+        for (i = 0; i < 25; i++) { pehost_editor_pump(h); rl_turn(5); XSync(d, False); usleep(20000); }
+    }
+    for (i = 0; i < 40; i++) { pehost_editor_pump(h); rl_turn(5); XSync(d, False); usleep(20000); }
+
+    im = XGetImage(d, win, 0, 0, (unsigned)w, (unsigned)ht, AllPlanes, ZPixmap);
+    if (!im) {
+        printf("  could not read the window back\n");
+    } else if (!(f = fopen(shot, "wb"))) {
+        perror(shot);
+    } else {
+        long nonblack = 0, total = (long)w * ht;
+        fprintf(f, "P6\n%d %d\n255\n", w, ht);
+        for (y = 0; y < ht; y++)
+            for (x = 0; x < w; x++) {
+                unsigned long px = XGetPixel(im, x, y);
+                unsigned char rgb[3];
+                rgb[0] = (unsigned char)((px >> 16) & 0xff);
+                rgb[1] = (unsigned char)((px >> 8) & 0xff);
+                rgb[2] = (unsigned char)(px & 0xff);
+                if (rgb[0] || rgb[1] || rgb[2]) nonblack++;
+                fwrite(rgb, 1, 3, f);
+            }
+        fclose(f);
+        printf("  captured %dx%d, %ld/%ld pixels non-black (%.1f%%)\n",
+               w, ht, nonblack, total, 100.0 * (double)nonblack / (double)total);
+        printf("  wrote %s\n", shot);
+    }
+    if (im) XDestroyImage(im);
+    pehost_editor_detach(h);
+    XDestroyWindow(d, win);
+    XFlush(d);
+    XCloseDisplay(d);
+}
+#endif
+
 static void capture_editor(pehost *h, const char *shot, const opts *o)
 {
     int kind = pehost_editor_kind(h);
@@ -512,8 +780,11 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
                ? (pehost_is_classic(h) ? "pixel buffer (QuickDraw shim)"
                   : pehost_is_macos(h) ? "pixel buffer (software Metal)"
                                      : "pixel buffer (Win32 layer)")
-           : kind == PEHOST_EDITOR_X11 ? "X11 embed (needs a window)"
+           : kind == PEHOST_EDITOR_X11 ? "X11 embed"
                                        : "none");
+#ifdef PEHOST_HAVE_X11
+    if (kind == PEHOST_EDITOR_X11) { capture_editor_x11(h, shot, o->ed_w, o->ed_h); return; }
+#endif
     if (kind != PEHOST_EDITOR_PIXELS) return;
 
     pehost_editor_size(h, &w, &ht);
@@ -794,6 +1065,10 @@ int main(int argc, char **argv)
     if (o.selftest) { int r = pehost_msvcp_selftest(); pehost_close(h); return r; }
 
     describe(h, &o);
+    /* Before the bank: a chunk can move every parameter, so applying it after
+     * a patch would undo the patch. State first, then the parameter values the
+     * caller asked for on top of it. */
+    load_state_in(h, &o);
     if (bank && apply_patch(h, bank, patch_ix, o.block)) { pehost_close(h); return 1; }
     dump_params(h, o.dump);
 
@@ -825,11 +1100,12 @@ int main(int argc, char **argv)
     }
     {
         const int gestured = o.shot && (o.nclick || o.has_drag);
-        if (!gestured) save_patch_out(h, &o);
+        if (!gestured) { save_patch_out(h, &o); save_state_out(h, &o); }
         if (gestured) {
             capture_editor(h, o.shot, &o);
             if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
             save_patch_out(h, &o);
+            save_state_out(h, &o);
         } else {
             if (o.wav && render_to_wav(h, &o)) { pehost_close(h); return 1; }
             if (o.shot) capture_editor(h, o.shot, &o);

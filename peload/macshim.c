@@ -565,11 +565,56 @@ static void __attribute__((constructor)) init_cf_constants(void)
 static void *g_p_maxfrac = &g_k_maxfrac;
 static void *g_p_minfrac = &g_k_minfrac;
 
+/* CFSTR("...").
+ *
+ * Every CFSTR in a plug-in's source compiles to a call to this with the
+ * address of the literal, and the result has to behave like a constant: never
+ * released, and the same object every time for the same literal, because code
+ * is entitled to compare two CFSTRs of the same text by pointer.
+ *
+ * Missing, it was reported as an unimplemented import and the caller then used
+ * the nothing it was handed -- u-he's whole macOS range, Surge XT and Dexed
+ * all faulted here before reaching a line of their own code. The literal's
+ * address is stable for the life of the mapped image, so it is the key, and
+ * nothing in the table is ever freed: that is what "constant" means here. */
+static struct { const char *lit; CFTypeRef obj; } *g_cfconst;
+static size_t g_cfconst_n, g_cfconst_cap;
+static pthread_mutex_t g_cfconst_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static CFTypeRef cf_make_constant_string(const char *lit)
+{
+    CFTypeRef r = NULL;
+    size_t i;
+
+    if (!lit) return NULL;
+    pthread_mutex_lock(&g_cfconst_lock);
+    for (i = 0; i < g_cfconst_n; i++)
+        if (g_cfconst[i].lit == lit) { r = g_cfconst[i].obj; break; }
+    if (!r && (r = cf_string_create(NULL, lit, 0))) {
+        if (g_cfconst_n == g_cfconst_cap) {
+            size_t cap = g_cfconst_cap ? g_cfconst_cap * 2 : 64;
+            void *p = realloc(g_cfconst, cap * sizeof *g_cfconst);
+            if (p) { g_cfconst = p; g_cfconst_cap = cap; }
+        }
+        /* A full table costs a duplicate object, not a failure. */
+        if (g_cfconst_n < g_cfconst_cap) {
+            g_cfconst[g_cfconst_n].lit = lit;
+            g_cfconst[g_cfconst_n].obj = r;
+            g_cfconst_n++;
+        }
+    }
+    pthread_mutex_unlock(&g_cfconst_lock);
+    return r;
+}
+
 const macshim_entry macshim_corefoundation[] = {
     { "_CFRetain",  cf_retain },
     { "_CFRelease", cf_release },
     { "_CFGetTypeID", cf_gettypeid },
     { "_CFStringCreateWithCString", cf_string_create },
+    /* Three underscores: the C function is __CFStringMakeConstantString, and
+     * Mach-O prefixes one more. */
+    { "___CFStringMakeConstantString", cf_make_constant_string },
     { "_CFStringGetCString",        cf_string_getcstring },
     { "_CFArrayCreate",             cf_array_create },
     { "_CFArrayGetCount",           cf_array_count },

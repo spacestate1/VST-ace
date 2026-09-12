@@ -2546,6 +2546,7 @@ typedef struct {
     int             map_prot;          /* H_MAP: the mmap protection */
     int             map_own_fd;        /* H_MAP: we made the backing file */
     int             borrowed;          /* H_FILE: the CRT owns this fd, not us */
+    int             suspend;           /* H_THREAD: CREATE_SUSPENDED, until resumed */
     char            map_name[64];      /* H_MAP: the section's name, if any */
 } hobj;
 
@@ -3357,7 +3358,22 @@ static MS int32_t st_EndUpdateResourceW(void *upd, int32_t discard)
 
 static MS int32_t st_FlushFileBuffers(void *h)
 { hobj *o = h_get(h, H_FILE); return o ? fsync(o->fd) == 0 : 1; }
-static MS uint32_t st_GetFileType(void *h) { (void)h; return 1; /* FILE_TYPE_DISK */ }
+/* What kind of thing a handle is. FILE_TYPE_CHAR 2, FILE_TYPE_DISK 1.
+ *
+ * This answered FILE_TYPE_DISK for everything, the standard handles included,
+ * and every plug-in in the corpus imports it -- the MSVC CRT calls it while
+ * setting up stdio. Telling the CRT that stderr is a disk file makes it fully
+ * buffer it, so a plug-in's own diagnostics sit in a buffer instead of coming
+ * out, which is the opposite of what they are for. st_GetStdHandle hands out
+ * 1 for stdin and 2 for the other two, so those are the ones to answer for;
+ * anything else is a real file this host opened. */
+static MS uint32_t st_GetFileType(void *h)
+{
+    uintptr_t v = (uintptr_t)h;
+    if (v == 1) return isatty(STDIN_FILENO)  ? 2u : 1u;
+    if (v == 2) return isatty(STDOUT_FILENO) ? 2u : 1u;
+    return 1u;                                       /* FILE_TYPE_DISK */
+}
 static MS int32_t st_SetEndOfFile(void *h)
 { hobj *o = h_get(h, H_FILE); return o ? ftruncate(o->fd, lseek(o->fd, 0, SEEK_CUR)) == 0 : 0; }
 /* Normalised here as well as in the wide form: a plugin may build the narrow
@@ -3603,11 +3619,44 @@ static MS int32_t st_SleepConditionVariableSRW(void *cv, void *l, uint32_t ms, u
 static volatile int g_guest_threads;
 int w32_guest_threads(void) { return g_guest_threads; }
 
+/* How long a CREATE_SUSPENDED thread waits before starting anyway. See below:
+ * this is a backstop against a resume path this host does not implement, not
+ * a timeout anything is expected to reach. */
+#define W32_SUSPEND_WAIT_SECS 5
+
 static void *thread_trampoline(void *ud)
 {
     hobj *o = ud;
     MS uint32_t (*start)(void *) = (MS uint32_t (*)(void *))o->start;
     teb_install();
+    /* CREATE_SUSPENDED, honoured.
+     *
+     * The flag used to be discarded and the thread started immediately. A
+     * plug-in creates a thread suspended for one reason -- to fill in the
+     * state the thread will read before letting it run -- so starting anyway
+     * is a race on exactly the data the flag exists to protect, and one the
+     * plug-in has every reason to assume cannot happen.
+     *
+     * The wait is bounded because only ResumeThread resumes it here: a
+     * plug-in that resumes through a path this host has not implemented --
+     * NtResumeThread, say -- would otherwise deadlock where before it merely
+     * raced. Starting late and saying so is the worse of two right answers,
+     * and strictly better than the silent race it replaces. */
+    pthread_mutex_lock(&o->m);
+    if (o->suspend > 0) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += W32_SUSPEND_WAIT_SECS;
+        while (o->suspend > 0)
+            if (pthread_cond_timedwait(&o->c, &o->m, &until) == ETIMEDOUT) {
+                fprintf(stderr, "  [w32] a thread created suspended was never "
+                                "resumed in %d seconds -- starting it anyway\n",
+                        W32_SUSPEND_WAIT_SECS);
+                o->suspend = 0;
+                break;
+            }
+    }
+    pthread_mutex_unlock(&o->m);
     __sync_fetch_and_add(&g_guest_threads, 1);
     start(o->param);
     __sync_fetch_and_sub(&g_guest_threads, 1);
@@ -3618,10 +3667,11 @@ static MS void *st_CreateThread(void *sa, size_t stack, void *start, void *param
 {
     void *h = h_new(H_THREAD);
     hobj *o;
-    (void)sa; (void)stack; (void)flags;
+    (void)sa; (void)stack;
     if (!h) return NULL;
     o = h_get(h, H_THREAD);
     o->start = start; o->param = param;
+    o->suspend = (flags & 0x4u) ? 1 : 0;              /* CREATE_SUSPENDED */
     if (pthread_create(&o->th, NULL, thread_trampoline, o) != 0) { st_CloseHandle(h); return NULL; }
     if (tid) *tid = (uint32_t)(uintptr_t)o->th;
     return h;
@@ -4203,7 +4253,21 @@ static MS void st_FreeLibraryAndExitThread(void *mod, uint32_t code)
 { st_FreeLibrary(mod); st_ExitThread(code); }
 static MS int32_t st_GetExitCodeThread(void *h, uint32_t *code)
 { (void)h; if (code) *code = 0; return 1; }
-static MS uint32_t st_ResumeThread(void *h) { (void)h; return 1; }
+/* Windows returns the thread's previous suspend count, or (DWORD)-1 on
+ * failure. Returning a flat 1 said "it was suspended once and now is not"
+ * about a thread this host had already started regardless. */
+static MS uint32_t st_ResumeThread(void *h)
+{
+    hobj *o = h_get(h, H_THREAD);
+    uint32_t prev;
+
+    if (!o) return 0xFFFFFFFFu;
+    pthread_mutex_lock(&o->m);
+    prev = (uint32_t)o->suspend;
+    if (o->suspend > 0 && --o->suspend == 0) pthread_cond_broadcast(&o->c);
+    pthread_mutex_unlock(&o->m);
+    return prev;
+}
 static MS int32_t st_SetThreadPriority(void *h, int32_t p) { (void)h;(void)p; return 1; }
 static MS int32_t st_GetThreadPriority(void *h) { (void)h; return 0; }
 static MS uint32_t st_GetTempPathA(uint32_t n, char *buf)
@@ -4796,6 +4860,52 @@ static MS int32_t st_RegOpenKeyExW(void *k, const uint16_t *sub, uint32_t opt,
 static MS int32_t st_RegQueryValueExW(void *k, const uint16_t *name, uint32_t *res,
         uint32_t *type, void *data, uint32_t *len);                     /* below */
 static void c2w_(const char *s, uint16_t *w, size_t n);                 /* below */
+static MS int32_t st_RegCloseKey(void *k);                              /* below */
+
+/* RegGetValue: open, query and close in one call.
+ *
+ * A Vista-era convenience over the three below, and it was not implemented --
+ * so it fell to the generic missing-import stub, which answers 0. For a
+ * registry call 0 is ERROR_SUCCESS. The caller is told its query succeeded
+ * and handed a buffer nobody wrote, and what it does next is read a path out
+ * of uninitialised stack.
+ *
+ * That is how u-he's Windows plug-ins die here: they keep the location of
+ * their Data folder in the registry, ask for it this way, believe the answer,
+ * and fault on a worker thread a moment later with nothing to connect it to
+ * the registry at all. Answering honestly -- ERROR_FILE_NOT_FOUND when there
+ * is no such value -- lets a plug-in take the fallback it already has.
+ *
+ * RRF_RT_* type restrictions in `flags` are not enforced; every caller in
+ * this corpus asks for a string and the table only holds what was put in it. */
+static MS int32_t st_RegGetValueW(void *key, const uint16_t *subkey,
+                                  const uint16_t *value, uint32_t flags,
+                                  uint32_t *type, void *data, uint32_t *len)
+{
+    void *k = key;
+    int32_t r;
+    int opened = 0;
+
+    (void)flags;
+    if (subkey && subkey[0]) {
+        if ((r = st_RegOpenKeyExW(key, subkey, 0, 0x20019 /* KEY_READ */, &k)))
+            return r;                       /* ERROR_FILE_NOT_FOUND, usually */
+        opened = 1;
+    }
+    r = st_RegQueryValueExW(k, value, NULL, type, data, len);
+    if (opened) st_RegCloseKey(k);
+    return r;
+}
+static MS int32_t st_RegGetValueA(void *key, const char *subkey, const char *value,
+                                  uint32_t flags, uint32_t *type, void *data,
+                                  uint32_t *len)
+{
+    uint16_t ws[192], wv[128];
+    c2w_(subkey ? subkey : "", ws, 192);
+    c2w_(value ? value : "", wv, 128);
+    return st_RegGetValueW(key, subkey ? ws : NULL, value ? wv : NULL,
+                           flags, type, data, len);
+}
 
 static MS int32_t st_RegOpenKeyExA(void *k, const char *s, uint32_t o, uint32_t a, void **out)
 { uint16_t w[192]; c2w_(s ? s : "", w, 192); return st_RegOpenKeyExW(k, w, o, a, out); }
@@ -8262,9 +8372,60 @@ static MS uint32_t st_MapVirtualKeyW(uint32_t code, uint32_t type)
 { (void)type; return code >= 'A' && code <= 'Z' ? code : 0; }
 static MS uint32_t st_MapVirtualKeyA(uint32_t code, uint32_t type)
 { return st_MapVirtualKeyW(code, type); }
+/* A virtual key plus the keyboard state, as the character it stands for.
+ *
+ * This returned 0 -- "this key produces no character" -- for every key, which
+ * is the right answer only for a dead key. A plug-in that names its patches
+ * through its own text field asks this on each WM_KEYDOWN and got nothing,
+ * so nothing could be typed into one. A US layout is what the rest of this
+ * host assumes elsewhere, and it is what the keys on the caller's side were
+ * mapped to on the way in.
+ *
+ * Only the printable keys are answered. The control keys the caller gets as
+ * WM_KEYDOWN in its own right are deliberately left at 0, so that a Backspace
+ * is not delivered twice by two different routes. */
 static MS int32_t st_ToUnicode(uint32_t vk, uint32_t sc, const uint8_t *ks,
                                uint16_t *buf, int32_t n, uint32_t f)
-{ (void)vk;(void)sc;(void)ks;(void)buf;(void)n;(void)f; return 0; }
+{
+    static const char *const oem[][2] = {
+        /* VK_OEM_1 .. VK_OEM_3, then VK_OEM_4 .. VK_OEM_7, unshifted/shifted */
+        { ";", ":" }, { "=", "+" }, { ",", "<" }, { "-", "_" },
+        { ".", ">" }, { "/", "?" }, { "`", "~" }
+    };
+    static const char *const digits_shifted = ")!@#$%^&*(";
+    int shift, caps, ch = 0;
+
+    (void)sc; (void)f;
+    if (!buf || n < 1) return 0;
+    shift = ks && ((ks[0x10] & 0x80) != 0);           /* VK_SHIFT   */
+    caps  = ks && ((ks[0x14] & 0x01) != 0);           /* VK_CAPITAL */
+    /* A control chord is not a character: Ctrl+C is a command to the plug-in,
+     * and answering 0x03 for it would put a control code in a patch name. */
+    if (ks && (ks[0x11] & 0x80)) return 0;            /* VK_CONTROL */
+
+    if (vk >= 'A' && vk <= 'Z')
+        ch = (shift ^ caps) ? (int)vk : (int)vk + 32;
+    else if (vk >= '0' && vk <= '9')
+        ch = shift ? digits_shifted[vk - '0'] : (int)vk;
+    else if (vk == 0x20) ch = ' ';                    /* VK_SPACE    */
+    else if (vk >= 0x60 && vk <= 0x69) ch = '0' + (int)(vk - 0x60);  /* numpad */
+    else if (vk == 0x6A) ch = '*';
+    else if (vk == 0x6B) ch = '+';
+    else if (vk == 0x6D) ch = '-';
+    else if (vk == 0x6E) ch = '.';
+    else if (vk == 0x6F) ch = '/';
+    else if (vk >= 0xBA && vk <= 0xC0) ch = oem[vk - 0xBA][shift ? 1 : 0][0];
+    else if (vk >= 0xDB && vk <= 0xDE) {
+        static const char *const br[][2] = {
+            { "[", "{" }, { "\\", "|" }, { "]", "}" }, { "\'", "\"" }
+        };
+        ch = br[vk - 0xDB][shift ? 1 : 0][0];
+    }
+    if (!ch) return 0;
+    buf[0] = (uint16_t)ch;
+    if (n > 1) buf[1] = 0;
+    return 1;
+}
 
 /* A process token, enough to be opened and closed. Nothing here consults it for
  * a privilege decision. */
@@ -12106,6 +12267,7 @@ static const winstub g_stubs[] = {
     S("user32.dll", EnumDisplayMonitors),
     S("shell32.dll", SHAppBarMessage),
     S("advapi32.dll", RegOpenKeyExW), S("advapi32.dll", RegQueryValueExW),
+    S("advapi32.dll", RegGetValueW), S("advapi32.dll", RegGetValueA),
     S("advapi32.dll", RegCreateKeyExA), S("advapi32.dll", RegCreateKeyExW),
     S("advapi32.dll", RegSetValueExA), S("advapi32.dll", RegSetValueExW),
     S("advapi32.dll", RegDeleteValueW), S("advapi32.dll", RegDeleteKeyW),
