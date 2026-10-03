@@ -453,6 +453,50 @@ static int run_quiet(char *const argv[])
  * edit silently runs the previous binary, and that looks exactly like the edit
  * not having worked. The output is shown for the same reason -- a minute of
  * silence is indistinguishable from a hang. */
+/* Whether a library a link line names has gone from the disk -- the build was
+ * configured against a version a system update has since replaced.
+ *
+ * Qt's imported targets name the fully versioned file (libQt6Core.so.6.11.1),
+ * so even a patch-level update leaves every link line pointing at nothing.
+ * CMake is meant to notice and reconfigure by itself, but it decides by
+ * comparing timestamps, and pacman installs files with the time the package
+ * was built -- usually older than the last configure here. So it looks, rather
+ * than trusting a date. Any absolute library path counts, not just Qt's:
+ * freetype, PipeWire and the rest can go the same way. */
+static int link_paths_stale(const char *builddir)
+{
+    char dir[PATH_MAX];
+    DIR *d;
+    struct dirent *e;
+    int stale = 0;
+
+    snprintf(dir, sizeof dir, "%s/CMakeFiles", builddir);
+    if (!(d = opendir(dir))) return 0;
+    while (!stale && (e = readdir(d))) {
+        char path[PATH_MAX], tok[PATH_MAX];
+        size_t l = strlen(e->d_name);
+        FILE *f;
+        if (l < 5 || strcmp(e->d_name + l - 4, ".dir")) continue;
+        snprintf(path, sizeof path, "%s/%s/link.txt", dir, e->d_name);
+        if (!(f = fopen(path, "r"))) continue;
+        while (fscanf(f, "%4095s", tok) == 1) {
+            size_t tl = strlen(tok);
+            if (tok[0] != '/') continue;
+            if (!strstr(tok, ".so") && !(tl > 2 && !strcmp(tok + tl - 2, ".a")))
+                continue;
+            if (access(tok, F_OK) != 0) {
+                fprintf(stderr, "va: %s is gone (a system update?) -- "
+                                "reconfiguring %s\n", tok, builddir);
+                stale = 1;
+                break;
+            }
+        }
+        fclose(f);
+    }
+    closedir(d);
+    return stale;
+}
+
 static int cmake_build(const char *srcdir, const char *target)
 {
     char cache[PATH_MAX], builddir[PATH_MAX];
@@ -463,6 +507,11 @@ static int cmake_build(const char *srcdir, const char *target)
     if (!is_file(cache)) {
         char *conf[] = { "cmake", "-S", (char *)srcdir, "-B", builddir,
                          "-DCMAKE_BUILD_TYPE=Release", NULL };
+        if (run(conf) != 0) return -1;
+    } else if (link_paths_stale(builddir)) {
+        /* The cache stays: it holds whatever was chosen at the first
+         * configure, and only the generated link lines are out of date. */
+        char *conf[] = { "cmake", "-S", (char *)srcdir, "-B", builddir, NULL };
         if (run(conf) != 0) return -1;
     }
     {
