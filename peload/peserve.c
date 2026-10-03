@@ -77,6 +77,10 @@ static void drain(server *s)
         pehost_midi_at(s->h, e.status, e.d1, e.d2, e.at);
     }
     atomic_store_explicit(&sh->m_tail, t, memory_order_release);
+    /* After the ring, so the release lands behind everything that got
+     * through -- pehost then holds it until its own queue has drained. */
+    if (atomic_exchange_explicit(&sh->m_release, 0, memory_order_acq_rel))
+        pehost_release_all(s->h);
 }
 
 static void *audio_thread(void *ud)
@@ -187,7 +191,7 @@ static int handle_request(server *s, const bridge_req *qp, bridge_rep *rp)
         case BR_EDITOR_MOUSE:  /* legacy: the host now writes these to memory */
                                pehost_editor_mouse(s->h, q.a, q.b, q.c, q.d, q.e); break;
         case BR_EDITOR_KEY:    pehost_editor_key(s->h, q.a, q.b, q.c); break;
-        case BR_ALL_NOTES_OFF: pehost_all_notes_off(s->h); break;
+        case BR_ALL_NOTES_OFF: pehost_release_all(s->h); break;
         case BR_INPUT_MASK:    pehost_set_input_mask(s->h, (unsigned)q.a); break;
         case BR_IMPORT_STATS:  pehost_import_stats(&r.a, &r.b, &r.c); break;
         case BR_QUIT:

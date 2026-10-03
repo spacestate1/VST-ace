@@ -2062,6 +2062,18 @@ struct pehost {
     uint64_t blk_t0;
     unsigned ev_dropped;
     unsigned ev_spilled;
+
+    /* What the plugin has been told is sounding: a note-on delivered and no
+     * note-off yet, one bit per note per channel. Audio thread only. It is what
+     * lets a release be explicit note-offs rather than CC 123, which a good
+     * share of plugins ignore. */
+    unsigned char sounding[16][16];
+    /* Raised by anyone -- a producer that lost an event, a reader whose ALSA
+     * input overran, a channel change -- and answered by the audio thread with
+     * a note-off for everything in `sounding`. An atomic flag rather than a
+     * queue entry, because the queue being full is one of the reasons to raise
+     * it. */
+    _Atomic int release_req;
 };
 
 static char g_err[256];
@@ -2207,11 +2219,15 @@ static void ev_push_at(pehost *h, unsigned char t, unsigned char a, unsigned cha
     unsigned tl = atomic_load_explicit(&h->tail, memory_order_acquire);
     if (((hd + 1) & (EVQ - 1)) == (tl & (EVQ - 1))) {
         /* Dropping silently is how a sequencer ends up with a held note nobody
-         * asked for: the note-on got through and its note-off did not. Say so,
-         * once, so it is a reported fault rather than a mystery. */
+         * asked for: the note-on got through and its note-off did not. Which
+         * events were lost cannot be known, so everything sounding is released
+         * once the queue has drained -- a cut note is a glitch, a hung one has
+         * to be found and stopped by hand. Said once on stderr as well, so it
+         * is a reported fault rather than a mystery. */
         if (!h->ev_dropped++)
             fprintf(stderr, "pehost: the event queue overflowed -- some MIDI was "
-                            "lost, and a note may hang\n");
+                            "lost; releasing every sounding note\n");
+        atomic_store_explicit(&h->release_req, 1, memory_order_release);
         return;
     }
     h->evq[hd & (EVQ - 1)] = (ev_t){ t, a, b, c, v, mono_ns(), at };
@@ -3717,6 +3733,31 @@ void pehost_all_notes_off(pehost *h)
     pehost_midi(h, 0xB0, 120, 0);       /* all sound off  */
 }
 
+void pehost_release_all(pehost *h)
+{
+    int ch, n;
+    if (!h) return;
+    /* Behind the bridge the helper's own pehost does the work -- peserve
+     * answers BR_ALL_NOTES_OFF with this function. */
+    if (h->br) { bridge_all_notes_off(h->br); return; }
+    if (h->cl) {
+        /* VST 1.0 has no controllers to send, only notes. */
+        for (n = 0; n < 128; n++) pefvst_note(h->cl, 0, n, 0);
+        return;
+    }
+    if (!h->mv && !h->au && !h->is_v3 && h->fx) {
+        atomic_store_explicit(&h->release_req, 1, memory_order_release);
+        return;
+    }
+    /* The other hosts keep their own queues and no record of what is sounding,
+     * so the most that can be done from here is the controller pair on every
+     * channel. */
+    for (ch = 0; ch < 16; ch++) {
+        pehost_midi(h, 0xB0 | ch, 123, 0);
+        pehost_midi(h, 0xB0 | ch, 120, 0);
+    }
+}
+
 void pehost_render(pehost *h, float *inter, int frames)
 { pehost_render_io(h, NULL, inter, frames); }
 
@@ -3850,9 +3891,61 @@ static void render_io_block(pehost *h, const float *src, float *inter,
                 m->midiData[1] = (char)e.b;
                 m->midiData[2] = (char)e.c;
             }
+            {   /* Keep `sounding` in step with what the plugin was handed. */
+                int ch = e.a & 0x0f, kind = e.a & 0xf0;
+                unsigned char bit = (unsigned char)(1u << (e.b & 7));
+                if (kind == 0x90 && e.c) h->sounding[ch][e.b >> 3] |= bit;
+                else if (kind == 0x80 || kind == 0x90)
+                    h->sounding[ch][e.b >> 3] &= (unsigned char)~bit;
+                else if (kind == 0xB0 && (e.b == 123 || e.b == 120))
+                    memset(h->sounding[ch], 0, sizeof h->sounding[ch]);
+            }
         }
     }
     atomic_store_explicit(&h->tail, tl, memory_order_release);
+
+    /* A release that was asked for. Only once the queue is drained to where it
+     * stood at the top of this block: what is still queued arrived before the
+     * request, and a note-on behind the release would be the hung note this is
+     * here to prevent. The note-offs go at the end of the block, after
+     * everything else in it, and the CC 123 / 120 pair follows on every
+     * channel for whatever the plugin latched on its own -- a sustain pedal, a
+     * hold, an arpeggiator. More than one packet's worth carries over: each
+     * note-off clears its bit, so the next block picks up where this stopped. */
+    if (tl == hd &&
+        atomic_exchange_explicit(&h->release_req, 0, memory_order_acq_rel)) {
+        const int cap = (int)(sizeof pkt.m / sizeof pkt.m[0]);
+        int ch, n, done = 1;
+        for (ch = 0; ch < 16 && done; ch++)
+            for (n = 0; n < 128; n++) {
+                VstMidiEvent *m;
+                if (!(h->sounding[ch][n >> 3] & (1u << (n & 7)))) continue;
+                if (nev >= cap) { done = 0; break; }
+                h->sounding[ch][n >> 3] &= (unsigned char)~(1u << (n & 7));
+                m = &pkt.m[nev++];
+                m->type = 1;
+                m->byteSize = (int32_t)sizeof *m;
+                m->deltaFrames = frames - 1;
+                m->midiData[0] = (char)(0x80 | ch);
+                m->midiData[1] = (char)n;
+                m->midiData[2] = 0;
+            }
+        if (done && nev + 32 <= cap) {
+            for (ch = 0; ch < 16; ch++)
+                for (n = 0; n < 2; n++) {
+                    VstMidiEvent *m = &pkt.m[nev++];
+                    m->type = 1;
+                    m->byteSize = (int32_t)sizeof *m;
+                    m->deltaFrames = frames - 1;
+                    m->midiData[0] = (char)(0xB0 | ch);
+                    m->midiData[1] = (char)(n ? 120 : 123);
+                    m->midiData[2] = 0;
+                }
+            memset(h->sounding, 0, sizeof h->sounding);
+        } else {
+            atomic_store_explicit(&h->release_req, 1, memory_order_release);
+        }
+    }
 
     if (nev) {
         /* VstEvents declares events[2] but is really variable-length: the pointer

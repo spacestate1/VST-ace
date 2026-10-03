@@ -206,6 +206,17 @@ void  pehost_note_on(pehost *h, int note, int vel);
 void  pehost_note_off(pehost *h, int note);
 void  pehost_all_notes_off(pehost *h);
 
+/* Stop everything the plugin has been told is sounding, on every channel, by
+ * sending each note its note-off and then CC 123 and 120 on all sixteen. For
+ * when MIDI is known to have been lost -- an ALSA input overrun, a channel
+ * filter changed under held notes -- and pehost_all_notes_off would leave a
+ * plugin that ignores CC 123 holding a note forever. pehost does this itself
+ * when its own queue overflows.
+ *
+ * Safe from any thread, including several at once: it raises a flag the audio
+ * thread answers at the top of its next block. */
+void  pehost_release_all(pehost *h);
+
 /* The transport a plugin reads for tempo-synced behaviour -- arpeggiators,
  * synced delays, tempo-locked LFOs. Without this the host reports a fixed 120
  * BPM and every one of them runs at the wrong rate against a sequencer set to

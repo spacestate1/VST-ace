@@ -2786,6 +2786,7 @@ int    plugview_playing(void) { return P.host ? pehost_playing(P.host) : 0; }
 void plugview_note_on(int note, int vel)  { if (P.host) pehost_note_on(P.host, note, vel); }
 void plugview_note_off(int note)          { if (P.host) pehost_note_off(P.host, note); }
 void plugview_all_notes_off(void)         { if (P.host) pehost_all_notes_off(P.host); }
+void plugview_release_all(void)           { if (P.host) pehost_release_all(P.host); }
 
 void plugview_bend(int value14)
 {

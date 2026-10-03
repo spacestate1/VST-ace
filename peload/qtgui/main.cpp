@@ -2382,6 +2382,15 @@ public:
         midi_->setRealtimeSink([this](int st, int d1, int d2) {
             eng_.withHost([&](pehost *h) { pehost_midi(h, st, d1, d2); });
         });
+        /* Lost input: the plugin is released from the reader thread, straight
+         * away, and the keys and the internal voices from the GUI's below. */
+        midi_->setOverrunSink([this] {
+            eng_.withHost([](pehost *h) { pehost_release_all(h); });
+        });
+        connect(midi_, &MidiIo::overrun, this, [this] {
+            eng_.allNotesOff();
+            if (piano_) for (int n = 0; n < 128; n++) piano_->setHeld(n, false);
+        });
         QString mErr;
         if (!midi_->open(&mErr)) {
             midiSources_->setText("unavailable: " + mErr);
@@ -2404,6 +2413,12 @@ public:
                                       : QString("MIDI: no new sources"), 4000);
         });
         connect(midiChan_, &QComboBox::currentIndexChanged, this, [this](int) {
+            /* Release first: once the filter moves, a note held on the old
+             * channel has its note-off filtered out and would never stop. */
+            if (piano_) piano_->releaseAll();
+            eng_.withHost([](pehost *h) { pehost_release_all(h); });
+            eng_.allNotesOff();
+            if (piano_) for (int n = 0; n < 128; n++) piano_->setHeld(n, false);
             midi_->setChannelFilter(midiChan_->currentData().toInt());
         });
         connect(midiThru_, &QCheckBox::toggled, this, [this](bool on) { midi_->setThru(on); });

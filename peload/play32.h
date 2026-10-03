@@ -13,6 +13,7 @@
 #ifndef PELOAD_PLAY32_H
 #define PELOAD_PLAY32_H
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <poll.h>
 #include <pipewire/pipewire.h>
@@ -61,6 +62,12 @@ typedef struct {
     float     **ins, **outs;
     float       gain;
     play_ring   midi;
+    /* MIDI known to be lost -- the ring full, or ALSA's input overrun -- raised
+     * by the reader and answered by the RT thread with a note-off for every
+     * note in `sounding`, which only the RT thread touches. Without it, a lost
+     * note-off is a note that never stops. */
+    _Atomic int   lost;
+    unsigned char sounding[16][16];
 
     struct pw_thread_loop *loop;
     struct pw_stream      *stream;
@@ -93,21 +100,62 @@ static void play_teb_once(void)
     if (!done) { done = 1; if (teb_install()) fprintf(stderr, "play: no TEB on RT thread\n"); }
 }
 
+static void play_send(play_engine *e, const unsigned char *m)
+{
+    if (!play_push(&e->midi, m, 3))
+        atomic_store_explicit(&e->lost, 1, memory_order_release);
+}
+
+static void play_add(play_engine *e, int n, int st, int d1, int d2)
+{
+    VstMidiEvent32 *ev = &e->evm[n];
+    memset(ev, 0, sizeof *ev);
+    ev->type = 1;                           /* kVstMidiType */
+    ev->byteSize = sizeof *ev;
+    ev->midiData[0] = (char)st;
+    ev->midiData[1] = (char)d1;
+    ev->midiData[2] = (char)d2;
+    vstevents32_array(e->evbuf)[n] = ev;
+}
+
 static void play_feed_midi(play_engine *e)
 {
     play_msg m;
-    int n = 0;
+    int n = 0, drained;
 
     while (n < PLAY_MAXEV && play_pop(&e->midi, &m)) {
-        VstMidiEvent32 *ev = &e->evm[n];
-        memset(ev, 0, sizeof *ev);
-        ev->type = 1;                       /* kVstMidiType */
-        ev->byteSize = sizeof *ev;
-        ev->midiData[0] = (char)m.d[0];
-        ev->midiData[1] = (char)m.d[1];
-        ev->midiData[2] = (char)m.d[2];
-        vstevents32_array(e->evbuf)[n] = ev;
-        n++;
+        int ch = m.d[0] & 0x0f, kind = m.d[0] & 0xf0, k = m.d[1] & 0x7f;
+        play_add(e, n++, m.d[0], m.d[1], m.d[2]);
+        if (kind == 0x90 && m.d[2]) e->sounding[ch][k >> 3] |= (unsigned char)(1u << (k & 7));
+        else if (kind == 0x80 || kind == 0x90)
+            e->sounding[ch][k >> 3] &= (unsigned char)~(1u << (k & 7));
+        else if (kind == 0xb0 && (k == 123 || k == 120))
+            memset(e->sounding[ch], 0, sizeof e->sounding[ch]);
+    }
+    drained = atomic_load_explicit(&e->midi.tail, memory_order_relaxed) ==
+              atomic_load_explicit(&e->midi.head, memory_order_acquire);
+
+    /* The release, once what was queued before the loss has gone out -- a
+     * note-on left behind it would hang all over again. Each note-off clears
+     * its bit, so a release bigger than one block carries over; the CC 123 /
+     * 120 pair on every channel goes last, for anything the plugin latched. */
+    if (drained && atomic_exchange_explicit(&e->lost, 0, memory_order_acq_rel)) {
+        int ch, k, done = 1;
+        for (ch = 0; ch < 16 && done; ch++)
+            for (k = 0; k < 128; k++) {
+                if (!(e->sounding[ch][k >> 3] & (1u << (k & 7)))) continue;
+                if (n >= PLAY_MAXEV) { done = 0; break; }
+                e->sounding[ch][k >> 3] &= (unsigned char)~(1u << (k & 7));
+                play_add(e, n++, 0x80 | ch, k, 0);
+            }
+        if (done && n + 32 <= PLAY_MAXEV) {
+            for (ch = 0; ch < 16; ch++) {
+                play_add(e, n++, 0xb0 | ch, 123, 0);
+                play_add(e, n++, 0xb0 | ch, 120, 0);
+            }
+        } else {
+            atomic_store_explicit(&e->lost, 1, memory_order_release);
+        }
     }
     if (!n) return;
     {
@@ -204,42 +252,53 @@ static void *play_seq_thread(void *ud)
         if (poll(pfd, (unsigned)nfd, 100) < 0) continue;
         /* Drain on pending, not on the fd: one wakeup can carry several events
          * and reading only one leaves the rest queued until the next note. */
-        while (snd_seq_event_input_pending(e->seq, 1) > 0) {
+        for (;;) {
             snd_seq_event_t *ev = NULL;
             unsigned char m[3];
-            if (snd_seq_event_input(e->seq, &ev) < 0 || !ev) break;
+            /* An input overrun is reported once, by whichever call next reads
+             * the kernel -- input_pending with fetch set is one. The events it
+             * threw away may have held note-offs. */
+            int r = snd_seq_event_input_pending(e->seq, 1);
+            if (r > 0) r = snd_seq_event_input(e->seq, &ev);
+            else if (r == 0) break;
+            if (r == -ENOSPC) {
+                fprintf(stderr, "play: MIDI input overran; releasing every note\n");
+                atomic_store_explicit(&e->lost, 1, memory_order_release);
+                continue;
+            }
+            if (r < 0 || !ev) break;
             switch (ev->type) {
             case SND_SEQ_EVENT_NOTEON:
                 m[0] = 0x90 | (ev->data.note.channel & 0x0f);
                 m[1] = ev->data.note.note;
                 m[2] = ev->data.note.velocity;
-                play_push(&e->midi, m, 3);
+                play_send(e, m);
                 break;
             case SND_SEQ_EVENT_NOTEOFF:
                 m[0] = 0x80 | (ev->data.note.channel & 0x0f);
                 m[1] = ev->data.note.note;
                 m[2] = ev->data.note.velocity;
-                play_push(&e->midi, m, 3);
+                play_send(e, m);
                 break;
             case SND_SEQ_EVENT_CONTROLLER:
                 m[0] = 0xb0 | (ev->data.control.channel & 0x0f);
                 m[1] = (unsigned char)ev->data.control.param;
                 m[2] = (unsigned char)ev->data.control.value;
-                play_push(&e->midi, m, 3);
+                play_send(e, m);
                 break;
             case SND_SEQ_EVENT_PITCHBEND: {
                 int v = ev->data.control.value + 8192;
                 m[0] = 0xe0 | (ev->data.control.channel & 0x0f);
                 m[1] = (unsigned char)(v & 0x7f);
                 m[2] = (unsigned char)((v >> 7) & 0x7f);
-                play_push(&e->midi, m, 3);
+                play_send(e, m);
                 break;
             }
             case SND_SEQ_EVENT_PGMCHANGE:
                 m[0] = 0xc0 | (ev->data.control.channel & 0x0f);
                 m[1] = (unsigned char)ev->data.control.value;
                 m[2] = 0;
-                play_push(&e->midi, m, 3);
+                play_send(e, m);
                 break;
             default: break;
             }

@@ -35,7 +35,10 @@ typedef struct {
      * separate member. See VSTEVENTS32_BYTES. */
     void          *evbuf;
     VstMidiEvent32 evm[BRIDGE_MIDIQ];
-    unsigned      in_mask;         /* which input channels get the fed signal; 0 = all */
+    /* Notes the plugin was sent and not yet released, one bit per note per
+     * channel, for answering sh->m_release. Audio thread only. */
+    unsigned char sounding[16][16];
+    unsigned      in_mask;        /* which input channels get the fed signal; 0 = all */
     double        last_publish;    /* ms; caps the pump at ~80 Hz */
 } serve_state;
 
@@ -69,6 +72,18 @@ static int sv_alloc(serve_state *s, int frames)
     return 0;
 }
 
+static void sv_add(serve_state *s, int n, int st, int d1, int d2)
+{
+    VstMidiEvent32 *ev = &s->evm[n];
+    memset(ev, 0, sizeof *ev);
+    ev->type = 1;
+    ev->byteSize = sizeof *ev;
+    ev->midiData[0] = (char)st;
+    ev->midiData[1] = (char)d1;
+    ev->midiData[2] = (char)d2;
+    vstevents32_array(s->evbuf)[n] = ev;
+}
+
 /* Drain the parameter and MIDI rings. Runs on the audio thread, immediately
  * before process(), which is where VST2 wants both to land. */
 static void sv_drain(serve_state *s)
@@ -90,16 +105,39 @@ static void sv_drain(serve_state *s)
     h = atomic_load_explicit(&sh->m_head, memory_order_acquire);
     for (; t != h && n < BRIDGE_MIDIQ; t++, n++) {
         bridge_ev m = sh->mq[t % BRIDGE_MIDIQ];
-        VstMidiEvent32 *ev = &s->evm[n];
-        memset(ev, 0, sizeof *ev);
-        ev->type = 1;
-        ev->byteSize = sizeof *ev;
-        ev->midiData[0] = (char)m.status;
-        ev->midiData[1] = (char)m.d1;
-        ev->midiData[2] = (char)m.d2;
-        vstevents32_array(s->evbuf)[n] = ev;
+        int ch = m.status & 0x0f, kind = m.status & 0xf0, k = m.d1 & 0x7f;
+        sv_add(s, n, m.status, m.d1, m.d2);
+        if (kind == 0x90 && m.d2) s->sounding[ch][k >> 3] |= (unsigned char)(1u << (k & 7));
+        else if (kind == 0x80 || kind == 0x90)
+            s->sounding[ch][k >> 3] &= (unsigned char)~(1u << (k & 7));
+        else if (kind == 0xb0 && (k == 123 || k == 120))
+            memset(s->sounding[ch], 0, sizeof s->sounding[ch]);
     }
     atomic_store_explicit(&sh->m_tail, t, memory_order_release);
+
+    /* A release that was asked for, once the ring has drained to where it
+     * stood -- a note-on still queued would hang again behind it. Note-offs
+     * for everything sounding, then CC 123 / 120 on every channel for what the
+     * plugin latched itself. Each note-off clears its bit, so one too big for
+     * this block finishes in the next. */
+    if (t == h && atomic_exchange_explicit(&sh->m_release, 0, memory_order_acq_rel)) {
+        int ch, k, done = 1;
+        for (ch = 0; ch < 16 && done; ch++)
+            for (k = 0; k < 128; k++) {
+                if (!(s->sounding[ch][k >> 3] & (1u << (k & 7)))) continue;
+                if (n >= BRIDGE_MIDIQ) { done = 0; break; }
+                s->sounding[ch][k >> 3] &= (unsigned char)~(1u << (k & 7));
+                sv_add(s, n++, 0x80 | ch, k, 0);
+            }
+        if (done && n + 32 <= BRIDGE_MIDIQ) {
+            for (ch = 0; ch < 16; ch++) {
+                sv_add(s, n++, 0xb0 | ch, 123, 0);
+                sv_add(s, n++, 0xb0 | ch, 120, 0);
+            }
+        } else {
+            atomic_store_explicit(&sh->m_release, 1, memory_order_release);
+        }
+    }
     if (n) {
         VstEvents32 *ve = s->evbuf;
         ve->numEvents = n;
@@ -400,17 +438,13 @@ static int serve_run(AEffect32 *fx, int sock, const char *shm_path)
             w32_key(q.a, q.b, q.c);
             break;
         case BR_INPUT_MASK:    S.in_mask = (unsigned)q.a; break;
-        case BR_ALL_NOTES_OFF: {
-            int ch;
-            for (ch = 0; ch < 16; ch++) {
-                bridge_ev m;
-                uint32_t hd = atomic_load_explicit(&sh->m_head, memory_order_relaxed);
-                m.status = (uint8_t)(0xB0 | ch); m.d1 = 123; m.d2 = 0; m.pad = 0;
-                sh->mq[hd % BRIDGE_MIDIQ] = m;
-                atomic_store_explicit(&sh->m_head, hd + 1, memory_order_release);
-            }
+        case BR_ALL_NOTES_OFF:
+            /* Raised rather than written into mq: the host is that ring's one
+             * producer, and a second one here, on another thread, could
+             * overwrite its entries. The audio thread sends each sounding note
+             * its note-off and the CC 123 / 120 pair on every channel. */
+            atomic_store_explicit(&sh->m_release, 1, memory_order_release);
             break;
-        }
         case BR_IMPORT_STATS: {
             int i, hit = 0;
             for (i = 0; i < g_nimp; i++) if (g_imp[i].calls) hit++;

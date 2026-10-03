@@ -25,6 +25,7 @@
 #define PELOAD_LIVE_H
 
 #include <alsa/asoundlib.h>
+#include <errno.h>
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
 #include <pthread.h>
@@ -107,8 +108,21 @@ static void *live_reader(void *ud)
         snd_seq_poll_descriptors(st->seq, pfd, (unsigned)n, POLLIN);
         /* A timeout rather than an indefinite wait, so stopping does not hang. */
         if (poll(pfd, (nfds_t)n, 50) <= 0) continue;
-        while (snd_seq_event_input_pending(st->seq, 1) > 0) {
-            if (snd_seq_event_input(st->seq, &ev) < 0 || !ev) break;
+        for (;;) {
+            /* The kernel's input pool overran: events were thrown away before
+             * we saw them, and any of them could have been a note-off. ALSA
+             * says so once, from whichever call next reads the kernel -- with
+             * fetch set, input_pending is one -- and then carries on, so this
+             * is the only chance. */
+            int r = snd_seq_event_input_pending(st->seq, 1);
+            if (r > 0) r = snd_seq_event_input(st->seq, &ev);
+            else if (r == 0) break;
+            if (r == -ENOSPC) {
+                fprintf(stderr, "live: MIDI input overran; releasing every note\n");
+                pehost_release_all(st->h);
+                continue;
+            }
+            if (r < 0 || !ev) break;
             live_dispatch(st, ev);
         }
     }

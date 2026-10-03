@@ -38,8 +38,10 @@
 #define BRIDGE_MAGIC    0x50423332u        /* 'PB32' */
 /* 2: MIDI events carry the frame they belong at, so a sequencer's timing
  * survives the crossing. Both sides are built together, so the check exists to
- * catch a stale helper binary rather than to support old ones. */
-#define BRIDGE_VERSION  2
+ * catch a stale helper binary rather than to support old ones.
+ * 3: m_release, so MIDI lost to a full ring releases what it may have left
+ * hanging. */
+#define BRIDGE_VERSION  3
 
 /* Generous enough for any period a host will ask for; the helper clamps. */
 #define BRIDGE_MAX_FRAMES  8192
@@ -119,6 +121,12 @@ typedef struct {
     /* ---- MIDI, GUI thread -> audio ---- */
     _Atomic uint32_t m_head, m_tail;
     bridge_ev      mq[BRIDGE_MIDIQ];
+    /* Release every sounding note. Raised by the host when the ring above was
+     * full and an event was lost -- possibly a note-off -- and by the helper's
+     * own BR_ALL_NOTES_OFF; answered on the helper's audio thread once the
+     * ring has drained, so nothing queued before it can restart a note. A flag
+     * rather than an entry in mq, because mq being full is why it is raised. */
+    _Atomic uint32_t m_release;
 
     /* ---- editor, helper -> host ----
      * The helper pumps the Win32 layer on its own thread and republishes the

@@ -34,6 +34,7 @@
 #include <spa/param/audio/format-utils.h>
 #include <gtk/gtk.h>
 #include <pthread.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <math.h>
@@ -1417,6 +1418,23 @@ static void note_stop(int n, int local)
 static void note_on(int n, int vel) { note_start(n, vel, 1); }
 static void note_off(int n)         { note_stop(n, 1); }
 
+/* Everything sounding, stopped everywhere it sounds: the drawn keys, the out
+ * port, the engines, and the plug-in on every channel.
+ *
+ * The held keys are released as if played here, so the out port hears a
+ * note-off for each note-on it was sent -- a note still held when this runs
+ * would otherwise be unstoppable from here, since U.held no longer says it is
+ * down. That only covers channel 1, though, and a note that came in on
+ * another channel is still sounding in the plug-in, which is what the release
+ * behind it is for. */
+static void release_all_notes(void)
+{
+    int n;
+    for (n = 0; n < 128; n++) note_stop(n, 1);
+    if (plugview_active()) plugview_release_all();
+    ev_push(EV_ALLOFF, 0, 0);
+}
+
 static void on_press(GtkGestureClick *g, int np, double x, double y, gpointer u)
 {
     (void)g; (void)np; (void)u;
@@ -1696,8 +1714,12 @@ static void on_chan_changed(GtkDropDown *d, GParamSpec *ps, gpointer u)
 {
     int ch = (int)gtk_drop_down_get_selected(d) - 1;   /* 0 = Omni */
     (void)ps; (void)u;
+    /* Released before the filter moves, not after: a note held on the old
+     * channel has its note-off filtered out from here on, so whatever is
+     * sounding now would never stop -- in the plug-in as much as the engines,
+     * and in the drawn keys too. */
+    release_all_notes();
     atomic_store_explicit(&g_midi_ch, ch, memory_order_relaxed);
-    ev_push(EV_ALLOFF, 0, 0);
     /* The same setting is a radio item under Inputs, and a menu still showing
      * the old channel is worse than no menu at all. The guard is for the trip
      * back: the action's handler sets this drop-down too. */
@@ -2044,10 +2066,23 @@ static int midi_rescan(void)
 static gboolean poll_midi(gpointer u)
 {
     snd_seq_event_t *ev;
+    int r;
     (void)u;
     if (!U.seq) return G_SOURCE_REMOVE;
-    while (snd_seq_event_input(U.seq, &ev) >= 0) {
+    while ((r = snd_seq_event_input(U.seq, &ev)) != -EAGAIN) {
         int status = -1, d1 = 0, d2 = 0, ch, voice;
+
+        /* The kernel's input pool overran -- easy to do with this poll on the
+         * GTK thread and an editor busy drawing -- and threw events away
+         * before they were read. Any of them could have been a note-off. ALSA
+         * reports it once and then carries on, so this is the one chance to
+         * stop whatever it left hanging. */
+        if (r == -ENOSPC) {
+            fprintf(stderr, "dwstudio: MIDI input overran; releasing every note\n");
+            release_all_notes();
+            continue;
+        }
+        if (r < 0) break;
 
         /* Every message is turned back into the three bytes it was on the
          * wire. That is what the plug-in wants -- a wheel, a pedal, aftertouch
@@ -2488,6 +2523,9 @@ static void on_midi_channel(GSimpleAction *a, GVariant *v, gpointer ud)
 {
     int ch = g_variant_get_int32(v);
     (void)ud;
+    /* The drop-down's handler releases held notes when this moves it; with no
+     * drop-down nothing else would. */
+    if (!GTK_IS_WIDGET(U.chan_dd)) release_all_notes();
     atomic_store_explicit(&g_midi_ch, ch, memory_order_relaxed);
     g_simple_action_set_state(a, v);
     if (GTK_IS_WIDGET(U.chan_dd) && !U.chan_echo) {
@@ -2506,11 +2544,8 @@ static void on_midi_channel(GSimpleAction *a, GVariant *v, gpointer ud)
  * key -- which is harder to recognise as the cause than a held note is. */
 static void act_panic(GSimpleAction *a, GVariant *p, gpointer ud)
 {
-    int n;
     (void)a; (void)p; (void)ud;
-    for (n = 0; n < 128; n++) note_stop(n, 1);
-    if (plugview_active()) plugview_all_notes_off();
-    ev_push(EV_ALLOFF, 0, 0);
+    release_all_notes();
     midi_send(0xB0, 123, 0);
     bend_recentre();
 }

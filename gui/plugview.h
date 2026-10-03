@@ -115,6 +115,10 @@ void plugview_set_note_key(int (*claims)(guint keyval));
 void plugview_note_on(int note, int vel);
 void plugview_note_off(int note);
 void plugview_all_notes_off(void);
+/* Every note the plug-in was sent, on every channel, released by its own
+ * note-off -- see pehost_release_all. For when MIDI is known to be lost, which
+ * all-notes-off alone does not cover for a plug-in that ignores CC 123. */
+void plugview_release_all(void);
 void plugview_program(int idx);
 
 /* Pitch bend, in MIDI's own 14-bit form (0..16383, 8192 at rest). Left in that

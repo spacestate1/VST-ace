@@ -49,6 +49,7 @@ struct bridge {
     int         pending;
     int         behind;            /* consecutive blocks with no reply */
     int         reported_dead;
+    unsigned    midi_dropped;      /* events lost to a full MIDI ring */
     /* What it takes to build the same helper again after one has died, and to
      * put the plug-in back the way the user had it. See bridge_recover. */
     char        path[1024];
@@ -628,7 +629,15 @@ void bridge_midi_at(bridge *b, int status, int d1, int d2, int at)
     s = b->sh;
     h = atomic_load_explicit(&s->m_head, memory_order_relaxed);
     t = atomic_load_explicit(&s->m_tail, memory_order_acquire);
-    if (h - t >= BRIDGE_MIDIQ) return;
+    if (h - t >= BRIDGE_MIDIQ) {
+        /* Lost, and it may have been a note-off. The helper releases
+         * everything once it has drained what got through. */
+        if (!b->midi_dropped++)
+            fprintf(stderr, "bridge: the MIDI ring overflowed -- some MIDI was "
+                            "lost; releasing every sounding note\n");
+        atomic_store_explicit(&s->m_release, 1, memory_order_release);
+        return;
+    }
     s->mq[h % BRIDGE_MIDIQ].at     = at;
     s->mq[h % BRIDGE_MIDIQ].status = (uint8_t)status;
     s->mq[h % BRIDGE_MIDIQ].d1     = (uint8_t)d1;

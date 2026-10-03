@@ -3,6 +3,8 @@
 #include <QSocketNotifier>
 #include <QString>
 #include <alsa/asoundlib.h>
+#include <cerrno>
+#include <cstdio>
 #include <poll.h>
 #include <time.h>
 
@@ -227,8 +229,21 @@ void MidiIo::drain()
      * with the fd already quiet -- and QSocketNotifier is level-triggered on
      * the fd, so it would not fire again and those events would be stranded.
      * Passing 1 lets ALSA also pull anything new from the kernel. */
-    while (snd_seq_event_input_pending(seq_, 1) > 0) {
-        if (snd_seq_event_input(seq_, &ev) < 0 || !ev) break;
+    for (;;) {
+        /* The kernel's input pool overran and threw events away unread. ALSA
+         * says so once, from whichever call next reads the kernel -- with
+         * fetch set, input_pending is one -- and then carries on, so this is
+         * the only chance to stop the notes whose note-offs went with them. */
+        int r = snd_seq_event_input_pending(seq_, 1);
+        if (r > 0) r = snd_seq_event_input(seq_, &ev);
+        else if (r == 0) break;
+        if (r == -ENOSPC) {
+            fprintf(stderr, "midi: input overran; releasing every note\n");
+            if (overrunSink_) overrunSink_();
+            emit overrun();
+            continue;
+        }
+        if (r < 0 || !ev) break;
 
         /* Channel filter applies to voice messages only, so clock and sysex
          * still get through when a single channel is selected. */

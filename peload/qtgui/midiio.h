@@ -87,6 +87,12 @@ public:
      * Set before open(). */
     void setRealtimeSink(std::function<void(int, int, int)> f) { rtSink_ = std::move(f); }
 
+    /* Called on the reader thread when ALSA's input overran and events were
+     * lost before they could be read -- any of them a note-off. Whatever it
+     * does must be thread-safe, as the realtime sink's must; the overrun()
+     * signal follows for the GUI's side. Set before open(). */
+    void setOverrunSink(std::function<void()> f) { overrunSink_ = std::move(f); }
+
 signals:
     /* Raw status byte including channel, then the data bytes. */
     void midi(int status, int d1, int d2);
@@ -94,6 +100,7 @@ signals:
     void noteOff(int note);
     void programChange(int program);
     void connectionsChanged();
+    void overrun();
 
 private slots:
     void drain();
@@ -107,7 +114,8 @@ private:
     void detachNotifiers();
 
     std::function<void(int, int, int)> rtSink_;
-    std::thread              reader_;
+    std::function<void()>    overrunSink_;
+    std::thread             reader_;
     std::atomic<bool>        stop_{false};
 
     /* send() runs on two threads -- the GUI's, for the on-screen piano and the
