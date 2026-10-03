@@ -185,6 +185,49 @@ int vstdirs_add(const char *os, const char *dir)
     return vstdirs_save(dirs, n) ? -1 : 1;
 }
 
+int vstdirs_identify(const char *path, vstdirs_id *id)
+{
+    struct stat st;
+
+    memset(id, 0, sizeof *id);
+    if (!path || stat(path, &st)) return -1;
+    id->dev     = (unsigned long long)st.st_dev;
+    id->ino     = (unsigned long long)st.st_ino;
+    id->size    = (unsigned long long)st.st_size;
+    id->regular = S_ISREG(st.st_mode);
+    return 0;
+}
+
+int vstdirs_same_plugin(const char *a, const vstdirs_id *ia,
+                        const char *b, const vstdirs_id *ib)
+{
+    FILE *fa, *fb;
+    char  ba[65536], bb[65536];
+    int   same = 1;
+
+    if (!ia->ino && !ia->dev) return 0;              /* could not be stat'ed */
+    if (ia->dev == ib->dev && ia->ino == ib->ino) return 1;
+    if (!ia->regular || !ib->regular || ia->size != ib->size || !ia->size) return 0;
+    /* A copy keeps its name. Asking for that as well is what keeps this cheap
+     * on a collection built from one template -- hundreds of plug-ins of the
+     * same size -- where comparing contents pairwise would read the lot. */
+    {
+        const char *na = strrchr(a, '/'), *nb = strrchr(b, '/');
+        if (strcmp(na ? na + 1 : a, nb ? nb + 1 : b)) return 0;
+    }
+    if (!(fa = fopen(a, "rb"))) return 0;
+    if (!(fb = fopen(b, "rb"))) { fclose(fa); return 0; }
+    for (;;) {
+        size_t na = fread(ba, 1, sizeof ba, fa);
+        size_t nb = fread(bb, 1, sizeof bb, fb);
+        if (na != nb || memcmp(ba, bb, na)) { same = 0; break; }
+        if (na < sizeof ba) break;
+    }
+    fclose(fa);
+    fclose(fb);
+    return same;
+}
+
 int vstdirs_remove(const char *dir)
 {
     vstdir dirs[VSTDIRS_MAX];

@@ -2515,6 +2515,7 @@ private:
         QString name, path, label, os, fmt;
         int     kind = 0;                /* pehost_kind, for the sort within a platform */
         bool    loadable = false;
+        vstdirs_id id{};                 /* which file it is, for spotting it found twice */
     };
 
 private slots:
@@ -2624,10 +2625,21 @@ private slots:
                 if (isV3 || isV2 || isMac || isClassic || isLinuxV2) {
                     const QString abs = fi.absoluteFilePath();
                     /* Roots overlap -- a system VST directory can sit inside a
-                     * corpus, and a user can add one that is already scanned.
-                     * The same file must not be listed twice. */
+                     * corpus, a user can add one that is already scanned, a
+                     * VST_PATH folder can be symlinks into one, and ~/.vst can
+                     * hold a copy of what a corpus has. The same plug-in is
+                     * listed once, wherever it was found first. */
+                    const QByteArray absb = abs.toLocal8Bit();
+                    vstdirs_id id;
+                    vstdirs_identify(absb.constData(), &id);
                     bool dup = false;
-                    for (const Entry &e : out) if (e.path == abs) { dup = true; break; }
+                    for (const Entry &e : out)
+                        if (e.path == abs ||
+                            vstdirs_same_plugin(absb.constData(), &id,
+                                                e.path.toLocal8Bit().constData(), &e.id)) {
+                            dup = true;
+                            break;
+                        }
                     if (dup) continue;
 
                     /* One verdict, not three. pehost_classify says what the
@@ -2647,6 +2659,7 @@ private slots:
                     e.os       = QString::fromLatin1(info.os);
                     e.fmt      = QString::fromLatin1(info.format);
                     e.loadable = info.loadable != 0;
+                    e.id       = id;
                     /* Room for a real explanation: "Classic Mac OS / Carbon
                      * (CFM/PEF, PowerPC)" is worth showing in full. */
                     e.label = nm + "   [" +

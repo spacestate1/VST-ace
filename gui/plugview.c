@@ -81,6 +81,7 @@ typedef struct {
     char os[16];              /* "windows" | "linux" | "macos" | "classic" */
     char fmt[8];              /* "VST2" | "VST3" | "AU" */
     int  kindv;               /* pehost_kind, ordering formats within a platform */
+    vstdirs_id id;            /* which file it is, for spotting it found twice */
 } entry;
 
 /* One entry in the platform dropdown: a corpus directory and what to call it. */
@@ -564,12 +565,19 @@ static void scan_tree(const char *dir)
              * find, and "why is it not there" is a worse question than "why
              * will it not load". pestudio does the same. */
             {   /* Folders overlap -- a system VST directory can sit inside a
-                 * corpus, and the user can add one that is already scanned.
-                 * The same file must not be listed twice. */
+                 * corpus, the user can add one that is already scanned, a
+                 * VST_PATH folder can be symlinks into one, and ~/.vst can hold
+                 * a copy of what a corpus has. The same plug-in is listed once,
+                 * wherever it was found first. */
+                vstdirs_id id;
                 int k, seen = 0;
+                vstdirs_identify(path, &id);
                 for (k = 0; k < P.nplug; k++)
-                    if (!strcmp(P.plug[k].path, path)) { seen = 1; break; }
+                    if (!strcmp(P.plug[k].path, path) ||
+                        vstdirs_same_plugin(path, &id, P.plug[k].path, &P.plug[k].id))
+                        { seen = 1; break; }
                 if (seen) continue;
+                P.plug[P.nplug].id = id;
             }
             e = &P.plug[P.nplug++];
             snprintf(e->path, sizeof e->path, "%s", path);

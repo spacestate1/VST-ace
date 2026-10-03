@@ -90,6 +90,29 @@ int vstdirs_save(const vstdir *dirs, int n);
 int vstdirs_add(const char *os, const char *dir);
 int vstdirs_remove(const char *dir);
 
+/* Which plug-in a path is, for spotting the same one found twice while
+ * scanning. The folders a browser walks overlap in ways a path comparison
+ * cannot see: a VST_PATH folder of symlinks into a corpus, ~/.vst holding a
+ * copy of something the corpus also has. Taken once per candidate and kept,
+ * so comparing against everything already listed costs no further stats. */
+typedef struct {
+    unsigned long long dev, ino, size;
+    int                regular;       /* a plain file, so its bytes can be compared */
+} vstdirs_id;
+
+/* 0, or -1 when the path cannot be stat'ed (the id is then all zero, and
+ * matches nothing). Symlinks are followed. */
+int vstdirs_identify(const char *path, vstdirs_id *id);
+
+/* Whether two candidates are the same plug-in: the same file however it was
+ * reached, or two plain files with identical contents. Contents are read only
+ * when the names and sizes already agree, which for distinct plug-ins is
+ * almost never.
+ * A bundle directory is the same only as itself -- two copies of a .vst3 are
+ * left as two. */
+int vstdirs_same_plugin(const char *a, const vstdirs_id *ia,
+                        const char *b, const vstdirs_id *ib);
+
 #ifdef __cplusplus
 }
 #endif
