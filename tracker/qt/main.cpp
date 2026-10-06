@@ -1,5 +1,8 @@
-// tracker -- the Qt window. Draws the song and hands keys to core/; every
-// decision about what a key does or what a file means is made there.
+// tracker -- the Qt UI. TrackerWidget is the whole tracker as a widget, so a
+// shell can host it in a tab; TrackerWindow, at the bottom, is the standalone
+// binary's thin shell around it. The widget draws the song and hands keys to
+// core/; every decision about what a key does or what a file means is made
+// there.
 #include "trk.h"
 #include "drumkit.h"
 
@@ -703,18 +706,33 @@ private:
     bool dirty_ = false, filling_ = false;
 };
 
-// ------------------------------------------------------------- the window --
+// -------------------------------------------------------- the host interface --
+//
+// TrackerWidget is the whole tracker UI as a plain widget, so a shell can
+// host it in a tab. What it needs from whatever window holds it -- top-level
+// menus to fill, a status line to write to, a way to ask to quit -- is a
+// TrackerHost; the standalone window at the bottom is one.
 
-class Window : public QMainWindow {
+class TrackerHost {
+public:
+    virtual ~TrackerHost() = default;
+    virtual QMenu *addMenu(const QString &title) = 0;          // a top-level menu, to fill
+    virtual void showStatus(const QString &msg, int ms) = 0;   // on the status line; ms a timeout
+    virtual void requestQuit() = 0;                            // File > Quit
+};
+
+// ------------------------------------------------------------- the widget --
+
+class TrackerWidget : public QWidget {
     Q_OBJECT
 public:
-    explicit Window(trk_engine *e) : e_(e), saved_(new trk_song)
+    TrackerWidget(trk_engine *e, TrackerHost *host, QWidget *parent = nullptr)
+        : QWidget(parent), e_(e), host_(host), saved_(new trk_song)
     {
         trk_editor_init(&ed_);
         trk_song_init(saved_.get());
 
-        auto *central = new QWidget;
-        auto *v = new QVBoxLayout(central);
+        auto *v = new QVBoxLayout(this);
         v->setContentsMargins(6, 6, 6, 0);
         v->setSpacing(4);
 
@@ -846,21 +864,19 @@ public:
         connect(scroll_->horizontalScrollBar(), &QScrollBar::valueChanged,
                 headScroll_->horizontalScrollBar(), &QScrollBar::setValue);
 
-        setCentralWidget(central);
-
-        // Menus.
-        QMenu *file = menuBar()->addMenu("&File");
-        file->addAction("&New", QKeySequence::New, this, &Window::newSong);
-        file->addAction("&Open…", QKeySequence::Open, this, &Window::openSong);
-        file->addAction("&Save", QKeySequence::Save, this, &Window::save);
-        file->addAction("Save &As…", QKeySequence::SaveAs, this, &Window::saveAs);
+        // Menus, on the host's menu bar.
+        QMenu *file = host_->addMenu("&File");
+        file->addAction("&New", QKeySequence::New, this, &TrackerWidget::newSong);
+        file->addAction("&Open…", QKeySequence::Open, this, &TrackerWidget::openSong);
+        file->addAction("&Save", QKeySequence::Save, this, &TrackerWidget::save);
+        file->addAction("Save &As…", QKeySequence::SaveAs, this, &TrackerWidget::saveAs);
         file->addSeparator();
-        file->addAction("&Quit", QKeySequence::Quit, this, &QWidget::close);
+        file->addAction("&Quit", QKeySequence::Quit, this, [this] { host_->requestQuit(); });
         // Samples: the folder of WAVs the tracks' samples come from. Rebuilt
         // each time it opens, so a folder dropped in since is there.
-        samplesMenu_ = menuBar()->addMenu("&Samples");
-        connect(samplesMenu_, &QMenu::aboutToShow, this, &Window::rebuildSamplesMenu);
-        QMenu *help = menuBar()->addMenu("&Help");
+        samplesMenu_ = host_->addMenu("&Samples");
+        connect(samplesMenu_, &QMenu::aboutToShow, this, &TrackerWidget::rebuildSamplesMenu);
+        QMenu *help = host_->addMenu("&Help");
         help->addAction("&Keys", this, [this] {
             QMessageBox box(this);
             box.setWindowTitle("tracker keys");
@@ -869,7 +885,7 @@ public:
             box.setFont(f);
             box.exec();
         });
-        help->addAction("&Cheat Sheet", QKeySequence(Qt::Key_F1), this, &Window::showCheat);
+        help->addAction("&Cheat Sheet", QKeySequence(Qt::Key_F1), this, &TrackerWidget::showCheat);
 
         // Wiring.
         connect(playSong, &QPushButton::clicked, this, [this] { key(TRK_K_PLAY_SONG); });
@@ -951,7 +967,7 @@ public:
                 trk_song_of(e_)->track[t].octave = o;
                 trk_unlock(e_);
                 if (t == ed_.track) ed_.octave = o;
-                QTimer::singleShot(0, this, &Window::refreshCheat);
+                QTimer::singleShot(0, this, &TrackerWidget::refreshCheat);
                 view_->setFocus();
             });
             connect(chan_[t], &QSpinBox::valueChanged, this, [this, t](int c) {
@@ -968,16 +984,16 @@ public:
                 view_->update();
             });
         }
-        connect(view_, &PatternView::cursorMoved, this, &Window::cursorMoved);
+        connect(view_, &PatternView::cursorMoved, this, &TrackerWidget::cursorMoved);
         connect(view_, &PatternView::clipped, this, [this](int k) {
             int rows = 0, tracks = 0;
             trk_clipboard(&rows, &tracks);
             const QString size = QString("%1 row%2 x %3 track%4").arg(rows).arg(rows > 1 ? "s" : "")
                                      .arg(tracks).arg(tracks > 1 ? "s" : "");
             if (!ed_.edit && k != TRK_K_COPY)
-                statusBar()->showMessage("edit is off -- ` to edit, then cut or paste", 4000);
+                host_->showStatus("edit is off -- ` to edit, then cut or paste", 4000);
             else
-                statusBar()->showMessage((k == TRK_K_COPY ? "copied " : k == TRK_K_CUT ? "cut " : "pasted ")
+                host_->showStatus((k == TRK_K_COPY ? "copied " : k == TRK_K_CUT ? "cut " : "pasted ")
                                          + size, 3000);
         });
         connect(view_, &PatternView::editToggled, this, [this] {
@@ -993,7 +1009,7 @@ public:
             const int r = trk_sample_at(e_, t, note, what, sizeof what);
             if (r < 0) return;
             drumkit_note_name(note, nn);
-            statusBar()->showMessage(r ? QString("%1  %2").arg(nn, QString::fromUtf8(what))
+            host_->showStatus(r ? QString("%1  %2").arg(nn, QString::fromUtf8(what))
                                        : QString("no sample on %1: %2").arg(nn, QString::fromUtf8(what)),
                                      r ? 3000 : 6000);
         });
@@ -1007,7 +1023,7 @@ public:
         // Playback position, thirty times a second; routing every two, so a
         // window opened after the song was loaded is found and connected.
         auto *tick = new QTimer(this);
-        connect(tick, &QTimer::timeout, this, &Window::followPlayback);
+        connect(tick, &QTimer::timeout, this, &TrackerWidget::followPlayback);
         tick->start(33);
         auto *route = new QTimer(this);
         connect(route, &QTimer::timeout, this, [this] { trk_route(e_); refreshDests(false); });
@@ -1016,7 +1032,6 @@ public:
         syncFromSong();
         refreshDests(true);
         updateTitle();
-        resize(std::min(1400, view_->gutter() + TRK_TRACKS * view_->colWidth() + 40), 760);
         view_->setFocus();
     }
 
@@ -1051,17 +1066,24 @@ public:
     QComboBox *dest(int t) const { return dest_[t]; }
     bool writeSong(const QString &p) { return writeTo(p); }
 
-protected:
-    void closeEvent(QCloseEvent *ev) override
+    // How wide the standalone window opens; a shell sizes the widget itself.
+    int preferredWidth() const
+    {
+        return std::min(1400, view_->gutter() + TRK_TRACKS * view_->colWidth() + 40);
+    }
+
+    // Ending the song session, as closing the standalone window does: asks
+    // about unsaved changes first, then stops playback. True means go ahead.
+    bool confirmClose()
     {
 #ifdef TRACKER_UITEST
         trk_stop(e_);
-        ev->accept();
-        return;
-#endif
-        if (!confirmDiscard()) { ev->ignore(); return; }
+        return true;
+#else
+        if (!confirmDiscard()) return false;
         trk_stop(e_);
-        ev->accept();
+        return true;
+#endif
     }
 
 private:
@@ -1229,14 +1251,14 @@ private:
         switch (what) {
         case 0: case 1: {
             const int p = trk_pattern_new(e_, what == 1 ? cur : -1);
-            if (p < 0) { statusBar()->showMessage("every pattern is in use", 4000); return; }
+            if (p < 0) { host_->showStatus("every pattern is in use", 4000); return; }
             r = trk_order_insert(e_, at, p);
             break;
         }
         case 2: r = trk_order_insert(e_, at, cur); break;
         case 3:
             r = trk_order_remove(e_, at);
-            if (r < 0) statusBar()->showMessage("a song keeps at least one part", 3000);
+            if (r < 0) host_->showStatus("a song keeps at least one part", 3000);
             break;
         case 4: r = trk_order_move(e_, at, -1); break;
         case 5: r = trk_order_move(e_, at, +1); break;
@@ -1333,7 +1355,7 @@ private:
             if (dir.isEmpty()) return;
             trk_add_sample_set(e_, dir.toUtf8().constData());
             refreshDests(true);
-            statusBar()->showMessage("loaded " + dir + " -- pick it in a track's sample-set box",
+            host_->showStatus("loaded " + dir + " -- pick it in a track's sample-set box",
                                      6000);
         });
         // The set the cursor's track plays, to begin with; any other from
@@ -1354,7 +1376,7 @@ private:
     void editShown()
     {
         view_->setEditing(ed_.edit);
-        statusBar()->showMessage(ed_.edit ? "edit on: keys write into the pattern"
+        host_->showStatus(ed_.edit ? "edit on: keys write into the pattern"
                                           : "edit off: note keys only play -- ` to edit again",
                                  ed_.edit ? 2500 : 0);
     }
@@ -1444,7 +1466,7 @@ private:
         // Where the samples play, or why they cannot -- only once a track has one.
         const QString audio = QString::fromUtf8(trk_audio_status(e_));
         if (kits && !audio.isEmpty() && audio != audioShown_) {
-            statusBar()->showMessage(audio, 6000);
+            host_->showStatus(audio, 6000);
             audioShown_ = audio;
         }
     }
@@ -1489,7 +1511,7 @@ private:
         trk_unlock(e_);
         oct_[ed_.track]->setCurrentIndex(ed_.octave);     // [ and ] change it too
         // A moment later, not here: this can run while the song is locked.
-        QTimer::singleShot(0, this, &Window::refreshCheat);
+        QTimer::singleShot(0, this, &TrackerWidget::refreshCheat);
         partName_->setText(QString::fromUtf8(trk_song_of(e_)->pattern[ed_.pattern].name));
         loading_ = false;
         scroll_->ensureVisible(view_->gutter() + ed_.track * view_->colWidth(),
@@ -1578,7 +1600,7 @@ private:
         }
         path_ = p;
         updateTitle();
-        statusBar()->showMessage("Saved " + p, 3000);
+        host_->showStatus("Saved " + p, 3000);
         return true;
     }
 
@@ -1590,6 +1612,7 @@ private:
     }
 
     trk_engine *e_;
+    TrackerHost *host_;
     trk_editor ed_;
     std::unique_ptr<trk_song> saved_;
     QString path_, lastDests_;
@@ -1621,6 +1644,40 @@ private:
     QLabel *state_[TRK_TRACKS];
 };
 
+// --------------------------------------------------- the standalone window --
+//
+// The tracker binary's shell: a menu bar and a status line behind the
+// widget's TrackerHost, the window title following the song's, and closing
+// the window ends the song session.
+
+class TrackerWindow : public QMainWindow, public TrackerHost {
+public:
+    explicit TrackerWindow(trk_engine *e)
+    {
+        tracker_ = new TrackerWidget(e, this, this);
+        setCentralWidget(tracker_);
+        connect(tracker_, &QWidget::windowTitleChanged, this, &QWidget::setWindowTitle);
+        setWindowTitle(tracker_->windowTitle());   // set before the connect above
+        resize(tracker_->preferredWidth(), 760);
+    }
+
+    TrackerWidget *tracker() const { return tracker_; }
+
+    QMenu *addMenu(const QString &title) override { return menuBar()->addMenu(title); }
+    void showStatus(const QString &msg, int ms) override { statusBar()->showMessage(msg, ms); }
+    void requestQuit() override { close(); }
+
+protected:
+    void closeEvent(QCloseEvent *ev) override
+    {
+        if (tracker_->confirmClose()) ev->accept();
+        else ev->ignore();
+    }
+
+private:
+    TrackerWidget *tracker_;
+};
+
 #ifdef TRACKER_UITEST
 // The window driven by real key events, offscreen, with a picture taken at
 // each step. Run it with QT_QPA_PLATFORM=offscreen; argv: song, output dir.
@@ -1648,10 +1705,11 @@ void wait(int ms)
     while (t.elapsed() < ms) QApplication::processEvents(QEventLoop::AllEvents, 10);
 }
 
-int uitest(trk_engine *e, Window &w, const QString &outdir)
+int uitest(trk_engine *e, TrackerWindow &w, const QString &outdir)
 {
-    PatternView *v = w.view();
-    trk_editor *ed = w.editor();
+    TrackerWidget *tw = w.tracker();
+    PatternView *v = tw->view();
+    trk_editor *ed = tw->editor();
     auto shot = [&](const char *name) {
         w.grab().save(outdir + "/" + name);
         std::printf("  picture: %s/%s\n", outdir.toLocal8Bit().constData(), name);
@@ -1695,8 +1753,8 @@ int uitest(trk_engine *e, Window &w, const QString &outdir)
         }
     }
     check(cell(0, 0, 0).note == 36, "song loaded: C-2 on track 1, row 0");
-    check(w.dest(0)->currentText().startsWith("aseqdump"), "track 1 shows its destination");
-    check(w.dest(2)->currentText().contains("(not open)"), "a closed destination is kept and marked");
+    check(tw->dest(0)->currentText().startsWith("aseqdump"), "track 1 shows its destination");
+    check(tw->dest(2)->currentText().contains("(not open)"), "a closed destination is kept and marked");
 
     std::printf("typing\n");
     v->setFocus();
@@ -1753,7 +1811,7 @@ int uitest(trk_engine *e, Window &w, const QString &outdir)
 
     std::printf("saving\n");
     const QString path = outdir + "/saved.trk";
-    check(w.writeSong(path), "saved");
+    check(tw->writeSong(path), "saved");
     {
         trk_song *back = (trk_song *)std::malloc(sizeof(trk_song));
         char err[256];
@@ -1783,8 +1841,8 @@ int main(int argc, char **argv)
     }
     int rc;
     {
-        Window w(e);
-        if (argc > 1) w.openPath(QString::fromLocal8Bit(argv[1]));
+        TrackerWindow w(e);
+        if (argc > 1) w.tracker()->openPath(QString::fromLocal8Bit(argv[1]));
         w.show();
 #ifdef TRACKER_UITEST
         rc = uitest(e, w, argc > 2 ? QString::fromLocal8Bit(argv[2]) : QString("."));
