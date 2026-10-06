@@ -21,6 +21,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "bank.h"
+#include "drumkit.h"
 #include "dw_synth.h"
 #include "dw_wavetable.h"
 #include "rom.h"
@@ -852,6 +853,51 @@ static int cmd_live(const char *sel) { (void)sel; return no_audio("live"); }
 
 #endif
 
+/* A drum kit as dwstudio and the tracker will play it: which note is which
+ * sample. --write puts that mapping in the kit's own kit.txt, to edit. */
+static int cmd_kit(int argc, char **argv)
+{
+    const char *dir = NULL;
+    int write = 0, i;
+    drumkit *k;
+
+    for (i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--write")) write = 1;
+        else if (!dir) dir = argv[i];
+        else { dir = NULL; break; }
+    }
+    if (!dir) { fprintf(stderr, "usage: va kit <dir> [--write]\n"); return 2; }
+    if (!(k = drumkit_load(dir, SR))) {
+        fprintf(stderr, "va: %s: no samples that load\n", dir);
+        return 1;
+    }
+    printf("%s -- %d pads, %s\n\n", dir, drumkit_count(k),
+           drumkit_mapped(k) ? "as its " DK_MAP_FILE " says"
+                             : "every .wav by name (no " DK_MAP_FILE ")");
+    printf("  note        choke  gain  sample\n");
+    for (i = 0; i < drumkit_count(k); i++) {
+        static const char *const nn[12] = { "C-", "C#", "D-", "D#", "E-", "F-",
+                                            "F#", "G-", "G#", "A-", "A#", "B-" };
+        int n = drumkit_note_of(k, i), c = drumkit_choke_of(k, i);
+        char cs[8] = "";
+        if (c) snprintf(cs, sizeof cs, "%d", c);
+        printf("  %s%d  (%3d)  %5s  %4.0f  %s\n", nn[n % 12], n / 12 - 1, n, cs,
+               drumkit_gain_db_of(k, i), drumkit_sample_name(k, i));
+    }
+    if (write) {
+        if (drumkit_write_map(k, dir)) {
+            fprintf(stderr, "\nva: %s/%s: %s\n", dir, DK_MAP_FILE,
+                    errno == EEXIST ? "there is one already -- edit that"
+                                    : strerror(errno));
+            drumkit_free(k);
+            return 1;
+        }
+        printf("\nwritten: %s/%s\n", dir, DK_MAP_FILE);
+    }
+    drumkit_free(k);
+    return 0;
+}
+
 static void usage(void)
 {
     printf(
@@ -869,6 +915,8 @@ static void usage(void)
 "  va render <dir>         render the whole bank to <dir>\n"
 "  va keys                 the note map, and what this terminal does with a\n"
 "                          held key\n"
+"  va kit <dir> [--write]  a drum kit's pads: which note plays which sample;\n"
+"                          --write saves that as the kit's kit.txt to edit\n"
 "\n"
 "  va gui                  GTK4 window: instruments, patches, drums, Juno panel\n"
 "  va pe [dir|bank.json]   Qt6 window: load and play real plug-ins natively,\n"
@@ -931,6 +979,7 @@ int main(int argc, char **argv)
         if (argc < 1) { fprintf(stderr, "usage: va render <dir>\n"); return 2; }
         return cmd_render(argv[0]);
     }
+    if (!strcmp(cmd, "kit"))    return cmd_kit(argc, argv);
     if (!strcmp(cmd, "keys")) {
 #ifdef DW_HAVE_ALSA
         return dwplay_keyboard_info();

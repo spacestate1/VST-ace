@@ -97,7 +97,11 @@ static uint16_t rd16(const unsigned char *p)
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-int wav_read_mono(const char *path, float **out, size_t *frames, int *samplerate)
+/* The reader behind both of the public ones. outch 1: every channel summed
+ * and averaged. outch 2: interleaved stereo -- a mono file on both sides, the
+ * first two channels of anything wider. */
+static int wav_read(const char *path, float **out, size_t *frames, int *samplerate,
+                    int outch)
 {
     FILE          *f;
     unsigned char *buf;
@@ -127,6 +131,9 @@ int wav_read_mono(const char *path, float **out, size_t *frames, int *samplerate
             ch   = rd16(body + 2);
             sr   = (int)rd32(body + 4);
             bits = rd16(body + 14);
+            /* WAVE_FORMAT_EXTENSIBLE carries the real format in its
+             * sub-format GUID, whose first two bytes are the old tag. */
+            if (fmt == 0xFFFE && csz >= 26) fmt = rd16(body + 24);
         } else if (!memcmp(buf + pos, "data", 4)) {
             dpos = pos + 8;
             dlen = csz;
@@ -137,27 +144,41 @@ int wav_read_mono(const char *path, float **out, size_t *frames, int *samplerate
     if (!dlen || ch < 1 || bits < 8) { free(buf); return -1; }
 
     n = dlen / (size_t)(ch * (bits / 8));
-    if (!(o = malloc(n * sizeof *o))) { free(buf); return -1; }
+    if (!(o = malloc(n * (size_t)outch * sizeof *o))) { free(buf); return -1; }
 
     for (i = 0; i < n; i++) {
         double acc = 0.0;
         for (c = 0; c < (size_t)ch; c++) {
             const unsigned char *s = buf + dpos + (i * (size_t)ch + c) * (size_t)(bits / 8);
-            if (bits == 8)       acc += ((double)s[0] - 128.0) / 128.0;
-            else if (bits == 16) acc += (double)(int16_t)rd16(s) / 32768.0;
+            double v = 0.0;
+            if (bits == 8)       v = ((double)s[0] - 128.0) / 128.0;
+            else if (bits == 16) v = (double)(int16_t)rd16(s) / 32768.0;
             else if (bits == 24) {
-                int32_t v = (int32_t)((uint32_t)s[0] << 8 | (uint32_t)s[1] << 16 |
+                int32_t x = (int32_t)((uint32_t)s[0] << 8 | (uint32_t)s[1] << 16 |
                                       (uint32_t)s[2] << 24);
-                acc += (double)(v >> 8) / 8388608.0;
+                v = (double)(x >> 8) / 8388608.0;
             } else if (bits == 32 && fmt == 3) {
-                float fv; uint32_t u = rd32(s); memcpy(&fv, &u, 4); acc += fv;
+                float fv; uint32_t u = rd32(s); memcpy(&fv, &u, 4); v = fv;
             } else if (bits == 32) {
-                acc += (double)(int32_t)rd32(s) / 2147483648.0;
+                v = (double)(int32_t)rd32(s) / 2147483648.0;
             }
+            if (outch == 1) acc += v;
+            else if (c < 2) o[2 * i + c] = (float)v;
         }
-        o[i] = (float)(acc / ch);
+        if (outch == 1) o[i] = (float)(acc / ch);
+        else if (ch == 1) o[2 * i + 1] = o[2 * i];
     }
     free(buf);
     *out = o; *frames = n; *samplerate = sr ? sr : 44100;
     return 0;
+}
+
+int wav_read_mono(const char *path, float **out, size_t *frames, int *samplerate)
+{
+    return wav_read(path, out, frames, samplerate, 1);
+}
+
+int wav_read_stereo(const char *path, float **out, size_t *frames, int *samplerate)
+{
+    return wav_read(path, out, frames, samplerate, 2);
 }

@@ -24,6 +24,11 @@ int wav_write_stereo16(const char *path, const double *interleaved,
  * Caller frees *out. Returns 0 on success. */
 int wav_read_mono(const char *path, float **out, size_t *frames, int *samplerate);
 
+/* The same, into interleaved stereo: a mono file is put on both sides, and a
+ * file of more than two channels gives its first two. *frames counts frames,
+ * so the buffer holds twice that many floats. */
+int wav_read_stereo(const char *path, float **out, size_t *frames, int *samplerate);
+
 #ifdef __cplusplus
 }
 #endif

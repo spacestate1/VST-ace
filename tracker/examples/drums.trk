@@ -1,0 +1,61 @@
+# Drums the tracker plays itself, from the drum-singles sample set -- no
+# window to open. Pads as Samples > Edit Sample Set shows them:
+# E-4 Kick 32, C-5 Snare 17, C#4 Hat 45, C-4 Clap 08, F-5/E-5 Toms 12/06.
+# Four tracks on the one set, so a kick, a snare, a hat and a clap can share
+# a row -- a track plays one note at a time.
+tracker 1
+bpm 100
+lpb 4
+track 1 channel 1 velocity 100 mute 0
+track 1 name Kick
+track 1 samples drum-singles
+track 2 channel 1 velocity 100 mute 0
+track 2 name Snare
+track 2 samples drum-singles
+track 3 channel 1 velocity 100 mute 0
+track 3 name Hats
+track 3 samples drum-singles
+track 4 channel 1 velocity 100 mute 0
+track 4 name Clap
+track 4 samples drum-singles
+track 5 channel 1 velocity 100 mute 0
+track 5 name Track 5
+track 6 channel 1 velocity 100 mute 0
+track 6 name Track 6
+track 7 channel 1 velocity 100 mute 0
+track 7 name Track 7
+track 8 channel 1 velocity 100 mute 0
+track 8 name Track 8
+order 0 0 0 1
+pattern 0 rows 16
+cell 0 0 1 E-4 .. .. ..
+cell 0 0 3 C#4 50 .. ..
+cell 0 2 3 C#4 2A .. ..
+cell 0 4 2 C-5 .. .. ..
+cell 0 4 3 C#4 50 .. ..
+cell 0 6 3 C#4 2A .. ..
+cell 0 8 1 E-4 .. .. ..
+cell 0 8 3 C#4 50 .. ..
+cell 0 10 1 E-4 .. .. ..
+cell 0 10 3 C#4 2A .. ..
+cell 0 12 2 C-5 .. .. ..
+cell 0 12 3 C#4 50 .. ..
+cell 0 14 3 C#4 2A .. ..
+pattern 1 rows 16
+cell 1 0 1 E-4 .. .. ..
+cell 1 0 3 C#4 50 .. ..
+cell 1 2 3 C#4 2A .. ..
+cell 1 4 2 C-5 .. .. ..
+cell 1 4 3 C#4 50 .. ..
+cell 1 6 3 C#4 2A .. ..
+cell 1 8 1 E-4 .. .. ..
+cell 1 8 3 C#4 50 .. ..
+cell 1 10 1 E-4 .. .. ..
+cell 1 10 3 C#4 2A .. ..
+cell 1 12 2 C-5 50 .. ..
+cell 1 12 3 C#4 50 .. ..
+cell 1 12 4 C-4 .. .. ..
+cell 1 13 2 C-5 3C .. ..
+cell 1 14 2 F-5 .. .. ..
+cell 1 14 3 C#4 2A .. ..
+cell 1 15 2 E-5 .. .. ..
