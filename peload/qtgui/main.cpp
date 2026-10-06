@@ -31,6 +31,32 @@ extern "C" {
 #include <spa/param/audio/format-utils.h>
 }
 
+/* The X11 halves of hosting a native plugin editor: libX11 to walk the window
+ * tree and read the keymap, xcb for the raw key events that surface through
+ * QAbstractNativeEventFilter. Everything that uses these is compiled out when
+ * pehost was built without X11 and guarded by the xcb platform check at
+ * runtime; on anything but xcb the snoop simply never starts. */
+#ifdef PEHOST_HAVE_X11
+#include <QAbstractNativeEventFilter>
+#include <QtGui/qguiapplication_platform.h>
+/* Xlib's window type is called Window, and so is this file's main window
+ * class -- rename X's for the duration of its headers and use plain
+ * "unsigned long" for window ids below. */
+#define Window X11Window
+#include <X11/Xlib.h>
+#undef Window
+/* Xlib also macros a handful of ordinary words; Bool at least breaks moc's
+ * QMetaType::Bool. None of them are used below. */
+#undef Bool
+#undef Status
+#undef None
+#undef True
+#undef False
+#undef KeyPress
+#undef KeyRelease
+#include <xcb/xproto.h>
+#endif
+
 /* Classic Mac OS hosting. A .vstclassic loads, renders audio and draws its own
  * editor -- the CFM/PEF loader, the PowerPC interpreter and the QuickDraw/PICT
  * path carry it end to end. Build with -DPESTUDIO_CLASSIC=0 to drop it. */
@@ -1367,6 +1393,163 @@ private:
     bool dragging_ = false;
 };
 
+#ifdef PEHOST_HAVE_X11
+/* Snoops the keys X delivers to an embedded plugin's windows.
+ *
+ * A native Linux editor is a real X11 window, and plugin toolkits take the X
+ * input focus for it on click (JUCE calls XSetInputFocus outright). From then
+ * on key events are delivered to the plugin's window and never enter Qt's
+ * event stream at all, so the application-wide filter that routes note keys to
+ * the piano cannot fire -- the computer keyboard plays dead until a Qt widget
+ * (the piano) is clicked and focus comes back. Qt cannot fix this, because the
+ * events are not being sent to any of its windows.
+ *
+ * What can be done is to ask X for a copy. KeyPressMask is selectable by any
+ * number of clients on one window, so selecting it on the plugin's windows
+ * delivers those events to this connection as well, where they surface through
+ * the native event filter and are routed to the piano. The plugin's own
+ * selection is untouched and it goes on receiving the key itself -- the same
+ * "note plus key" trade the Qt path already makes over the editor, so there is
+ * nothing to swallow. */
+class XKeySnoop : public QAbstractNativeEventFilter {
+public:
+    /* Set by the owner; the piano is two objects away and this class is X
+     * mechanics only. (int qtKey, bool down), keysym passed raw -- for the
+     * letters and digits of the note rows the keysym *is* the Qt key code. */
+    std::function<void(int qtKey, bool down)> route;
+
+    /* Selects SubstructureNotify on the host window and keys on every window
+     * of the subtree already beneath it. */
+    void start(Display *d, unsigned long host)
+    {
+        dpy_ = d;
+        loadKeymap();
+        watch(host, false);
+    }
+    void stop()
+    {
+        if (!dpy_) return;
+        for (unsigned long w : watched_) {
+            XWindowAttributes a;
+            /* A plugin window can be gone by the time the editor detaches;
+             * a dead id just fails the call. */
+            if (XGetWindowAttributes(dpy_, w, &a))
+                XSelectInput(dpy_, w, a.your_event_mask & ~(KeyPressMask |
+                             KeyReleaseMask | SubstructureNotifyMask));
+        }
+        watched_.clear();
+        dpy_ = nullptr;
+        if (map_) { XFree(map_); map_ = nullptr; }
+        lastTime_ = lastType_ = 0;
+    }
+    bool watching() const { return dpy_ != nullptr; }
+
+    bool nativeEventFilter(const QByteArray &type, void *message,
+                           qintptr *) override
+    {
+        if (type != "xcb_generic_event_t") return false;
+        auto *ev = static_cast<xcb_generic_event_t *>(message);
+        switch (ev->response_type & ~0x80) {
+        case XCB_CREATE_NOTIFY: {
+            /* A child born after attach, reported because the parent was
+             * watched. */
+            auto *c = static_cast<xcb_create_notify_event_t *>(message);
+            if (dpy_ && watched_.contains(c->parent)) watch(c->window, true);
+            break;
+        }
+        case XCB_DESTROY_NOTIFY: {
+            auto *d = static_cast<xcb_destroy_notify_event_t *>(message);
+            watched_.remove(d->window);
+            break;
+        }
+        case XCB_MAPPING_NOTIFY:
+            /* The user remapped the keyboard mid-session; re-read it. */
+            if (dpy_) loadKeymap();
+            break;
+        case XCB_KEY_PRESS:
+        case XCB_KEY_RELEASE: {
+            auto *k = static_cast<xcb_key_press_event_t *>(message);
+            if (!dpy_ || !watched_.contains(k->event)) break;
+            const bool down = (ev->response_type & ~0x80) == XCB_KEY_PRESS;
+            /* One press reaches this client once per watched window it
+             * propagates through -- propagation does not stop at the plugin's
+             * own window, and every window of the subtree is selected. The
+             * copies carry the same keycode and timestamp with a different
+             * target window; only the first counts. Repeats from detectable
+             * auto-repeat arrive as presses with fresh timestamps and pass
+             * through, which the piano's held-note guard absorbs. */
+            if (k->time == lastTime_ && k->detail == lastDetail_ &&
+                (ev->response_type & ~0x80) == lastType_)
+                break;
+            lastTime_ = k->time; lastDetail_ = k->detail;
+            lastType_ = ev->response_type & ~0x80;
+            /* A press carrying Ctrl, Alt or Meta is a command -- the same rule
+             * the Qt path applies. Releases always go through, so a modifier
+             * reached for mid-note cannot strand the note on. */
+            if (down && (k->state & (ControlMask | Mod1Mask | Mod4Mask))) break;
+            const KeySym sym = keysym(k->detail);
+            if (sym != NoSymbol && sym <= 0x10FFFF && route)
+                route(int(sym), down);
+            break;
+        }
+        default:
+            break;
+        }
+        return false;   /* a snoop consumes nothing */
+    }
+
+private:
+    /* w plus, recursively, the windows already beneath it. SubstructureNotify
+     * is selected everywhere so children created later are caught by
+     * XCB_CREATE_NOTIFY at whatever depth they appear. */
+    void watch(unsigned long w, bool keys)
+    {
+        if (!dpy_ || watched_.contains(w)) return;
+        XWindowAttributes a;
+        if (!XGetWindowAttributes(dpy_, w, &a)) return;
+        /* OR into the mask already there rather than replacing it: Qt and this
+         * code are the same client on one X connection, and a bare
+         * XSelectInput would clobber the mask Qt's own windows rely on. */
+        long bits = SubstructureNotifyMask;
+        if (keys) bits |= KeyPressMask | KeyReleaseMask;
+        XSelectInput(dpy_, w, a.your_event_mask | bits);
+        watched_.insert(w);
+        unsigned long root, parent, *kids = nullptr;
+        unsigned n = 0;
+        if (XQueryTree(dpy_, w, &root, &parent, &kids, &n)) {
+            /* Everything beneath the host window is the plugin's, whatever
+             * the depth -- only the host itself is watched without keys. */
+            for (unsigned i = 0; i < n; i++) watch(kids[i], true);
+            if (kids) XFree(kids);
+        }
+    }
+    /* The whole keymap is read once per attach rather than per key: the press
+     * path is no place for a synchronous X round trip. Index 0 of each group
+     * is the unshifted keysym, which is what the note rows are. */
+    void loadKeymap()
+    {
+        int minKC = 0, maxKC = 0, per = 0;
+        XDisplayKeycodes(dpy_, &minKC, &maxKC);
+        if (map_) XFree(map_);
+        map_ = XGetKeyboardMapping(dpy_, minKC, maxKC - minKC + 1, &per);
+        minKC_ = minKC; perKC_ = per;
+    }
+    KeySym keysym(int keycode) const
+    {
+        if (!map_ || keycode < minKC_ || perKC_ < 1) return NoSymbol;
+        return map_[(keycode - minKC_) * perKC_];
+    }
+
+    Display *dpy_ = nullptr;
+    QSet<unsigned long> watched_;
+    KeySym *map_ = nullptr;
+    int minKC_ = 0, perKC_ = 0;
+    /* The last key event routed, for dropping its propagated copies. */
+    uint32_t lastTime_ = 0;
+    uint8_t lastDetail_ = 0, lastType_ = 0;
+};
+#endif
+
 /* ----------------------------------------------------------- plugin editor */
 
 /* Hosts the plugin's own GUI. VST3 editors draw themselves into a native window
@@ -1380,6 +1563,11 @@ private:
  * onto those registrations directly. */
 class EditorHost : public QWidget {
     Q_OBJECT
+signals:
+    /* A key X delivered to the plugin's window, snooped at the X level. Only
+     * fires for a native editor, and only while one is attached. */
+    void editorKey(int qtKey, bool down);
+
 public:
     explicit EditorHost(QWidget *p = nullptr) : QWidget(p)
     {
@@ -1388,6 +1576,9 @@ public:
         setAttribute(Qt::WA_NativeWindow);
         setAttribute(Qt::WA_DontCreateNativeAncestors);
         setMinimumSize(320, 200);
+#ifdef PEHOST_HAVE_X11
+        snoop_.route = [this](int k, bool down) { emit editorKey(k, down); };
+#endif
         install();
     }
     /* detach() first, so unregisters the plugin makes on the way out are still
@@ -1426,6 +1617,20 @@ public:
         fprintf(stderr, "editor: embedded as a child of window 0x%lx (%dx%d)\n",
                 (unsigned long)winId(), w, ht);
         host_ = h;
+#ifdef PEHOST_HAVE_X11
+        /* Start snooping the plugin window's keys. The plugin's toolkit takes
+         * the X input focus for its own window on click, and from then on key
+         * events go straight to that window and never enter Qt's event stream
+         * -- the application-wide note-key filter cannot see them, and the
+         * computer keyboard appears dead until a Qt widget is clicked. Only
+         * the xcb backend reaches here: attach() refused everything else just
+         * above, and the X connection is the one Qt already owns, so the
+         * snooped events surface through the native event filter. */
+        if (auto *x = qApp->nativeInterface<QNativeInterface::QX11Application>()) {
+            qApp->installNativeEventFilter(&snoop_);
+            snoop_.start(x->display(), (unsigned long)winId());
+        }
+#endif
         /* Idle it.
          *
          * An embedded editor draws itself into its own X window, so nothing on
@@ -1458,6 +1663,14 @@ public:
         if (idle_) idle_->stop();
         if (host_) { pehost_editor_detach(host_); host_ = nullptr; }
         natW_ = natH_ = 0;
+#ifdef PEHOST_HAVE_X11
+        /* Before clearWatches, for the same reason: the snoop, like the hooks,
+         * points back at this object. */
+        if (snoop_.watching()) {
+            qApp->removeNativeEventFilter(&snoop_);
+            snoop_.stop();
+        }
+#endif
         clearWatches();
     }
     bool attached() const { return host_ != nullptr; }
@@ -1603,6 +1816,9 @@ private:
     QMultiHash<void *, QSocketNotifier *> fds_;
     QMultiHash<void *, QTimer *>          timers_;
     QTimer                               *idle_ = nullptr;  /* effEditIdle */
+#ifdef PEHOST_HAVE_X11
+    XKeySnoop snoop_;
+#endif
 public:
     /* What the plug-in laid itself out at, which is what a zoom is a multiple
      * of. Public because the run-loop resize hook is a plain lambda. */
@@ -2349,6 +2565,17 @@ public:
          * and over the plug-in's editor nothing is consumed at all -- see
          * eventFilter. */
         qApp->installEventFilter(this);
+
+        /* Keys X delivers to an embedded native editor never enter Qt's event
+         * stream at all -- the plugin's toolkit takes the X input focus for
+         * its own window on click -- so the filter above cannot route them.
+         * EditorHost snoops them at the X level and re-offers them here. The
+         * modifier rule for presses has already been applied at that level;
+         * auto-repeat is passed as false because with detectable auto-repeat
+         * repeats arrive as plain presses, which routeKey's held-note guard
+         * makes harmless. */
+        connect(editor_, &EditorHost::editorKey, this,
+                [this](int k, bool down) { piano_->routeKey(k, down, false); });
 
         connect(piano_, &Piano::noteOn, this, [this](int n, int v) {
             if (eng_.host()) pehost_note_on(eng_.host(), n, v);
@@ -3634,8 +3861,16 @@ private:
         if (qApp->activePopupWidget()) return true;
         QWidget *f = qApp->focusWidget();
         if (!f) return false;
-        if (qobject_cast<QLineEdit *>(f) || qobject_cast<QAbstractSpinBox *>(f) ||
-            qobject_cast<QTextEdit *>(f) || qobject_cast<QPlainTextEdit *>(f))
+        if (auto *le = qobject_cast<QLineEdit *>(f)) {
+            /* ...unless the line edit is read-only. One is the Dir field: it
+             * is focusable so the path in it can be selected and copied, but
+             * nothing typed into it can take effect, and treating it as typing
+             * silenced every note key after it was clicked. The keyboard
+             * looked dead -- no letter appeared, no note played -- until the
+             * piano was clicked to move focus back. */
+            if (!le->isReadOnly()) return true;
+        } else if (qobject_cast<QAbstractSpinBox *>(f) ||
+                   qobject_cast<QTextEdit *>(f) || qobject_cast<QPlainTextEdit *>(f))
             return true;
         if (auto *cb = qobject_cast<QComboBox *>(f)) return cb->isEditable();
         /* No test for an item view, on purpose.
@@ -3702,7 +3937,10 @@ private:
             const bool inEditor = f && (f == pixelEditor_ || f == editor_ ||
                                         (editorStack_ && editorStack_->isAncestorOf(f)));
             if (down) {
-                if (qobject_cast<QLineEdit *>(f)) break;
+                /* The same read-only exception as isTyping(): a line edit that
+                 * cannot take the letter has no claim on it. */
+                if (auto *le = qobject_cast<QLineEdit *>(f);
+                    le && !le->isReadOnly()) break;
                 /* Not `if (inEditor) break;`.
                  *
                  * Turning a knob in a plug-in's editor moves focus to it, and
