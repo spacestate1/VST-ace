@@ -159,6 +159,52 @@ void trk_reload_sample_set(trk_engine *e, const char *name);
  * a path of its own. -1 when it will not load or there is no output. */
 int  trk_audition(trk_engine *e, const char *dir, const char *file, double gain_db, int vel);
 
+/* ------------------------------------------------------- in-process sinks --
+ *
+ * A MIDI destination inside this process, registered alongside the ALSA
+ * outputs: a synth the same program hosts, played without a trip through the
+ * sequencer. A track routed to a sink plays there INSTEAD of its ALSA window
+ * -- one destination per track, as with a window or a sample set; the window
+ * its client/port name stays in the song, and routing back (-1) reconnects
+ * it. Sink routing is runtime state: a saved song carries no sink.
+ *
+ * Timing mirrors the sample sets: the scheduling thread queues every event
+ * against the queue's tick clock, and a delivery thread turns the tick into
+ * wall time exactly as the ALSA path's timestamps mean it, calling the sink
+ * once per block with the block's start and each event's sample offset in it
+ * -- so a sink gets the placement the kernel's queue gives an ALSA window.
+ * Clock, start/stop and song position follow a sink-routed track as they
+ * follow a window. */
+
+#define TRK_SINK_RATE   48000          /* the clock `frame` counts on */
+typedef struct {
+    uint32_t frame;                    /* sample offset within the block */
+    uint8_t  status, d1, d2;           /* a raw MIDI message */
+} trk_sink_ev;
+
+/* Called from the engine's delivery thread, up to one block ahead of `wall`
+ * (CLOCK_MONOTONIC seconds, when the block's first sample is due). It runs
+ * under the delivery lock: keep it fast, never block, and never call back
+ * into the engine. */
+typedef void (*trk_sink_fn)(void *ud, double wall, const trk_sink_ev *evs, int n);
+
+/* A named in-process destination -- the name is what a destination list
+ * shows. Returns its id (>= 0), or -1 when the slots are full. */
+int  trk_add_sink(trk_engine *e, const char *name, trk_sink_fn fn, void *ud);
+/* Unregister: tracks routed to the sink go back to their ALSA windows (what
+ * they have sounding is released to the sink first, while it is still there
+ * to hear it), and any delivery call in flight is waited out -- after this
+ * returns, the sink is never called again. */
+void trk_remove_sink(trk_engine *e, int id);
+void trk_sink_rename(trk_engine *e, int id, const char *name);
+/* Route track t to a sink, or back to its ALSA window with id -1. What the
+ * track has sounding is released to the destination it is leaving. */
+void trk_route_sink(trk_engine *e, int t, int id);
+/* The sink track t plays, or -1. */
+int  trk_sink_of(trk_engine *e, int t);
+/* A sink's name, copied out; -1 when there is no such sink. */
+int  trk_sink_name(trk_engine *e, int id, char *buf, size_t n);
+
 enum { TRK_PLAY_PATTERN = 0, TRK_PLAY_SONG = 1 };
 /* Start at a position: `order` indexes the order list (the pattern is
  * order[] of it) for TRK_PLAY_SONG; for TRK_PLAY_PATTERN `order` is the

@@ -561,6 +561,29 @@ public:
     void    setInputGain(float g) { inGain_.store(g, std::memory_order_relaxed); }
     float   inputGain() const { return inGain_.load(std::memory_order_relaxed); }
 
+    /* MIDI from an in-process sequencer, due at a wall-clock time (seconds,
+     * CLOCK_MONOTONIC) -- the session shell's tracker playing this tab without
+     * a trip through ALSA. Lock-free SPSC: the sequencer's delivery thread
+     * produces, the audio callback consumes, placing each event into the
+     * block its time falls in, on the sample -- pehost_midi_at with the true
+     * offset rather than the arrival-time placement ALSA-delivered events
+     * get. Events whose block has not come yet stay queued for it. */
+    void injectMidi(double wall, int st, int d1, int d2)
+    {
+        const unsigned hd = injHead_.load(std::memory_order_relaxed);
+        const unsigned tl = injTail_.load(std::memory_order_acquire);
+        if (hd - tl >= kInjQ) return;      /* full: dropped -- the caller counts its own */
+        InjEv &v = inj_[hd % kInjQ];
+        v.wall = wall;
+        v.st = uint8_t(st); v.d1 = uint8_t(d1); v.d2 = uint8_t(d2);
+        injHead_.store(hd + 1, std::memory_order_release);
+        injIn_.fetch_add(1, std::memory_order_relaxed);
+    }
+    /* Instrumentation for the shell's smoke drive: events offered, and events
+     * the audio callback has placed into a block. */
+    unsigned long midiInjected() const { return injIn_.load(std::memory_order_relaxed); }
+    unsigned long midiPlaced() const { return injPlaced_.load(std::memory_order_relaxed); }
+
 private:
     static const int kMaxFrames = 8192;
 
@@ -589,6 +612,11 @@ private:
         if (b->requested && int(b->requested) < n) n = int(b->requested);
         if (n > kMaxFrames) n = kMaxFrames;
 
+        /* When this block starts, on the clock the injected MIDI is stamped
+         * with. Measured here rather than derived from PipeWire's time: what
+         * matters is agreement with the sequencer's CLOCK_MONOTONIC. */
+        const double bwall = monoNow();
+
         if (parkReq_.load(std::memory_order_acquire)) {
             parked_.store(true, std::memory_order_release);
             memset(dst, 0, size_t(n) * 2 * sizeof(float));
@@ -598,6 +626,9 @@ private:
             rec_.feed(dst, n);
         } else {
             parked_.store(false, std::memory_order_release);
+            /* Injected MIDI goes in first, so a note due at this block's very
+             * start still makes the block. */
+            drainInjected(n, bwall);
             /* A synth makes its own sound and wants nothing fed to it; an effect
              * needs something to work on or it can only output silence. */
             /* `n` can exceed kQuantum: PipeWire's requested latency is only a
@@ -698,6 +729,40 @@ private:
     std::atomic<bool>    parkReq_{false}, parked_{false};
     std::atomic<unsigned long> calls_{0};
     std::atomic<float>   peak_{0.0f};
+
+    /* The injection ring injectMidi feeds; see there. */
+    struct InjEv { double wall; uint8_t st, d1, d2; };
+    static const unsigned kInjQ = 1024;
+    InjEv                inj_[kInjQ];
+    std::atomic<unsigned> injHead_{0}, injTail_{0};
+    std::atomic<unsigned long> injIn_{0}, injPlaced_{0};
+
+    /* Place what is due into this block; leave what belongs to a later one
+     * queued. Audio thread only. With no plugin there is nothing to play to,
+     * so due events are discarded rather than saved up to burst in when one
+     * loads. */
+    void drainInjected(int frames, double bwall)
+    {
+        unsigned tl = injTail_.load(std::memory_order_relaxed);
+        const unsigned hd = injHead_.load(std::memory_order_acquire);
+        while (tl != hd) {
+            const InjEv v = inj_[tl % kInjQ];
+            const double f = (v.wall - bwall) * double(kSampleRate);
+            if (f >= frames) break;                /* a later block's */
+            tl++;
+            if (host_) {
+                pehost_midi_at(host_, v.st, v.d1, v.d2, f < 0 ? 0 : int(f));
+                injPlaced_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        injTail_.store(tl, std::memory_order_release);
+    }
+
+    static double monoNow()
+    {
+        using namespace std::chrono;
+        return duration<double>(steady_clock::now().time_since_epoch()).count();
+    }
 
     /* The input signal, for effects. */
     float               *in_ = nullptr;

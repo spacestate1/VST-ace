@@ -3681,6 +3681,15 @@ void pehost_midi(pehost *h, int status, int d1, int d2)
 }
 void pehost_midi_at(pehost *h, int status, int d1, int d2, int frame)
 {
+    /* System messages carry no frame placement -- clock, transport and song
+     * position act on arrival -- and the ordinary path is where the host's
+     * tempo and transport bookkeeping lives. Pushed raw into the event batch
+     * instead, a sequencer's clock reached the plugin as junk voice messages
+     * and never set the tempo at all. */
+    if ((status & 0xF8) == 0xF8 || status == 0xF2) {
+        pehost_midi(h, status, d1, d2);
+        return;
+    }
     /* The bridge carries the offset across to the helper, which applies it on the
      * far side -- so a 32-bit plugin and an isolated one keep their timing. */
     if (h && h->br) { bridge_midi_at(h->br, status, d1, d2, frame); return; }

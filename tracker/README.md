@@ -28,6 +28,18 @@ it plays; the list shows every program that can be played. A green dot means
 connected, a red one means that window is not open -- open it and the tracker
 connects within two seconds, without anything being clicked.
 
+In studio (the session shell, `session/`), the synth tabs appear in the same
+list as `this window: <plug-in>`, after the ALSA windows. Picking one plays
+the tab directly, in-process -- no trip through the sequencer -- with the
+same sample-accurate timing the kernel's queue gives an ALSA window: the
+engine's delivery thread turns each event's queue tick into wall-clock time
+exactly as the queue's timestamps mean it and hands the tab a block at a
+time, and the tab's audio engine places every event on its own sample. One
+destination per track, as with a window: the track's window names wait in the
+song, and routing back reconnects them. Sink routing is runtime state -- a
+saved song carries no sink -- and a routed tab closing sends the track back
+to its window.
+
 ## Samples
 
 A track can play a sample set instead of a window, which the tracker sounds
@@ -170,5 +182,8 @@ finds its windows again however many times they have been reopened.
 
 `trktest` runs two ALSA receivers standing in for two windows and checks
 timing, the clock, routing, that the ports refuse other subscribers, and that
-stop, panic and quitting leave nothing sounding. The UI tests drive each
-window with real key events and save a picture at each step.
+stop, panic and quitting leave nothing sounding -- plus the in-process sinks:
+delivery timing against the sink's own clock, clock and transport once per
+sink, preview, moving a track between a window and a sink, and a sink removed
+mid-song. The UI tests drive each window with real key events and save a
+picture at each step.

@@ -723,6 +723,14 @@ public:
     virtual QMenu *addMenu(const QString &title) = 0;          // a top-level menu, to fill
     virtual void showStatus(const QString &msg, int ms) = 0;   // on the status line; ms a timeout
     virtual void requestQuit() = 0;                            // File > Quit
+    // In-process destinations the shell can play a track to directly, beyond
+    // the ALSA windows trk_list_dests offers -- studio's synth tabs, named by
+    // plug-in. The defaults are no destinations and a pick ignored, which is
+    // the standalone tracker's whole answer: nothing there changes.
+    virtual QStringList midiSinks() { return {}; }
+    // A track's destination picked one of midiSinks -- or a window again
+    // (name empty). The shell makes the routing change.
+    virtual void midiSinkPicked(int track, const QString &name) { (void)track; (void)name; }
 };
 
 // ------------------------------------------------------------- the widget --
@@ -946,13 +954,20 @@ public:
                 trk_unlock(e_);
             });
             connect(dest_[t], &QComboBox::activated, this, [this, t](int) {
-                const QStringList d = dest_[t]->currentData().toString().split('\t');
-                trk_lock(e_);
-                trk_track *k = &trk_song_of(e_)->track[t];
-                std::snprintf(k->client, TRK_DEST_LEN, "%s", d.value(0).toUtf8().constData());
-                std::snprintf(k->port, TRK_DEST_LEN, "%s", d.value(1).toUtf8().constData());
-                trk_unlock(e_);
-                trk_route(e_);
+                const QString data = dest_[t]->currentData().toString();
+                if (data.startsWith("sink\t")) {
+                    // An in-process tab: the shell owns the routing change.
+                    host_->midiSinkPicked(t, data.mid(5));
+                } else {
+                    host_->midiSinkPicked(t, QString());   // back to a window, if it was a sink
+                    const QStringList d = data.split('\t');
+                    trk_lock(e_);
+                    trk_track *k = &trk_song_of(e_)->track[t];
+                    std::snprintf(k->client, TRK_DEST_LEN, "%s", d.value(0).toUtf8().constData());
+                    std::snprintf(k->port, TRK_DEST_LEN, "%s", d.value(1).toUtf8().constData());
+                    trk_unlock(e_);
+                    trk_route(e_);
+                }
                 refreshDests(true);
                 view_->setFocus();
             });
@@ -1069,6 +1084,14 @@ public:
     trk_editor *editor() { return &ed_; }
     QComboBox *dest(int t) const { return dest_[t]; }
     bool writeSong(const QString &p) { return writeTo(p); }
+    // A scripted drive that changed the song for its own purposes: closing
+    // should not ask about those changes.
+    void markClean()
+    {
+        trk_lock(e_);
+        std::memcpy(saved_.get(), trk_song_of(e_), sizeof(trk_song));
+        trk_unlock(e_);
+    }
 
     // How wide the standalone window opens; a shell sizes the widget itself.
     int preferredWidth() const
@@ -1275,14 +1298,27 @@ private:
     // The destination lists: every window that can be played, plus whatever
     // a track names that is not open right now -- kept, and marked, so
     // loading a song before its windows does not forget where tracks go.
+    // After the windows, the shell's in-process destinations (studio's synth
+    // tabs); a track routed to one shows it, and its window names wait in the
+    // song for the track to be routed back.
     void refreshDests(bool force)
     {
         static char buf[16384];
         trk_list_dests(e_, buf, sizeof buf);
-        const QString list = QString::fromUtf8(buf);
+        const QStringList sinks = host_->midiSinks();
+        // The sink each track plays, so a routing changed from elsewhere --
+        // a routed tab closing -- rebuilds the lists on the next pass.
+        QStringList routed;
+        for (int t = 0; t < TRK_TRACKS; t++) {
+            char nm[TRK_DEST_LEN] = "";
+            const int id = trk_sink_of(e_, t);
+            if (id >= 0) trk_sink_name(e_, id, nm, sizeof nm);
+            routed << QString::fromUtf8(nm);
+        }
+        const QString list = QString::fromUtf8(buf) + '|' + sinks.join('\n') + '|' + routed.join('\n');
         if (!force && list == lastDests_) { updateStates(); return; }
         lastDests_ = list;
-        const QStringList lines = list.split('\n', Qt::SkipEmptyParts);
+        const QStringList lines = QString::fromUtf8(buf).split('\n', Qt::SkipEmptyParts);
         for (int t = 0; t < TRK_TRACKS; t++) {
             QComboBox *c = dest_[t];
             if (c->view()->isVisible()) continue;          // not under the user's pointer
@@ -1290,18 +1326,29 @@ private:
             const QString want = QString::fromUtf8(trk_song_of(e_)->track[t].client) + '\t' +
                                  QString::fromUtf8(trk_song_of(e_)->track[t].port);
             trk_unlock(e_);
+            const QString sinkName = routed[t];
             c->blockSignals(true);
             c->clear();
             c->addItem("(nowhere)", QString("\t"));
             int sel = 0;
-            for (const QString &l : lines) {
-                const QStringList d = l.split('\t');
-                c->addItem(d.value(0) + ": " + d.value(1), l);
-                if (l == want) sel = c->count() - 1;
+            if (sinkName.isEmpty()) {
+                for (const QString &l : lines) {
+                    const QStringList d = l.split('\t');
+                    c->addItem(d.value(0) + ": " + d.value(1), l);
+                    if (l == want) sel = c->count() - 1;
+                }
+                if (!sel && want != "\t") {
+                    const QStringList d = want.split('\t');
+                    c->addItem(d.value(0) + ": " + d.value(1) + " (not open)", want);
+                    sel = c->count() - 1;
+                }
             }
-            if (!sel && want != "\t") {
-                const QStringList d = want.split('\t');
-                c->addItem(d.value(0) + ": " + d.value(1) + " (not open)", want);
+            for (const QString &s : sinks) {
+                c->addItem("this window: " + s, QString("sink\t") + s);
+                if (!sinkName.isEmpty() && s == sinkName) sel = c->count() - 1;
+            }
+            if (!sinkName.isEmpty() && !sel) {
+                c->addItem("this window: " + sinkName + " (closed)", QString("sink\t") + sinkName);
                 sel = c->count() - 1;
             }
             c->setCurrentIndex(sel);

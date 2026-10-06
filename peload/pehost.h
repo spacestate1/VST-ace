@@ -270,7 +270,9 @@ void  pehost_set_input_mask(pehost *h, unsigned mask);
  * which the event should take effect. This is what a sequencer wants -- it knows
  * exactly where a note falls, and passing that through is the difference between
  * a rhythm that lands and one quantised to the block size. Out-of-range offsets
- * are clamped into the block. Use pehost_midi when the time is simply "now". */
+ * are clamped into the block. Use pehost_midi when the time is simply "now".
+ * System messages (clock, transport, song position) take that path themselves:
+ * they act on arrival, not on a frame. */
 void  pehost_midi_at(pehost *h, int status, int d1, int d2, int frame);
 
 /* MIDI that did not reach the plugin: events lost to a full queue, and events

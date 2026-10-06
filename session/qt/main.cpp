@@ -7,7 +7,19 @@
  * (peload/qtgui/hostwindow.h) and the tracker tab is a TrackerWidget
  * (tracker/qt/trackerwidget.h). This file is only what both ask a frame for --
  * a menu bar, a status line, tab bookkeeping, and a say over which tab's piano
- * answers the computer keyboard. */
+ * answers the computer keyboard.
+ *
+ * And the routing: every synth tab is registered with the tracker's engine as
+ * an in-process MIDI sink (trk_add_sink), named by its plug-in, so a track can
+ * play a tab directly -- the track's destination list shows it as "this
+ * window: <name>" beside the ALSA windows, and picking it moves the track,
+ * exactly as moving it to another window does. Delivery is sample-accurate:
+ * the engine's delivery thread hands each tab's Engine wall-clock-stamped
+ * blocks (sinkDeliver), and the Engine places every event in its own rendered
+ * block on the sample (Engine::injectMidi). A tab closing unregisters its
+ * sink first -- trk_remove_sink waits out any delivery in flight -- so the
+ * tracker never calls into a dead engine, and tracks routed there fall back
+ * to the ALSA windows their songs name. */
 
 #include <QtWidgets>
 
@@ -17,6 +29,19 @@
 extern "C" {
 #include "trk.h"
 #include "version.h"
+}
+
+/* The tracker's delivery into a synth tab: the engine's delivery thread calls
+ * this with one block of events, each placed in the block by its frame
+ * offset; the tab's Engine re-places them into its own rendered block by
+ * wall-clock time. Never blocks, never calls back into the tracker -- the
+ * delivery lock is held while this runs. */
+static void sinkDeliver(void *ud, double wall, const trk_sink_ev *evs, int n)
+{
+    Engine *eng = static_cast<Engine *>(ud);
+    for (int i = 0; i < n; i++)
+        eng->injectMidi(wall + double(evs[i].frame) / TRK_SINK_RATE,
+                        evs[i].status, evs[i].d1, evs[i].d2);
 }
 
 /* The shell answers to both widgets' host interfaces. HostShell::addMenu and
@@ -84,6 +109,29 @@ public:
     }
     int tabCount() const { return tabs_->count(); }
 
+    /* --route <track>: play the track into the first synth tab, in-process,
+     * and start the song. A four-note figure goes into the pattern first so
+     * the scripted proof does not depend on the song's contents. */
+    bool routeTrack(int track)
+    {
+        if (!trkEngine_ || track < 0 || track >= TRK_TRACKS || sinks_.isEmpty())
+            return false;
+        trk_lock(trkEngine_);
+        trk_song *s = trk_song_of(trkEngine_);
+        if (s->pattern[0].rows < 16) s->pattern[0].rows = 16;
+        for (int i = 0; i < 4; i++) {
+            s->pattern[0].cell[i * 4][track].note = uint8_t(60 + i * 4);
+            s->pattern[0].cell[i * 4][track].vel = 100;
+        }
+        trk_unlock(trkEngine_);
+        if (tracker_) tracker_->markClean();   // the figure is the drive's, not the user's
+        trk_route_sink(trkEngine_, track, sinks_.first().id);
+        if (trk_sink_of(trkEngine_, track) < 0) return false;
+        routed_ = true;
+        trk_play(trkEngine_, TRK_PLAY_SONG, 0, 0);
+        return true;
+    }
+
     /* Scripted exercise for a machine with no XTEST, in the idiom of
      * pestudio's --cycle: what clicking through the smoke test by hand cannot
      * prove twice. Every second the next tab is brought to the front (so the
@@ -91,7 +139,9 @@ public:
      * (so its peak meter has something to say), and each engine's callback
      * count and peak are printed. Three seconds before the end the first
      * synth tab is closed through the ordinary close path, and at `ms` the
-     * application quits. */
+     * application quits. With --route the note injection is skipped -- the
+     * tracker is playing the routed tab by then, and its peak has to be the
+     * tracker's alone to prove anything. */
     void startSmokeDrive(int ms)
     {
         smokeStep_ = 0;
@@ -102,12 +152,18 @@ public:
             for (int i = 0; i < n; i++) {
                 auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
                 if (!h) {
-                    fprintf(stderr, "smoke: tab %d \"%s\" (tracker)\n",
-                            i, qPrintable(tabs_->tabText(i)));
+                    /* The tracker: how its first two tracks are routed, as the
+                     * destination boxes show it. */
+                    auto *tw = qobject_cast<TrackerWidget *>(tabs_->widget(i));
+                    fprintf(stderr, "smoke: tab %d \"%s\" (tracker)%s dest1=\"%s\" dest2=\"%s\"\n",
+                            i, qPrintable(tabs_->tabText(i)),
+                            trkEngine_ && trk_playing(trkEngine_) ? " playing" : "",
+                            tw ? qPrintable(tw->dest(0)->currentText()) : "",
+                            tw ? qPrintable(tw->dest(1)->currentText()) : "");
                     continue;
                 }
                 pehost *ph = h->engine()->host();
-                if (ph) {
+                if (ph && !routed_) {
                     pehost_note_off(ph, smokeNote_);
                     smokeNote_ = 60 + (smokeStep_ + i) % 12;
                     pehost_note_on(ph, smokeNote_, 100);
@@ -115,10 +171,11 @@ public:
                 unsigned dropped = 0, spilled = 0;
                 if (ph) pehost_midi_stats(ph, &dropped, &spilled);
                 fprintf(stderr, "smoke: tab %d \"%s\" callbacks=%lu peak=%.3f "
-                                "keysLive=%d dropped=%u spilled=%u%s\n",
+                                "keysLive=%d dropped=%u spilled=%u injected=%lu placed=%lu%s\n",
                         i, qPrintable(tabs_->tabText(i)),
                         h->engine()->callbacks(), h->engine()->peak(),
                         int(h->keysLive()), dropped, spilled,
+                        h->engine()->midiInjected(), h->engine()->midiPlaced(),
                         ph ? "" : " (no plug-in)");
             }
             smokeStep_++;
@@ -156,12 +213,38 @@ public:
         return m;
     }
 
+    /* -- TrackerHost: the synth tabs as in-process tracker destinations ---- */
+
+    /* Every synth tab is a destination, named by its plug-in. The tracker
+     * offers them after the ALSA windows; picking one routes that track to
+     * the tab directly, no trip through the sequencer. */
+    QStringList midiSinks() override
+    {
+        QStringList names;
+        for (const SinkEntry &s : sinks_) names << s.name;
+        return names;
+    }
+    void midiSinkPicked(int track, const QString &name) override
+    {
+        if (!trkEngine_) return;
+        if (name.isEmpty()) { trk_route_sink(trkEngine_, track, -1); return; }
+        for (const SinkEntry &s : sinks_)
+            if (s.name == name) { trk_route_sink(trkEngine_, track, s.id); return; }
+    }
+
 protected:
     void closeEvent(QCloseEvent *e) override
     {
         /* The tracker's song may have unsaved changes; closing the window asks
          * exactly as closing its tab does. */
         if (tracker_ && !tracker_->confirmClose()) { e->ignore(); return; }
+        /* The tabs are deleted with the window, not through closeTab, so
+         * their tracker destinations are unregistered here: after the last
+         * trk_remove_sink returns the delivery thread is provably out of
+         * every tab's engine, whatever order the widgets die in. The engine
+         * itself is left to the process exit, as before -- with no sinks
+         * left, its threads touch nothing of the tabs'. */
+        while (!sinks_.isEmpty()) removeSink(sinks_.first().tab);
         /* The crash marker belongs to the process, and the close comes to the
          * shell rather than to any HostWidget -- see HostWidget::closeEvent. */
         HostWidget::clearCrashMarker();
@@ -198,7 +281,9 @@ private:
         connect(h, &QWidget::windowTitleChanged, this, [this, h](const QString &t) {
             const int i = tabs_->indexOf(h);
             if (i >= 0) tabs_->setTabText(i, t.isEmpty() ? QString("synth") : t);
+            renameSink(h);           // the tracker's destination list follows
         });
+        ensureSink(h);               // a destination the tracker can play directly
         tabs_->setCurrentIndex(ix);
         updateCanvas();
         return h;
@@ -220,6 +305,10 @@ private:
                                      .arg(QString::fromLocal8Bit(err)));
             return nullptr;
         }
+        /* The engine did not exist when earlier synth tabs opened; register
+         * their destinations now. */
+        for (int i = 0; i < tabs_->count(); i++)
+            if (auto *h = qobject_cast<HostWidget *>(tabs_->widget(i))) ensureSink(h);
         building_ = true;
         auto *t = new TrackerWidget(trkEngine_, this);
         building_ = false;
@@ -265,8 +354,14 @@ private:
             tracker_ = nullptr;
             trk_close(trkEngine_);
             trkEngine_ = nullptr;
+            sinks_.clear();            /* the destinations died with the engine */
             newTracker_->setEnabled(true);
         } else {
+            /* Unregister first: the tracker's delivery thread may be calling
+             * into the tab's engine right now, and trk_remove_sink waits that
+             * out -- after it returns, nothing touches the engine again, and
+             * tracks routed here fall back to their ALSA windows. */
+            removeSink(static_cast<HostWidget *>(w));
             /* ~HostWidget lets go of the plug-in cleanly: the MIDI reader is
              * stopped and the editors detached in its body, then the Engine's
              * own teardown stops the PipeWire loop before pehost_close. */
@@ -274,6 +369,54 @@ private:
         }
         updateCanvas();
         arbitrateKeys();
+    }
+
+    /* The tracker destinations: one per synth tab, named by its plug-in. */
+    struct SinkEntry { HostWidget *tab; int id; QString name; };
+
+    QString uniqueSinkName(const QString &base, const HostWidget *exclude) const
+    {
+        const QString b = base.isEmpty() ? QString("synth") : base;
+        QString name = b;
+        for (int n = 2; ; n++) {
+            bool taken = false;
+            for (const SinkEntry &s : sinks_)
+                if (s.tab != exclude && s.name == name) { taken = true; break; }
+            if (!taken) return name;
+            name = QString("%1 %2").arg(b).arg(n);
+        }
+    }
+    void ensureSink(HostWidget *h)
+    {
+        if (!trkEngine_ || !h) return;
+        for (const SinkEntry &s : sinks_) if (s.tab == h) return;
+        const int id = trk_add_sink(trkEngine_,
+                                    uniqueSinkName(h->windowTitle(), h).toUtf8().constData(),
+                                    &sinkDeliver, h->engine());
+        if (id < 0) return;
+        char nm[TRK_DEST_LEN] = "";
+        trk_sink_name(trkEngine_, id, nm, sizeof nm);
+        sinks_.append({ h, id, QString::fromUtf8(nm) });
+    }
+    void removeSink(HostWidget *h)
+    {
+        for (int i = 0; i < sinks_.size(); i++)
+            if (sinks_[i].tab == h) {
+                if (trkEngine_) trk_remove_sink(trkEngine_, sinks_[i].id);
+                sinks_.removeAt(i);
+                return;
+            }
+    }
+    void renameSink(HostWidget *h)
+    {
+        for (SinkEntry &s : sinks_)
+            if (s.tab == h) {
+                const QString name = uniqueSinkName(h->windowTitle(), h);
+                if (name == s.name) return;
+                s.name = name;
+                if (trkEngine_) trk_sink_rename(trkEngine_, s.id, name.toUtf8().constData());
+                return;
+            }
     }
 
     /* Only the tab in front answers the computer keyboard. Every HostWidget
@@ -333,6 +476,8 @@ private:
     QAction        *newTracker_ = nullptr;
     TrackerWidget  *tracker_ = nullptr;
     trk_engine     *trkEngine_ = nullptr;
+    QList<SinkEntry> sinks_;             /* every synth tab the tracker can play directly */
+    bool           routed_ = false;      /* --route: the tracker drives the proof, not smoke's notes */
     /* Set around each tab's construction, which is when both widgets build
      * their menus through addMenu; the menus collected are filed under the
      * new tab once it exists -- see menusOf_. */
@@ -391,13 +536,14 @@ int main(int argc, char **argv)
      *
      *   studio --synth blooo64.dll --synth "Surge XT.vst3" --tracker
      *   studio --song song.trk
+     *   studio --route 2 --synth ... --tracker   track 2 plays the first synth tab
      *   studio --smoke 15000 --synth ...   scripted exercise, then quit
      *   studio --quit-after 15000 ...      just quit then
      */
     QStringList synths;
     QString song;
     bool wantTracker = false;
-    int quitAfter = 0, smoke = 0;
+    int quitAfter = 0, smoke = 0, route = -1;
     for (int i = 1; i < argc; i++) {
         const QString a = QString::fromLocal8Bit(argv[i]);
         if (a == "--synth" && i + 1 < argc)
@@ -406,15 +552,20 @@ int main(int argc, char **argv)
             wantTracker = true;
         else if (a == "--song" && i + 1 < argc)
             song = QString::fromLocal8Bit(argv[++i]);
+        else if (a == "--route" && i + 1 < argc)
+            route = atoi(argv[++i]);
         else if (a == "--quit-after" && i + 1 < argc)
             quitAfter = atoi(argv[++i]);
         else if (a == "--smoke" && i + 1 < argc)
             smoke = atoi(argv[++i]);
         else if (a == "--help" || a == "-h") {
             printf("studio [--synth <plug-in>]... [--tracker] [--song <file.trk>]\n"
-                   "       [--smoke <ms>] [--quit-after <ms>]\n\n"
+                   "       [--route <track>] [--smoke <ms>] [--quit-after <ms>]\n\n"
                    "The session window: a tab per synth plug-in, one for the "
-                   "tracker.\nWith no arguments it opens on a blank canvas.\n");
+                   "tracker.\nWith no arguments it opens on a blank canvas.\n"
+                   "--route plays the numbered track into the first synth tab, "
+                   "in-process,\nand starts the song -- the scripted proof of the "
+                   "direct routing.\n");
             return 0;
         } else {
             fprintf(stderr, "studio: unknown argument %s -- try --help\n",
@@ -428,6 +579,8 @@ int main(int argc, char **argv)
     for (const QString &s : synths) w.openSynth(s);
     if (wantTracker) w.openTracker();
     if (!song.isEmpty()) w.openSongPath(song);
+    if (route > 0 && !w.routeTrack(route - 1))
+        fprintf(stderr, "studio: --route %d failed (no synth tab, or no tracker?)\n", route);
     if (smoke > 0)
         w.startSmokeDrive(smoke);
     else if (quitAfter > 0)

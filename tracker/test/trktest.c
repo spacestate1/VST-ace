@@ -51,6 +51,30 @@ static volatile int g_stop;
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static int      g_fail;
 
+/* What the in-process sink was handed: one block's events, each with the
+ * block's wall-clock start and its sample offset within it. */
+#define MAXSEV 8192
+typedef struct { double wall; unsigned frame; int st, d1, d2; } sink_rec;
+static sink_rec g_sev[MAXSEV];
+static int      g_snev;
+static pthread_mutex_t g_smx = PTHREAD_MUTEX_INITIALIZER;
+
+static void sink_cb(void *ud, double wall, const trk_sink_ev *evs, int n)
+{
+    int i;
+    (void)ud;
+    pthread_mutex_lock(&g_smx);
+    for (i = 0; i < n && g_snev < MAXSEV; i++) {
+        g_sev[g_snev].wall = wall;
+        g_sev[g_snev].frame = evs[i].frame;
+        g_sev[g_snev].st = evs[i].status;
+        g_sev[g_snev].d1 = evs[i].d1;
+        g_sev[g_snev].d2 = evs[i].d2;
+        g_snev++;
+    }
+    pthread_mutex_unlock(&g_smx);
+}
+
 static double now_s(void)
 {
     struct timespec ts;
@@ -352,6 +376,169 @@ int main(void)
     snprintf(s->track[0].client, sizeof s->track[0].client, "trkrx A");
     trk_unlock(e);
     trk_route(e);
+
+    printf("in-process sinks\n");
+    {
+        int id, mark_s, mark_r, non;
+        char nm[TRK_DEST_LEN];
+
+        id = trk_add_sink(e, "test sink", sink_cb, NULL);
+        check(id >= 0, "a sink registers");
+        check(id >= 0 && trk_sink_name(e, id, nm, sizeof nm) == 0 && !strcmp(nm, "test sink"),
+              "the sink keeps its name");
+        check(trk_sink_of(e, 0) == -1, "tracks start on their windows");
+        trk_route_sink(e, 0, id);
+        trk_route_sink(e, 1, id);
+        check(trk_sink_of(e, 0) == id && trk_routed(e, 0), "track 1 routed to the sink");
+        check(trk_route(e) == 0, "a sink-routed track is not a missing window");
+
+        pthread_mutex_lock(&g_mx); mark_r = g_nev; pthread_mutex_unlock(&g_mx);
+        pthread_mutex_lock(&g_smx); mark_s = g_snev; pthread_mutex_unlock(&g_smx);
+        t0 = now_s();
+        trk_play(e, TRK_PLAY_PATTERN, 0, 0);
+        usleep(1600000);
+        trk_stop(e);
+        usleep(300000);
+        pthread_mutex_lock(&g_smx);
+        {
+            int cc74 = 0, clk = 0, starts = 0, stops = 0, spps = 0, disordered = 0;
+            int sounding[16][128];
+            double on[16], prev = 0, first = -1, worst = 0;
+            non = 0;
+            memset(sounding, 0, sizeof sounding);
+            for (i = mark_s; i < g_snev; i++) {
+                const sink_rec *x = &g_sev[i];
+                const double tev = x->wall + x->frame / 48000.0;
+                const int kind = x->st & 0xF0, ch = x->st & 15;
+                if (i > mark_s && tev < prev - 0.0001) disordered++;
+                prev = tev;
+                if (x->st == 0xF8) clk++;
+                if (x->st == 0xFA) starts++;
+                if (x->st == 0xFC) stops++;
+                if (x->st == 0xF2) spps++;
+                if (kind == 0xB0 && x->d1 == 74 && x->d2 == 0x40) cc74++;
+                if (kind == 0xB0 && (x->d1 == 123 || x->d1 == 120)) memset(sounding[ch], 0, sizeof sounding[ch]);
+                if (kind == 0x90 && x->d2 > 0) {
+                    sounding[ch][x->d1] = 1;
+                    if (ch == 0 && x->d1 == 60 && non < 16) {
+                        if (first < 0) first = tev - t0;
+                        else {
+                            double d = fabs(tev - on[non - 1] - 0.5);
+                            if (d > worst) worst = d;
+                        }
+                        on[non++] = tev;
+                    }
+                }
+                if (kind == 0x80 || (kind == 0x90 && x->d2 == 0)) sounding[ch][x->d1] = 0;
+            }
+            {
+                int held = 0;
+                for (i = 0; i < 16 * 128; i++) held += sounding[i / 128][i % 128];
+                printf("  sink: %d note-ons, first after %.1f ms, worst spacing error %.2f ms, "
+                       "%d clocks, %d held at stop\n", non, first * 1000, worst * 1000, clk, held);
+                check(non >= 3 && non <= 5, "track 1's beats reach the sink");
+                check(first >= 0 && first < 0.1, "the first note within 100 ms");
+                check(worst < 0.003, "beat spacing at the sink within 3 ms");
+                check(cc74 >= 1, "the controller column reaches the sink");
+                check(clk > 60 && clk < 90, "clock once to the sink, though two tracks play it");
+                check(starts == 1 && spps == 1 && stops == 1, "start, song position and stop each once");
+                check(!disordered, "events arrive in time order");
+                check(held == 0, "stop releases everything at the sink");
+            }
+        }
+        pthread_mutex_unlock(&g_smx);
+        pthread_mutex_lock(&g_mx);
+        {
+            int a_notes = 0, b_notes = 0;
+            for (i = mark_r; i < g_nev; i++) {
+                const rec *x = &g_ev[i];
+                if (x->rx == 0 && (x->type == SND_SEQ_EVENT_NOTEON || x->type == SND_SEQ_EVENT_NOTEOFF ||
+                                   x->type == SND_SEQ_EVENT_CONTROLLER)) a_notes++;
+                if (x->rx == 1 && is_on(x)) b_notes++;
+            }
+            check(a_notes == 0, "nothing of the sink-routed tracks reaches their old windows");
+            check(b_notes >= 1, "a track left on its window still plays it");
+        }
+        pthread_mutex_unlock(&g_mx);
+
+        pthread_mutex_lock(&g_mx); mark_r = g_nev; pthread_mutex_unlock(&g_mx);
+        pthread_mutex_lock(&g_smx); mark_s = g_snev; pthread_mutex_unlock(&g_smx);
+        trk_preview(e, 0, 64, 90);
+        usleep(60000);
+        trk_preview_off(e, 0);
+        usleep(150000);
+        pthread_mutex_lock(&g_smx);
+        non = 0;
+        {
+            int off = 0;
+            for (i = mark_s; i < g_snev; i++) {
+                const sink_rec *x = &g_sev[i];
+                if (x->d1 != 64) continue;
+                if ((x->st & 0xF0) == 0x90 && x->d2 > 0) non++;
+                if ((x->st & 0xF0) == 0x80 || ((x->st & 0xF0) == 0x90 && x->d2 == 0)) off++;
+            }
+            check(non == 1 && off == 1, "a preview plays at the sink");
+        }
+        pthread_mutex_unlock(&g_smx);
+        pthread_mutex_lock(&g_mx);
+        {
+            int at_a = 0;
+            for (i = mark_r; i < g_nev; i++)
+                if (g_ev[i].rx == 0 && g_ev[i].note == 64) at_a++;
+            check(at_a == 0, "and not at the window it left");
+        }
+        pthread_mutex_unlock(&g_mx);
+
+        trk_route_sink(e, 0, -1);
+        trk_route_sink(e, 1, -1);
+        check(trk_sink_of(e, 0) == -1, "routed back to the window");
+        pthread_mutex_lock(&g_mx); mark_r = g_nev; pthread_mutex_unlock(&g_mx);
+        pthread_mutex_lock(&g_smx); mark_s = g_snev; pthread_mutex_unlock(&g_smx);
+        trk_play(e, TRK_PLAY_PATTERN, 0, 0);
+        usleep(700000);
+        trk_stop(e);
+        usleep(250000);
+        pthread_mutex_lock(&g_mx);
+        non = 0;
+        for (i = mark_r; i < g_nev; i++)
+            if (g_ev[i].rx == 0 && g_ev[i].ch == 0 && g_ev[i].note == 60 && is_on(&g_ev[i])) non++;
+        check(non >= 1, "the window plays the track again");
+        pthread_mutex_unlock(&g_mx);
+        pthread_mutex_lock(&g_smx);
+        non = 0;
+        for (i = mark_s; i < g_snev; i++)
+            if ((g_sev[i].st & 0xF0) == 0x90 && g_sev[i].d2 > 0) non++;
+        check(non == 0, "and the sink hears nothing more");
+        pthread_mutex_unlock(&g_smx);
+
+        trk_route_sink(e, 0, id);
+        trk_play(e, TRK_PLAY_PATTERN, 0, 0);
+        usleep(400000);
+        pthread_mutex_lock(&g_mx); mark_r = g_nev; pthread_mutex_unlock(&g_mx);
+        pthread_mutex_lock(&g_smx); mark_s = g_snev; pthread_mutex_unlock(&g_smx);
+        trk_remove_sink(e, id);
+        check(trk_sink_of(e, 0) == -1, "removing the sink returns the track to its window");
+        check(trk_sink_name(e, id, nm, sizeof nm) == -1, "the sink is gone");
+        usleep(700000);
+        trk_stop(e);
+        usleep(250000);
+        pthread_mutex_lock(&g_smx);
+        non = 0;
+        for (i = mark_s; i < g_snev; i++) {
+            const sink_rec *x = &g_sev[i];
+            if ((x->st & 0xF0) == 0x80 ||
+                ((x->st & 0xF0) == 0xB0 && (x->d1 == 123 || x->d1 == 120))) non++;
+        }
+        check(non > 0, "what was sounding is released to the sink at removal");
+        pthread_mutex_unlock(&g_smx);
+        pthread_mutex_lock(&g_mx);
+        non = 0;
+        for (i = mark_r; i < g_nev; i++)
+            if (g_ev[i].rx == 0 && g_ev[i].ch == 0 && g_ev[i].note == 60 && is_on(&g_ev[i])) non++;
+        check(non >= 1, "the window takes over mid-song");
+        pthread_mutex_unlock(&g_mx);
+        check(trk_route(e) == 0, "routing is whole again afterwards");
+    }
 
     printf("restart while playing, then close while playing\n");
     pthread_mutex_lock(&g_mx); mark = g_nev; pthread_mutex_unlock(&g_mx);
