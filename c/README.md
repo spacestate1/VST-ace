@@ -166,3 +166,40 @@ The `--- column profile ---` block is the check that the mapping is right:
 every column must fall inside the range its name implies — waveforms 1..16,
 levels and envelope stages 0..31, octaves 0..2, cutoff 0..63, velocity 0..7.
 `Volume` is the only parameter the factory banks store as a fraction.
+
+## What a render costs
+
+The render loop priced every voice-sample with fresh libm calls — two `pow()`
+for pitch, two `log()` for the wavetable mip, three `pow(2,…)` for the cutoff,
+an `exp()` in the filter — about 28% of all cycles inside libm, even though
+those inputs are *exactly* constant through a sustain and whenever no
+modulation reaches them. The fix is memoisation keyed on the exact input
+doubles: equal bits in means identical libm bits out, so a cache hit is not an
+approximation but the same number, already computed. Per voice: pitch, mip,
+keyboard-tracking and envelope factors, and the whole filter-coefficient call.
+The mod-generator terms shared by every voice are computed once per sample, the
+invariant reads the compiler cannot prove constant are hoisted, and the delay
+skips its `sin()` at zero modulation depth. The juno's highpass coefficient got
+the same treatment, and the build moved to `-O3 -flto -fno-math-errno`.
+
+Measured (48 kHz, 10 s renders, ns/frame):
+
+| voices | before | after | |
+|---|---|---|---|
+| 1 | 209 | 119 | 1.76× |
+| 4 | 681 | 403 | 1.69× |
+| 8 | 1343 | 774 | 1.74× |
+
+Static patches improve more (LOW STRINGS at 8 voices: 1191 → 293); the
+all-modulation worst case — portamento retriggered, mod wheel to pitch and
+cutoff at full depth, autobend — is 1268 → 1166, so a cache that always misses
+still costs less than the old code. The check that makes the whole thing safe:
+26 render scenarios — sustained chords, portamento, every modulation route,
+delay on and off, all twelve juno patches — compared byte-for-byte before and
+after, in three splits (flags alone, sources alone, both). All identical.
+
+The one lever deliberately not taken: `pow(2,x)` → `exp2(x)` is worth about
+another 2× on modulated patches, but glibc's two results differ by up to an
+ulp, and an ulp through the filter's feedback flips 16-bit samples in a long
+render — which is what `dwrender`'s byte-stability is for. It stays available
+the day render diff-stability is formally waived.

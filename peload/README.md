@@ -502,6 +502,73 @@ Control changes reach the audio in **one block** (~5.3 ms at 256 frames), measur
 by moving a control in the plugin's editor and counting blocks until the parameter
 took effect. Adjusting a control while a note sounds does what it should.
 
+## The note keys, wherever focus goes
+
+The application-wide filter above was not the end of it. "A key-up is therefore
+always seen" held only as long as every key event stayed inside Qt's event stream,
+and two paths out of it were found the way these things are found: by a user
+reporting that the keyboard still cut out, sometimes, and that clicking the
+on-screen piano always brought it back.
+
+**The Dir field.** The directory display above the plugin list is a read-only but
+focusable line edit. One stray click and focus sat in a `QLineEdit`, which the
+note-key router treats as "the user is typing" -- so every note key was swallowed
+by a field no letter can land in. Nothing appeared, no note played, and the
+keyboard looked dead. A read-only line edit no longer counts as typing; the field
+stays selectable and copyable.
+
+**The native editor's X focus.** A native Linux editor is a real X11 window, and
+plugin toolkits take the X input focus for it on click (JUCE calls
+`XSetInputFocus` outright). From then on key events are delivered to the plugin's
+window and never enter Qt's event stream at all, so no Qt-side filter can see
+them. The fix snoops at the X level: `KeyPressMask` is selectable by any number
+of clients on one window, so pestudio selects it on the plugin's windows -- the
+plugin's own selection untouched, the key still delivered to it -- and routes the
+copies to the piano, deduping the propagated repeats. Windows created after
+attach are caught through `SubstructureNotify`, and a mid-session keyboard remap
+reloads the keymap.
+
+**Releases that reach nobody.** A native plugin's popup menu is a separate
+top-level window on the plugin's *own* X connection, and toolkits move the input
+focus to it. A key released there -- or lost to any grab, crash or focus
+transition mid-note -- reaches neither the Qt filter nor the snoop, and the note
+sticks for good. Chasing every window a release might land on is a losing game,
+so the watchdog asks about the key instead: while any computer-key note is held,
+a 150 ms timer polls `XQueryKeymap` -- physical state, unaffected by focus or
+grabs -- and a note whose key reads up on two consecutive ticks is released,
+with a log line so a report can confirm the mechanism fired:
+
+```
+piano: key 'z' up but note 48 held -- released (release event lost)
+```
+
+The mouse and MIDI hold notes without a key behind them, so the piano tracks
+key-held notes apart from held ones, and the watchdog can never cut a drag or a
+MIDI chord. A key that maps to no known keycode is treated as still down --
+never release on a guess. Off the xcb platform the watchdog never starts,
+because only there can a foreign X window eat a release.
+
+## One plug-in, one entry
+
+The selector dedupes by file identity and by content, which caught every way a
+plug-in file could be reached twice -- symlinks, overlapping roots, a copy in
+`~/.vst` of what the corpus holds. What it did not catch was a copy of a
+*bundle*: a `.vst3` is a directory, a copy of one has a different inode, and
+directories were the same only as themselves. So Surge XT, Odin2, OB-Xf and the
+Cardinals each appeared twice -- once from the unpacked release in the corpus,
+once from the copy installed into `~/.vst3`, the two byte-identical.
+
+A bundle is now identified by the module inside it
+(`Contents/x86_64-linux/Surge XT.so`, or the library of a flat bundle), and the
+same-content test that dedupes copied files dedupes copied bundles. The order
+stays cheap -- name, then size, then bytes -- and the failure modes are all in
+the right direction: two versions of one plug-in differ in the module and are
+both kept; siblings (Surge XT beside Surge XT Effects) stay separate; a renamed
+bundle with the same module still dedupes; a bundle with no findable module is
+the same only as itself, as before. The scan here went from **369 entries to
+355** -- fourteen duplicates, no false merges, and dwstudio shares the code, so
+it lists the same way.
+
 ## The bridge, under a GUI
 
 Three things about the helper only show up with an editor open and a hand on the
