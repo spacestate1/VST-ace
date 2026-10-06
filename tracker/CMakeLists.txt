@@ -55,13 +55,23 @@ else()
 endif()
 
 pkg_check_modules(GTK4 IMPORTED_TARGET gtk4)
-if(GTK4_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/gtk/main.c)
+if(GTK4_FOUND AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/gtk/trackerview.c)
+  # The whole UI as a view a shell can embed, out of the same file the
+  # standalone wraps in a window -- the mirror of qt/trackerwidget.h, in C.
+  # studiogtk (session/) links this and packs the view into a tab.
+  add_library(trkgtk STATIC gtk/trackerview.c)
+  target_link_libraries(trkgtk PUBLIC trkcore PkgConfig::GTK4)
+  target_include_directories(trkgtk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/gtk)
+  target_compile_options(trkgtk PRIVATE -Wall -Wextra)
   add_executable(tracker-gtk gtk/main.c)
-  target_link_libraries(tracker-gtk PRIVATE trkcore PkgConfig::GTK4)
+  target_link_libraries(tracker-gtk PRIVATE trkgtk PkgConfig::GTK4)
   target_compile_options(tracker-gtk PRIVATE -Wall -Wextra)
-  # Driven by a script under the broadway backend -- see uitest() in main.c.
-  add_executable(tracker-gtk-uitest gtk/main.c)
+  # Driven by a script under the broadway backend -- see uitest() in
+  # trackerview.c. Built from the sources rather than the library so the
+  # TRACKER_UITEST drive is compiled in; the library never carries it.
+  add_executable(tracker-gtk-uitest gtk/main.c gtk/trackerview.c)
   target_compile_definitions(tracker-gtk-uitest PRIVATE TRACKER_UITEST)
+  target_include_directories(tracker-gtk-uitest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gtk)
   target_link_libraries(tracker-gtk-uitest PRIVATE trkcore PkgConfig::GTK4)
 else()
   message(STATUS "tracker-gtk skipped: needs gtk4")

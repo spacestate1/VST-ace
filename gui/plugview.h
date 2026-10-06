@@ -90,8 +90,9 @@ void plugview_enter_key(plugview *pv, GtkWindow *parent);
  * pane -- the input-channel mask, and what an effect's input is fed from --
  * and a fresh plug-in starts with neither. Polling for it would mean noticing
  * a load only when something visible changed, which a load onto a plug-in of
- * the same shape does not. */
-void plugview_set_load_hook(plugview *pv, void (*fn)(void));
+ * the same shape does not. The instance is passed because a shell hosting
+ * several panes has to know which one loaded. */
+void plugview_set_load_hook(plugview *pv, void (*fn)(plugview *pv));
 
 /* Keyboard reach into the pane, for the window's accelerators. Everything here
  * is otherwise only a click: which list has focus, and which of the two pages
@@ -104,6 +105,34 @@ void plugview_toggle_editor(plugview *pv);
 /* True when a plug-in is loaded, i.e. when it -- and not an engine -- is what
  * should be heard. Cheap enough for the audio callback. */
 int  plugview_active(plugview *pv);
+
+/* Load one plug-in by path, without the dialog -- a shell's --synth, where
+ * plugview_open_vst is the clicked equivalent. Returns 1 when it loaded. */
+int  plugview_load_path(plugview *pv, const char *path);
+
+/* The loaded plug-in's own name, or "" when nothing is loaded -- what a
+ * shell puts on the pane's tab and in the tracker's destination list. */
+const char *plugview_loaded_name(plugview *pv);
+
+/* The highest output level seen since the last plugview_peak_reset, as a
+ * fraction of full scale -- for a shell's instrumentation, where the pane's
+ * own meter is the display version of the same number. */
+double plugview_peak(plugview *pv);
+void   plugview_peak_reset(plugview *pv);
+
+/* MIDI from an in-process sequencer, due at a wall-clock time (seconds,
+ * CLOCK_MONOTONIC) -- the session shell's tracker playing this pane without
+ * a trip through ALSA. Lock-free SPSC: the sequencer's delivery thread
+ * produces, plugview_render_io drains at the top of the block, placing each
+ * event into the block its time falls in, on the sample -- pehost_midi_at
+ * with the true offset rather than the arrival-time placement ALSA-delivered
+ * events get. Never blocks; a full ring drops, and the caller counts its own
+ * drops. Mirrors Engine::injectMidi in peload/qtgui/hostwindow.h.
+ * plugview_inject_stats is the instrumentation: events offered, and events
+ * the audio thread has placed into a block. */
+void plugview_inject_midi(plugview *pv, double wall, int status, int d1, int d2);
+void plugview_inject_stats(plugview *pv, unsigned long *injected,
+                           unsigned long *placed);
 
 /* Audio thread. Fills `out` with `frames` interleaved stereo frames and
  * returns 1; returns 0 when no plug-in is loaded, leaving `out` untouched. */

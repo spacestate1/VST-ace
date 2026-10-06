@@ -59,7 +59,8 @@ a folder, pick a plug-in, and get its programs, every exposed parameter, a
 playable keyboard, a pitch wheel, patch banks, a recorder, and the plug-in's
 own editor -- blitted for Windows plug-ins, embedded as an X11 child window for
 native Linux ones. studio is the same host in a session window: a tab per
-plug-in beside the pattern tracker's tab. dwstudio (GTK4) drives the
+plug-in beside the pattern tracker's tab, and studiogtk is that session
+window in GTK. dwstudio (GTK4) drives the
 reimplemented engines: a Korg DW-8000, a 4-op FM synth, a Juno-6 and sample
 kits.
 
@@ -110,6 +111,7 @@ cmake -B obj-session -S session \
     -DCMAKE_CXX_FLAGS="%{build_cxxflags}" \
     -DCMAKE_EXE_LINKER_FLAGS="%{build_ldflags}"
 cmake --build obj-session --parallel --target studio
+cmake --build obj-session --parallel --target studiogtk
 
 # pestudio, dwstudio and studio are skipped rather than failed when their
 # toolkit is missing, so without this a package built without Qt6 or GTK4
@@ -119,6 +121,7 @@ test -x obj-peload/peserve
 test -x obj-peload/pestudio
 test -x obj-gui/dwstudio
 test -x obj-session/studio
+test -x obj-session/studiogtk
 
 %install
 # The real programs go together in one private directory because that is where
@@ -129,6 +132,8 @@ install -D -m 0755 obj-peload/peserve  %{buildroot}%{pkglibdir}/peserve
 install -D -m 0755 obj-peload/pestudio %{buildroot}%{pkglibdir}/pestudio
 install -D -m 0755 obj-gui/dwstudio    %{buildroot}%{pkglibdir}/dwstudio
 install -D -m 0755 obj-session/studio  %{buildroot}%{pkglibdir}/studio
+%{pkglibdir}/studiogtk
+install -D -m 0755 obj-session/studiogtk %{buildroot}%{pkglibdir}/studiogtk
 install -D -m 0755 c/build/va          %{buildroot}%{_bindir}/va
 
 # Where real Microsoft runtime DLLs go. Empty, because the redistributable is
@@ -141,7 +146,7 @@ install -D -m 0644 packaging/runtime-README %{buildroot}%{pkglibdir}/runtime/REA
 # -r, so the links are relative: an absolute one records the buildroot's idea
 # of the path and rpm warns about it. /proc/self/exe resolves either kind back
 # to pkglibdir, which is what the helper lookup depends on.
-for p in peload pestudio dwstudio studio; do
+for p in peload pestudio dwstudio studio studiogtk; do
     ln -sfr %{buildroot}%{pkglibdir}/$p %{buildroot}%{_bindir}/$p
 done
 
@@ -158,8 +163,11 @@ install -D -m 0644 packaging/dwstudio.desktop \
     %{buildroot}%{_datadir}/applications/dwstudio.desktop
 install -D -m 0644 packaging/studio.desktop \
     %{buildroot}%{_datadir}/applications/studio.desktop
+%{_datadir}/applications/studiogtk.desktop
+install -D -m 0644 packaging/studiogtk.desktop \
+    %{buildroot}%{_datadir}/applications/studiogtk.desktop
 
-for m in va peload pestudio dwstudio studio; do
+for m in va peload pestudio dwstudio studio studiogtk; do
     install -D -m 0644 packaging/$m.1 %{buildroot}%{_mandir}/man1/$m.1
 done
 
@@ -167,6 +175,7 @@ done
 desktop-file-validate %{buildroot}%{_datadir}/applications/pestudio.desktop
 desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 desktop-file-validate %{buildroot}%{_datadir}/applications/studio.desktop
+desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
 
 %files
 %license LICENSE
@@ -176,6 +185,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studio.desktop
 %{_bindir}/pestudio
 %{_bindir}/dwstudio
 %{_bindir}/studio
+%{_bindir}/studiogtk
 %dir %{pkglibdir}
 %{pkglibdir}/peload
 %{pkglibdir}/peserve
@@ -195,6 +205,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studio.desktop
 %{_mandir}/man1/pestudio.1*
 %{_mandir}/man1/dwstudio.1*
 %{_mandir}/man1/studio.1*
+%{_mandir}/man1/studiogtk.1*
 
 %changelog
 * Mon Sep 07 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.0-1

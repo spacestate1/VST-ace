@@ -37,7 +37,7 @@ fi
 # Called through a symlink named after one of the programs, be that program.
 #
 # An AppImage is normally one application behind one name, and this one holds
-# six: three windows, the loader, the out-of-process host and the i386 helper.
+# seven: four windows, the loader, the out-of-process host and the i386 helper.
 # Renaming or symlinking the file is the AppImage convention for reaching the
 # others, so `ln -s vst-ace.AppImage peload && ./peload plug.dll --render out.wav`
 # works the way the installed packages' /usr/bin/peload does. ARGV0 is what the
@@ -68,7 +68,7 @@ case "$self" in
         fi
         exec "$APPDIR/usr/lib/vst-ace/peload32" "$@"
         ;;
-    peload|peserve|dwstudio)
+    peload|peserve|dwstudio|studiogtk)
         exec "$APPDIR/usr/lib/vst-ace/$self" "$@"
         ;;
 esac

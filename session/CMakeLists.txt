@@ -77,3 +77,19 @@ if(Qt6_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND)
 else()
   message(STATUS "studio skipped (needs Qt6Widgets, libpipewire-0.3 and alsa)")
 endif()
+
+# studiogtk -- the same shell in GTK: each synth tab is a plugview out of
+# gui/'s gtkhost (what dwstudio is one of), the tracker tab is tracker/gtk's
+# trackerview, embedded through the trkgtk library. gui/ is pulled in as a
+# subdirectory for gtkhost; it sees pehost already exists (added above) and
+# does not add peload a second time.
+pkg_check_modules(GTK4 IMPORTED_TARGET gtk4)
+pkg_check_modules(X11 IMPORTED_TARGET x11)
+if(GTK4_FOUND AND X11_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND AND TARGET trkgtk)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../gui gui-build EXCLUDE_FROM_ALL)
+  add_executable(studiogtk gtk/main.c)
+  target_link_libraries(studiogtk PRIVATE gtkhost trkgtk
+      PkgConfig::PIPEWIRE PkgConfig::ALSA m pthread)
+else()
+  message(STATUS "studiogtk skipped (needs gtk4, x11, libpipewire-0.3 and alsa)")
+endif()

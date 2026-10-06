@@ -2448,8 +2448,9 @@ static void apply_input_mask(void)
  * plug-in handle rather than in the pane, so a fresh plug-in starts without
  * them and a load onto one of the same shape would not be noticed by anything
  * watching the pane. */
-static void on_plugin_loaded(void)
+static void on_plugin_loaded(plugview *pv)
 {
+    (void)pv;                    /* one pane here; a shell's hook uses it */
     apply_input_mask();
     /* Ask what the plug-in has rather than whether it calls itself a synth --
      * Full Bucket's vocoder is a synth with two inputs, and asking the wrong

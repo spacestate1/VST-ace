@@ -1,0 +1,66 @@
+.TH STUDIOGTK 1 "October 2026" "vst-ace" "User Commands"
+.SH NAME
+studiogtk \- the session window in GTK: a tab per plug\-in, beside the tracker
+.SH SYNOPSIS
+.B studiogtk
+.RI [ \-\-synth " plug\-in" "]... [" \-\-tracker "] [" \-\-song " file.trk] [" \-\-quit\-after " ms]"
+.SH DESCRIPTION
+.B studiogtk
+is the vst\-ace session window in GTK, the counterpart of
+.BR studio (1):
+it opens on a blank canvas; File > New synth opens a tab hosting one plug\-in
+\(em the full dwstudio host, with its programs, parameters, keyboard, patch
+banks and editor \(em and File > New tracker opens the pattern sequencer in a
+tab of its own. Only the tab in front answers the computer keyboard, and the
+tabs mix into one audio stream, so several plug\-ins play at once.
+.PP
+Plug\-ins built for Windows, macOS and Linux all load as native code; there is
+no Wine and no emulation. They are hosted out of process by default, so one
+that faults costs a helper rather than the session.
+.PP
+The tracker tab is the same tracker the standalone binary runs, one per
+process. A track's destination list offers the synth tabs beside it as
+"this window: <name>", and picking one plays the track into the tab directly,
+in process, with sample\-accurate timing \(em no trip through the ALSA
+sequencer. A tab closing unregisters itself first, so tracks routed there
+fall back to the windows their songs name.
+.SH OPTIONS
+A session can be named rather than clicked together. Each
+.B \-\-synth
+opens a synth tab with that plug\-in loaded,
+.B \-\-tracker
+opens the tracker tab, and
+.B \-\-song
+loads a song into it, opening the tab first if needed.
+.B \-\-route
+plays the numbered track into the first synth tab, in process, and starts the
+song \(em the scripted proof of the direct routing.
+.B \-\-smoke
+runs the scripted exercise for that many milliseconds, printing each tab's
+callback count and peak once a second, then quits;
+.B \-\-quit\-after
+just quits then. With no arguments the window opens on the blank canvas.
+.SH ENVIRONMENT
+.TP
+.B GDK_BACKEND
+Editors embed through an X11 window id, so this wants to be \fBx11\fR under
+Wayland; XWayland is enough. Override it for a native Wayland window and no
+native editors.
+.TP
+.B GSK_RENDERER
+Forced to \fBcairo\fR: GTK's GL renderer on the toplevel's window hierarchy
+breaks the GLX contexts native plug\-in editors draw with. Set it yourself to
+override.
+.TP
+.B PEHOST_ISOLATE
+Set to 0 to host in process rather than behind the helper.
+.TP
+.BR DW_PERIOD ", " DW_LATENCY ", " DW_BACKEND
+Audio block size (frames), buffer depth (ms) and backend
+.RB ( auto ", " pipewire " or " alsa ).
+.SH SEE ALSO
+.BR va (1),
+.BR studio (1),
+.BR dwstudio (1),
+.BR pestudio (1),
+.BR peload (1).

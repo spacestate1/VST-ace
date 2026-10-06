@@ -28,7 +28,8 @@ it plays; the list shows every program that can be played. A green dot means
 connected, a red one means that window is not open -- open it and the tracker
 connects within two seconds, without anything being clicked.
 
-In studio (the session shell, `session/`), the synth tabs appear in the same
+In studio and studiogtk (the session shells, `session/`), the synth tabs
+appear in the same
 list as `this window: <plug-in>`, after the ALSA windows. Picking one plays
 the tab directly, in-process -- no trip through the sequencer -- with the
 same sample-accurate timing the kernel's queue gives an ALSA window: the

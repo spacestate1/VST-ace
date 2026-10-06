@@ -62,10 +62,11 @@ override_dh_auto_build:
 	cmake --build $(BUILD_PELOAD) $(PARALLEL)
 	cmake --build $(BUILD_GUI) $(PARALLEL) --target dwstudio
 	cmake --build $(BUILD_SESSION) $(PARALLEL) --target studio
-# pestudio, dwstudio, studio and peload32 are all skipped rather than failed when
+	cmake --build $(BUILD_SESSION) $(PARALLEL) --target studiogtk
+# pestudio, dwstudio, studio, studiogtk and peload32 are all skipped rather than failed when
 # their toolkit is missing, so a package built without Qt6, GTK4 or the i386
 # multilib toolchain present would otherwise ship quietly incomplete. Insist
-# on all six here, where the missing build-dependency is still the obvious
+# on all seven here, where the missing build-dependency is still the obvious
 # explanation.
 	test -x $(BUILD_PELOAD)/peload
 	test -x $(BUILD_PELOAD)/peserve
@@ -73,6 +74,7 @@ override_dh_auto_build:
 	test -x $(BUILD_PELOAD)/peload32
 	test -x $(BUILD_GUI)/dwstudio
 	test -x $(BUILD_SESSION)/studio
+	test -x $(BUILD_SESSION)/studiogtk
 # peload32 has to be the complete one, not merely present. Its editor window
 # and its audio path are both optional in peload/CMakeLists.txt -- without
 # 32-bit X11 or PipeWire it is configured windowless or render-only and still
@@ -102,6 +104,7 @@ override_dh_auto_install:
 	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
 	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
 	install -D -m 0755 $(BUILD_SESSION)/studio  $(DESTDIR)$(PKGLIBDIR)/studio
+	install -D -m 0755 $(BUILD_SESSION)/studiogtk $(DESTDIR)$(PKGLIBDIR)/studiogtk
 	install -D -m 0755 c/build/va               $(DESTDIR)/usr/bin/va
 # peload32 goes in here too, i386 binary in an amd64 package and all.
 #
@@ -127,9 +130,9 @@ override_dh_auto_install:
 	install -d $(DESTDIR)$(PKGLIBDIR)/runtime32
 	install -D -m 0644 packaging/runtime-README \
 	    $(DESTDIR)$(PKGLIBDIR)/runtime/README
-# The four that are worth having on $$PATH, as symlinks rather than copies:
+# The five that are worth having on $$PATH, as symlinks rather than copies:
 # the helper lookup above depends on the real programs staying together.
-	for p in peload pestudio dwstudio studio; do \
+	for p in peload pestudio dwstudio studio studiogtk; do \
 	    ln -sf ../lib/vst-ace/$$p $(DESTDIR)/usr/bin/$$p; \
 	done
 # The patch banks. Only the .json banks -- the generators beside them in the
@@ -143,7 +146,9 @@ override_dh_auto_install:
 	    $(DESTDIR)/usr/share/applications/dwstudio.desktop
 	install -D -m 0644 packaging/studio.desktop \
 	    $(DESTDIR)/usr/share/applications/studio.desktop
-	for m in va peload pestudio dwstudio studio; do \
+	install -D -m 0644 packaging/studiogtk.desktop \
+	    $(DESTDIR)/usr/share/applications/studiogtk.desktop
+	for m in va peload pestudio dwstudio studio studiogtk; do \
 	    install -D -m 0644 packaging/$$m.1 \
 	        $(DESTDIR)/usr/share/man/man1/$$m.1; \
 	done

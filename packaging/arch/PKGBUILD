@@ -102,8 +102,9 @@ build() {
         -DCMAKE_CXX_FLAGS="$CXXFLAGS $CPPFLAGS" \
         -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS"
     cmake --build obj-session --target studio
+    cmake --build obj-session --target studiogtk
 
-    # pestudio, dwstudio and studio are skipped rather than failed when their
+    # pestudio, dwstudio, studio and studiogtk are skipped rather than failed when their
     # toolkit is missing, so without this a package built without Qt6 or GTK4
     # would ship quietly incomplete. Insist on them here, where the missing
     # dependency is still the obvious explanation.
@@ -112,6 +113,7 @@ build() {
     test -x obj-peload/pestudio
     test -x obj-gui/dwstudio
     test -x obj-session/studio
+    test -x obj-session/studiogtk
 
     # peload32 is not insisted on. Unlike Debian, where the i386 libraries are
     # ordinary build-dependencies, this one needs multilib enabled in
@@ -137,6 +139,7 @@ check() {
     desktop-file-validate packaging/pestudio.desktop
     desktop-file-validate packaging/dwstudio.desktop
     desktop-file-validate packaging/studio.desktop
+    desktop-file-validate packaging/studiogtk.desktop
 }
 
 package() {
@@ -151,6 +154,7 @@ package() {
     install -Dm755 obj-peload/pestudio "$pkgdir$_pkglibdir/pestudio"
     install -Dm755 obj-gui/dwstudio    "$pkgdir$_pkglibdir/dwstudio"
     install -Dm755 obj-session/studio  "$pkgdir$_pkglibdir/studio"
+    install -Dm755 obj-session/studiogtk "$pkgdir$_pkglibdir/studiogtk"
     install -Dm755 c/build/va          "$pkgdir/usr/bin/va"
 
     # An i386 binary in an x86_64 package, deliberately -- namcap will say so.
@@ -172,9 +176,9 @@ package() {
     install -d "$pkgdir$_pkglibdir/runtime32"
     install -Dm644 packaging/runtime-README "$pkgdir$_pkglibdir/runtime/README"
 
-    # The four that are worth having on $PATH, as symlinks rather than copies:
+    # The five that are worth having on $PATH, as symlinks rather than copies:
     # the helper lookup above depends on the real programs staying together.
-    for p in peload pestudio dwstudio studio; do
+    for p in peload pestudio dwstudio studio studiogtk; do
         ln -sf "../lib/$pkgname/$p" "$pkgdir/usr/bin/$p"
     done
 
@@ -190,8 +194,10 @@ package() {
         "$pkgdir/usr/share/applications/dwstudio.desktop"
     install -Dm644 packaging/studio.desktop \
         "$pkgdir/usr/share/applications/studio.desktop"
+    install -Dm644 packaging/studiogtk.desktop \
+        "$pkgdir/usr/share/applications/studiogtk.desktop"
 
-    for m in va peload pestudio dwstudio studio; do
+    for m in va peload pestudio dwstudio studio studiogtk; do
         install -Dm644 "packaging/$m.1" "$pkgdir/usr/share/man/man1/$m.1"
     done
 

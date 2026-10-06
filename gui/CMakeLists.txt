@@ -65,14 +65,26 @@ pkg_check_modules(X11 REQUIRED x11)
 # pehost, so this window can host real plug-ins the way pestudio does rather
 # than only reading preset banks out of them. EXCLUDE_FROM_ALL because peload's
 # own programs are not wanted here -- only the library, and only what it pulls
-# in with it.
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../peload peload-build EXCLUDE_FROM_ALL)
+# in with it. session/ may already have added it when this project is pulled in
+# as a subdirectory of that one.
+if(NOT TARGET pehost)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../peload peload-build EXCLUDE_FROM_ALL)
+endif()
+
+# The plug-in pane as a library of its own, the mirror of peload's qthost:
+# dwstudio is one plugview in a window, and the multi-plug-in studiogtk window
+# links this and embeds several.
+add_library(gtkhost STATIC plugview.c)
+target_include_directories(gtkhost PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                           ${GTK4_INCLUDE_DIRS} ${X11_INCLUDE_DIRS})
+target_compile_options(gtkhost PUBLIC ${GTK4_CFLAGS_OTHER})
+target_link_libraries(gtkhost PUBLIC pehost ${GTK4_LIBRARIES} ${X11_LIBRARIES} m)
+target_link_directories(gtkhost PUBLIC ${GTK4_LIBRARY_DIRS})
 
 # The same C engine the command-line tools use; the GUI is only a front-end.
 set(ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../c/src)
 add_executable(dwstudio
     dwstudio.c
-    plugview.c
     ${ENGINE_DIR}/pe.c
     ${ENGINE_DIR}/wav.c
     ${ENGINE_DIR}/wavedst.c
@@ -90,5 +102,5 @@ target_include_directories(dwstudio PRIVATE ${ENGINE_DIR} ${GTK4_INCLUDE_DIRS} $
 # lengths, but the compiler has no way to prove it -- same as the CLI Makefile.
 target_compile_options(dwstudio PRIVATE ${GTK4_CFLAGS_OTHER} -Wall -Wextra
                        -Wno-format-truncation)
-target_link_libraries(dwstudio PRIVATE pehost ${GTK4_LIBRARIES} ${ALSA_LIBRARIES} ${PIPEWIRE_LIBRARIES} ${X11_LIBRARIES} m pthread)
+target_link_libraries(dwstudio PRIVATE gtkhost ${ALSA_LIBRARIES} ${PIPEWIRE_LIBRARIES} pthread)
 target_link_directories(dwstudio PRIVATE ${GTK4_LIBRARY_DIRS} ${PIPEWIRE_LIBRARY_DIRS})

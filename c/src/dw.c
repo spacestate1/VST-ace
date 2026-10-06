@@ -924,6 +924,7 @@ static void usage(void)
 "                          native Linux VST3, and each plug-in's own GUI\n"
 "  va studio               the session window: a tab per plug-in, each the\n"
 "                          full host, beside the pattern tracker's tab\n"
+"  va studiogtk            the same session window in GTK\n"
 "  va peload <plug>        the same hosts from the command line: --params,\n"
 "                          --render out.wav, --patch/--pick, --detect, --as\n"
 "  va peload32 <plug>      the i386 loader, for 32-bit Windows builds:\n"
@@ -1010,12 +1011,15 @@ int main(int argc, char **argv)
         setenv("QT_QPA_PLATFORM", "xcb", 0);   /* 0: only if unset */
         return exec_tool(dir, "pestudio", argc, argv, NULL, NULL);
     }
-    if (!strcmp(cmd, "studio")) {
+    if (!strcmp(cmd, "studio") || !strcmp(cmd, "studiogtk")) {
         snprintf(dir, sizeof dir, "%s/session", g_re);
-        /* Same coercion as `pe` above, same reason: the shell's synth tabs
-         * embed plug-in editors through X11 window ids. */
-        setenv("QT_QPA_PLATFORM", "xcb", 0);   /* 0: only if unset */
-        return exec_tool(dir, "studio", argc, argv, NULL, NULL);
+        /* Same coercion as `pe` and `gui` above, same reason: the shell's
+         * synth tabs embed plug-in editors through X11 window ids, whichever
+         * toolkit the shell itself is. Each of these sets it for itself as
+         * well; here keeps `va` the one place the answer is given. */
+        if (!strcmp(cmd, "studio")) setenv("QT_QPA_PLATFORM", "xcb", 0);
+        else                        setenv("GDK_BACKEND", "x11", 0);
+        return exec_tool(dir, cmd, argc, argv, NULL, NULL);
     }
     if (!strcmp(cmd, "peload") || !strcmp(cmd, "peload32")) {
         int is32 = !strcmp(cmd, "peload32");
@@ -1055,7 +1059,8 @@ int main(int argc, char **argv)
         {
             char sdir[PATH_MAX];
             snprintf(sdir, sizeof sdir, "%s/session", g_re);
-            if (cmake_build(sdir, "studio")) { fprintf(stderr, "va: studio failed to build\n"); failed = 1; }
+            if (cmake_build(sdir, "studio"))    { fprintf(stderr, "va: studio failed to build\n");    failed = 1; }
+            if (cmake_build(sdir, "studiogtk")) { fprintf(stderr, "va: studiogtk failed to build\n"); failed = 1; }
         }
         return failed;
     }

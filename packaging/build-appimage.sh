@@ -167,13 +167,14 @@ cmake --build obj-peload --parallel
 cmake -B obj-gui -S gui -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build obj-gui --parallel --target dwstudio
 cmake -B obj-session -S session -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
-cmake --build obj-session --parallel --target studio
+cmake --build obj-session --parallel --target studio studiogtk
 
 # The windows are skipped rather than failed when their toolkit is missing, so
 # insist here, where the missing dependency is still the obvious explanation.
 for p in peload peserve pestudio; do test -x "obj-peload/$p"; done
 test -x obj-gui/dwstudio
 test -x obj-session/studio
+test -x obj-session/studiogtk
 
 # ----------------------------------------------------------------- the AppDir
 
@@ -185,7 +186,7 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib/vst-ace" \
          "$APPDIR/usr/share/vst-ace/patches" \
          "$APPDIR/usr/share/doc/vst-ace"
 
-# The five 64-bit programs, in the layout va expects: itself in usr/bin, the
+# The six 64-bit programs, in the layout va expects: itself in usr/bin, the
 # helpers together in usr/lib/vst-ace, which each of them finds beside the
 # running executable.
 install -m 0755 obj-peload/peload   "$APPDIR/usr/lib/vst-ace/peload"
@@ -193,6 +194,7 @@ install -m 0755 obj-peload/peserve  "$APPDIR/usr/lib/vst-ace/peserve"
 install -m 0755 obj-peload/pestudio "$APPDIR/usr/lib/vst-ace/pestudio"
 install -m 0755 obj-gui/dwstudio    "$APPDIR/usr/lib/vst-ace/dwstudio"
 install -m 0755 obj-session/studio  "$APPDIR/usr/lib/vst-ace/studio"
+install -m 0755 obj-session/studiogtk "$APPDIR/usr/lib/vst-ace/studiogtk"
 
 install -m 0644 "$SCRIPT_DIR/appimage/vst-ace.desktop" \
     "$APPDIR/usr/share/applications/vst-ace.desktop"

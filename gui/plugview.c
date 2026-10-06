@@ -248,7 +248,15 @@ struct plugview {
     int  (*note_key)(guint keyval);
     /* What the window wants re-sending after every load -- see
      * plugview_set_load_hook. */
-    void (*load_hook)(void);
+    void (*load_hook)(struct plugview *pv);
+
+    /* MIDI from an in-process sequencer, wall-clock stamped -- see
+     * plugview_inject_midi. The delivery thread produces, the audio thread
+     * drains at the top of plugview_render_io. */
+#define PV_INJQ 1024
+    struct { double wall; unsigned char st, d1, d2; } inj[PV_INJQ];
+    _Atomic unsigned inj_head, inj_tail;
+    _Atomic unsigned long inj_in, inj_placed;
 
     int    meter_shown;   /* the level the meter last drew, for its decay */
 
@@ -1824,7 +1832,7 @@ static void unload_locked(plugview *pv)
     pv->host = NULL;
 }
 
-void plugview_set_load_hook(plugview *pv, void (*fn)(void)) { pv->load_hook = fn; }
+void plugview_set_load_hook(plugview *pv, void (*fn)(plugview *pv)) { pv->load_hook = fn; }
 
 static void load(plugview *pv, const entry *e)
 {
@@ -1935,7 +1943,7 @@ static void load(plugview *pv, const entry *e)
 
     /* Last, so the window is told about a plug-in that is finished loading and
      * not one that is halfway in. */
-    if (pv->load_hook) pv->load_hook();
+    if (pv->load_hook) pv->load_hook(pv);
 }
 
 /* Rescan every folder and show the result. What File > Load Folder and the
@@ -2788,6 +2796,36 @@ int plugview_render_io(plugview *pv, const float *in, float *out, int frames)
     float pk = 0.0f;
     int   i, cur;
 
+    /* Injected MIDI goes in first, so a note due at this block's very start
+     * still makes the block. Drained whether or not a plug-in is loaded:
+     * with none there is nothing to play to, so due events are discarded
+     * rather than saved up to burst in when one loads. */
+    {
+        struct timespec ts;
+        double bwall;
+        unsigned t, h;
+
+        /* When this block starts, on the clock the injected MIDI is stamped
+         * with. Measured here rather than derived from PipeWire's time: what
+         * matters is agreement with the sequencer's CLOCK_MONOTONIC. */
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        bwall = ts.tv_sec + ts.tv_nsec / 1e9;
+        t = atomic_load_explicit(&pv->inj_tail, memory_order_relaxed);
+        h = atomic_load_explicit(&pv->inj_head, memory_order_acquire);
+        while (t != h) {
+            const double f = (pv->inj[t % PV_INJQ].wall - bwall) * pv->rate;
+            if (f >= frames) break;              /* a later block's */
+            if (pv->host) {
+                pehost_midi_at(pv->host, pv->inj[t % PV_INJQ].st,
+                               pv->inj[t % PV_INJQ].d1, pv->inj[t % PV_INJQ].d2,
+                               f < 0 ? 0 : (int)f);
+                atomic_fetch_add_explicit(&pv->inj_placed, 1, memory_order_relaxed);
+            }
+            t++;
+        }
+        atomic_store_explicit(&pv->inj_tail, t, memory_order_release);
+    }
+
     if (!atomic_load_explicit(&pv->live, memory_order_acquire) || !pv->host) return 0;
     /* `in` is the captured signal, interleaved stereo, or NULL when there is
      * no input open. A synth ignores it either way; an effect with nothing to
@@ -2811,6 +2849,40 @@ int plugview_render_io(plugview *pv, const float *in, float *out, int frames)
 /* The old spelling, for callers with nothing to feed it. */
 int plugview_render(plugview *pv, float *out, int frames)
 { return plugview_render_io(pv, NULL, out, frames); }
+
+int plugview_load_path(plugview *pv, const char *path)
+{
+    open_path(pv, path);
+    return pv->host != NULL;
+}
+
+const char *plugview_loaded_name(plugview *pv)
+{ return pv->host ? pehost_name(pv->host) : ""; }
+
+double plugview_peak(plugview *pv)
+{ return atomic_load_explicit(&pv->peak_milli, memory_order_relaxed) / 1000.0; }
+
+void plugview_peak_reset(plugview *pv)
+{ atomic_store_explicit(&pv->peak_milli, 0, memory_order_relaxed); }
+
+void plugview_inject_midi(plugview *pv, double wall, int status, int d1, int d2)
+{
+    unsigned h = atomic_load_explicit(&pv->inj_head, memory_order_relaxed);
+    unsigned t = atomic_load_explicit(&pv->inj_tail, memory_order_acquire);
+    if (h - t >= PV_INJQ) return;   /* full: dropped -- the caller counts its own */
+    pv->inj[h % PV_INJQ].wall = wall;
+    pv->inj[h % PV_INJQ].st = (unsigned char)status;
+    pv->inj[h % PV_INJQ].d1 = (unsigned char)d1;
+    pv->inj[h % PV_INJQ].d2 = (unsigned char)d2;
+    atomic_store_explicit(&pv->inj_head, h + 1, memory_order_release);
+    atomic_fetch_add_explicit(&pv->inj_in, 1, memory_order_relaxed);
+}
+
+void plugview_inject_stats(plugview *pv, unsigned long *injected, unsigned long *placed)
+{
+    if (injected) *injected = atomic_load_explicit(&pv->inj_in, memory_order_relaxed);
+    if (placed)   *placed   = atomic_load_explicit(&pv->inj_placed, memory_order_relaxed);
+}
 
 /* Which input channels the fed signal reaches. A vocoder has a modulator and a
  * carrier bus and wants the microphone on one of them; sending it to both puts
