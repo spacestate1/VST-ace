@@ -141,9 +141,14 @@ pkg_check_modules(FREETYPE REQUIRED IMPORTED_TARGET freetype2)
 
 if(Qt6_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND)
   set(CMAKE_AUTOMOC ON)
-  add_executable(pestudio qtgui/main.cpp qtgui/midiio.cpp)
-  target_link_libraries(pestudio PRIVATE pehost Qt6::Widgets PkgConfig::PIPEWIRE PkgConfig::ALSA)
-  target_include_directories(pestudio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # The per-plug-in host as a library of its own: pestudio is one HostWidget
+  # in a QMainWindow shell, and the multi-plug-in studio window links this and
+  # embeds several.
+  add_library(qthost STATIC qtgui/hostwindow.cpp qtgui/hostwindow.h qtgui/midiio.cpp)
+  target_link_libraries(qthost PUBLIC pehost Qt6::Widgets PkgConfig::PIPEWIRE PkgConfig::ALSA)
+  target_include_directories(qthost PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  add_executable(pestudio qtgui/main.cpp)
+  target_link_libraries(pestudio PRIVATE qthost)
 else()
   message(STATUS "pestudio skipped (needs Qt6Widgets, libpipewire-0.3 and alsa)")
 endif()
