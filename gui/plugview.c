@@ -87,7 +87,20 @@ typedef struct {
 /* One entry in the platform dropdown: a corpus directory and what to call it. */
 typedef struct { char label[64]; char path[1024]; } proot;
 
-static struct {
+#define MAX_WATCH 128
+
+/* One run-loop registration a native editor has made -- an X11 descriptor or
+ * a timer. See the longer note where they are dispatched, below. */
+typedef struct {
+    void    *handler;
+    int      fd;              /* -1 for a timer */
+    GSource *src;
+} watch;
+
+/* One plug-in pane, whole: what it browses, what it has loaded, its editor.
+ * plugview_new makes one per plug-in window; every function below takes it as
+ * its first parameter. Nothing in this file is shared between instances. */
+struct plugview {
     GtkWidget *root;
     /* What to browse, in the two terms a plug-in actually has: the format it
      * is and the platform it was built for. These replace a dropdown that
@@ -153,10 +166,10 @@ static struct {
      * made with Xlib and GTK never learns about it. */
     /* The plug-in's editor lives in the Editor page, not in a window of its
      * own: an X11 child of this window's toplevel, moved and sized to sit over
-     * P.editor. GTK4 hands out an X11 id only for a toplevel, so the child has
-     * to be made with Xlib and placed by hand -- but it is placed inside our
-     * window, which is where a plug-in editor belongs and where pestudio puts
-     * its own. */
+     * the pane's editor widget. GTK4 hands out an X11 id only for a toplevel,
+     * so the child has to be made with Xlib and placed by hand -- but it is
+     * placed inside our window, which is where a plug-in editor belongs and
+     * where pestudio puts its own. */
     /* Two windows, not one. `ed_xwin` is the whole editor at its natural size
      * -- that is what the plug-in is given and what it lays itself out in --
      * and `ed_clip` is a window the size of the visible pane that it is a child
@@ -209,7 +222,48 @@ static struct {
      * lock, and a meter does not need more resolution than a thousandth. */
     _Atomic int peak_milli;
     char        loaded_msg[512];   /* the status line the level is appended to */
-} P;
+
+    /* A --dir, or the folder a plug-in was opened out of. Remembered across
+     * the roots_discover(pv) calls that reset the list, which happen after this
+     * is set: plugview_scan runs before the pane exists and roots_discover
+     * runs when it is built, so without this the folder the user actually
+     * asked for was the one folder dropped from the scan. */
+    char   session_dir[1024];
+
+    /* The run-loop registrations the loaded plug-in's native editor has made.
+     * The hook table they arrive through is pehost's and is process-global --
+     * see the note in plugview.h. */
+    watch  watches[MAX_WATCH];
+
+    /* Every entry into a plug-in from the GTK thread raises this, and anything
+     * that could be re-entered checks it. The same guard pestudio carries, for
+     * the same reason: a plug-in's own modal drag loop pumps the host's event
+     * queue, so a click on the plug-in list can be delivered while that
+     * plug-in is still running -- and loading another one there frees what is
+     * currently executing. */
+    int    in_plugin;
+
+    /* Which computer keys the piano claims, as the window answers it. See
+     * plugview_set_note_key. */
+    int  (*note_key)(guint keyval);
+    /* What the window wants re-sending after every load -- see
+     * plugview_set_load_hook. */
+    void (*load_hook)(void);
+
+    int    meter_shown;   /* the level the meter last drew, for its decay */
+
+    /* --cycle: where the unattended walk over the whole list has got to. */
+    int    cycle_ms, cycle_at, cycle_report;
+
+    /* Settings > Plug-in Folders, while the dialog is open. */
+    struct {
+        GtkWidget *win;
+        GtkWidget *list;          /* the folders, grouped */
+        GtkWidget *rm;
+        GtkWidget *asdd;          /* which group Add puts the next one in */
+        char       sel[1024];     /* the selected folder, or "" */
+    } folders;
+};
 
 /* --------------------------------------------------------- platform roots */
 
@@ -223,7 +277,7 @@ static int is_dir(const char *p)
  * the checkout actually has rather than on a path compiled in. Only the ones
  * that exist are listed, so a tree without the macOS downloads simply does not
  * offer them. */
-static void roots_discover(void)
+static void roots_discover(plugview *pv)
 {
     static const struct { const char *label, *rel; } cand[] = {
         { "Windows VST2 64-bit", "windows/VST2-64" },
@@ -244,7 +298,7 @@ static void roots_discover(void)
     char   *slash;
     int     up, i, j;
 
-    P.nroot = 0;
+    pv->nroot = 0;
     if (n <= 0) return;   /* roots_add_standard still applies */
     exe[n] = 0;
 
@@ -257,11 +311,11 @@ static void roots_discover(void)
             int  dup = 0;
             snprintf(path, sizeof path, "%s/%s", exe, cand[i].rel);
             if (!is_dir(path)) continue;
-            for (j = 0; j < P.nroot; j++) if (!strcmp(P.roots[j].path, path)) dup = 1;
-            if (dup || P.nroot >= MAX_ROOTS) continue;
-            snprintf(P.roots[P.nroot].label, sizeof P.roots[0].label, "%s", cand[i].label);
-            snprintf(P.roots[P.nroot].path,  sizeof P.roots[0].path,  "%s", path);
-            P.nroot++;
+            for (j = 0; j < pv->nroot; j++) if (!strcmp(pv->roots[j].path, path)) dup = 1;
+            if (dup || pv->nroot >= MAX_ROOTS) continue;
+            snprintf(pv->roots[pv->nroot].label, sizeof pv->roots[0].label, "%s", cand[i].label);
+            snprintf(pv->roots[pv->nroot].path,  sizeof pv->roots[0].path,  "%s", path);
+            pv->nroot++;
         }
     }
 }
@@ -269,7 +323,7 @@ static void roots_discover(void)
 /* Add a directory that is not one of the built-in corpora -- a Downloads
  * folder, a system VST path -- and say where it came from. Returns its index,
  * or the existing one if it is already listed. */
-static int roots_add(const char *path, const char *label)
+static int roots_add(plugview *pv, const char *path, const char *label)
 {
     /* PATH_MAX, not a size of our choosing: realpath() is specified to write up
      * to that much, and glibc's fortified form checks the buffer against it
@@ -279,12 +333,12 @@ static int roots_add(const char *path, const char *label)
     int  i;
 
     if (realpath(path, real)) path = real;
-    for (i = 0; i < P.nroot; i++) if (!strcmp(P.roots[i].path, path)) return i;
-    if (P.nroot >= MAX_ROOTS) return -1;
+    for (i = 0; i < pv->nroot; i++) if (!strcmp(pv->roots[i].path, path)) return i;
+    if (pv->nroot >= MAX_ROOTS) return -1;
     snprintf(lbl, sizeof lbl, "%s", label);
-    snprintf(P.roots[P.nroot].label, sizeof P.roots[0].label, "%s", lbl);
-    snprintf(P.roots[P.nroot].path,  sizeof P.roots[0].path,  "%s", path);
-    return P.nroot++;
+    snprintf(pv->roots[pv->nroot].label, sizeof pv->roots[0].label, "%s", lbl);
+    snprintf(pv->roots[pv->nroot].path,  sizeof pv->roots[0].path,  "%s", path);
+    return pv->nroot++;
 }
 
 /* Where a Linux system actually keeps plug-ins.
@@ -296,7 +350,7 @@ static int roots_add(const char *path, const char *label)
  * list and, in dwstudio's case, printed "no such directory" at a path the user
  * had never mentioned. These are the conventional locations, plus whatever
  * VST_PATH and VST3_PATH name, and only the ones that exist are offered. */
-static void roots_add_standard(void)
+static void roots_add_standard(plugview *pv)
 {
     static const struct { const char *label, *fmt; int home; } cand[] = {
         { "VST2 (yours)",  "%s/.vst",                        1 },
@@ -319,7 +373,7 @@ static void roots_add_standard(void)
         } else {
             snprintf(path, sizeof path, "%s", cand[i].fmt);
         }
-        if (is_dir(path)) roots_add(path, cand[i].label);
+        if (is_dir(path)) roots_add(pv, path, cand[i].label);
     }
 
     /* VST_PATH and VST3_PATH are colon-separated, like PATH. */
@@ -336,7 +390,7 @@ static void roots_add_standard(void)
                 if (len && len < sizeof path) {
                     memcpy(path, p, len);
                     path[len] = 0;
-                    if (is_dir(path)) roots_add(path, vars[v]);
+                    if (is_dir(path)) roots_add(pv, path, vars[v]);
                 }
                 if (!sep) break;
                 p = sep + 1;
@@ -350,19 +404,19 @@ static void roots_add_standard(void)
  * a blank one on a machine with no corpora and no system VST folders left the
  * window showing plug-ins from a directory it would not admit to. The default
  * falls back to the home folder, so the selector has to be able to say so. */
-static void roots_add_fallback(void)
+static void roots_add_fallback(plugview *pv)
 {
     const char *home;
-    if (P.nroot > 0) return;
+    if (pv->nroot > 0) return;
     home = getenv("HOME");
-    if (home && *home && is_dir(home)) roots_add(home, "Home folder");
+    if (home && *home && is_dir(home)) roots_add(pv, home, "Home folder");
 }
 
 /* The folders the user set, from the file pestudio writes too -- one list per
  * machine, not one per window. See vstdirs.h. Added after the discovered
  * corpora so a folder that is already one of them is deduped away by
  * roots_add rather than scanned twice. */
-static void roots_add_user(void)
+static void roots_add_user(plugview *pv)
 {
     vstdir dirs[VSTDIRS_MAX];
     int    n = vstdirs_load(dirs, VSTDIRS_MAX), i;
@@ -372,30 +426,23 @@ static void roots_add_user(void)
      * sniffed on the way into the list. */
     for (i = 0; i < n; i++)
         if (is_dir(dirs[i].path))
-            roots_add(dirs[i].path, vstdirs_os_label(dirs[i].os));
+            roots_add(pv, dirs[i].path, vstdirs_os_label(dirs[i].os));
 }
-
-/* A --dir, or the folder a plug-in was opened out of. Remembered across the
- * roots_discover() calls that reset the list, which happen after this is set:
- * plugview_scan runs before the pane exists and roots_discover runs when it is
- * built, so without this the folder the user actually asked for was the one
- * folder dropped from the scan. */
-static char g_session_dir[1024];
 
 /* The directory to open on, for a caller that was given none. The checkout's
  * own corpus first so a developer's window opens where it always did, then the
  * system locations, and the home directory only if nothing else exists --
  * which at least browses somewhere real. */
-const char *plugview_default_dir(void)
+const char *plugview_default_dir(plugview *pv)
 {
     static char out[1024];
     const char *home;
 
-    roots_discover();
-    roots_add_standard();
-    roots_add_fallback();
-    if (P.nroot > 0) {
-        snprintf(out, sizeof out, "%s", P.roots[0].path);
+    roots_discover(pv);
+    roots_add_standard(pv);
+    roots_add_fallback(pv);
+    if (pv->nroot > 0) {
+        snprintf(out, sizeof out, "%s", pv->roots[0].path);
         return out;
     }
     home = getenv("HOME");
@@ -411,14 +458,14 @@ const char *plugview_default_dir(void)
  * straight to the widget survived for one tick and vanished -- which is how a
  * refused plug-in looked like nothing happening at all. The text is kept, and
  * the meter appends to it. */
-static void plug_status(const char *fmt, ...)
+static void plug_status(plugview *pv, const char *fmt, ...)
 {
     va_list ap;
 
     va_start(ap, fmt);
-    vsnprintf(P.loaded_msg, sizeof P.loaded_msg, fmt, ap);
+    vsnprintf(pv->loaded_msg, sizeof pv->loaded_msg, fmt, ap);
     va_end(ap);
-    if (P.status) gtk_label_set_text(GTK_LABEL(P.status), P.loaded_msg);
+    if (pv->status) gtk_label_set_text(GTK_LABEL(pv->status), pv->loaded_msg);
 }
 
 /* Platform first, then format within it, then name.
@@ -517,7 +564,7 @@ static int is_candidate(const char *path, const char *name, int isdir)
  * plugview_scan because there are several folders now and each is walked the
  * same way -- and because the caller, not this, decides when the list starts
  * over. */
-static void scan_tree(const char *dir)
+static void scan_tree(plugview *pv, const char *dir)
 {
     char   queue[512][1024];
     int    head = 0, tail = 0, visited = 0;
@@ -532,7 +579,7 @@ static void scan_tree(const char *dir)
     if (realpath(dir, real)) snprintf(queue[tail++], sizeof queue[0], "%s", real);
     else                     snprintf(queue[tail++], sizeof queue[0], "%s", dir);
 
-    while (head < tail && P.nplug < MAX_PLUGINS && visited < 512) {
+    while (head < tail && pv->nplug < MAX_PLUGINS && visited < 512) {
         char        base[1024];
         GDir       *d;
         const char *nm;
@@ -543,7 +590,7 @@ static void scan_tree(const char *dir)
             if (head == 1) fprintf(stderr, "plugview: no such directory: %s\n", base);
             continue;
         }
-        while ((nm = g_dir_read_name(d)) && P.nplug < MAX_PLUGINS) {
+        while ((nm = g_dir_read_name(d)) && pv->nplug < MAX_PLUGINS) {
             char  path[1024];
             int   isdir;
             entry *e;
@@ -572,14 +619,14 @@ static void scan_tree(const char *dir)
                 vstdirs_id id;
                 int k, seen = 0;
                 vstdirs_identify(path, &id);
-                for (k = 0; k < P.nplug; k++)
-                    if (!strcmp(P.plug[k].path, path) ||
-                        vstdirs_same_plugin(path, &id, P.plug[k].path, &P.plug[k].id))
+                for (k = 0; k < pv->nplug; k++)
+                    if (!strcmp(pv->plug[k].path, path) ||
+                        vstdirs_same_plugin(path, &id, pv->plug[k].path, &pv->plug[k].id))
                         { seen = 1; break; }
                 if (seen) continue;
-                P.plug[P.nplug].id = id;
+                pv->plug[pv->nplug].id = id;
             }
-            e = &P.plug[P.nplug++];
+            e = &pv->plug[pv->nplug++];
             snprintf(e->path, sizeof e->path, "%s", path);
             snprintf(e->name, sizeof e->name, "%s", nm);
             /* One verdict, not two. pehost_classify already reports whether
@@ -618,45 +665,45 @@ static void scan_tree(const char *dir)
  * is not asked to choose between platforms it has none of, and a format spread
  * over three folders is still one entry -- which is the whole complaint about
  * the dropdown this replaced. */
-static void rebuild_filters(void)
+static void rebuild_filters(plugview *pv)
 {
     int i, j;
 
-    P.ntypes = P.noses = 0;
-    for (i = 0; i < P.nplug; i++) {
-        const char *f = fmt_of(&P.plug[i]);
-        for (j = 0; j < P.ntypes; j++) if (!strcmp(P.types[j], f)) break;
-        if (j == P.ntypes && P.ntypes < (int)(sizeof P.types / sizeof P.types[0]))
-            snprintf(P.types[P.ntypes++], sizeof P.types[0], "%s", f);
-        for (j = 0; j < P.noses; j++) if (!strcmp(P.oses[j], P.plug[i].os)) break;
-        if (j == P.noses && P.noses < (int)(sizeof P.oses / sizeof P.oses[0]))
-            snprintf(P.oses[P.noses++], sizeof P.oses[0], "%s", P.plug[i].os);
+    pv->ntypes = pv->noses = 0;
+    for (i = 0; i < pv->nplug; i++) {
+        const char *f = fmt_of(&pv->plug[i]);
+        for (j = 0; j < pv->ntypes; j++) if (!strcmp(pv->types[j], f)) break;
+        if (j == pv->ntypes && pv->ntypes < (int)(sizeof pv->types / sizeof pv->types[0]))
+            snprintf(pv->types[pv->ntypes++], sizeof pv->types[0], "%s", f);
+        for (j = 0; j < pv->noses; j++) if (!strcmp(pv->oses[j], pv->plug[i].os)) break;
+        if (j == pv->noses && pv->noses < (int)(sizeof pv->oses / sizeof pv->oses[0]))
+            snprintf(pv->oses[pv->noses++], sizeof pv->oses[0], "%s", pv->plug[i].os);
     }
     /* plug[] is already in platform order, so the platforms come out in it
      * too; the formats are sorted by name, there being no better order. */
-    for (i = 0; i < P.ntypes; i++)
-        for (j = i + 1; j < P.ntypes; j++)
-            if (g_ascii_strcasecmp(P.types[i], P.types[j]) > 0) {
-                char t[sizeof P.types[0]];
-                memcpy(t, P.types[i], sizeof t);
-                memcpy(P.types[i], P.types[j], sizeof t);
-                memcpy(P.types[j], t, sizeof t);
+    for (i = 0; i < pv->ntypes; i++)
+        for (j = i + 1; j < pv->ntypes; j++)
+            if (g_ascii_strcasecmp(pv->types[i], pv->types[j]) > 0) {
+                char t[sizeof pv->types[0]];
+                memcpy(t, pv->types[i], sizeof t);
+                memcpy(pv->types[i], pv->types[j], sizeof t);
+                memcpy(pv->types[j], t, sizeof t);
             }
 
-    if (!P.typedd) return;
+    if (!pv->typedd) return;
     /* Rebuilding a model the dropdown is watching moves its selection; both go
      * back to "All", which is the honest answer after a rescan anyway -- what
      * was selected may no longer be among the choices. */
-    P.loading = 1;
-    while (g_list_model_get_n_items(G_LIST_MODEL(P.typemodel)) > 1)
-        gtk_string_list_remove(P.typemodel, 1);
-    for (i = 0; i < P.ntypes; i++) gtk_string_list_append(P.typemodel, P.types[i]);
-    while (g_list_model_get_n_items(G_LIST_MODEL(P.osmodel)) > 1)
-        gtk_string_list_remove(P.osmodel, 1);
-    for (i = 0; i < P.noses; i++) gtk_string_list_append(P.osmodel, os_label(P.oses[i]));
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(P.typedd), 0);
-    gtk_drop_down_set_selected(GTK_DROP_DOWN(P.osdd), 0);
-    P.loading = 0;
+    pv->loading = 1;
+    while (g_list_model_get_n_items(G_LIST_MODEL(pv->typemodel)) > 1)
+        gtk_string_list_remove(pv->typemodel, 1);
+    for (i = 0; i < pv->ntypes; i++) gtk_string_list_append(pv->typemodel, pv->types[i]);
+    while (g_list_model_get_n_items(G_LIST_MODEL(pv->osmodel)) > 1)
+        gtk_string_list_remove(pv->osmodel, 1);
+    for (i = 0; i < pv->noses; i++) gtk_string_list_append(pv->osmodel, os_label(pv->oses[i]));
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(pv->typedd), 0);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(pv->osdd), 0);
+    pv->loading = 0;
 }
 
 /* Every folder the browser walks: the corpora found by walking up from the
@@ -664,34 +711,34 @@ static void rebuild_filters(void)
  * and anything named on the command line. The list is held whole and sifted by
  * fill_browser, so changing format or platform costs nothing -- the expensive
  * part is sniffing files, and it happens once. */
-void plugview_scan(const char *dir)
+void plugview_scan(plugview *pv, const char *dir)
 {
     int i;
 
     /* A folder handed in is somewhere to scan rather than somewhere to browse:
      * it joins the roots, and what it holds turns up in the one list. */
     if (dir && *dir) {
-        snprintf(g_session_dir, sizeof g_session_dir, "%s", dir);
-        roots_add(dir, "given folder");
+        snprintf(pv->session_dir, sizeof pv->session_dir, "%s", dir);
+        roots_add(pv, dir, "given folder");
     }
-    if (P.nroot == 0) { roots_discover(); roots_add_standard(); roots_add_user(); }
+    if (pv->nroot == 0) { roots_discover(pv); roots_add_standard(pv); roots_add_user(pv); }
     /* Called before the pane exists -- dwstudio hands over its --dir or its
      * default from main(). Remembering the folder is all that is wanted here:
      * plugview_new rebuilds the root list and scans, so walking every folder
      * now would only be to throw the result away and walk them again. */
-    if (!P.list) return;
+    if (!pv->list) return;
 
-    P.nplug = 0;
-    for (i = 0; i < P.nroot; i++) scan_tree(P.roots[i].path);
-    qsort(P.plug, (size_t)P.nplug, sizeof P.plug[0], entry_cmp);
-    rebuild_filters();
+    pv->nplug = 0;
+    for (i = 0; i < pv->nroot; i++) scan_tree(pv, pv->roots[i].path);
+    qsort(pv->plug, (size_t)pv->nplug, sizeof pv->plug[0], entry_cmp);
+    rebuild_filters(pv);
     /* Said out loud, the way pestudio says it, so the two windows can be
      * compared on the same corpus without reading either one's status bar. */
     fprintf(stderr, "plugview: scanned %d folder(s) -> %d plug-in(s)\n",
-            P.nroot, P.nplug);
+            pv->nroot, pv->nplug);
 }
 
-static void append_row(const entry *e);
+static void append_row(plugview *pv, const entry *e);
 
 static void clear_list(GtkWidget *lb)
 {
@@ -702,42 +749,42 @@ static void clear_list(GtkWidget *lb)
 
 /* What the selectors are set to, or NULL for "all of them". Index 0 is the
  * "All ..." row in both, so anything else indexes the arrays the scan built. */
-static const char *want_type(void)
+static const char *want_type(plugview *pv)
 {
     guint i;
-    if (!P.typedd) return NULL;
-    i = gtk_drop_down_get_selected(GTK_DROP_DOWN(P.typedd));
-    if (i == GTK_INVALID_LIST_POSITION || i == 0 || (int)i > P.ntypes) return NULL;
-    return P.types[i - 1];
+    if (!pv->typedd) return NULL;
+    i = gtk_drop_down_get_selected(GTK_DROP_DOWN(pv->typedd));
+    if (i == GTK_INVALID_LIST_POSITION || i == 0 || (int)i > pv->ntypes) return NULL;
+    return pv->types[i - 1];
 }
 
-static const char *want_os(void)
+static const char *want_os(plugview *pv)
 {
     guint i;
-    if (!P.osdd) return NULL;
-    i = gtk_drop_down_get_selected(GTK_DROP_DOWN(P.osdd));
-    if (i == GTK_INVALID_LIST_POSITION || i == 0 || (int)i > P.noses) return NULL;
-    return P.oses[i - 1];
+    if (!pv->osdd) return NULL;
+    i = gtk_drop_down_get_selected(GTK_DROP_DOWN(pv->osdd));
+    if (i == GTK_INVALID_LIST_POSITION || i == 0 || (int)i > pv->noses) return NULL;
+    return pv->oses[i - 1];
 }
 
-static void fill_browser(void)
+static void fill_browser(plugview *pv)
 {
-    const char *wt = want_type(), *wo = want_os();
+    const char *wt = want_type(pv), *wo = want_os(pv);
     int i;
 
-    if (!P.list) return;
-    clear_list(P.list);
-    P.nvis = 0;
-    for (i = 0; i < P.nplug; i++) {
-        const entry *e = &P.plug[i];
+    if (!pv->list) return;
+    clear_list(pv->list);
+    pv->nvis = 0;
+    for (i = 0; i < pv->nplug; i++) {
+        const entry *e = &pv->plug[i];
         if (wt && strcmp(fmt_of(e), wt)) continue;
         if (wo && strcmp(e->os, wo)) continue;
-        P.vis[P.nvis++] = i;
-        append_row(e);
+        pv->vis[pv->nvis++] = i;
+        append_row(pv, e);
     }
 
-    if (!wt && !wo) plug_status("%d plug-in(s) in %d folder(s)", P.nplug, P.nroot);
-    else            plug_status("%d of %d plug-in(s) -- %s%s%s", P.nvis, P.nplug,
+    if (!wt && !wo) plug_status(pv, "%d plug-in(s) in %d folder(s)", pv->nplug, pv->nroot);
+    else            plug_status(pv, "%d of %d plug-in(s) -- %s%s%s", pv->nvis, pv->nplug,
                                 wo ? os_label(wo) : "every platform",
                                 wt ? ", " : "", wt ? wt : "");
 
@@ -745,18 +792,19 @@ static void fill_browser(void)
      * GtkListBox picks a row for itself when it first takes focus, so without
      * saying which, the window came up having loaded whichever row that
      * happened to be -- different one each run. */
-    if (P.nvis > 0)
-        gtk_list_box_select_row(GTK_LIST_BOX(P.list),
-            gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), 0));
+    if (pv->nvis > 0)
+        gtk_list_box_select_row(GTK_LIST_BOX(pv->list),
+            gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->list), 0));
 }
 
 /* Both selectors sift the list already in hand -- no folder is walked again,
  * so switching format or platform is instant however long the scan took. */
 static void on_filter_changed(GObject *dd, GParamSpec *ps, gpointer ud)
 {
-    (void)dd; (void)ps; (void)ud;
-    if (P.loading) return;
-    fill_browser();
+    plugview *pv = ud;
+    (void)dd; (void)ps;
+    if (pv->loading) return;
+    fill_browser(pv);
 }
 
 /* --------------------------------------------------- native (X11) editor */
@@ -781,15 +829,6 @@ static void on_filter_changed(GObject *dd, GParamSpec *ps, gpointer ud)
  *   - A plug-in unregisters from inside the callback being dispatched --
  *     dismissing a popup is exactly that. g_source_destroy is safe there; the
  *     GSource itself is freed when our own reference goes, not on the spot. */
-#define MAX_WATCH 128
-
-typedef struct {
-    void    *handler;
-    int      fd;              /* -1 for a timer */
-    GSource *src;
-} watch;
-
-static watch g_watch[MAX_WATCH];
 
 static void watch_retire(watch *w)
 {
@@ -800,17 +839,17 @@ static void watch_retire(watch *w)
     w->handler = NULL;
 }
 
-static watch *watch_slot(void)
+static watch *watch_slot(plugview *pv)
 {
     int i;
-    for (i = 0; i < MAX_WATCH; i++) if (!g_watch[i].src) return &g_watch[i];
+    for (i = 0; i < MAX_WATCH; i++) if (!pv->watches[i].src) return &pv->watches[i];
     return NULL;
 }
 
-static void watches_clear(void)
+static void watches_clear(plugview *pv)
 {
     int i;
-    for (i = 0; i < MAX_WATCH; i++) watch_retire(&g_watch[i]);
+    for (i = 0; i < MAX_WATCH; i++) watch_retire(&pv->watches[i]);
 }
 
 static gboolean on_watch_fd(gint fd, GIOCondition cond, gpointer ud)
@@ -828,14 +867,13 @@ static gboolean on_watch_timer(gpointer ud)
 
 static void hook_add_fd(void *ud, void *handler, int fd)
 {
-    watch *w;
-    int    i;
-
-    (void)ud;
+    plugview *pv = ud;
+    watch    *w;
+    int       i;
     for (i = 0; i < MAX_WATCH; i++)          /* same fd, same handler: replace */
-        if (g_watch[i].src && g_watch[i].handler == handler && g_watch[i].fd == fd)
-            watch_retire(&g_watch[i]);
-    if (!(w = watch_slot())) {
+        if (pv->watches[i].src && pv->watches[i].handler == handler && pv->watches[i].fd == fd)
+            watch_retire(&pv->watches[i]);
+    if (!(w = watch_slot(pv))) {
         fprintf(stderr, "plugview: too many editor watches; ignoring fd %d\n", fd);
         return;
     }
@@ -848,20 +886,20 @@ static void hook_add_fd(void *ud, void *handler, int fd)
 
 static void hook_del_fd(void *ud, void *handler)
 {
-    int i;
-    (void)ud;
+    plugview *pv = ud;
+    int       i;
     /* unregisterEventHandler names only the handler, so every descriptor
      * registered under it goes. */
     for (i = 0; i < MAX_WATCH; i++)
-        if (g_watch[i].src && g_watch[i].handler == handler && g_watch[i].fd >= 0)
-            watch_retire(&g_watch[i]);
+        if (pv->watches[i].src && pv->watches[i].handler == handler && pv->watches[i].fd >= 0)
+            watch_retire(&pv->watches[i]);
 }
 
 static void hook_add_timer(void *ud, void *handler, unsigned long long ms)
 {
-    watch *w;
-    (void)ud;
-    if (!(w = watch_slot())) return;
+    plugview *pv = ud;
+    watch    *w;
+    if (!(w = watch_slot(pv))) return;
     w->handler = handler;
     w->fd      = -1;
     w->src     = g_timeout_source_new((guint)(ms ? ms : 16));
@@ -871,11 +909,11 @@ static void hook_add_timer(void *ud, void *handler, unsigned long long ms)
 
 static void hook_del_timer(void *ud, void *handler)
 {
-    int i;
-    (void)ud;
+    plugview *pv = ud;
+    int       i;
     for (i = 0; i < MAX_WATCH; i++)
-        if (g_watch[i].src && g_watch[i].handler == handler && g_watch[i].fd < 0)
-            watch_retire(&g_watch[i]);
+        if (pv->watches[i].src && pv->watches[i].handler == handler && pv->watches[i].fd < 0)
+            watch_retire(&pv->watches[i]);
 }
 
 G_GNUC_BEGIN_IGNORE_DEPRECATIONS
@@ -888,30 +926,30 @@ static Display *ed_display(void)
 
 /* The zoom, which is defined with the rest of the editor input further down but
  * is reached from the run-loop resize hook and from the attach path above it. */
-static void     zoom_apply(void);
-static void     zoom_update_ui(void);
+static void     zoom_apply(plugview *pv);
+static void     zoom_update_ui(plugview *pv);
 static gboolean zoom_fit_idle(gpointer u);
-static void     zoom_fit(int only_shrink);
-static void     zoom_fit_poll(void);
+static void     zoom_fit(plugview *pv, int only_shrink);
+static void     zoom_fit_poll(plugview *pv);
 
 static void hook_resize(void *ud, int w, int h)
 {
-    Display *dpy = ed_display();
-    (void)ud;
+    plugview *pv = ud;
+    Display  *dpy = ed_display();
     (void)dpy;
     if (w > 0 && h > 0) {
         /* The plug-in's own idea of its natural size, which replaces whatever
          * it opened at -- otherwise a later zoom would scale from a size the
          * plug-in has moved on from. The zoom is then re-applied on top. */
-        P.ed_base_w = w; P.ed_base_h = h;
-        P.ed_w = w; P.ed_h = h;
-        P.ed_nat_w = w; P.ed_nat_h = h;
-        gtk_widget_set_size_request(P.editor, w, h);   /* the pane follows */
-        zoom_apply();
+        pv->ed_base_w = w; pv->ed_base_h = h;
+        pv->ed_w = w; pv->ed_h = h;
+        pv->ed_nat_w = w; pv->ed_nat_h = h;
+        gtk_widget_set_size_request(pv->editor, w, h);   /* the pane follows */
+        zoom_apply(pv);
     }
 }
 
-static int native_editor_open(pehost *h, const char *title);
+static int native_editor_open(plugview *pv, pehost *h, const char *title);
 
 
 /* Where the editor goes, in the toplevel's coordinates.
@@ -924,18 +962,18 @@ static int native_editor_open(pehost *h, const char *title);
  * Fails when the two do not overlap at all, which is what a pane dragged shut
  * or scrolled out of view looks like; the caller hides the editor rather than
  * leaving it wherever it last was. */
-static int editor_bounds(GdkRectangle *clip, GdkRectangle *plug)
+static int editor_bounds(plugview *pv, GdkRectangle *clip, GdkRectangle *plug)
 {
-    GtkWidget       *root = GTK_WIDGET(gtk_widget_get_root(P.editor));
+    GtkWidget       *root = GTK_WIDGET(gtk_widget_get_root(pv->editor));
     /* The viewport GtkScrolledWindow wrapped the drawing area in. Its
      * allocation is the visible rectangle; the drawing area's is the whole
      * editor, which is larger as soon as the size request below exceeds it. */
-    GtkWidget       *port = gtk_widget_get_parent(P.editor);
+    GtkWidget       *port = gtk_widget_get_parent(pv->editor);
     graphene_rect_t  full, vis;
     int              x0, y0, x1, y1;
 
     if (!root || !port) return 0;
-    if (!gtk_widget_compute_bounds(P.editor, root, &full)) return 0;
+    if (!gtk_widget_compute_bounds(pv->editor, root, &full)) return 0;
     if (!gtk_widget_compute_bounds(port, root, &vis))      return 0;
 
     /* The plug-in's own size is a floor on the editor rectangle, not just
@@ -948,8 +986,8 @@ static int editor_bounds(GdkRectangle *clip, GdkRectangle *plug)
      * nothing ever needed scrolling. Taking the larger of the two makes the
      * window the plug-in gets independent of when GTK gets round to the
      * layout. */
-    if ((int)full.size.width  < P.ed_nat_w) full.size.width  = (float)P.ed_nat_w;
-    if ((int)full.size.height < P.ed_nat_h) full.size.height = (float)P.ed_nat_h;
+    if ((int)full.size.width  < pv->ed_nat_w) full.size.width  = (float)pv->ed_nat_w;
+    if ((int)full.size.height < pv->ed_nat_h) full.size.height = (float)pv->ed_nat_h;
 
     x0 = (int)(full.origin.x > vis.origin.x ? full.origin.x : vis.origin.x);
     y0 = (int)(full.origin.y > vis.origin.y ? full.origin.y : vis.origin.y);
@@ -982,32 +1020,32 @@ static int editor_bounds(GdkRectangle *clip, GdkRectangle *plug)
  * parameter list. Unmapping our own clip window costs the plug-in nothing --
  * it is never told, and does not go through the attach/detach cycle that
  * Cardinal comes apart in. */
-static void native_editor_place(void)
+static void native_editor_place(plugview *pv)
 {
     Display     *dpy = ed_display();
     GdkRectangle clip, plug;
     int          show;
 
-    if (!dpy || !P.ed_clip || !P.ed_xwin) return;
+    if (!dpy || !pv->ed_clip || !pv->ed_xwin) return;
 
-    show = GTK_IS_WIDGET(P.editor) && gtk_widget_get_mapped(P.editor) &&
-           editor_bounds(&clip, &plug);
+    show = GTK_IS_WIDGET(pv->editor) && gtk_widget_get_mapped(pv->editor) &&
+           editor_bounds(pv, &clip, &plug);
     if (!show) {
-        if (P.ed_shown) { XUnmapWindow(dpy, P.ed_clip); P.ed_shown = 0; XFlush(dpy); }
+        if (pv->ed_shown) { XUnmapWindow(dpy, pv->ed_clip); pv->ed_shown = 0; XFlush(dpy); }
         return;
     }
-    if (P.ed_shown &&
-        !memcmp(&clip, &P.ed_clip_at, sizeof clip) &&
-        !memcmp(&plug, &P.ed_plug_at, sizeof plug))
+    if (pv->ed_shown &&
+        !memcmp(&clip, &pv->ed_clip_at, sizeof clip) &&
+        !memcmp(&plug, &pv->ed_plug_at, sizeof plug))
         return;
 
-    XMoveResizeWindow(dpy, P.ed_clip, clip.x, clip.y,
+    XMoveResizeWindow(dpy, pv->ed_clip, clip.x, clip.y,
                       (unsigned)clip.width, (unsigned)clip.height);
-    XMoveResizeWindow(dpy, P.ed_xwin, plug.x, plug.y,
+    XMoveResizeWindow(dpy, pv->ed_xwin, plug.x, plug.y,
                       (unsigned)plug.width, (unsigned)plug.height);
-    if (!P.ed_shown) { XMapWindow(dpy, P.ed_clip); P.ed_shown = 1; }
-    P.ed_clip_at = clip;
-    P.ed_plug_at = plug;
+    if (!pv->ed_shown) { XMapWindow(dpy, pv->ed_clip); pv->ed_shown = 1; }
+    pv->ed_clip_at = clip;
+    pv->ed_plug_at = plug;
     XFlush(dpy);
 }
 
@@ -1020,12 +1058,13 @@ static void native_editor_place(void)
  * The layout pass that follows is what actually makes it possible. */
 static void on_editor_resize(GtkDrawingArea *a, int w, int h, gpointer u)
 {
-    (void)a; (void)w; (void)h; (void)u;
-    if (P.ed_attached) { native_editor_place(); return; }
-    if (P.ready && P.host && P.ed_native && P.stack) {
-        const char *page = gtk_stack_get_visible_child_name(GTK_STACK(P.stack));
+    plugview *pv = u;
+    (void)a; (void)w; (void)h;
+    if (pv->ed_attached) { native_editor_place(pv); return; }
+    if (pv->ready && pv->host && pv->ed_native && pv->stack) {
+        const char *page = gtk_stack_get_visible_child_name(GTK_STACK(pv->stack));
         if (page && !strcmp(page, "editor"))
-            native_editor_open(P.host, pehost_name(P.host));
+            native_editor_open(pv, pv->host, pehost_name(pv->host));
     }
 }
 
@@ -1040,15 +1079,15 @@ static void on_editor_resize(GtkDrawingArea *a, int w, int h, gpointer u)
  * juce::OpenGLContext::CachedImage::stop(), down in the NVIDIA driver, on the
  * way out. The window costs nothing to keep and the plug-in that owns it has
  * already let go by the time the next one attaches. */
-static void native_editor_close(void)
+static void native_editor_close(plugview *pv)
 {
-    if (P.ed_attached) { pehost_editor_detach(P.ed_attached); P.ed_attached = NULL; }
+    if (pv->ed_attached) { pehost_editor_detach(pv->ed_attached); pv->ed_attached = NULL; }
     /* Forget the last placement with it: the next plug-in's editor is a
      * different size, and a cached rectangle that still matches would let
      * native_editor_place decide there was nothing to do. */
-    memset(&P.ed_clip_at, 0, sizeof P.ed_clip_at);
-    memset(&P.ed_plug_at, 0, sizeof P.ed_plug_at);
-    watches_clear();
+    memset(&pv->ed_clip_at, 0, sizeof pv->ed_clip_at);
+    memset(&pv->ed_plug_at, 0, sizeof pv->ed_plug_at);
+    watches_clear(pv);
 }
 
 /* The window really does go, at shutdown.
@@ -1062,27 +1101,27 @@ static void native_editor_close(void)
 static int ed_swallow_x_error(Display *d, XErrorEvent *e)
 { (void)d; (void)e; return 0; }
 
-static void native_editor_destroy(void)
+static void native_editor_destroy(plugview *pv)
 {
     Display *dpy = ed_display();
 
-    native_editor_close();
-    if (dpy && (P.ed_xwin || P.ed_clip)) {
+    native_editor_close(pv);
+    if (dpy && (pv->ed_xwin || pv->ed_clip)) {
         int (*prev)(Display *, XErrorEvent *);
         XSync(dpy, False);                  /* let earlier errors land first */
         prev = XSetErrorHandler(ed_swallow_x_error);
         /* The child first, then its parent. Destroying the clip window would
          * take the other with it, but naming both keeps this readable and
          * costs one request. */
-        if (P.ed_xwin) XDestroyWindow(dpy, P.ed_xwin);
-        if (P.ed_clip) XDestroyWindow(dpy, P.ed_clip);
+        if (pv->ed_xwin) XDestroyWindow(dpy, pv->ed_xwin);
+        if (pv->ed_clip) XDestroyWindow(dpy, pv->ed_clip);
         XSync(dpy, False);                  /* and ours inside the handler */
         XSetErrorHandler(prev);
     }
-    P.ed_xwin  = 0;
-    P.ed_clip  = 0;
-    P.ed_xid   = 0;
-    P.ed_shown = 0;
+    pv->ed_xwin  = 0;
+    pv->ed_clip  = 0;
+    pv->ed_xid   = 0;
+    pv->ed_shown = 0;
 }
 
 /* One X11 window, made by hand.
@@ -1109,27 +1148,27 @@ static Window ed_make_window(Display *dpy, Window parent, const GdkRectangle *r)
 }
 
 /* Give the plug-in a window inside the Editor page and hand it the id. */
-static int native_editor_open(pehost *h, const char *title)
+static int native_editor_open(plugview *pv, pehost *h, const char *title)
 {
     Display     *dpy = ed_display();
     GdkSurface  *surf;
     Window       parent;
     GdkRectangle clip, plug;
 
-    native_editor_close();
+    native_editor_close(pv);
     if (!dpy) {
-        plug_status("%s: a native editor needs the X11 backend -- "
+        plug_status(pv, "%s: a native editor needs the X11 backend -- "
                     "run with GDK_BACKEND=x11", title);
         return -1;
     }
-    if (!editor_bounds(&clip, &plug)) {
+    if (!editor_bounds(pv, &clip, &plug)) {
         /* The pane has not been laid out yet; the page change that brings it
          * into view will come back through here. */
         return -1;
     }
-    surf = gtk_native_get_surface(gtk_widget_get_native(P.editor));
+    surf = gtk_native_get_surface(gtk_widget_get_native(pv->editor));
     if (!surf || !GDK_IS_X11_SURFACE(surf)) {
-        plug_status("%s: no X11 window to embed into", title);
+        plug_status(pv, "%s: no X11 window to embed into", title);
         return -1;
     }
     parent = gdk_x11_surface_get_xid(GDK_X11_SURFACE(surf));
@@ -1140,23 +1179,23 @@ static int native_editor_open(pehost *h, const char *title)
      * JE8086 crashed inside juce::OpenGLContext::CachedImage::stop(), down in
      * the NVIDIA driver, on the way out. They cost nothing to keep and the
      * plug-in that owns one has let go by the time the next attaches. */
-    if (!P.ed_clip && !(P.ed_clip = ed_make_window(dpy, parent, &clip))) {
-        plug_status("%s: could not create an editor window", title);
+    if (!pv->ed_clip && !(pv->ed_clip = ed_make_window(dpy, parent, &clip))) {
+        plug_status(pv, "%s: could not create an editor window", title);
         return -1;
     }
-    if (!P.ed_xwin && !(P.ed_xwin = ed_make_window(dpy, P.ed_clip, &plug))) {
-        plug_status("%s: could not create an editor window", title);
+    if (!pv->ed_xwin && !(pv->ed_xwin = ed_make_window(dpy, pv->ed_clip, &plug))) {
+        plug_status(pv, "%s: could not create an editor window", title);
         return -1;
     }
-    XMoveResizeWindow(dpy, P.ed_clip, clip.x, clip.y,
+    XMoveResizeWindow(dpy, pv->ed_clip, clip.x, clip.y,
                       (unsigned)clip.width, (unsigned)clip.height);
-    XMoveResizeWindow(dpy, P.ed_xwin, plug.x, plug.y,
+    XMoveResizeWindow(dpy, pv->ed_xwin, plug.x, plug.y,
                       (unsigned)plug.width, (unsigned)plug.height);
-    XMapWindow(dpy, P.ed_xwin);
-    XMapWindow(dpy, P.ed_clip);
-    P.ed_shown   = 1;
-    P.ed_clip_at = clip;
-    P.ed_plug_at = plug;
+    XMapWindow(dpy, pv->ed_xwin);
+    XMapWindow(dpy, pv->ed_clip);
+    pv->ed_shown   = 1;
+    pv->ed_clip_at = clip;
+    pv->ed_plug_at = plug;
 
     /* Wait for it to be on screen before handing it over.
      *
@@ -1168,30 +1207,30 @@ static int native_editor_open(pehost *h, const char *title)
         int spins;
         for (spins = 0; spins < 200; spins++) {
             XSync(dpy, False);
-            if (XGetWindowAttributes(dpy, P.ed_xwin, &a) && a.map_state == IsViewable)
+            if (XGetWindowAttributes(dpy, pv->ed_xwin, &a) && a.map_state == IsViewable)
                 break;
             { struct timespec ts = { 0, 5000000 }; nanosleep(&ts, NULL); }
         }
     }
-    P.ed_xid = (unsigned long)P.ed_xwin;
+    pv->ed_xid = (unsigned long)pv->ed_xwin;
 
-    if (pehost_editor_attach(h, P.ed_xid) != 0) {
-        plug_status("%s: the plug-in refused to embed into window 0x%lx",
-                    title, P.ed_xid);
+    if (pehost_editor_attach(h, pv->ed_xid) != 0) {
+        plug_status(pv, "%s: the plug-in refused to embed into window 0x%lx",
+                    title, pv->ed_xid);
         return -1;
     }
-    P.ed_attached = h;
+    pv->ed_attached = h;
     /* Zoomable from here, not from load(): until the plug-in has a window there
      * is nothing to ask to resize. Fit on the next turn of the main loop, once
      * the pane has been laid out at this editor's size. */
-    zoom_update_ui();
-    g_idle_add(zoom_fit_idle, NULL);
+    zoom_update_ui(pv);
+    g_idle_add(zoom_fit_idle, pv);
     /* Said out loud, the way pestudio says it. Both rectangles, because which
      * one is bigger is the whole question when an editor does not fit: the
      * plug-in gets the first, and the second is how much of it you can see. */
     fprintf(stderr, "plugview: embedded as a child of window 0x%lx "
                     "(%dx%d editor, %dx%d visible)\n",
-            P.ed_xid, plug.width, plug.height, clip.width, clip.height);
+            pv->ed_xid, plug.width, plug.height, clip.width, clip.height);
     XFlush(dpy);
 
     /* No pehost_editor_resized() here, deferred or otherwise: it crashes
@@ -1199,23 +1238,14 @@ static int native_editor_open(pehost *h, const char *title)
      * nullptr" and then dereferences it anyway. pestudio does not send one
      * either -- its editor widget is already the right size before it
      * attaches, so Qt has no resize left to deliver. */
-    P.ed_w = plug.width;
-    P.ed_h = plug.height;
+    pv->ed_w = plug.width;
+    pv->ed_h = plug.height;
     return 0;
 }
 
 G_GNUC_END_IGNORE_DEPRECATIONS
 
 /* ------------------------------------------------------------- the editor */
-
-/* Every entry into a plug-in from the GTK thread raises this, and anything
- * that could be re-entered checks it.
- *
- * The same guard pestudio carries, for the same reason: a plug-in's own modal
- * drag loop pumps the host's event queue, so a click on the plug-in list can
- * be delivered while that plug-in is still running -- and loading another one
- * there frees what is currently executing. */
-static int in_plugin;
 
 /* WM_* codes, so the plug-in sees the messages it was written against. */
 enum { WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202,
@@ -1228,10 +1258,11 @@ static void editor_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointe
     const unsigned int *px = NULL;
     int pw = 0, ph = 0;
     cairo_surface_t *surf;
+    plugview *pv = ud;
 
-    (void)area; (void)ud;
-    if (!P.host || !P.ed_open ||
-        !pehost_editor_pixels(P.host, &px, &pw, &ph) ||
+    (void)area;
+    if (!pv->host || !pv->ed_open ||
+        !pehost_editor_pixels(pv->host, &px, &pw, &ph) ||
         !px || pw <= 0 || ph <= 0) {
         /* Nothing drawn yet. Paint the background rather than leaving whatever
          * was on the surface before. */
@@ -1249,13 +1280,13 @@ static void editor_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointe
      * its own size into its own buffer, and only this last step -- putting that
      * buffer on the screen -- knows about it. Input is mapped back the other
      * way in ed_mouse. */
-    if (P.ed_zoom != 1.0) cairo_scale(cr, P.ed_zoom, P.ed_zoom);
+    if (pv->ed_zoom != 1.0) cairo_scale(cr, pv->ed_zoom, pv->ed_zoom);
     cairo_set_source_surface(cr, surf, 0, 0);
     /* Smoothed on the way down, sharp on the way up. Dropping every other pixel
      * of a knob leaves it ragged; an editor enlarged is bitmaps and text at a
      * fixed size, and blurring those is worse than seeing the pixels. */
     cairo_pattern_set_filter(cairo_get_source(cr),
-                             P.ed_zoom < 1.0 ? CAIRO_FILTER_GOOD : CAIRO_FILTER_NEAREST);
+                             pv->ed_zoom < 1.0 ? CAIRO_FILTER_GOOD : CAIRO_FILTER_NEAREST);
     cairo_paint(cr);
     cairo_surface_destroy(surf);
 }
@@ -1265,8 +1296,8 @@ static void editor_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointe
  * pestudio settled on -- fast enough that a dragged knob tracks the mouse. */
 static gboolean editor_tick(gpointer ud)
 {
-    (void)ud;
-    if (in_plugin) return G_SOURCE_CONTINUE;
+    plugview *pv = ud;
+    if (pv->in_plugin) return G_SOURCE_CONTINUE;
 
     /* A plug-in whose helper has died stops repainting and goes silent, and
      * both look exactly like a plug-in that is working and idle. The Qt window
@@ -1279,18 +1310,18 @@ static gboolean editor_tick(gpointer ud)
      * attempts, because a plug-in that faults on something it will meet again
      * faults the same way every time, and restarting for ever is worse than
      * saying so. */
-    if (P.host && !pehost_alive(P.host) && !P.dead_reported) {
-        if (pehost_restarts(P.host) < 3 && pehost_recover(P.host)) {
-            P.ed_open = 0;                 /* reopened below, as after a load */
-            plug_status("this plug-in stopped responding and was restarted "
+    if (pv->host && !pehost_alive(pv->host) && !pv->dead_reported) {
+        if (pehost_restarts(pv->host) < 3 && pehost_recover(pv->host)) {
+            pv->ed_open = 0;                 /* reopened below, as after a load */
+            plug_status(pv, "this plug-in stopped responding and was restarted "
                         "(attempt %d) — its settings were put back",
-                        pehost_restarts(P.host));
-            if (pehost_editor_kind(P.host) == PEHOST_EDITOR_PIXELS &&
-                pehost_editor_open(P.host) == 0)
-                P.ed_open = 1;
+                        pehost_restarts(pv->host));
+            if (pehost_editor_kind(pv->host) == PEHOST_EDITOR_PIXELS &&
+                pehost_editor_open(pv->host) == 0)
+                pv->ed_open = 1;
         } else {
-            P.dead_reported = 1;
-            plug_status("this plug-in stopped responding and would not restart "
+            pv->dead_reported = 1;
+            plug_status(pv, "this plug-in stopped responding and would not restart "
                         "— reload it to try again");
         }
         return G_SOURCE_CONTINUE;
@@ -1301,19 +1332,19 @@ static gboolean editor_tick(gpointer ud)
      * as that scrolls, resizes, and comes and goes with the page. Scrolling in
      * particular emits no signal that reports the new geometry after layout,
      * so this is where it is noticed. */
-    if (P.ed_attached) {
-        native_editor_place();
-        zoom_fit_poll();
+    if (pv->ed_attached) {
+        native_editor_place(pv);
+        zoom_fit_poll(pv);
         return G_SOURCE_CONTINUE;
     }
-    if (!P.host || !P.ed_open) return G_SOURCE_CONTINUE;
-    if (!GTK_IS_WIDGET(P.editor) || !gtk_widget_get_mapped(P.editor))
+    if (!pv->host || !pv->ed_open) return G_SOURCE_CONTINUE;
+    if (!GTK_IS_WIDGET(pv->editor) || !gtk_widget_get_mapped(pv->editor))
         return G_SOURCE_CONTINUE;
-    in_plugin++;
-    pehost_editor_pump(P.host);
-    in_plugin--;
-    gtk_widget_queue_draw(P.editor);
-    zoom_fit_poll();
+    pv->in_plugin++;
+    pehost_editor_pump(pv->host);
+    pv->in_plugin--;
+    gtk_widget_queue_draw(pv->editor);
+    zoom_fit_poll(pv);
     return G_SOURCE_CONTINUE;
 }
 
@@ -1322,18 +1353,16 @@ static gboolean editor_tick(gpointer ud)
  * making sound", which otherwise needs a recording to establish. */
 static gboolean meter_tick(gpointer ud)
 {
-    static int shown;
+    plugview *pv = ud;
     char txt[640];
     int  pk;
-
-    (void)ud;
-    if (!P.host || !P.status || !P.loaded_msg[0]) return G_SOURCE_CONTINUE;
-    pk = atomic_exchange_explicit(&P.peak_milli, 0, memory_order_relaxed);
-    if (pk < shown) pk = shown - 40 > 0 ? shown - 40 : 0;   /* ease down */
-    shown = pk;
-    snprintf(txt, sizeof txt, "%s   ·   out %.3f %s", P.loaded_msg, pk / 1000.0,
+    if (!pv->host || !pv->status || !pv->loaded_msg[0]) return G_SOURCE_CONTINUE;
+    pk = atomic_exchange_explicit(&pv->peak_milli, 0, memory_order_relaxed);
+    if (pk < pv->meter_shown) pk = pv->meter_shown - 40 > 0 ? pv->meter_shown - 40 : 0;
+    pv->meter_shown = pk;                                   /* ease down */
+    snprintf(txt, sizeof txt, "%s   ·   out %.3f %s", pv->loaded_msg, pk / 1000.0,
              pk > 0 ? "\xe2\x96\xa0" : "");
-    gtk_label_set_text(GTK_LABEL(P.status), txt);
+    gtk_label_set_text(GTK_LABEL(pv->status), txt);
     return G_SOURCE_CONTINUE;
 }
 
@@ -1341,13 +1370,13 @@ static gboolean meter_tick(gpointer ud)
  * add: the plug-in is told where the click landed in its own picture, not where
  * it landed on screen. Getting this wrong does not look like a bug in the zoom
  * -- it looks like the plug-in's knobs have stopped working. */
-static void ed_mouse(int x, int y, int msg, int wheel)
+static void ed_mouse(plugview *pv, int x, int y, int msg, int wheel)
 {
-    if (!P.host || !P.ed_open) return;
-    if (P.ed_zoom != 1.0) { x = (int)(x / P.ed_zoom); y = (int)(y / P.ed_zoom); }
-    in_plugin++;
-    pehost_editor_mouse(P.host, x, y, msg, P.buttons, wheel);
-    in_plugin--;
+    if (!pv->host || !pv->ed_open) return;
+    if (pv->ed_zoom != 1.0) { x = (int)(x / pv->ed_zoom); y = (int)(y / pv->ed_zoom); }
+    pv->in_plugin++;
+    pehost_editor_mouse(pv->host, x, y, msg, pv->buttons, wheel);
+    pv->in_plugin--;
 }
 
 /* ---------------------------------------------------------------- zoom */
@@ -1368,17 +1397,17 @@ static void ed_mouse(int x, int y, int msg, int wheel)
 #define ZOOM_MIN 0.25
 #define ZOOM_MAX 4.00
 
-static int zoom_can(void)
+static int zoom_can(plugview *pv)
 {
-    if (!P.host || P.ed_base_w <= 0) return 0;
-    if (P.ed_native) return P.ed_attached && pehost_editor_can_resize(P.host);
-    return P.ed_open;
+    if (!pv->host || pv->ed_base_w <= 0) return 0;
+    if (pv->ed_native) return pv->ed_attached && pehost_editor_can_resize(pv->host);
+    return pv->ed_open;
 }
 
-static void zoom_update_ui(void)
+static void zoom_update_ui(plugview *pv)
 {
     char txt[32];
-    int  on = zoom_can();
+    int  on = zoom_can(pv);
 
     /* Six pointers are touched below and the guard used to check one of them,
      * so a call arriving after the pane went away wrote to five stale widgets
@@ -1386,71 +1415,71 @@ static void zoom_update_ui(void)
      * one test covers the lot -- but each is checked anyway, because this runs
      * from an idle callback and being inert is the only safe thing for it to be
      * when it arrives late. */
-    if (!P.zoom_lbl || !P.zoom_out || !P.zoom_in ||
-        !P.zoom_fit || !P.zoom_one || !P.zoom_note) return;
-    snprintf(txt, sizeof txt, "%d%%", (int)(P.ed_zoom * 100.0 + 0.5));
-    gtk_label_set_text(GTK_LABEL(P.zoom_lbl), txt);
-    gtk_widget_set_sensitive(P.zoom_lbl, on);
-    gtk_widget_set_sensitive(P.zoom_out, on && P.ed_zoom > ZOOM_MIN);
-    gtk_widget_set_sensitive(P.zoom_in,  on && P.ed_zoom < ZOOM_MAX);
-    gtk_widget_set_sensitive(P.zoom_fit, on);
-    gtk_widget_set_sensitive(P.zoom_one, on && P.ed_zoom != 1.0);
+    if (!pv->zoom_lbl || !pv->zoom_out || !pv->zoom_in ||
+        !pv->zoom_fit || !pv->zoom_one || !pv->zoom_note) return;
+    snprintf(txt, sizeof txt, "%d%%", (int)(pv->ed_zoom * 100.0 + 0.5));
+    gtk_label_set_text(GTK_LABEL(pv->zoom_lbl), txt);
+    gtk_widget_set_sensitive(pv->zoom_lbl, on);
+    gtk_widget_set_sensitive(pv->zoom_out, on && pv->ed_zoom > ZOOM_MIN);
+    gtk_widget_set_sensitive(pv->zoom_in,  on && pv->ed_zoom < ZOOM_MAX);
+    gtk_widget_set_sensitive(pv->zoom_fit, on);
+    gtk_widget_set_sensitive(pv->zoom_one, on && pv->ed_zoom != 1.0);
     /* Say why, when they are dead. A disabled button with no reason beside it
      * reads as something broken rather than something that cannot be done to
      * this particular plug-in. */
-    gtk_label_set_text(GTK_LABEL(P.zoom_note),
-        on      ? (P.ed_native ? "the plug-in redraws itself at this size" : "")
-        : !P.host || P.ed_base_w <= 0 ? "no editor open"
-        : P.ed_native ? "this plug-in draws its own window and will not resize it"
+    gtk_label_set_text(GTK_LABEL(pv->zoom_note),
+        on      ? (pv->ed_native ? "the plug-in redraws itself at this size" : "")
+        : !pv->host || pv->ed_base_w <= 0 ? "no editor open"
+        : pv->ed_native ? "this plug-in draws its own window and will not resize it"
                       : "");
 }
 
-static void zoom_apply(void)
+static void zoom_apply(plugview *pv)
 {
     int sw, sh;
 
-    if (P.ed_base_w <= 0 || P.ed_base_h <= 0) { zoom_update_ui(); return; }
-    if (!zoom_can()) {                  /* shown at the size the plug-in drew */
-        P.ed_zoom = 1.0;
-        zoom_update_ui();
+    if (pv->ed_base_w <= 0 || pv->ed_base_h <= 0) { zoom_update_ui(pv); return; }
+    if (!zoom_can(pv)) {                  /* shown at the size the plug-in drew */
+        pv->ed_zoom = 1.0;
+        zoom_update_ui(pv);
         return;
     }
-    sw = (int)(P.ed_base_w * P.ed_zoom + 0.5);
-    sh = (int)(P.ed_base_h * P.ed_zoom + 0.5);
-    P.ed_w = sw; P.ed_h = sh;
-    if (P.ed_native) {
+    sw = (int)(pv->ed_base_w * pv->ed_zoom + 0.5);
+    sh = (int)(pv->ed_base_h * pv->ed_zoom + 0.5);
+    pv->ed_w = sw; pv->ed_h = sh;
+    if (pv->ed_native) {
         /* The window the plug-in was given changes size, and editor_bounds
          * reads ed_nat_* to decide how big that is -- so it is the scaled size
          * that goes there, not the one the plug-in first asked for. */
-        P.ed_nat_w = sw; P.ed_nat_h = sh;
-        gtk_widget_set_size_request(P.editor, sw, sh);
-        native_editor_place();
-        in_plugin++;
-        pehost_editor_resized(P.host, sw, sh);
-        in_plugin--;
+        pv->ed_nat_w = sw; pv->ed_nat_h = sh;
+        gtk_widget_set_size_request(pv->editor, sw, sh);
+        native_editor_place(pv);
+        pv->in_plugin++;
+        pehost_editor_resized(pv->host, sw, sh);
+        pv->in_plugin--;
     } else {
-        gtk_widget_set_size_request(P.editor, sw, sh);
-        gtk_widget_queue_draw(P.editor);
+        gtk_widget_set_size_request(pv->editor, sw, sh);
+        gtk_widget_queue_draw(pv->editor);
     }
-    zoom_update_ui();
+    zoom_update_ui(pv);
 }
 
-static void zoom_set(double z)
+static void zoom_set(plugview *pv, double z)
 {
     if (z < ZOOM_MIN) z = ZOOM_MIN;
     if (z > ZOOM_MAX) z = ZOOM_MAX;
-    P.ed_zoom = z;
-    zoom_apply();
+    pv->ed_zoom = z;
+    zoom_apply(pv);
 }
 
 /* One notch. Geometric rather than a fixed number of percent: stepping down
  * from 100 in tenths takes ten presses to halve the picture and then crawls,
  * where a constant ratio feels the same at every size. */
-static void zoom_step(int dir)
+static void zoom_step(plugview *pv, int dir)
 {
     if (!dir) return;
-    P.ed_fit_auto = 0;
-    zoom_set(P.ed_zoom * (dir > 0 ? 1.25 : 1.0 / 1.25));
+    pv->ed_fit_auto = 0;
+    zoom_set(pv, pv->ed_zoom * (dir > 0 ? 1.25 : 1.0 / 1.25));
 }
 
 /* Scale the editor to the space there is.
@@ -1460,38 +1489,38 @@ static void zoom_step(int dir)
  * not an improvement -- the artwork is bitmaps and text at a fixed size, and
  * stretching it only makes it soft. Pressing Fit is an explicit request and
  * will enlarge. */
-static void zoom_fit(int only_shrink)
+static void zoom_fit(plugview *pv, int only_shrink)
 {
     GtkWidget *port;
     double     z, zy;
     int        vw, vh;
 
-    if (!zoom_can() || P.ed_base_w <= 0 || P.ed_base_h <= 0) return;
-    if (!P.editor || !(port = gtk_widget_get_parent(P.editor))) return;
+    if (!zoom_can(pv) || pv->ed_base_w <= 0 || pv->ed_base_h <= 0) return;
+    if (!pv->editor || !(port = gtk_widget_get_parent(pv->editor))) return;
     vw = gtk_widget_get_width(port);
     vh = gtk_widget_get_height(port);
     if (vw < 16 || vh < 16) return;        /* not laid out yet -- try again */
-    z  = (double)vw / P.ed_base_w;
-    zy = (double)vh / P.ed_base_h;
+    z  = (double)vw / pv->ed_base_w;
+    zy = (double)vh / pv->ed_base_h;
     if (zy < z) z = zy;
     if (only_shrink && z >= 1.0) z = 1.0;
-    zoom_set(z);
-    P.ed_fit_pending = 0;                  /* measured something real */
-    P.ed_fit_vw = vw; P.ed_fit_vh = vh;
+    zoom_set(pv, z);
+    pv->ed_fit_pending = 0;                  /* measured something real */
+    pv->ed_fit_vw = vw; pv->ed_fit_vh = vh;
 }
 
 /* Keep the editor fitted while nobody has asked for a particular zoom: re-fit
  * when the pane changes size, and keep trying while it has not been laid out
  * yet. Touching the zoom controls ends it -- a chosen zoom is a decision. */
-static void zoom_fit_poll(void)
+static void zoom_fit_poll(plugview *pv)
 {
     GtkWidget *port;
-    if (!P.ed_fit_auto && !P.ed_fit_pending) return;
-    if (!P.editor || !(port = gtk_widget_get_parent(P.editor))) return;
-    if (!P.ed_fit_pending &&
-        gtk_widget_get_width(port)  == P.ed_fit_vw &&
-        gtk_widget_get_height(port) == P.ed_fit_vh) return;
-    zoom_fit(1);
+    if (!pv->ed_fit_auto && !pv->ed_fit_pending) return;
+    if (!pv->editor || !(port = gtk_widget_get_parent(pv->editor))) return;
+    if (!pv->ed_fit_pending &&
+        gtk_widget_get_width(port)  == pv->ed_fit_vw &&
+        gtk_widget_get_height(port) == pv->ed_fit_vh) return;
+    zoom_fit(pv, 1);
 }
 
 /* The automatic fit runs one main-loop turn after the editor opens: the pane
@@ -1507,61 +1536,63 @@ static void zoom_fit_poll(void)
  * flag keeps the request alive and editor_tick retries it until the pane can
  * actually be measured. */
 static gboolean zoom_fit_idle(gpointer u)
-{ (void)u; P.ed_fit_pending = 1; P.ed_fit_auto = 1;
-  P.ed_fit_vw = P.ed_fit_vh = -1; zoom_fit(1); return G_SOURCE_REMOVE; }
+{ plugview *pv = u; pv->ed_fit_pending = 1; pv->ed_fit_auto = 1;
+  pv->ed_fit_vw = pv->ed_fit_vh = -1; zoom_fit(pv, 1); return G_SOURCE_REMOVE; }
 
-static void on_zoom_out(GtkButton *b, gpointer u) { (void)b; (void)u; zoom_step(-1); }
-static void on_zoom_in (GtkButton *b, gpointer u) { (void)b; (void)u; zoom_step(+1); }
+static void on_zoom_out(GtkButton *b, gpointer u) { plugview *pv = u; (void)b; zoom_step(pv, -1); }
+static void on_zoom_in (GtkButton *b, gpointer u) { plugview *pv = u; (void)b; zoom_step(pv, +1); }
 static void on_zoom_fit(GtkButton *b, gpointer u)
-{ (void)b; (void)u; P.ed_fit_auto = 1; zoom_fit(0); }
+{ plugview *pv = u; (void)b; pv->ed_fit_auto = 1; zoom_fit(pv, 0); }
 static void on_zoom_one(GtkButton *b, gpointer u)
-{ (void)b; (void)u; P.ed_fit_auto = 0; zoom_set(1.0); }
+{ plugview *pv = u; (void)b; pv->ed_fit_auto = 0; zoom_set(pv, 1.0); }
 
 static void on_ed_pressed(GtkGestureClick *g, int n, double x, double y, gpointer ud)
 {
     int button = (int)gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(g));
+    plugview *pv = ud;
     int msg;
 
-    (void)ud;
-    gtk_widget_grab_focus(P.editor);
-    if (button == 3)      { P.buttons |= MK_RBUTTON; msg = WM_RBUTTONDOWN; }
-    else if (button == 2) { P.buttons |= MK_MBUTTON; msg = WM_MBUTTONDOWN; }
-    else                  { P.buttons |= MK_LBUTTON;
+    gtk_widget_grab_focus(pv->editor);
+    if (button == 3)      { pv->buttons |= MK_RBUTTON; msg = WM_RBUTTONDOWN; }
+    else if (button == 2) { pv->buttons |= MK_MBUTTON; msg = WM_MBUTTONDOWN; }
+    else                  { pv->buttons |= MK_LBUTTON;
                             msg = (n >= 2) ? WM_LBUTTONDBLCLK : WM_LBUTTONDOWN; }
-    ed_mouse((int)x, (int)y, msg, 0);
+    ed_mouse(pv, (int)x, (int)y, msg, 0);
 }
 
 static void on_ed_released(GtkGestureClick *g, int n, double x, double y, gpointer ud)
 {
     int button = (int)gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(g));
+    plugview *pv = ud;
     int msg;
 
-    (void)n; (void)ud;
-    if (button == 3)      { P.buttons &= ~MK_RBUTTON; msg = WM_RBUTTONUP; }
-    else if (button == 2) { P.buttons &= ~MK_MBUTTON; msg = WM_MBUTTONUP; }
-    else                  { P.buttons &= ~MK_LBUTTON; msg = WM_LBUTTONUP; }
-    ed_mouse((int)x, (int)y, msg, 0);
+    (void)n;
+    if (button == 3)      { pv->buttons &= ~MK_RBUTTON; msg = WM_RBUTTONUP; }
+    else if (button == 2) { pv->buttons &= ~MK_MBUTTON; msg = WM_MBUTTONUP; }
+    else                  { pv->buttons &= ~MK_LBUTTON; msg = WM_LBUTTONUP; }
+    ed_mouse(pv, (int)x, (int)y, msg, 0);
 }
 
 static void on_ed_motion(GtkEventControllerMotion *m, double x, double y, gpointer ud)
-{ (void)m; (void)ud; ed_mouse((int)x, (int)y, WM_MOUSEMOVE, 0); }
+{ plugview *pv = ud; (void)m; ed_mouse(pv, (int)x, (int)y, WM_MOUSEMOVE, 0); }
 
 static gboolean on_ed_scroll(GtkEventControllerScroll *s, double dx, double dy, gpointer ud)
 {
     GdkModifierType st;
+    plugview *pv = ud;
 
-    (void)dx; (void)ud;
+    (void)dx;
     /* Ctrl and the wheel is the zoom everywhere else, and the plug-in is not
      * expecting it -- a bare wheel still belongs to whatever control is under
      * the pointer, which is the only way to work some editors. */
     st = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(s));
     if (st & GDK_CONTROL_MASK) {
-        if (dy != 0.0) zoom_step(dy < 0.0 ? 1 : -1);
+        if (dy != 0.0) zoom_step(pv, dy < 0.0 ? 1 : -1);
         return TRUE;
     }
     /* GTK counts notches, Windows counts 120ths of one; the plug-in expects
      * the latter. Sign flipped: scrolling down is a negative delta there. */
-    ed_mouse(0, 0, WM_MOUSEWHEEL, (int)(-dy));
+    ed_mouse(pv, 0, 0, WM_MOUSEWHEEL, (int)(-dy));
     return TRUE;
 }
 
@@ -1589,11 +1620,8 @@ static int gdk_to_vk(guint kv)
     }
 }
 
-/* Which computer keys the piano claims, as dwstudio answers it. See
- * plugview_set_note_key. */
-static int (*note_key)(guint keyval);
-
-void plugview_set_note_key(int (*claims)(guint keyval)) { note_key = claims; }
+void plugview_set_note_key(plugview *pv, int (*claims)(guint keyval))
+{ pv->note_key = claims; }
 
 /* Keys over the editor go to the plug-in -- and a note key goes to the piano
  * as well.
@@ -1626,29 +1654,31 @@ static gboolean on_ed_key_down(GtkEventControllerKey *c, guint kv, guint code,
                                GdkModifierType st, gpointer ud)
 {
     guint32 ch;
-    (void)c; (void)code; (void)st; (void)ud;
-    if (!P.host || !P.ed_open) return FALSE;
+    plugview *pv = ud;
+    (void)c; (void)code; (void)st;
+    if (!pv->host || !pv->ed_open) return FALSE;
     ch = gdk_keyval_to_unicode(kv);
-    in_plugin++;
-    pehost_editor_key(P.host, gdk_to_vk(kv), 1, (int)ch);
-    in_plugin--;
-    if (note_key && note_key(kv)) return FALSE;    /* on to the piano */
+    pv->in_plugin++;
+    pehost_editor_key(pv->host, gdk_to_vk(kv), 1, (int)ch);
+    pv->in_plugin--;
+    if (pv->note_key && pv->note_key(kv)) return FALSE;    /* on to the piano */
     return TRUE;
 }
 
 static void on_ed_key_up(GtkEventControllerKey *c, guint kv, guint code,
                          GdkModifierType st, gpointer ud)
 {
-    (void)c; (void)code; (void)st; (void)ud;
-    if (!P.host || !P.ed_open) return;
-    in_plugin++;
-    pehost_editor_key(P.host, gdk_to_vk(kv), 0, 0);
-    in_plugin--;
+    plugview *pv = ud;
+    (void)c; (void)code; (void)st;
+    if (!pv->host || !pv->ed_open) return;
+    pv->in_plugin++;
+    pehost_editor_key(pv->host, gdk_to_vk(kv), 0, 0);
+    pv->in_plugin--;
 }
 
 /* -------------------------------------------------------------- parameters */
 
-typedef struct { int index; GtkWidget *value; } prow;
+typedef struct { plugview *pv; int index; GtkWidget *value; } prow;
 
 /* g_free has the wrong shape for a GClosureNotify, and casting it there is a
  * warning the compiler is right to give. */
@@ -1657,35 +1687,36 @@ static void prow_free(gpointer p, GClosure *c) { (void)c; g_free(p); }
 static void on_param_changed(GtkRange *r, gpointer ud)
 {
     prow *pr = ud;
+    plugview *pv = pr->pv;
     char  ds[64], lb[64], txt[160];
 
-    if (P.loading || !P.host || in_plugin) return;
-    in_plugin++;
-    pehost_set_param(P.host, pr->index, (float)gtk_range_get_value(r));
-    pehost_param_display(P.host, pr->index, ds, sizeof ds);
-    pehost_param_label(P.host, pr->index, lb, sizeof lb);
-    in_plugin--;
+    if (pv->loading || !pv->host || pv->in_plugin) return;
+    pv->in_plugin++;
+    pehost_set_param(pv->host, pr->index, (float)gtk_range_get_value(r));
+    pehost_param_display(pv->host, pr->index, ds, sizeof ds);
+    pehost_param_label(pv->host, pr->index, lb, sizeof lb);
+    pv->in_plugin--;
     snprintf(txt, sizeof txt, "%s %s", ds, lb);
     gtk_label_set_text(GTK_LABEL(pr->value), txt);
 }
 
-static void fill_params(void)
+static void fill_params(plugview *pv)
 {
     int n, i;
 
-    clear_list(P.paramlist);
-    if (!P.host) return;
+    clear_list(pv->paramlist);
+    if (!pv->host) return;
 
-    P.loading = 1;
-    n = pehost_num_params(P.host);
+    pv->loading = 1;
+    n = pehost_num_params(pv->host);
     for (i = 0; i < n; i++) {
         char nm[64], ds[64], lb[64], txt[160];
         GtkWidget *row, *name, *scale, *value;
         prow *pr;
 
-        pehost_param_name(P.host, i, nm, sizeof nm);
-        pehost_param_display(P.host, i, ds, sizeof ds);
-        pehost_param_label(P.host, i, lb, sizeof lb);
+        pehost_param_name(pv->host, i, nm, sizeof nm);
+        pehost_param_display(pv->host, i, ds, sizeof ds);
+        pehost_param_label(pv->host, i, lb, sizeof lb);
 
         row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
         gtk_widget_set_margin_start(row, 4);
@@ -1697,7 +1728,7 @@ static void fill_params(void)
 
         scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 1.0, 0.001);
         gtk_scale_set_draw_value(GTK_SCALE(scale), FALSE);
-        gtk_range_set_value(GTK_RANGE(scale), pehost_get_param(P.host, i));
+        gtk_range_set_value(GTK_RANGE(scale), pehost_get_param(pv->host, i));
         gtk_widget_set_hexpand(scale, TRUE);
 
         snprintf(txt, sizeof txt, "%s %s", ds, lb);
@@ -1706,6 +1737,7 @@ static void fill_params(void)
         gtk_widget_set_size_request(value, 130, -1);
 
         pr = g_new0(prow, 1);
+        pr->pv = pv;
         pr->index = i;
         pr->value = value;
         g_signal_connect_data(scale, "value-changed", G_CALLBACK(on_param_changed),
@@ -1714,135 +1746,132 @@ static void fill_params(void)
         gtk_box_append(GTK_BOX(row), name);
         gtk_box_append(GTK_BOX(row), scale);
         gtk_box_append(GTK_BOX(row), value);
-        gtk_list_box_append(GTK_LIST_BOX(P.paramlist), row);
+        gtk_list_box_append(GTK_LIST_BOX(pv->paramlist), row);
     }
-    P.loading = 0;
+    pv->loading = 0;
 }
 
-static void fill_programs(void)
+static void fill_programs(plugview *pv)
 {
     int n, i;
 
-    clear_list(P.proglist);
-    if (!P.host) return;
+    clear_list(pv->proglist);
+    if (!pv->host) return;
 
-    P.loading = 1;
-    n = pehost_num_programs(P.host);
+    pv->loading = 1;
+    n = pehost_num_programs(pv->host);
     for (i = 0; i < n; i++) {
         char pn[64] = { 0 }, lbl[96];
         GtkWidget *l;
-        pehost_program_name(P.host, i, pn, sizeof pn);
+        pehost_program_name(pv->host, i, pn, sizeof pn);
         snprintf(lbl, sizeof lbl, "%3d  %s", i, pn[0] ? pn : "-");
         l = gtk_label_new(lbl);
         gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
         gtk_widget_set_margin_start(l, 4);
-        gtk_list_box_append(GTK_LIST_BOX(P.proglist), l);
+        gtk_list_box_append(GTK_LIST_BOX(pv->proglist), l);
     }
     if (n > 0)
-        gtk_list_box_select_row(GTK_LIST_BOX(P.proglist),
-            gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.proglist),
-                                          pehost_get_program(P.host)));
-    P.loading = 0;
+        gtk_list_box_select_row(GTK_LIST_BOX(pv->proglist),
+            gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->proglist),
+                                          pehost_get_program(pv->host)));
+    pv->loading = 0;
 }
 
 /* ------------------------------------------------------------------ loading */
 
-static void set_header(void)
+static void set_header(plugview *pv)
 {
     char txt[512];
 
     /* Inert once the pane has gone, the way plug_status and zoom_update_ui
      * are: this runs from load and unload paths, and one of those is reached
      * during teardown. */
-    if (!P.header) return;
-    if (!P.host) {
-        gtk_label_set_text(GTK_LABEL(P.header), "no plug-in loaded");
+    if (!pv->header) return;
+    if (!pv->host) {
+        gtk_label_set_text(GTK_LABEL(pv->header), "no plug-in loaded");
         return;
     }
     snprintf(txt, sizeof txt,
              "%s — %s\n%s   in %d / out %d   programs %d   params %d",
-             pehost_name(P.host), pehost_vendor(P.host),
-             pehost_is_synth(P.host) ? "synth" : "effect",
-             pehost_num_inputs(P.host), pehost_num_outputs(P.host),
-             pehost_num_programs(P.host), pehost_num_params(P.host));
-    gtk_label_set_text(GTK_LABEL(P.header), txt);
+             pehost_name(pv->host), pehost_vendor(pv->host),
+             pehost_is_synth(pv->host) ? "synth" : "effect",
+             pehost_num_inputs(pv->host), pehost_num_outputs(pv->host),
+             pehost_num_programs(pv->host), pehost_num_params(pv->host));
+    gtk_label_set_text(GTK_LABEL(pv->header), txt);
 }
 
-static void unload_locked(void)
+static void unload_locked(plugview *pv)
 {
-    if (!P.host) return;
+    if (!pv->host) return;
     /* The editor first: it holds a pointer to this plug-in, and the run-loop
      * watches hold pointers into it. Closing the plug-in with either still
      * live is a callback into freed memory. */
-    native_editor_close();
+    native_editor_close(pv);
     /* The pane goes back to following the window. A size request left behind by
      * a large editor would keep the scrollbars up for the next plug-in loaded,
      * whatever size that one turns out to be. */
-    if (GTK_IS_WIDGET(P.editor)) gtk_widget_set_size_request(P.editor, -1, -1);
-    P.ed_nat_w = P.ed_nat_h = 0;
-    P.ed_base_w = P.ed_base_h = 0;
-    P.ed_zoom = 1.0;
-    P.ed_fit_pending = 0;          /* whatever was still to be fitted is gone */
-    P.ed_fit_auto = 0;
-    zoom_update_ui();
-    atomic_store_explicit(&P.live, 0, memory_order_release);
-    P.ed_open = 0;
-    P.ed_native = 0;
-    pehost_close(P.host);
-    P.host = NULL;
+    if (GTK_IS_WIDGET(pv->editor)) gtk_widget_set_size_request(pv->editor, -1, -1);
+    pv->ed_nat_w = pv->ed_nat_h = 0;
+    pv->ed_base_w = pv->ed_base_h = 0;
+    pv->ed_zoom = 1.0;
+    pv->ed_fit_pending = 0;          /* whatever was still to be fitted is gone */
+    pv->ed_fit_auto = 0;
+    zoom_update_ui(pv);
+    atomic_store_explicit(&pv->live, 0, memory_order_release);
+    pv->ed_open = 0;
+    pv->ed_native = 0;
+    pehost_close(pv->host);
+    pv->host = NULL;
 }
 
-/* What the window wants re-sending after every load -- see
- * plugview_set_load_hook. */
-static void (*load_hook)(void);
-void plugview_set_load_hook(void (*fn)(void)) { load_hook = fn; }
+void plugview_set_load_hook(plugview *pv, void (*fn)(void)) { pv->load_hook = fn; }
 
-static void load(const entry *e)
+static void load(plugview *pv, const entry *e)
 {
     char msg[1024];
 
     /* Refuse rather than free a plug-in that is mid-call. */
-    if (in_plugin) return;
-    in_plugin++;
+    if (pv->in_plugin) return;
+    pv->in_plugin++;
 
     /* Park first, always. The callback may be inside pehost_render_io on the
      * plug-in we are about to close, and closing it under a realtime thread is
      * a crash while playing rather than a tidy failure. */
-    if (P.park) P.park();
-    unload_locked();
-    P.host = pehost_open_as(e->path, PEHOST_KIND_AUTO, P.rate, P.block);
-    snprintf(P.loaded_path, sizeof P.loaded_path, "%s", P.host ? e->path : "");
-    if (P.host) atomic_store_explicit(&P.live, 1, memory_order_release);
-    if (P.unpark) P.unpark();
+    if (pv->park) pv->park();
+    unload_locked(pv);
+    pv->host = pehost_open_as(e->path, PEHOST_KIND_AUTO, pv->rate, pv->block);
+    snprintf(pv->loaded_path, sizeof pv->loaded_path, "%s", pv->host ? e->path : "");
+    if (pv->host) atomic_store_explicit(&pv->live, 1, memory_order_release);
+    if (pv->unpark) pv->unpark();
 
-    if (!P.host) {
-        plug_status("%s: %s", e->name, pehost_last_error());
-        set_header();
-        clear_list(P.proglist);
-        clear_list(P.paramlist);
-        in_plugin--;
+    if (!pv->host) {
+        plug_status(pv, "%s: %s", e->name, pehost_last_error());
+        set_header(pv);
+        clear_list(pv->proglist);
+        clear_list(pv->paramlist);
+        pv->in_plugin--;
         return;
     }
 
-    set_header();
-    fill_programs();
-    fill_params();
+    set_header(pv);
+    fill_programs(pv);
+    fill_params(pv);
 
     {
-        int kind = pehost_editor_kind(P.host);
+        int kind = pehost_editor_kind(pv->host);
         int w = 0, h = 0;
-        P.dead_reported = 0;              /* a fresh plug-in gets a fresh verdict */
-        if (kind == PEHOST_EDITOR_PIXELS && pehost_editor_open(P.host) == 0) {
-            P.ed_open = 1;
-            pehost_editor_size(P.host, &w, &h);
+        pv->dead_reported = 0;              /* a fresh plug-in gets a fresh verdict */
+        if (kind == PEHOST_EDITOR_PIXELS && pehost_editor_open(pv->host) == 0) {
+            pv->ed_open = 1;
+            pehost_editor_size(pv->host, &w, &h);
             if (w > 0 && h > 0) {
-                P.ed_w = w; P.ed_h = h;
-                P.ed_base_w = w; P.ed_base_h = h;
-                gtk_widget_set_size_request(P.editor, w, h);
-                zoom_update_ui();
+                pv->ed_w = w; pv->ed_h = h;
+                pv->ed_base_w = w; pv->ed_base_h = h;
+                gtk_widget_set_size_request(pv->editor, w, h);
+                zoom_update_ui(pv);
                 /* Fit it if it does not already fit, one turn later -- the pane
                  * has not been laid out at this editor's size yet. */
-                g_idle_add(zoom_fit_idle, NULL);
+                g_idle_add(zoom_fit_idle, pv);
             }
             snprintf(msg, sizeof msg, "%s loaded — editor %dx%d", e->name, w, h);
         } else if (kind == PEHOST_EDITOR_X11) {
@@ -1854,13 +1883,13 @@ static void load(const entry *e)
              * than the window. Without it the pane was only ever as big as the
              * window, the plug-in was handed that, and an editor that did not
              * fit was simply cut off with no way to reach the rest of it. */
-            P.ed_native = 1;
-            pehost_editor_size(P.host, &w, &h);
+            pv->ed_native = 1;
+            pehost_editor_size(pv->host, &w, &h);
             if (w > 0 && h > 0) {
-                P.ed_w = w; P.ed_h = h;
-                P.ed_nat_w = w; P.ed_nat_h = h;
-                P.ed_base_w = w; P.ed_base_h = h;
-                gtk_widget_set_size_request(P.editor, w, h);
+                pv->ed_w = w; pv->ed_h = h;
+                pv->ed_nat_w = w; pv->ed_nat_h = h;
+                pv->ed_base_w = w; pv->ed_base_h = h;
+                gtk_widget_set_size_request(pv->editor, w, h);
                 snprintf(msg, sizeof msg,
                          "%s loaded — editor %dx%d, on the Editor page",
                          e->name, w, h);
@@ -1882,15 +1911,15 @@ static void load(const entry *e)
          * item that opens them. */
         {
             char hits[16][1024];
-            int  n = patch_find_for(P.host, e->path, hits, 16);
+            int  n = patch_find_for(pv->host, e->path, hits, 16);
             if (n > 0)
                 snprintf(msg + strlen(msg), sizeof msg - strlen(msg),
                          "   \xc2\xb7   %d patch file(s) saved for it "
                          "— File > Open Patch", n);
         }
-        plug_status("%s", msg);
+        plug_status(pv, "%s", msg);
     }
-    in_plugin--;
+    pv->in_plugin--;
 
     /* Already looking at the Editor page: bring this plug-in's up, because the
      * page is not changing and nothing else will.
@@ -1898,23 +1927,23 @@ static void load(const entry *e)
      * Losing this line is what made 54 of 55 plug-ins show nothing -- the
      * first one attached from the page change and every one after it silently
      * did not. */
-    if (P.ed_native && P.stack && !P.ed_attached) {
-        const char *page = gtk_stack_get_visible_child_name(GTK_STACK(P.stack));
+    if (pv->ed_native && pv->stack && !pv->ed_attached) {
+        const char *page = gtk_stack_get_visible_child_name(GTK_STACK(pv->stack));
         if (page && !strcmp(page, "editor"))
-            native_editor_open(P.host, pehost_name(P.host));
+            native_editor_open(pv, pv->host, pehost_name(pv->host));
     }
 
     /* Last, so the window is told about a plug-in that is finished loading and
      * not one that is halfway in. */
-    if (load_hook) load_hook();
+    if (pv->load_hook) pv->load_hook();
 }
 
 /* Rescan every folder and show the result. What File > Load Folder and the
  * settings dialog call once they have changed the set of folders. */
-static void rescan_all(void)
+static void rescan_all(plugview *pv)
 {
-    plugview_scan(NULL);
-    fill_browser();
+    plugview_scan(pv, NULL);
+    fill_browser(pv);
 }
 
 /* Looking at the Editor page is what opens a native editor. Leaving the page
@@ -1929,56 +1958,59 @@ static void on_page_changed(GObject *stack, GParamSpec *ps, gpointer ud)
 {
     const char *page = gtk_stack_get_visible_child_name(GTK_STACK(stack));
 
-    (void)ps; (void)ud;
+    plugview *pv = ud;
+    (void)ps;
     /* GtkStack emits this while the pane is still being assembled -- adding
      * pages and attaching a switcher both move the visible child. Opening a
      * plug-in editor from inside plugview_new is not what the user asked for,
      * and it happened before anything was on screen. */
-    if (!P.ready || !P.host || !P.ed_native || P.ed_attached) return;
+    if (!pv->ready || !pv->host || !pv->ed_native || pv->ed_attached) return;
     if (page && !strcmp(page, "editor"))
-        native_editor_open(P.host, pehost_name(P.host));
+        native_editor_open(pv, pv->host, pehost_name(pv->host));
 }
 
 static void on_plug_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer ud)
 {
+    plugview *pv = ud;
     int i;
-    (void)lb; (void)ud;
+    (void)lb;
     if (!row) return;
     /* A row index is an index into the *visible* rows, which the selectors
      * decide -- not into plug[]. Reading plug[] with it directly loaded a
      * different plug-in from the one clicked as soon as anything was
      * filtered. */
     i = gtk_list_box_row_get_index(row);
-    if (i < 0 || i >= P.nvis) return;
-    i = P.vis[i];
+    if (i < 0 || i >= pv->nvis) return;
+    i = pv->vis[i];
     /* Which folder it came out of, now that the list spans all of them: two
      * builds of one plug-in under different roots are otherwise one name
      * twice. */
-    if (P.dirlabel) {
+    if (pv->dirlabel) {
         char dir[1024], *slash;
-        snprintf(dir, sizeof dir, "%s", P.plug[i].path);
+        snprintf(dir, sizeof dir, "%s", pv->plug[i].path);
         if ((slash = strrchr(dir, '/'))) *slash = 0;
-        snprintf(P.dir, sizeof P.dir, "%s", dir);
-        gtk_label_set_text(GTK_LABEL(P.dirlabel), dir);
+        snprintf(pv->dir, sizeof pv->dir, "%s", dir);
+        gtk_label_set_text(GTK_LABEL(pv->dirlabel), dir);
     }
-    if (!P.plug[i].loadable) {
-        plug_status("%s: %s", P.plug[i].name, P.plug[i].kind);
+    if (!pv->plug[i].loadable) {
+        plug_status(pv, "%s: %s", pv->plug[i].name, pv->plug[i].kind);
         return;
     }
-    load(&P.plug[i]);
+    load(pv, &pv->plug[i]);
 }
 
 static void on_prog_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer ud)
 {
-    (void)lb; (void)ud;
-    if (P.loading || !P.host || !row || in_plugin) return;
-    in_plugin++;
-    pehost_set_program(P.host, gtk_list_box_row_get_index(row));
-    in_plugin--;
-    fill_params();          /* a program change rewrites every parameter */
+    plugview *pv = ud;
+    (void)lb;
+    if (pv->loading || !pv->host || !row || pv->in_plugin) return;
+    pv->in_plugin++;
+    pehost_set_program(pv->host, gtk_list_box_row_get_index(row));
+    pv->in_plugin--;
+    fill_params(pv);          /* a program change rewrites every parameter */
 }
 
-static void append_row(const entry *e)
+static void append_row(plugview *pv, const entry *e)
 {
     char       lbl[288];
     GtkWidget *l;
@@ -1992,12 +2024,12 @@ static void append_row(const entry *e)
     gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
     gtk_widget_set_margin_start(l, 4);
     gtk_widget_set_margin_end(l, 4);
-    gtk_list_box_append(GTK_LIST_BOX(P.list), l);
+    gtk_list_box_append(GTK_LIST_BOX(pv->list), l);
 }
 
 /* Load one plug-in by path, wherever it came from. Already-listed ones are
  * selected rather than added twice. */
-static void open_path(const char *path)
+static void open_path(plugview *pv, const char *path)
 {
     pehost_info info;
     const char *base;
@@ -2006,31 +2038,31 @@ static void open_path(const char *path)
     int         i;
 
     if (!pehost_can_load(path, why, (int)sizeof why)) {
-        plug_status("%s: %s", path,
+        plug_status(pv, "%s: %s", path,
                     why[0] ? why : "not a plug-in this host can load");
         return;
     }
     /* Anything opened by hand has to end up visible, so the selectors go back
      * to "All" first: opening a Linux plug-in while the list is filtered to
      * Windows would otherwise add it and select nothing. */
-    if (P.typedd && (gtk_drop_down_get_selected(GTK_DROP_DOWN(P.typedd)) ||
-                     gtk_drop_down_get_selected(GTK_DROP_DOWN(P.osdd)))) {
-        P.loading = 1;
-        gtk_drop_down_set_selected(GTK_DROP_DOWN(P.typedd), 0);
-        gtk_drop_down_set_selected(GTK_DROP_DOWN(P.osdd), 0);
-        P.loading = 0;
-        fill_browser();
+    if (pv->typedd && (gtk_drop_down_get_selected(GTK_DROP_DOWN(pv->typedd)) ||
+                     gtk_drop_down_get_selected(GTK_DROP_DOWN(pv->osdd)))) {
+        pv->loading = 1;
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(pv->typedd), 0);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(pv->osdd), 0);
+        pv->loading = 0;
+        fill_browser(pv);
     }
-    for (i = 0; i < P.nvis; i++)
-        if (!strcmp(P.plug[P.vis[i]].path, path)) {
-            gtk_list_box_select_row(GTK_LIST_BOX(P.list),
-                gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), i));
+    for (i = 0; i < pv->nvis; i++)
+        if (!strcmp(pv->plug[pv->vis[i]].path, path)) {
+            gtk_list_box_select_row(GTK_LIST_BOX(pv->list),
+                gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->list), i));
             return;
         }
-    if (P.nplug >= MAX_PLUGINS) return;
+    if (pv->nplug >= MAX_PLUGINS) return;
 
     base = strrchr(path, '/');
-    e = &P.plug[P.nplug];
+    e = &pv->plug[pv->nplug];
     snprintf(e->path, sizeof e->path, "%s", path);
     snprintf(e->name, sizeof e->name, "%s", base ? base + 1 : path);
     pehost_classify(path, &info);
@@ -2039,13 +2071,13 @@ static void open_path(const char *path)
     snprintf(e->fmt,  sizeof e->fmt,  "%s", info.format);
     e->kindv = (int)info.kind;
     e->loadable = 1;                          /* pehost_can_load said so above */
-    append_row(e);
-    P.vis[P.nvis++] = P.nplug;
-    P.nplug++;
+    append_row(pv, e);
+    pv->vis[pv->nvis++] = pv->nplug;
+    pv->nplug++;
 
     /* Selecting it is what loads it -- one path in, not two. */
-    gtk_list_box_select_row(GTK_LIST_BOX(P.list),
-        gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), P.nvis - 1));
+    gtk_list_box_select_row(GTK_LIST_BOX(pv->list),
+        gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->list), pv->nvis - 1));
 }
 
 /* Opening an installer rather than a plug-in.
@@ -2137,8 +2169,8 @@ static void on_vst_chosen(GObject *src, GAsyncResult *res, gpointer ud)
     GError *err = NULL;
     GFile  *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, &err);
     char   *path;
+    plugview *pv = ud;
 
-    (void)ud;
     g_clear_error(&err);
     g_object_unref(src);                         /* the ref taken in open_vst */
     if (!f) return;                              /* cancelled */
@@ -2146,22 +2178,22 @@ static void on_vst_chosen(GObject *src, GAsyncResult *res, gpointer ud)
         if (installer_ext(path)) {
             char why[256] = "";
             char *got = unpack_installer(path, why, sizeof why);
-            if (got) { open_path(got); g_free(got); }
-            else plug_status("%s", why[0] ? why : "nothing came out of it");
+            if (got) { open_path(pv, got); g_free(got); }
+            else plug_status(pv, "%s", why[0] ? why : "nothing came out of it");
         } else {
-            open_path(path);
+            open_path(pv, path);
         }
         g_free(path);
     }
     g_object_unref(f);
 }
 
-void plugview_open_vst(GtkWindow *parent)
+void plugview_open_vst(plugview *pv, GtkWindow *parent)
 {
     GtkFileDialog *d = gtk_file_dialog_new();
 
     gtk_file_dialog_set_title(d, "Open VST");
-    gtk_file_dialog_open(d, parent, NULL, on_vst_chosen, NULL);
+    gtk_file_dialog_open(d, parent, NULL, on_vst_chosen, pv);
 }
 
 /* ------------------------------------------------------------- patches ---- */
@@ -2179,7 +2211,7 @@ static void on_patch_save_chosen(GObject *src, GAsyncResult *res, gpointer ud)
     GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
     char *path;
     char err[256] = "";
-    (void)ud;
+    plugview *pv = ud;
     if (!f) return;
     if ((path = g_file_get_path(f)) != NULL) {
         char with_ext[1100];
@@ -2188,14 +2220,14 @@ static void on_patch_save_chosen(GObject *src, GAsyncResult *res, gpointer ud)
             snprintf(with_ext, sizeof with_ext, "%s.json", path);
         else
             snprintf(with_ext, sizeof with_ext, "%s", path);
-        if (!P.host)
-            plug_status("load a plug-in first");
-        else if (patch_save(P.host, with_ext,
-                            P.loaded_path[0] ? P.loaded_path : NULL,
+        if (!pv->host)
+            plug_status(pv, "load a plug-in first");
+        else if (patch_save(pv->host, with_ext,
+                            pv->loaded_path[0] ? pv->loaded_path : NULL,
                             err, sizeof err) != 0)
-            plug_status("save failed: %s", err);
+            plug_status(pv, "save failed: %s", err);
         else
-            plug_status("saved %s", strrchr(with_ext, '/')
+            plug_status(pv, "saved %s", strrchr(with_ext, '/')
                                         ? strrchr(with_ext, '/') + 1 : with_ext);
         g_free(path);
     }
@@ -2216,17 +2248,17 @@ static void patch_dialog_start_here(GtkFileDialog *d)
     g_object_unref(f);
 }
 
-void plugview_save_patch(GtkWindow *parent)
+void plugview_save_patch(plugview *pv, GtkWindow *parent)
 {
     GtkFileDialog *d;
     char suggest[160] = "patch.json";
 
-    if (!P.host) { plug_status("load a plug-in first"); return; }
+    if (!pv->host) { plug_status(pv, "load a plug-in first"); return; }
     patch_user_dir_ensure();              /* saving is the ask; looking is not */
-    if (P.loaded_path[0]) {
-        const char *base = strrchr(P.loaded_path, '/');
+    if (pv->loaded_path[0]) {
+        const char *base = strrchr(pv->loaded_path, '/');
         const char *dot;
-        base = base ? base + 1 : P.loaded_path;
+        base = base ? base + 1 : pv->loaded_path;
         snprintf(suggest, sizeof suggest, "%s", base);
         if ((dot = strrchr(suggest, '.')) != NULL) *(char *)dot = 0;
         g_strlcat(suggest, ".json", sizeof suggest);
@@ -2235,7 +2267,7 @@ void plugview_save_patch(GtkWindow *parent)
     gtk_file_dialog_set_title(d, "Save patch");
     gtk_file_dialog_set_initial_name(d, suggest);
     patch_dialog_start_here(d);
-    gtk_file_dialog_save(d, parent, NULL, on_patch_save_chosen, NULL);
+    gtk_file_dialog_save(d, parent, NULL, on_patch_save_chosen, pv);
     g_object_unref(d);
 }
 
@@ -2243,24 +2275,24 @@ static void on_patch_open_chosen(GObject *src, GAsyncResult *res, gpointer ud)
 {
     GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
     char *path;
-    (void)ud;
+    plugview *pv = ud;
     if (!f) return;
     if ((path = g_file_get_path(f)) != NULL) {
         char err[256] = "";
         int applied = 0, missed = 0;
-        if (!P.host) {
-            plug_status("load a plug-in first");
-        } else if (patch_load(P.host, path, err, sizeof err, &applied, &missed) != 0) {
-            plug_status("open failed: %s", err);
+        if (!pv->host) {
+            plug_status(pv, "load a plug-in first");
+        } else if (patch_load(pv->host, path, err, sizeof err, &applied, &missed) != 0) {
+            plug_status(pv, "open failed: %s", err);
         } else {
             /* The values changed under the list, so it has to be rebuilt --
              * otherwise the patch is audible and invisible. */
-            fill_params();
+            fill_params(pv);
             if (missed)
-                plug_status("%d parameter(s) set, %d matched nothing%s%s",
+                plug_status(pv, "%d parameter(s) set, %d matched nothing%s%s",
                             applied, missed, err[0] ? " -- " : "", err);
             else
-                plug_status("%d parameter(s) set%s%s", applied,
+                plug_status(pv, "%d parameter(s) set%s%s", applied,
                             err[0] ? " -- " : "", err);
         }
         g_free(path);
@@ -2268,22 +2300,22 @@ static void on_patch_open_chosen(GObject *src, GAsyncResult *res, gpointer ud)
     g_object_unref(f);
 }
 
-void plugview_load_patch(GtkWindow *parent)
+void plugview_load_patch(plugview *pv, GtkWindow *parent)
 {
     GtkFileDialog *d;
 
-    if (!P.host) { plug_status("load a plug-in first"); return; }
+    if (!pv->host) { plug_status(pv, "load a plug-in first"); return; }
     d = gtk_file_dialog_new();
     gtk_file_dialog_set_title(d, "Open patch");
     patch_dialog_start_here(d);
-    gtk_file_dialog_open(d, parent, NULL, on_patch_open_chosen, NULL);
+    gtk_file_dialog_open(d, parent, NULL, on_patch_open_chosen, pv);
     g_object_unref(d);
 }
 
 static void on_dir_chosen(GObject *src, GAsyncResult *res, gpointer ud)
 {
     GFile *f = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res, NULL);
-    (void)ud;
+    plugview *pv = ud;
     if (!f) return;
     {
         char *path = g_file_get_path(f);
@@ -2293,21 +2325,21 @@ static void on_dir_chosen(GObject *src, GAsyncResult *res, gpointer ud)
              * pestudio reads. Untagged -- File > Load Folder does not ask
              * which platform, and Settings is where that is chosen. */
             if (vstdirs_add(VSTDIRS_ANY, path) < 0)
-                plug_status("could not save the folder list to %s", vstdirs_file());
-            roots_add(path, "user folder");
-            rescan_all();
+                plug_status(pv, "could not save the folder list to %s", vstdirs_file());
+            roots_add(pv, path, "user folder");
+            rescan_all(pv);
             g_free(path);
         }
     }
     g_object_unref(f);
 }
 
-void plugview_load_folder(GtkWindow *parent)
+void plugview_load_folder(plugview *pv, GtkWindow *parent)
 {
     GtkFileDialog *d = gtk_file_dialog_new();
 
     gtk_file_dialog_set_title(d, "Load plug-in folder");
-    gtk_file_dialog_select_folder(d, parent, NULL, on_dir_chosen, NULL);
+    gtk_file_dialog_select_folder(d, parent, NULL, on_dir_chosen, pv);
     g_object_unref(d);
 }
 
@@ -2331,36 +2363,29 @@ static const char *const g_dir_groups[] = {
     VSTDIRS_WINDOWS, VSTDIRS_LINUX, VSTDIRS_MACOS, VSTDIRS_CLASSIC, VSTDIRS_ANY
 };
 
-static struct {
-    GtkWidget *win;
-    GtkWidget *list;          /* the folders, grouped */
-    GtkWidget *rm;
-    GtkWidget *asdd;          /* which group Add puts the next one in */
-    char       sel[1024];     /* the selected folder, or "" */
-} F;
-
-static void folders_refill(void);
+static void folders_refill(plugview *pv);
 
 static void on_folder_row(GtkListBox *lb, GtkListBoxRow *row, gpointer ud)
 {
+    plugview *pv = ud;
     const char *p;
-    (void)lb; (void)ud;
-    F.sel[0] = 0;
+    (void)lb;
+    pv->folders.sel[0] = 0;
     if (row && (p = g_object_get_data(G_OBJECT(row), "path")))
-        snprintf(F.sel, sizeof F.sel, "%s", p);
-    if (F.rm) gtk_widget_set_sensitive(F.rm, F.sel[0] != 0);
+        snprintf(pv->folders.sel, sizeof pv->folders.sel, "%s", p);
+    if (pv->folders.rm) gtk_widget_set_sensitive(pv->folders.rm, pv->folders.sel[0] != 0);
 }
 
-static void folders_refill(void)
+static void folders_refill(plugview *pv)
 {
     vstdir dirs[VSTDIRS_MAX];
     int    n, i, added = 0;
     size_t g;
 
-    if (!F.list) return;
-    clear_list(F.list);
-    F.sel[0] = 0;
-    if (F.rm) gtk_widget_set_sensitive(F.rm, FALSE);
+    if (!pv->folders.list) return;
+    clear_list(pv->folders.list);
+    pv->folders.sel[0] = 0;
+    if (pv->folders.rm) gtk_widget_set_sensitive(pv->folders.rm, FALSE);
 
     n = vstdirs_load(dirs, VSTDIRS_MAX);
     /* In the order the browser lists plug-ins, so the Windows folders read
@@ -2379,76 +2404,92 @@ static void folders_refill(void)
             gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
             gtk_widget_set_margin_start(l, 4);
             gtk_widget_set_margin_end(l, 4);
-            gtk_list_box_append(GTK_LIST_BOX(F.list), l);
+            gtk_list_box_append(GTK_LIST_BOX(pv->folders.list), l);
             /* The path lives on the row, not in a parallel array: rows are
              * built group by group, so a row's position is not an index into
              * anything the caller still has. */
-            row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(F.list), added++);
+            row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->folders.list), added++);
             if (row) g_object_set_data_full(G_OBJECT(row), "path",
                                             g_strdup(dirs[i].path), g_free);
         }
 }
 
+/* What on_folder_chosen needs from on_folder_add: the instance, and which
+ * platform group the folder was filed under. GTK hands a callback one user
+ * pointer, so the two travel together. */
+typedef struct { plugview *pv; char *os; } folder_pick;
+
 static void on_folder_chosen(GObject *src, GAsyncResult *res, gpointer ud)
 {
+    folder_pick *pick = ud;
+    plugview    *pv = pick->pv;
     GFile *f = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res, NULL);
-    char  *os = ud, *path;
+    const char *os = pick->os;
+    char       *path;
 
     g_object_unref(src);
     if (f) {
         if ((path = g_file_get_path(f))) {
             if (vstdirs_add(os, path) < 0)
-                plug_status("could not save the folder list to %s", vstdirs_file());
-            folders_refill();
+                plug_status(pv, "could not save the folder list to %s", vstdirs_file());
+            folders_refill(pv);
             /* The scan set changed, so the browser behind the dialog is out of
              * date the moment this returns. */
-            roots_discover(); roots_add_standard(); roots_add_user();
-            roots_add_fallback();
-            if (g_session_dir[0]) roots_add(g_session_dir, "given folder");
-            rescan_all();
+            roots_discover(pv); roots_add_standard(pv); roots_add_user(pv);
+            roots_add_fallback(pv);
+            if (pv->session_dir[0]) roots_add(pv, pv->session_dir, "given folder");
+            rescan_all(pv);
             g_free(path);
         }
         g_object_unref(f);
     }
-    g_free(os);
+    g_free(pick->os);
+    g_free(pick);
 }
 
 static void on_folder_add(GtkButton *b, gpointer ud)
 {
+    plugview      *pv = ud;
     GtkFileDialog *d = gtk_file_dialog_new();
-    guint          i = gtk_drop_down_get_selected(GTK_DROP_DOWN(F.asdd));
+    guint          i = gtk_drop_down_get_selected(GTK_DROP_DOWN(pv->folders.asdd));
     const char    *os = i < sizeof g_dir_groups / sizeof g_dir_groups[0]
                             ? g_dir_groups[i] : VSTDIRS_ANY;
     char           title[64];
+    folder_pick   *pick = g_new(folder_pick, 1);
 
-    (void)b; (void)ud;
+    (void)b;
+    pick->pv = pv;
+    pick->os = g_strdup(os);
     snprintf(title, sizeof title, "Add %s plug-in folder", vstdirs_os_label(os));
     gtk_file_dialog_set_title(d, title);
-    gtk_file_dialog_select_folder(d, GTK_WINDOW(F.win), NULL,
-                                  on_folder_chosen, g_strdup(os));
+    gtk_file_dialog_select_folder(d, GTK_WINDOW(pv->folders.win), NULL,
+                                  on_folder_chosen, pick);
 }
 
 static void on_folder_remove(GtkButton *b, gpointer ud)
 {
-    (void)b; (void)ud;
-    if (!F.sel[0]) return;
-    vstdirs_remove(F.sel);
-    folders_refill();
-    roots_discover(); roots_add_standard(); roots_add_user(); roots_add_fallback();
-    if (g_session_dir[0]) roots_add(g_session_dir, "given folder");
-    rescan_all();
+    plugview *pv = ud;
+    (void)b;
+    if (!pv->folders.sel[0]) return;
+    vstdirs_remove(pv->folders.sel);
+    folders_refill(pv);
+    roots_discover(pv); roots_add_standard(pv); roots_add_user(pv); roots_add_fallback(pv);
+    if (pv->session_dir[0]) roots_add(pv, pv->session_dir, "given folder");
+    rescan_all(pv);
 }
 
 static void on_folder_close(GtkButton *b, gpointer ud)
 {
-    (void)b; (void)ud;
-    if (F.win) gtk_window_destroy(GTK_WINDOW(F.win));
+    plugview *pv = ud;
+    (void)b;
+    if (pv->folders.win) gtk_window_destroy(GTK_WINDOW(pv->folders.win));
 }
 
 static void on_folders_gone(GtkWidget *w, gpointer ud)
 {
-    (void)w; (void)ud;
-    F.win = NULL; F.list = NULL; F.rm = NULL; F.asdd = NULL;
+    plugview *pv = ud;
+    (void)w;
+    pv->folders.win = NULL; pv->folders.list = NULL; pv->folders.rm = NULL; pv->folders.asdd = NULL;
 }
 
 /* Send text to whatever the editor has focused, as if it were typed.
@@ -2457,43 +2498,44 @@ static void on_folders_gone(GtkWidget *w, gpointer ud)
  * reads only one of the three is common; Return follows, since a field that
  * commits on Enter commits on nothing else. The editor is pumped between keys
  * so a plug-in that repaints per keystroke gets the chance to. */
-static void plugview_type(const char *text)
+static void plugview_type(plugview *pv, const char *text)
 {
     const unsigned char *t;
-    if (!P.host || !P.ed_open || !text) return;
+    if (!pv->host || !pv->ed_open || !text) return;
     for (t = (const unsigned char *)text; *t; t++) {
         int ch = *t, vk;
         if (ch < 32 || ch > 126) continue;
         vk = (ch >= 'a' && ch <= 'z') ? ch - 'a' + 'A' : ch;
-        pehost_editor_key(P.host, vk, 1, ch);
-        pehost_editor_pump(P.host);
-        pehost_editor_key(P.host, vk, 0, ch);
-        pehost_editor_pump(P.host);
+        pehost_editor_key(pv->host, vk, 1, ch);
+        pehost_editor_pump(pv->host);
+        pehost_editor_key(pv->host, vk, 0, ch);
+        pehost_editor_pump(pv->host);
     }
-    pehost_editor_key(P.host, 0x0D, 1, 13);          /* VK_RETURN */
-    pehost_editor_pump(P.host);
-    pehost_editor_key(P.host, 0x0D, 0, 0);
-    pehost_editor_pump(P.host);
+    pehost_editor_key(pv->host, 0x0D, 1, 13);          /* VK_RETURN */
+    pehost_editor_pump(pv->host);
+    pehost_editor_key(pv->host, 0x0D, 0, 0);
+    pehost_editor_pump(pv->host);
 }
 
-static void key_status(const char *msg)
+static void key_status(plugview *pv, const char *msg)
 {
-    if (P.status) gtk_label_set_text(GTK_LABEL(P.status), msg);
+    if (pv->status) gtk_label_set_text(GTK_LABEL(pv->status), msg);
 }
 
 /* Both the Enter key on the field and the button land here; the window to
  * close is hung off the entry so one callback serves both signals. */
 static void on_key_entry_done(GtkWidget *entry, gpointer ud)
 {
+    plugview   *pv = g_object_get_data(G_OBJECT(entry), "pv");
     const char *text = gtk_editable_get_text(GTK_EDITABLE(entry));
     GtkWidget *win = ud ? GTK_WIDGET(ud)
                         : GTK_WIDGET(g_object_get_data(G_OBJECT(entry), "win"));
     char msg[128];
     int n = text ? (int)strlen(text) : 0;
     if (n > 0) {
-        plugview_type(text);
+        plugview_type(pv, text);
         snprintf(msg, sizeof msg, "sent %d character(s) to the editor", n);
-        key_status(msg);
+        key_status(pv, msg);
     }
     if (win) gtk_window_destroy(GTK_WINDOW(win));
 }
@@ -2501,12 +2543,12 @@ static void on_key_entry_done(GtkWidget *entry, gpointer ud)
 static void on_key_send_clicked(GtkButton *b, gpointer entry)
 { (void)b; on_key_entry_done(GTK_WIDGET(entry), NULL); }
 
-void plugview_enter_key(GtkWindow *parent)
+void plugview_enter_key(plugview *pv, GtkWindow *parent)
 {
     GtkWidget *win, *box, *lbl, *entry, *send;
 
-    if (!P.host || !P.ed_open) {
-        key_status("open a plug-in and its editor first");
+    if (!pv->host || !pv->ed_open) {
+        key_status(pv, "open a plug-in and its editor first");
         return;
     }
     win = gtk_window_new();
@@ -2532,6 +2574,7 @@ void plugview_enter_key(GtkWindow *parent)
     gtk_box_append(GTK_BOX(box), entry);
 
     g_object_set_data(G_OBJECT(entry), "win", win);
+    g_object_set_data(G_OBJECT(entry), "pv", pv);
     send = gtk_button_new_with_label("Send to editor");
     g_signal_connect(send, "clicked", G_CALLBACK(on_key_send_clicked), entry);
     gtk_box_append(GTK_BOX(box), send);
@@ -2541,21 +2584,21 @@ void plugview_enter_key(GtkWindow *parent)
     gtk_widget_grab_focus(entry);
 }
 
-void plugview_edit_folders(GtkWindow *parent)
+void plugview_edit_folders(plugview *pv, GtkWindow *parent)
 {
     GtkWidget     *box, *sw, *btns, *lbl, *close;
     GtkStringList *asmodel;
     size_t         g;
     int            i;
 
-    if (F.win) { gtk_window_present(GTK_WINDOW(F.win)); return; }
+    if (pv->folders.win) { gtk_window_present(GTK_WINDOW(pv->folders.win)); return; }
 
-    F.win = gtk_window_new();
-    gtk_window_set_title(GTK_WINDOW(F.win), "Plug-in folders");
-    gtk_window_set_default_size(GTK_WINDOW(F.win), 660, 440);
-    gtk_window_set_transient_for(GTK_WINDOW(F.win), parent);
-    gtk_window_set_modal(GTK_WINDOW(F.win), TRUE);
-    g_signal_connect(F.win, "destroy", G_CALLBACK(on_folders_gone), NULL);
+    pv->folders.win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(pv->folders.win), "Plug-in folders");
+    gtk_window_set_default_size(GTK_WINDOW(pv->folders.win), 660, 440);
+    gtk_window_set_transient_for(GTK_WINDOW(pv->folders.win), parent);
+    gtk_window_set_modal(GTK_WINDOW(pv->folders.win), TRUE);
+    g_signal_connect(pv->folders.win, "destroy", G_CALLBACK(on_folders_gone), pv);
 
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_set_margin_top(box, 10);    gtk_widget_set_margin_bottom(box, 10);
@@ -2566,10 +2609,10 @@ void plugview_edit_folders(GtkWindow *parent)
     gtk_label_set_xalign(GTK_LABEL(lbl), 0.0f);
     gtk_box_append(GTK_BOX(box), lbl);
 
-    F.list = gtk_list_box_new();
-    g_signal_connect(F.list, "row-selected", G_CALLBACK(on_folder_row), NULL);
+    pv->folders.list = gtk_list_box_new();
+    g_signal_connect(pv->folders.list, "row-selected", G_CALLBACK(on_folder_row), pv);
     sw = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), F.list);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), pv->folders.list);
     gtk_widget_set_vexpand(sw, TRUE);
     gtk_box_append(GTK_BOX(box), sw);
 
@@ -2578,17 +2621,17 @@ void plugview_edit_folders(GtkWindow *parent)
     asmodel = gtk_string_list_new(NULL);
     for (g = 0; g < sizeof g_dir_groups / sizeof g_dir_groups[0]; g++)
         gtk_string_list_append(asmodel, vstdirs_os_label(g_dir_groups[g]));
-    F.asdd = gtk_drop_down_new(G_LIST_MODEL(asmodel), NULL);
-    gtk_box_append(GTK_BOX(btns), F.asdd);
+    pv->folders.asdd = gtk_drop_down_new(G_LIST_MODEL(asmodel), NULL);
+    gtk_box_append(GTK_BOX(btns), pv->folders.asdd);
     {
         GtkWidget *add = gtk_button_new_with_label("Add Folder…");
-        g_signal_connect(add, "clicked", G_CALLBACK(on_folder_add), NULL);
+        g_signal_connect(add, "clicked", G_CALLBACK(on_folder_add), pv);
         gtk_box_append(GTK_BOX(btns), add);
     }
-    F.rm = gtk_button_new_with_label("Remove");
-    gtk_widget_set_sensitive(F.rm, FALSE);
-    g_signal_connect(F.rm, "clicked", G_CALLBACK(on_folder_remove), NULL);
-    gtk_box_append(GTK_BOX(btns), F.rm);
+    pv->folders.rm = gtk_button_new_with_label("Remove");
+    gtk_widget_set_sensitive(pv->folders.rm, FALSE);
+    g_signal_connect(pv->folders.rm, "clicked", G_CALLBACK(on_folder_remove), pv);
+    gtk_box_append(GTK_BOX(btns), pv->folders.rm);
     gtk_box_append(GTK_BOX(box), btns);
 
     /* Said out loud, because a settings page that groups things by platform
@@ -2610,13 +2653,13 @@ void plugview_edit_folders(GtkWindow *parent)
         vstdir     ud[VSTDIRS_MAX];
         int        un = vstdirs_load(ud, VSTDIRS_MAX), k, shown = 0;
 
-        for (i = 0; i < P.nroot; i++) {
+        for (i = 0; i < pv->nroot; i++) {
             char line[1200];
             int  mine = 0;
             for (k = 0; k < un; k++)
-                if (!strcmp(ud[k].path, P.roots[i].path)) { mine = 1; break; }
+                if (!strcmp(ud[k].path, pv->roots[i].path)) { mine = 1; break; }
             if (mine) continue;
-            snprintf(line, sizeof line, "%s   (%s)", P.roots[i].path, P.roots[i].label);
+            snprintf(line, sizeof line, "%s   (%s)", pv->roots[i].path, pv->roots[i].label);
             gtk_list_box_append(GTK_LIST_BOX(bl), gtk_label_new(line));
             shown++;
         }
@@ -2643,12 +2686,12 @@ void plugview_edit_folders(GtkWindow *parent)
 
     close = gtk_button_new_with_label("Close");
     gtk_widget_set_halign(close, GTK_ALIGN_END);
-    g_signal_connect(close, "clicked", G_CALLBACK(on_folder_close), NULL);
+    g_signal_connect(close, "clicked", G_CALLBACK(on_folder_close), pv);
     gtk_box_append(GTK_BOX(box), close);
 
-    gtk_window_set_child(GTK_WINDOW(F.win), box);
-    folders_refill();
-    gtk_window_present(GTK_WINDOW(F.win));
+    gtk_window_set_child(GTK_WINDOW(pv->folders.win), box);
+    folders_refill(pv);
+    gtk_window_present(GTK_WINDOW(pv->folders.win));
 }
 
 /* ---------------------------------------------------- installing plug-in data */
@@ -2664,20 +2707,20 @@ void plugview_edit_folders(GtkWindow *parent)
  * Deliberately a menu command and not something load() does on its own: it
  * writes outside the tree, into the user's home, and that is a decision to be
  * taken rather than a side effect of clicking a plug-in in a list. */
-void plugview_install_missing_data(void)
+void plugview_install_missing_data(plugview *pv)
 {
     int i, files = 0, plugins = 0, failed = 0;
     char lasterr[160] = "";
 
-    for (i = 0; i < P.nplug; i++) {
+    for (i = 0; i < pv->nplug; i++) {
         pehost_data_need dn;
         char err[160];
         int  n;
 
-        if (!P.plug[i].repairable) continue;
+        if (!pv->plug[i].repairable) continue;
         /* Re-checked rather than trusting what the scan recorded: the folders
          * may have moved, and this is the call that is about to write. */
-        if (!pehost_data_check(P.plug[i].path, &dn) || !dn.repairable) continue;
+        if (!pehost_data_check(pv->plug[i].path, &dn) || !dn.repairable) continue;
         if ((n = pehost_data_repair(&dn, err, (int)sizeof err)) > 0) {
             files += n;
             plugins++;
@@ -2690,19 +2733,19 @@ void plugview_install_missing_data(void)
     }
 
     if (!plugins && !failed) {
-        plug_status("nothing to install -- no scanned plug-in is missing data "
+        plug_status(pv, "nothing to install -- no scanned plug-in is missing data "
                     "that this machine has a copy of");
         return;
     }
     if (!plugins) {
-        plug_status("could not install: %s", lasterr[0] ? lasterr : "unknown error");
+        plug_status(pv, "could not install: %s", lasterr[0] ? lasterr : "unknown error");
         return;
     }
     /* Reload, because these are read when the editor is built: a plug-in that
      * is already open went looking before the folders existed. */
-    plug_status("linked %d folder(s) for %d plug-in(s)%s -- reload one to see it",
+    plug_status(pv, "linked %d folder(s) for %d plug-in(s)%s -- reload one to see it",
                 files, plugins, failed ? ", some failed" : "");
-    rescan_all();
+    rescan_all(pv);
 }
 
 /* ------------------------------------------------------------ the audio API */
@@ -2725,32 +2768,32 @@ static void focus_row(GtkWidget *box)
     if (r) gtk_widget_grab_focus(GTK_WIDGET(r));
 }
 
-void plugview_focus_list(void)     { focus_row(P.list); }
-void plugview_focus_programs(void) { focus_row(P.proglist); }
+void plugview_focus_list(plugview *pv)     { focus_row(pv->list); }
+void plugview_focus_programs(plugview *pv) { focus_row(pv->proglist); }
 
-void plugview_toggle_editor(void)
+void plugview_toggle_editor(plugview *pv)
 {
     const char *page;
-    if (!GTK_IS_WIDGET(P.stack)) return;
-    page = gtk_stack_get_visible_child_name(GTK_STACK(P.stack));
-    gtk_stack_set_visible_child_name(GTK_STACK(P.stack),
+    if (!GTK_IS_WIDGET(pv->stack)) return;
+    page = gtk_stack_get_visible_child_name(GTK_STACK(pv->stack));
+    gtk_stack_set_visible_child_name(GTK_STACK(pv->stack),
         page && !strcmp(page, "editor") ? "params" : "editor");
 }
 
-int plugview_active(void)
-{ return atomic_load_explicit(&P.live, memory_order_acquire); }
+int plugview_active(plugview *pv)
+{ return atomic_load_explicit(&pv->live, memory_order_acquire); }
 
-int plugview_render_io(const float *in, float *out, int frames)
+int plugview_render_io(plugview *pv, const float *in, float *out, int frames)
 {
     float pk = 0.0f;
     int   i, cur;
 
-    if (!atomic_load_explicit(&P.live, memory_order_acquire) || !P.host) return 0;
+    if (!atomic_load_explicit(&pv->live, memory_order_acquire) || !pv->host) return 0;
     /* `in` is the captured signal, interleaved stereo, or NULL when there is
      * no input open. A synth ignores it either way; an effect with nothing to
      * process renders silence, which is why this window used to be silent for
      * every effect in the corpus -- it passed NULL unconditionally. */
-    pehost_render_io(P.host, in, out, frames);
+    pehost_render_io(pv->host, in, out, frames);
 
     /* Peak for the meter. Kept here rather than in the GTK thread because this
      * is the only place the samples exist, and "it loaded and the editor drew"
@@ -2760,79 +2803,77 @@ int plugview_render_io(const float *in, float *out, int frames)
         if (a > pk) pk = a;
     }
     cur = (int)(pk * 1000.0f);
-    if (cur > atomic_load_explicit(&P.peak_milli, memory_order_relaxed))
-        atomic_store_explicit(&P.peak_milli, cur, memory_order_relaxed);
+    if (cur > atomic_load_explicit(&pv->peak_milli, memory_order_relaxed))
+        atomic_store_explicit(&pv->peak_milli, cur, memory_order_relaxed);
     return 1;
 }
 
 /* The old spelling, for callers with nothing to feed it. */
-int plugview_render(float *out, int frames)
-{ return plugview_render_io(NULL, out, frames); }
+int plugview_render(plugview *pv, float *out, int frames)
+{ return plugview_render_io(pv, NULL, out, frames); }
 
 /* Which input channels the fed signal reaches. A vocoder has a modulator and a
  * carrier bus and wants the microphone on one of them; sending it to both puts
  * the raw voice in the output beside the analysis. 0 means every channel. */
-void plugview_set_input_mask(unsigned mask)
-{ if (P.host) pehost_set_input_mask(P.host, mask); }
+void plugview_set_input_mask(plugview *pv, unsigned mask)
+{ if (pv->host) pehost_set_input_mask(pv->host, mask); }
 
-int plugview_num_inputs(void)
-{ return P.host ? pehost_num_inputs(P.host) : 0; }
+int plugview_num_inputs(plugview *pv)
+{ return pv->host ? pehost_num_inputs(pv->host) : 0; }
 
-/* Raw MIDI, straight through. in_plugin is not raised around it the way
+/* Raw MIDI, straight through. pv->in_plugin is not raised around it the way
  * plugview_bend does: pehost_midi is a queue write the audio thread drains, so
  * there is no call into the plug-in here to be re-entered. */
-void plugview_midi(int status, int d1, int d2)
-{ if (P.host) pehost_midi(P.host, status, d1, d2); }
+void plugview_midi(plugview *pv, int status, int d1, int d2)
+{ if (pv->host) pehost_midi(pv->host, status, d1, d2); }
 
 /* 4/4 because nothing upstream of this knows any better: a time signature
  * arrives with a sequencer's song position, not with its clock, and a plug-in
  * that cares reads the tempo. */
-void   plugview_set_tempo(double bpm) { if (P.host) pehost_set_tempo(P.host, bpm, 4, 4); }
-double plugview_tempo(void)   { return P.host ? pehost_tempo(P.host) : 0.0; }
-int    plugview_playing(void) { return P.host ? pehost_playing(P.host) : 0; }
+void   plugview_set_tempo(plugview *pv, double bpm) { if (pv->host) pehost_set_tempo(pv->host, bpm, 4, 4); }
+double plugview_tempo(plugview *pv)   { return pv->host ? pehost_tempo(pv->host) : 0.0; }
+int    plugview_playing(plugview *pv) { return pv->host ? pehost_playing(pv->host) : 0; }
 
-void plugview_note_on(int note, int vel)  { if (P.host) pehost_note_on(P.host, note, vel); }
-void plugview_note_off(int note)          { if (P.host) pehost_note_off(P.host, note); }
-void plugview_all_notes_off(void)         { if (P.host) pehost_all_notes_off(P.host); }
-void plugview_release_all(void)           { if (P.host) pehost_release_all(P.host); }
+void plugview_note_on(plugview *pv, int note, int vel)  { if (pv->host) pehost_note_on(pv->host, note, vel); }
+void plugview_note_off(plugview *pv, int note)          { if (pv->host) pehost_note_off(pv->host, note); }
+void plugview_all_notes_off(plugview *pv)         { if (pv->host) pehost_all_notes_off(pv->host); }
+void plugview_release_all(plugview *pv)           { if (pv->host) pehost_release_all(pv->host); }
 
-void plugview_bend(int value14)
+void plugview_bend(plugview *pv, int value14)
 {
-    if (!P.host) return;
+    if (!pv->host) return;
     if (value14 < 0) value14 = 0;
     if (value14 > 16383) value14 = 16383;
-    in_plugin++;
-    pehost_midi(P.host, 0xE0, value14 & 0x7F, (value14 >> 7) & 0x7F);
-    in_plugin--;
+    pv->in_plugin++;
+    pehost_midi(pv->host, 0xE0, value14 & 0x7F, (value14 >> 7) & 0x7F);
+    pv->in_plugin--;
 }
 
-void plugview_program(int idx)
+void plugview_program(plugview *pv, int idx)
 {
-    if (!P.host) return;
-    gtk_list_box_select_row(GTK_LIST_BOX(P.proglist),
-        gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.proglist), idx));
+    if (!pv->host) return;
+    gtk_list_box_select_row(GTK_LIST_BOX(pv->proglist),
+        gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->proglist), idx));
 }
 
 /* ------------------------------------------------------------------ --cycle */
 
-static int g_cycle_ms, g_cycle_at, g_cycle_report = -1;
-
 /* One line per plug-in, in the same shape pestudio prints. */
-static void cycle_report(int i)
+static void cycle_report(plugview *pv, int i)
 {
-    fprintf(stderr, "plugview: cycle %d/%d %s -- %s\n", i + 1, P.nplug,
-            P.plug[i].name,
-            !P.plug[i].loadable ? "not loadable"
-            : !P.host           ? "load failed"
-            : P.ed_attached     ? "editor attached"
-            : P.ed_native       ? "editor did not attach"
-            : P.ed_open         ? "editor (pixels)"
+    fprintf(stderr, "plugview: cycle %d/%d %s -- %s\n", i + 1, pv->nplug,
+            pv->plug[i].name,
+            !pv->plug[i].loadable ? "not loadable"
+            : !pv->host           ? "load failed"
+            : pv->ed_attached     ? "editor attached"
+            : pv->ed_native       ? "editor did not attach"
+            : pv->ed_open         ? "editor (pixels)"
                                 : "no editor");
 }
 
 static gboolean cycle_step(gpointer u)
 {
-    (void)u;
+    plugview *pv = u;
     /* Report the previous plug-in first, not in the step that loaded it. A
      * native editor attaches when the Editor page gets its first layout, which
      * is after the page switch returns -- printing in the same step called
@@ -2840,33 +2881,33 @@ static gboolean cycle_step(gpointer u)
      * later. One interval later the attach has either happened or it has not,
      * and the line also confirms the last plug-in survived a full interval
      * alongside the new one. */
-    if (g_cycle_report >= 0) {
-        cycle_report(g_cycle_report);
-        g_cycle_report = -1;
+    if (pv->cycle_report >= 0) {
+        cycle_report(pv, pv->cycle_report);
+        pv->cycle_report = -1;
     }
-    if (g_cycle_at >= P.nplug) {
-        fprintf(stderr, "plugview: cycle finished (%d plug-in(s))\n", P.nplug);
+    if (pv->cycle_at >= pv->nplug) {
+        fprintf(stderr, "plugview: cycle finished (%d plug-in(s))\n", pv->nplug);
         return G_SOURCE_REMOVE;
     }
     {
-        int i = g_cycle_at++;
-        gtk_list_box_select_row(GTK_LIST_BOX(P.list),
-            gtk_list_box_get_row_at_index(GTK_LIST_BOX(P.list), i));
-        gtk_stack_set_visible_child_name(GTK_STACK(P.stack), "editor");
-        g_cycle_report = i;
+        int i = pv->cycle_at++;
+        gtk_list_box_select_row(GTK_LIST_BOX(pv->list),
+            gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->list), i));
+        gtk_stack_set_visible_child_name(GTK_STACK(pv->stack), "editor");
+        pv->cycle_report = i;
     }
     return G_SOURCE_CONTINUE;
 }
 
-void plugview_start_cycle(int ms)
+void plugview_start_cycle(plugview *pv, int ms)
 {
-    g_cycle_ms = ms > 0 ? ms : 1500;
-    g_cycle_at = 0;
-    g_cycle_report = -1;
-    g_timeout_add(g_cycle_ms, cycle_step, NULL);
+    pv->cycle_ms = ms > 0 ? ms : 1500;
+    pv->cycle_at = 0;
+    pv->cycle_report = -1;
+    g_timeout_add(pv->cycle_ms, cycle_step, pv);
 }
 
-void plugview_shutdown(void)
+void plugview_shutdown(plugview *pv)
 {
     /* The timeouts go first, before anything they read is torn down.
      *
@@ -2876,8 +2917,8 @@ void plugview_shutdown(void)
      * That is the `GTK_IS_LABEL (self)' assertion printed on the way out of
      * every session. Clearing the pointers as well means a source that somehow
      * outlives this call is inert rather than merely unlikely to run. */
-    if (P.tick)  { g_source_remove(P.tick);  P.tick  = 0; }
-    if (P.meter) { g_source_remove(P.meter); P.meter = 0; }
+    if (pv->tick)  { g_source_remove(pv->tick);  pv->tick  = 0; }
+    if (pv->meter) { g_source_remove(pv->meter); pv->meter = 0; }
     /* Every widget pointer, and before the unload rather than after it.
      *
      * Clearing `status` and `editor` fixed the meter and left the zoom bar,
@@ -2891,99 +2932,111 @@ void plugview_shutdown(void)
      * lines. Nothing below this point may touch a widget, so nothing below it
      * has a pointer to touch. A pointer that is not cleared here is one that
      * outlives what it points at. */
-    P.dirlabel = P.list = P.proglist = P.paramlist = NULL;
-    P.paramsw = P.editorsw = P.editorpage = P.stack = P.header = NULL;
-    P.status = NULL;
-    P.editor = NULL;
-    P.zoom_out = P.zoom_in = P.zoom_fit = NULL;
-    P.zoom_one = P.zoom_lbl = P.zoom_note = NULL;
-    unload_locked();
-    native_editor_destroy();
+    pv->dirlabel = pv->list = pv->proglist = pv->paramlist = NULL;
+    pv->paramsw = pv->editorsw = pv->editorpage = pv->stack = pv->header = NULL;
+    pv->status = NULL;
+    pv->editor = NULL;
+    pv->zoom_out = pv->zoom_in = pv->zoom_fit = NULL;
+    pv->zoom_one = pv->zoom_lbl = pv->zoom_note = NULL;
+    unload_locked(pv);
+    native_editor_destroy(pv);
 }
 
 /* ------------------------------------------------------------------ the pane */
 
-GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
-                        double samplerate, int blocksize)
+plugview *plugview_new(void (*park)(void), void (*unpark)(void),
+                       double samplerate, int blocksize)
+{
+    plugview *pv = g_new0(plugview, 1);
+
+    pv->park   = park;
+    pv->unpark = unpark;
+    pv->ed_zoom = 1.0;          /* a fresh instance starts at 0, which is no picture */
+    pv->rate   = samplerate > 0 ? samplerate : 48000.0;
+    pv->block  = blocksize > 0 ? blocksize : 512;
+    return pv;
+}
+
+void plugview_free(plugview *pv)
+{
+    if (!pv) return;            /* plugview_shutdown has already run */
+    g_free(pv);
+}
+
+GtkWidget *plugview_pane(plugview *pv)
 {
     GtkWidget *left, *right, *paned, *top, *sw, *progsw, *sws;
     GtkWidget *sidebar;
     GtkEventController *ctl;
     GtkGesture *click;
 
-    P.park   = park;
-    P.unpark = unpark;
-    P.ed_zoom = 1.0;          /* a static struct starts at 0, which is no picture */
-    P.rate   = samplerate > 0 ? samplerate : 48000.0;
-    P.block  = blocksize > 0 ? blocksize : 512;
-
     /* ---- left: what to browse, plug-ins, programs ---- */
     /* Every folder is walked, once, and the two selectors below sift the
      * result. The dropdown here used to name folders -- one per corpus, plus
      * every one the user had added -- which made the tree layout the user's
      * problem and offered the same format once per folder holding it. */
-    roots_discover();
+    roots_discover(pv);
     /* The system's own VST directories, and the folders the user set in
      * Settings. Without the first an installed copy has nothing to scan, the
      * walk-up above having found no checkout to walk. */
-    roots_add_standard();
-    roots_add_user();
-    /* roots_discover() above cleared the list, so the fallback has to be
+    roots_add_standard(pv);
+    roots_add_user(pv);
+    /* roots_discover(pv) above cleared the list, so the fallback has to be
      * re-applied here or nothing is scanned at all on a machine that has
      * neither a checkout nor a system VST directory. */
-    roots_add_fallback();
+    roots_add_fallback(pv);
     /* Whatever plugview_scan was told to look at before the pane existed --
      * dwstudio's --dir, or its default -- survives that reset here. */
-    if (g_session_dir[0]) roots_add(g_session_dir, "given folder");
+    if (pv->session_dir[0]) roots_add(pv, pv->session_dir, "given folder");
 
     /* Format, then platform: the two terms a plug-in actually has, and the
-     * same pair in the same order as pestudio's. Filled by rebuild_filters()
+     * same pair in the same order as pestudio's. Filled by rebuild_filters(pv)
      * from what the scan found, so neither offers a choice with nothing
      * behind it. */
-    P.typemodel = gtk_string_list_new(NULL);
-    gtk_string_list_append(P.typemodel, "All types");
-    P.typedd = gtk_drop_down_new(G_LIST_MODEL(P.typemodel), NULL);
-    gtk_widget_set_hexpand(P.typedd, TRUE);
-    P.osmodel = gtk_string_list_new(NULL);
-    gtk_string_list_append(P.osmodel, "All platforms");
-    P.osdd = gtk_drop_down_new(G_LIST_MODEL(P.osmodel), NULL);
-    gtk_widget_set_hexpand(P.osdd, TRUE);
+    pv->typemodel = gtk_string_list_new(NULL);
+    gtk_string_list_append(pv->typemodel, "All types");
+    pv->typedd = gtk_drop_down_new(G_LIST_MODEL(pv->typemodel), NULL);
+    gtk_widget_set_hexpand(pv->typedd, TRUE);
+    pv->osmodel = gtk_string_list_new(NULL);
+    gtk_string_list_append(pv->osmodel, "All platforms");
+    pv->osdd = gtk_drop_down_new(G_LIST_MODEL(pv->osmodel), NULL);
+    gtk_widget_set_hexpand(pv->osdd, TRUE);
     {
         GtkWidget *tr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
         GtkWidget *orow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
         gtk_box_append(GTK_BOX(tr), gtk_label_new("Type:"));
-        gtk_box_append(GTK_BOX(tr), P.typedd);
+        gtk_box_append(GTK_BOX(tr), pv->typedd);
         gtk_box_append(GTK_BOX(orow), gtk_label_new("OS:"));
-        gtk_box_append(GTK_BOX(orow), P.osdd);
-        P.filterrows[0] = tr;
-        P.filterrows[1] = orow;
+        gtk_box_append(GTK_BOX(orow), pv->osdd);
+        pv->filterrows[0] = tr;
+        pv->filterrows[1] = orow;
     }
 
     /* Where the plug-in under the cursor came from. A display now, not the
      * thing being browsed: with every folder scanned at once there is no one
      * directory to point at, and the useful one is the selection's. */
     top = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    P.dirlabel = gtk_label_new(P.dir[0] ? P.dir : "(no folder)");
-    gtk_label_set_ellipsize(GTK_LABEL(P.dirlabel), PANGO_ELLIPSIZE_START);
-    gtk_widget_set_hexpand(P.dirlabel, TRUE);
-    gtk_label_set_xalign(GTK_LABEL(P.dirlabel), 0.0f);
-    gtk_box_append(GTK_BOX(top), P.dirlabel);
+    pv->dirlabel = gtk_label_new(pv->dir[0] ? pv->dir : "(no folder)");
+    gtk_label_set_ellipsize(GTK_LABEL(pv->dirlabel), PANGO_ELLIPSIZE_START);
+    gtk_widget_set_hexpand(pv->dirlabel, TRUE);
+    gtk_label_set_xalign(GTK_LABEL(pv->dirlabel), 0.0f);
+    gtk_box_append(GTK_BOX(top), pv->dirlabel);
 
-    P.list = gtk_list_box_new();
-    g_signal_connect(P.list, "row-selected", G_CALLBACK(on_plug_selected), NULL);
+    pv->list = gtk_list_box_new();
+    g_signal_connect(pv->list, "row-selected", G_CALLBACK(on_plug_selected), pv);
     sw = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), P.list);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), pv->list);
     gtk_widget_set_vexpand(sw, TRUE);
 
-    P.proglist = gtk_list_box_new();
-    g_signal_connect(P.proglist, "row-selected", G_CALLBACK(on_prog_selected), NULL);
+    pv->proglist = gtk_list_box_new();
+    g_signal_connect(pv->proglist, "row-selected", G_CALLBACK(on_prog_selected), pv);
     progsw = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(progsw), P.proglist);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(progsw), pv->proglist);
     gtk_widget_set_size_request(progsw, -1, 170);
 
     left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_box_append(GTK_BOX(left), P.filterrows[0]);
-    gtk_box_append(GTK_BOX(left), P.filterrows[1]);
+    gtk_box_append(GTK_BOX(left), pv->filterrows[0]);
+    gtk_box_append(GTK_BOX(left), pv->filterrows[1]);
     gtk_box_append(GTK_BOX(left), top);
     gtk_box_append(GTK_BOX(left), gtk_label_new("Plug-ins"));
     gtk_box_append(GTK_BOX(left), sw);
@@ -2992,44 +3045,44 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
     gtk_widget_set_size_request(left, 300, -1);
 
     /* ---- right: header, then Parameters | Editor ---- */
-    P.header = gtk_label_new("no plug-in loaded");
-    gtk_label_set_xalign(GTK_LABEL(P.header), 0.0f);
+    pv->header = gtk_label_new("no plug-in loaded");
+    gtk_label_set_xalign(GTK_LABEL(pv->header), 0.0f);
 
-    P.paramlist = gtk_list_box_new();
-    gtk_list_box_set_selection_mode(GTK_LIST_BOX(P.paramlist), GTK_SELECTION_NONE);
-    P.paramsw = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(P.paramsw), P.paramlist);
-    gtk_widget_set_vexpand(P.paramsw, TRUE);
+    pv->paramlist = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(pv->paramlist), GTK_SELECTION_NONE);
+    pv->paramsw = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(pv->paramsw), pv->paramlist);
+    gtk_widget_set_vexpand(pv->paramsw, TRUE);
 
-    P.editor = gtk_drawing_area_new();
-    gtk_widget_set_focusable(P.editor, TRUE);
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(P.editor), editor_draw, NULL, NULL);
+    pv->editor = gtk_drawing_area_new();
+    gtk_widget_set_focusable(pv->editor, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(pv->editor), editor_draw, pv, NULL);
     /* A foreign X window does not move with GTK's layout, so it is put back
      * over the pane whenever the pane changes shape. */
-    g_signal_connect(P.editor, "resize", G_CALLBACK(on_editor_resize), NULL);
+    g_signal_connect(pv->editor, "resize", G_CALLBACK(on_editor_resize), pv);
 
     click = gtk_gesture_click_new();
     gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 0);   /* any button */
-    g_signal_connect(click, "pressed",  G_CALLBACK(on_ed_pressed),  NULL);
-    g_signal_connect(click, "released", G_CALLBACK(on_ed_released), NULL);
-    gtk_widget_add_controller(P.editor, GTK_EVENT_CONTROLLER(click));
+    g_signal_connect(click, "pressed",  G_CALLBACK(on_ed_pressed),  pv);
+    g_signal_connect(click, "released", G_CALLBACK(on_ed_released), pv);
+    gtk_widget_add_controller(pv->editor, GTK_EVENT_CONTROLLER(click));
 
     ctl = gtk_event_controller_motion_new();
-    g_signal_connect(ctl, "motion", G_CALLBACK(on_ed_motion), NULL);
-    gtk_widget_add_controller(P.editor, ctl);
+    g_signal_connect(ctl, "motion", G_CALLBACK(on_ed_motion), pv);
+    gtk_widget_add_controller(pv->editor, ctl);
 
     ctl = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
-    g_signal_connect(ctl, "scroll", G_CALLBACK(on_ed_scroll), NULL);
-    gtk_widget_add_controller(P.editor, ctl);
+    g_signal_connect(ctl, "scroll", G_CALLBACK(on_ed_scroll), pv);
+    gtk_widget_add_controller(pv->editor, ctl);
 
     ctl = gtk_event_controller_key_new();
-    g_signal_connect(ctl, "key-pressed",  G_CALLBACK(on_ed_key_down), NULL);
-    g_signal_connect(ctl, "key-released", G_CALLBACK(on_ed_key_up),   NULL);
-    gtk_widget_add_controller(P.editor, ctl);
+    g_signal_connect(ctl, "key-pressed",  G_CALLBACK(on_ed_key_down), pv);
+    g_signal_connect(ctl, "key-released", G_CALLBACK(on_ed_key_up),   pv);
+    gtk_widget_add_controller(pv->editor, ctl);
 
-    P.editorsw = gtk_scrolled_window_new();
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(P.editorsw), P.editor);
-    gtk_widget_set_vexpand(P.editorsw, TRUE);
+    pv->editorsw = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(pv->editorsw), pv->editor);
+    gtk_widget_set_vexpand(pv->editorsw, TRUE);
     /* Scrollbars that take their own strip, not GTK's overlay ones.
      *
      * An overlay scrollbar is drawn on top of the viewport, and the viewport is
@@ -3039,7 +3092,7 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
      * window, stay visible, and can be dragged, which is the only way to pan a
      * large editor: the wheel over the editor itself belongs to the plug-in,
      * which uses it for its own controls. */
-    gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(P.editorsw), FALSE);
+    gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(pv->editorsw), FALSE);
 
     /* The zoom bar, above the viewport rather than floating over it: a foreign
      * X11 child sits on top of everything GTK paints, so anything overlaid on
@@ -3050,56 +3103,56 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
         GtkWidget *zb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
         GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
 
-        P.zoom_out = gtk_button_new_with_label("\xe2\x88\x92");
-        P.zoom_in  = gtk_button_new_with_label("+");
-        P.zoom_fit = gtk_button_new_with_label("Fit");
-        P.zoom_one = gtk_button_new_with_label("1:1");
-        P.zoom_lbl = gtk_label_new("100%");
-        P.zoom_note = gtk_label_new("");
-        gtk_widget_set_size_request(P.zoom_lbl, 48, -1);
-        gtk_label_set_xalign(GTK_LABEL(P.zoom_note), 0.0f);
-        gtk_widget_set_hexpand(P.zoom_note, TRUE);
-        gtk_label_set_ellipsize(GTK_LABEL(P.zoom_note), PANGO_ELLIPSIZE_END);
-        gtk_widget_set_tooltip_text(P.zoom_out, "Zoom out  (Ctrl+wheel over the editor)");
-        gtk_widget_set_tooltip_text(P.zoom_in,  "Zoom in  (Ctrl+wheel over the editor)");
-        gtk_widget_set_tooltip_text(P.zoom_fit, "Scale the editor to fit the space there is");
-        gtk_widget_set_tooltip_text(P.zoom_one, "Back to the size the plug-in drew");
+        pv->zoom_out = gtk_button_new_with_label("\xe2\x88\x92");
+        pv->zoom_in  = gtk_button_new_with_label("+");
+        pv->zoom_fit = gtk_button_new_with_label("Fit");
+        pv->zoom_one = gtk_button_new_with_label("1:1");
+        pv->zoom_lbl = gtk_label_new("100%");
+        pv->zoom_note = gtk_label_new("");
+        gtk_widget_set_size_request(pv->zoom_lbl, 48, -1);
+        gtk_label_set_xalign(GTK_LABEL(pv->zoom_note), 0.0f);
+        gtk_widget_set_hexpand(pv->zoom_note, TRUE);
+        gtk_label_set_ellipsize(GTK_LABEL(pv->zoom_note), PANGO_ELLIPSIZE_END);
+        gtk_widget_set_tooltip_text(pv->zoom_out, "Zoom out  (Ctrl+wheel over the editor)");
+        gtk_widget_set_tooltip_text(pv->zoom_in,  "Zoom in  (Ctrl+wheel over the editor)");
+        gtk_widget_set_tooltip_text(pv->zoom_fit, "Scale the editor to fit the space there is");
+        gtk_widget_set_tooltip_text(pv->zoom_one, "Back to the size the plug-in drew");
         /* Not focus stops. Tab is how you get out of the plug-in list, and four
          * more places for the keyboard to end up is four more ways to be typing
          * at something that is not the synth. */
-        gtk_widget_set_focus_on_click(P.zoom_out, FALSE);
-        gtk_widget_set_focus_on_click(P.zoom_in,  FALSE);
-        gtk_widget_set_focus_on_click(P.zoom_fit, FALSE);
-        gtk_widget_set_focus_on_click(P.zoom_one, FALSE);
-        g_signal_connect(P.zoom_out, "clicked", G_CALLBACK(on_zoom_out), NULL);
-        g_signal_connect(P.zoom_in,  "clicked", G_CALLBACK(on_zoom_in),  NULL);
-        g_signal_connect(P.zoom_fit, "clicked", G_CALLBACK(on_zoom_fit), NULL);
-        g_signal_connect(P.zoom_one, "clicked", G_CALLBACK(on_zoom_one), NULL);
+        gtk_widget_set_focus_on_click(pv->zoom_out, FALSE);
+        gtk_widget_set_focus_on_click(pv->zoom_in,  FALSE);
+        gtk_widget_set_focus_on_click(pv->zoom_fit, FALSE);
+        gtk_widget_set_focus_on_click(pv->zoom_one, FALSE);
+        g_signal_connect(pv->zoom_out, "clicked", G_CALLBACK(on_zoom_out), pv);
+        g_signal_connect(pv->zoom_in,  "clicked", G_CALLBACK(on_zoom_in),  pv);
+        g_signal_connect(pv->zoom_fit, "clicked", G_CALLBACK(on_zoom_fit), pv);
+        g_signal_connect(pv->zoom_one, "clicked", G_CALLBACK(on_zoom_one), pv);
 
         gtk_box_append(GTK_BOX(zb), gtk_label_new("Zoom"));
-        gtk_box_append(GTK_BOX(zb), P.zoom_out);
-        gtk_box_append(GTK_BOX(zb), P.zoom_lbl);
-        gtk_box_append(GTK_BOX(zb), P.zoom_in);
-        gtk_box_append(GTK_BOX(zb), P.zoom_fit);
-        gtk_box_append(GTK_BOX(zb), P.zoom_one);
-        gtk_box_append(GTK_BOX(zb), P.zoom_note);
+        gtk_box_append(GTK_BOX(zb), pv->zoom_out);
+        gtk_box_append(GTK_BOX(zb), pv->zoom_lbl);
+        gtk_box_append(GTK_BOX(zb), pv->zoom_in);
+        gtk_box_append(GTK_BOX(zb), pv->zoom_fit);
+        gtk_box_append(GTK_BOX(zb), pv->zoom_one);
+        gtk_box_append(GTK_BOX(zb), pv->zoom_note);
         gtk_box_append(GTK_BOX(page), zb);
-        gtk_box_append(GTK_BOX(page), P.editorsw);
-        P.editorpage = page;
+        gtk_box_append(GTK_BOX(page), pv->editorsw);
+        pv->editorpage = page;
     }
 
-    P.stack = gtk_stack_new();
-    gtk_stack_add_titled(GTK_STACK(P.stack), P.paramsw,  "params", "Parameters");
-    gtk_stack_add_titled(GTK_STACK(P.stack), P.editorpage, "editor", "Editor");
-    g_signal_connect(P.stack, "notify::visible-child", G_CALLBACK(on_page_changed), NULL);
+    pv->stack = gtk_stack_new();
+    gtk_stack_add_titled(GTK_STACK(pv->stack), pv->paramsw,  "params", "Parameters");
+    gtk_stack_add_titled(GTK_STACK(pv->stack), pv->editorpage, "editor", "Editor");
+    g_signal_connect(pv->stack, "notify::visible-child", G_CALLBACK(on_page_changed), pv);
     sws = gtk_stack_switcher_new();
-    gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(sws), GTK_STACK(P.stack));
+    gtk_stack_switcher_set_stack(GTK_STACK_SWITCHER(sws), GTK_STACK(pv->stack));
     gtk_widget_set_halign(sws, GTK_ALIGN_START);
 
     right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_box_append(GTK_BOX(right), P.header);
+    gtk_box_append(GTK_BOX(right), pv->header);
     gtk_box_append(GTK_BOX(right), sws);
-    gtk_box_append(GTK_BOX(right), P.stack);
+    gtk_box_append(GTK_BOX(right), pv->stack);
 
     paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_paned_set_start_child(GTK_PANED(paned), left);
@@ -3107,32 +3160,34 @@ GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
     gtk_paned_set_position(GTK_PANED(paned), 320);
     gtk_paned_set_resize_start_child(GTK_PANED(paned), FALSE);
 
-    P.status = gtk_label_new("");
-    gtk_label_set_xalign(GTK_LABEL(P.status), 0.0f);
-    gtk_label_set_ellipsize(GTK_LABEL(P.status), PANGO_ELLIPSIZE_MIDDLE);
+    pv->status = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(pv->status), 0.0f);
+    gtk_label_set_ellipsize(GTK_LABEL(pv->status), PANGO_ELLIPSIZE_MIDDLE);
 
     sidebar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_set_vexpand(paned, TRUE);
     gtk_box_append(GTK_BOX(sidebar), paned);
-    gtk_box_append(GTK_BOX(sidebar), P.status);
+    gtk_box_append(GTK_BOX(sidebar), pv->status);
 
-    P.root = sidebar;
+    pv->root = sidebar;
     /* The roots were rebuilt above, so what was scanned before the pane
      * existed is out of date -- scan again over the full set, then show it. */
-    plugview_scan(NULL);
-    g_signal_connect(P.typedd, "notify::selected", G_CALLBACK(on_filter_changed), NULL);
-    g_signal_connect(P.osdd,   "notify::selected", G_CALLBACK(on_filter_changed), NULL);
-    fill_browser();
-    {   /* Where a native editor's descriptors and timers end up. Installed
-         * once: only one editor is open at a time. */
-        static const v3_runloop_hooks hooks = {
-            NULL, hook_add_fd, hook_del_fd, hook_add_timer, hook_del_timer, hook_resize
+    plugview_scan(pv, NULL);
+    g_signal_connect(pv->typedd, "notify::selected", G_CALLBACK(on_filter_changed), pv);
+    g_signal_connect(pv->osdd,   "notify::selected", G_CALLBACK(on_filter_changed), pv);
+    fill_browser(pv);
+    {   /* Where a native editor's descriptors and timers end up. The table
+         * itself is pehost's and process-global, so with more than one pane
+         * the last one built is the one editors register with -- see
+         * plugview.h. */
+        v3_runloop_hooks hooks = {
+            pv, hook_add_fd, hook_del_fd, hook_add_timer, hook_del_timer, hook_resize
         };
         v3_set_runloop_hooks(&hooks);
     }
-    zoom_update_ui();
-    P.tick  = g_timeout_add(30, editor_tick, NULL);
-    P.meter = g_timeout_add(100, meter_tick, NULL);
-    P.ready = 1;
-    return P.root;
+    zoom_update_ui(pv);
+    pv->tick  = g_timeout_add(30, editor_tick, pv);
+    pv->meter = g_timeout_add(100, meter_tick, pv);
+    pv->ready = 1;
+    return pv->root;
 }

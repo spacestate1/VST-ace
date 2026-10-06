@@ -11,7 +11,14 @@
  * plug-in draws itself.
  *
  * Everything here runs on the GTK thread except plugview_render, which the
- * audio callback owns. */
+ * audio callback owns.
+ *
+ * All state is per-instance: one plugview is one plug-in pane -- its browser,
+ * its loaded plug-in, its editor. dwstudio makes one; a shell hosting several
+ * plug-in windows makes one per window. Every entry point takes the instance
+ * first. The one exception is the VST3 run-loop hook table, which lives in
+ * pehost and is process-global (v3_set_runloop_hooks), so the last pane built
+ * is the one native editors register their descriptors and timers with. */
 #ifndef DW_PLUGVIEW_H
 #define DW_PLUGVIEW_H
 
@@ -21,16 +28,26 @@
 extern "C" {
 #endif
 
-/* Build the pane.
+typedef struct plugview plugview;
+
+/* Make an instance, and build its pane on it.
+ *
+ * plugview_new only allocates and remembers the audio parameters, so it can be
+ * made before GTK is up -- dwstudio scans plug-in folders from main(), before
+ * the window exists. plugview_pane builds the widgets and returns what to
+ * pack. plugview_free releases the instance; the plug-in must already be shut
+ * down (plugview_shutdown, from the window's teardown).
  *
  * `park` and `unpark` stop and restart the caller's audio callback. Loading a
  * plug-in frees the one the callback may be rendering out of, so they are not
  * optional -- dwstudio already had this pair for swapping engines. */
-GtkWidget *plugview_new(void (*park)(void), void (*unpark)(void),
+plugview  *plugview_new(void (*park)(void), void (*unpark)(void),
                         double samplerate, int blocksize);
+GtkWidget *plugview_pane(plugview *pv);
+void       plugview_free(plugview *pv);
 
 /* Fill the plug-in list from a directory. Safe before the pane is realised. */
-void plugview_scan(const char *dir);
+void plugview_scan(plugview *pv, const char *dir);
 
 /* The two File-menu commands. They were buttons in this pane; they are menu
  * items now, in the same place and under the same names as pestudio's, so the
@@ -40,8 +57,8 @@ void plugview_scan(const char *dir);
  * when it lives outside the scanned folder. plugview_load_folder picks a
  * folder and rescans. Both are asynchronous -- the dialog returns immediately
  * and the work happens when the user chooses. */
-void plugview_open_vst(GtkWindow *parent);
-void plugview_load_folder(GtkWindow *parent);
+void plugview_open_vst(plugview *pv, GtkWindow *parent);
+void plugview_load_folder(plugview *pv, GtkWindow *parent);
 
 /* File > Save Patch / Open Patch: the plug-in's current parameters written as
  * JSON, and read back. The plug-in's own programs are its factory presets and
@@ -51,13 +68,13 @@ void plugview_load_folder(GtkWindow *parent);
  * Opening a file holding several patches applies the first -- pestudio lists
  * them all, which is the one place the two windows differ, because this one has
  * no list to put them in. */
-void plugview_save_patch(GtkWindow *parent);
-void plugview_load_patch(GtkWindow *parent);
+void plugview_save_patch(plugview *pv, GtkWindow *parent);
+void plugview_load_patch(plugview *pv, GtkWindow *parent);
 
 /* Settings > Plug-in Folders: the folders searched for plug-ins, each under
  * the platform it holds. Persisted, and shared with pestudio -- one answer per
  * machine to "where are my plug-ins", not one per window. See vstdirs.h. */
-void plugview_edit_folders(GtkWindow *parent);
+void plugview_edit_folders(plugview *pv, GtkWindow *parent);
 
 /* Settings > Enter Key / Serial: type a registration key into the editor of
  * whatever is loaded. Some plug-ins do nothing until something has been typed
@@ -66,7 +83,7 @@ void plugview_edit_folders(GtkWindow *parent);
  * it -- and a key is twenty-five characters nobody wants to mistype into a
  * skinned field with no visible caret. Asks once, then sends it a character at
  * a time to whatever the editor has focused. */
-void plugview_enter_key(GtkWindow *parent);
+void plugview_enter_key(plugview *pv, GtkWindow *parent);
 
 /* Called after every load, successful or not, and after an unload. The window
  * has things to re-send that live on the plug-in handle rather than in the
@@ -74,79 +91,81 @@ void plugview_enter_key(GtkWindow *parent);
  * and a fresh plug-in starts with neither. Polling for it would mean noticing
  * a load only when something visible changed, which a load onto a plug-in of
  * the same shape does not. */
-void plugview_set_load_hook(void (*fn)(void));
+void plugview_set_load_hook(plugview *pv, void (*fn)(void));
 
 /* Keyboard reach into the pane, for the window's accelerators. Everything here
  * is otherwise only a click: which list has focus, and which of the two pages
  * is showing. Focusing a list is what makes the arrow keys walk the corpus, so
  * a plug-in can be picked without touching the mouse. */
-void plugview_focus_list(void);
-void plugview_focus_programs(void);
-void plugview_toggle_editor(void);
+void plugview_focus_list(plugview *pv);
+void plugview_focus_programs(plugview *pv);
+void plugview_toggle_editor(plugview *pv);
 
 /* True when a plug-in is loaded, i.e. when it -- and not an engine -- is what
  * should be heard. Cheap enough for the audio callback. */
-int  plugview_active(void);
+int  plugview_active(plugview *pv);
 
 /* Audio thread. Fills `out` with `frames` interleaved stereo frames and
  * returns 1; returns 0 when no plug-in is loaded, leaving `out` untouched. */
-int  plugview_render(float *out, int frames);
+int  plugview_render(plugview *pv, float *out, int frames);
 
 /* The same, with the captured input the plug-in should process. An effect with
  * no input renders silence, so this is what makes one audible at all. `in` is
  * interleaved stereo of `frames` frames, or NULL for none. Audio thread. */
-int  plugview_render_io(const float *in, float *out, int frames);
+int  plugview_render_io(plugview *pv, const float *in, float *out, int frames);
 
 /* Which input channels that signal reaches, as a bitmask over channels; 0 is
  * all of them. GTK thread. */
-void plugview_set_input_mask(unsigned mask);
-int  plugview_num_inputs(void);
+void plugview_set_input_mask(plugview *pv, unsigned mask);
+int  plugview_num_inputs(plugview *pv);
 
 /* Which computer keys play notes. dwstudio owns that map, and this pane has to
  * ask about it: a key over the plug-in's editor is given to the plug-in, and
  * one the piano claims is then left to carry on to the window rather than
  * being swallowed -- otherwise the note keys go dead the moment a knob in an
  * editor is touched. `claims` returns non-zero for a key the piano wants.
- * Without it the editor keeps every key it is given. */
-void plugview_set_note_key(int (*claims)(guint keyval));
+ * Without it the editor keeps every key it is given. Per-instance, not shared:
+ * which keys are notes is the window's answer, and each pane's editor asks its
+ * own window. */
+void plugview_set_note_key(plugview *pv, int (*claims)(guint keyval));
 
 /* From the GTK thread, which is also where dwstudio's MIDI poll runs. No-ops
  * when nothing is loaded. */
-void plugview_note_on(int note, int vel);
-void plugview_note_off(int note);
-void plugview_all_notes_off(void);
+void plugview_note_on(plugview *pv, int note, int vel);
+void plugview_note_off(plugview *pv, int note);
+void plugview_all_notes_off(plugview *pv);
 /* Every note the plug-in was sent, on every channel, released by its own
  * note-off -- see pehost_release_all. For when MIDI is known to be lost, which
  * all-notes-off alone does not cover for a plug-in that ignores CC 123. */
-void plugview_release_all(void);
-void plugview_program(int idx);
+void plugview_release_all(plugview *pv);
+void plugview_program(plugview *pv, int idx);
 
 /* Pitch bend, in MIDI's own 14-bit form (0..16383, 8192 at rest). Left in that
  * form rather than converted to semitones because bend range is the plug-in's
  * parameter, and converting here would mean guessing it. */
-void plugview_bend(int value14);
+void plugview_bend(plugview *pv, int value14);
 
 /* One raw MIDI message, as it arrived: status byte and up to two data bytes.
  * Wheels, pedals, aftertouch and a sequencer's clock are all this and nothing
  * else, so a port that only carried notes left every one of them on the floor.
  * The clock messages (0xF8, 0xFA-0xFC, 0xF2) also drive the transport below
  * without anybody setting a tempo by hand. */
-void plugview_midi(int status, int d1, int d2);
+void plugview_midi(plugview *pv, int status, int d1, int d2);
 
 /* The transport the plug-in reads for anything tempo-synced -- arpeggiators,
  * synced delays, tempo-locked LFOs. plugview_tempo answers what the plug-in
  * currently believes, which is the sequencer's tempo once its clock is
  * arriving, and 0 when nothing is loaded. */
-void   plugview_set_tempo(double bpm);
-double plugview_tempo(void);
-int    plugview_playing(void);
+void   plugview_set_tempo(plugview *pv, double bpm);
+double plugview_tempo(plugview *pv);
+int    plugview_playing(plugview *pv);
 
 /* Walk the whole list unattended, opening each plug-in's editor in turn, and
  * report what happened for each. Switching plug-ins with an editor attached is
  * the failure-prone path and clicking through fifty-odd of them by hand is not
  * repeatable -- the same reason pestudio has --cycle, and the same option name
  * so the two can be compared on one corpus. */
-void plugview_start_cycle(int ms);
+void plugview_start_cycle(plugview *pv, int ms);
 
 /* Link in the data the scanned plug-ins are missing and this machine already
  * has -- a u-he release's Images and Fonts, which its installer would have put
@@ -155,10 +174,10 @@ void plugview_start_cycle(int ms);
  *
  * A menu command rather than something loading does by itself: it writes into
  * the user's home directory. */
-void plugview_install_missing_data(void);
+void plugview_install_missing_data(plugview *pv);
 
 /* Close whatever is loaded. The caller must have parked the audio first. */
-void plugview_shutdown(void);
+void plugview_shutdown(plugview *pv);
 
 #ifdef __cplusplus
 }
@@ -167,6 +186,6 @@ void plugview_shutdown(void);
 
 /* The directory to open on when the caller named none: the checkout's own
  * corpus, else a standard system VST location, else $HOME. */
-const char *plugview_default_dir(void);
+const char *plugview_default_dir(plugview *pv);
 
 #endif /* DW_PLUGVIEW_H */

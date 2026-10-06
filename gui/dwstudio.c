@@ -275,6 +275,12 @@ typedef struct {
 static unsigned long g_xruns;   /* ALSA underruns, reported on exit */
 static engine g_eng;
 
+/* The plug-in pane's instance. dwstudio has the one window, so there is one of
+ * these, made in main() before the scan and owned here; plugview itself no
+ * longer keeps any of it. File scope rather than in ui_t because the audio
+ * callback renders out of it and ui_t is defined below that code. */
+static plugview *g_pv;
+
 /* Drain queued events and render one block. Shared by both backends -- the
  * PipeWire path calls this from PipeWire's realtime thread, the ALSA path from
  * our own normal-priority one. */
@@ -458,7 +464,7 @@ static void render_block(engine *e, double *buf, int frames)
      * notes -- they were handed to pehost on the GTK thread -- so this path
      * does not drain ours, and the engine below is left idle rather than
      * playing underneath it. */
-    if (plugview_active()) {
+    if (plugview_active(g_pv)) {
         int i, n = frames > PERIOD_MAX ? PERIOD_MAX : frames;
         /* Whatever the effect input is set to -- an effect with nothing fed to
          * it renders silence, which is the one setting that hands over NULL
@@ -468,7 +474,7 @@ static void render_block(engine *e, double *buf, int frames)
             fill_input(g_cap_buf, n);
             in = g_cap_buf;
         }
-        if (plugview_render_io(in, g_plug_buf, n)) {
+        if (plugview_render_io(g_pv, in, g_plug_buf, n)) {
             for (i = 0; i < n * 2; i++) buf[i] = g_plug_buf[i];
             if (n < frames) memset(buf + (size_t)n * 2, 0,
                                    (size_t)(frames - n) * 2 * sizeof *buf);
@@ -1017,7 +1023,7 @@ static void set_status(void)
     const instrument *in = (U.cur_inst >= 0) ? &g_inst[U.cur_inst] : NULL;
 
     if (!GTK_IS_LABEL(U.status)) return;
-    if (plugview_active() || !in)
+    if (plugview_active(g_pv) || !in)
         snprintf(msg, sizeof msg, "plug-in host%s%s", U.midi, U.hint);
     else
         snprintf(msg, sizeof msg, "nothing loaded — the %s would sound%s%s",
@@ -1204,7 +1210,7 @@ static void midi_send(int status, int d1, int d2);
  * came in on is how two devices end up bending each other. */
 static void bend_send(void)
 {
-    if (plugview_active()) plugview_bend(U.bend);
+    if (plugview_active(g_pv)) plugview_bend(g_pv, U.bend);
     midi_send(0xE0, U.bend & 0x7f, (U.bend >> 7) & 0x7f);
     gtk_widget_queue_draw(U.wheel);
 }
@@ -1398,7 +1404,7 @@ static void note_start(int n, int vel, int local)
     U.held[n] = 1;
     atomic_store_explicit(&g_gate[n], (unsigned char)(vel > 127 ? 127 : vel),
                           memory_order_relaxed);
-    if (plugview_active()) { if (local) plugview_note_on(n, vel); }
+    if (plugview_active(g_pv)) { if (local) plugview_note_on(g_pv, n, vel); }
     else                   ev_push(EV_ON, (unsigned char)n, (unsigned char)vel);
     if (local) midi_send(0x90, n, vel);
     gtk_widget_queue_draw(U.piano);
@@ -1409,7 +1415,7 @@ static void note_stop(int n, int local)
     if (n < 0 || n > 127 || !U.held[n]) return;
     U.held[n] = 0;
     atomic_store_explicit(&g_gate[n], 0, memory_order_relaxed);
-    if (plugview_active()) { if (local) plugview_note_off(n); }
+    if (plugview_active(g_pv)) { if (local) plugview_note_off(g_pv, n); }
     else                   ev_push(EV_OFF, (unsigned char)n, 0);
     if (local) midi_send(0x80, n, 0);
     gtk_widget_queue_draw(U.piano);
@@ -1431,7 +1437,7 @@ static void release_all_notes(void)
 {
     int n;
     for (n = 0; n < 128; n++) note_stop(n, 1);
-    if (plugview_active()) plugview_release_all();
+    if (plugview_active(g_pv)) plugview_release_all(g_pv);
     ev_push(EV_ALLOFF, 0, 0);
 }
 
@@ -1740,7 +1746,7 @@ static void on_tempo(GtkSpinButton *sb, gpointer u)
 {
     (void)u;
     if (U.tempo_echo) return;
-    plugview_set_tempo(gtk_spin_button_get_value(sb));
+    plugview_set_tempo(g_pv, gtk_spin_button_get_value(sb));
 }
 
 static void on_vol(GtkRange *r, gpointer u)
@@ -2123,7 +2129,7 @@ static gboolean poll_midi(gpointer u)
         }
         case SND_SEQ_EVENT_PGMCHANGE:
             status = 0xC0 | ch; d1 = ev->data.control.value & 0x7f;
-            if (!plugview_active() && U.cur.count) {
+            if (!plugview_active(g_pv) && U.cur.count) {
                 int i = d1 % U.cur.count;
                 gtk_list_box_select_row(GTK_LIST_BOX(U.list),
                     gtk_list_box_get_row_at_index(GTK_LIST_BOX(U.list), i));
@@ -2134,7 +2140,7 @@ static gboolean poll_midi(gpointer u)
             d1 = ev->data.control.param & 0x7f;
             d2 = ev->data.control.value & 0x7f;
             if (d1 == 123) { int n; for (n = 0; n < 128; n++) note_stop(n, 0);
-                             if (!plugview_active()) ev_push(EV_ALLOFF, 0, 0); }
+                             if (!plugview_active(g_pv)) ev_push(EV_ALLOFF, 0, 0); }
             break;
         case SND_SEQ_EVENT_CHANPRESS:
             status = 0xD0 | ch; d1 = ev->data.control.value & 0x7f;
@@ -2159,7 +2165,7 @@ static gboolean poll_midi(gpointer u)
         }
 
         if (status < 0) continue;
-        plugview_midi(status, d1, d2);
+        plugview_midi(g_pv, status, d1, d2);
         /* Realtime is deliberately not echoed: thru exists to pass playing
          * through to other gear, and re-sending a clock we were given is how
          * two devices end up driving each other. */
@@ -2189,21 +2195,21 @@ static gboolean poll_transport(gpointer u)
      * tells it when that changes -- loading happens in the pane, and a load
      * that failed changes it back. Cheaper to notice here than to thread a
      * callback out of plugview for one label. */
-    if (plugview_active() != was_active) {
-        was_active = plugview_active();
+    if (plugview_active(g_pv) != was_active) {
+        was_active = plugview_active(g_pv);
         set_status();
     }
     audio_state_update();
-    if (!plugview_active()) return G_SOURCE_CONTINUE;
-    bpm = plugview_tempo();
+    if (!plugview_active(g_pv)) return G_SOURCE_CONTINUE;
+    bpm = plugview_tempo(g_pv);
     if (bpm >= 20.0 &&
         fabs(bpm - gtk_spin_button_get_value(GTK_SPIN_BUTTON(U.tempo_sb))) > 0.05) {
         U.tempo_echo = 1;
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(U.tempo_sb), bpm);
         U.tempo_echo = 0;
     }
-    state = U.clock_seen ? (plugview_playing() ? "following clock" : "clock, stopped")
-                         : (plugview_playing() ? "internal" : "stopped");
+    state = U.clock_seen ? (plugview_playing(g_pv) ? "following clock" : "clock, stopped")
+                         : (plugview_playing(g_pv) ? "internal" : "stopped");
     if (GTK_IS_LABEL(U.tempo_state))
         gtk_label_set_text(GTK_LABEL(U.tempo_state), state);
     return G_SOURCE_CONTINUE;
@@ -2290,14 +2296,14 @@ static void act_open_vst(GSimpleAction *a, GVariant *p, gpointer ud)
     (void)a; (void)p; (void)ud;
     /* Whatever is opened is a plug-in, so show the half that hosts it. */
     gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
-    plugview_open_vst(GTK_WINDOW(U.win));
+    plugview_open_vst(g_pv, GTK_WINDOW(U.win));
 }
 
 static void act_load_folder(GSimpleAction *a, GVariant *p, gpointer ud)
 {
     (void)a; (void)p; (void)ud;
     gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
-    plugview_load_folder(GTK_WINDOW(U.win));
+    plugview_load_folder(g_pv, GTK_WINDOW(U.win));
 }
 
 /* Settings > Plug-in Folders. Where the plug-ins are, set once and kept --
@@ -2307,7 +2313,7 @@ static void act_plugin_folders(GSimpleAction *a, GVariant *p, gpointer ud)
 {
     (void)a; (void)p; (void)ud;
     gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
-    plugview_edit_folders(GTK_WINDOW(U.win));
+    plugview_edit_folders(g_pv, GTK_WINDOW(U.win));
 }
 
 /* A plug-in's own programs are its factory presets and are read-only, so a
@@ -2318,14 +2324,14 @@ static void act_save_patch(GSimpleAction *a, GVariant *p, gpointer ud)
 {
     (void)a; (void)p; (void)ud;
     gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
-    plugview_save_patch(GTK_WINDOW(U.win));
+    plugview_save_patch(g_pv, GTK_WINDOW(U.win));
 }
 
 static void act_open_patch(GSimpleAction *a, GVariant *p, gpointer ud)
 {
     (void)a; (void)p; (void)ud;
     gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
-    plugview_load_patch(GTK_WINDOW(U.win));
+    plugview_load_patch(g_pv, GTK_WINDOW(U.win));
 }
 
 /* Some plug-ins do nothing until something has been typed into them: a
@@ -2337,7 +2343,7 @@ static void act_enter_key(GSimpleAction *a, GVariant *p, gpointer ud)
 {
     (void)a; (void)p; (void)ud;
     gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
-    plugview_enter_key(GTK_WINDOW(U.win));
+    plugview_enter_key(g_pv, GTK_WINDOW(U.win));
 }
 
 /* Plug-ins that need data they have not got are marked in the list and spelled
@@ -2348,7 +2354,7 @@ static void act_install_data(GSimpleAction *a, GVariant *p, gpointer ud)
 {
     (void)a; (void)p; (void)ud;
     gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
-    plugview_install_missing_data();
+    plugview_install_missing_data(g_pv);
 }
 
 /* --------------------------------------------------------------- Inputs menu */
@@ -2433,7 +2439,7 @@ static void apply_input_mask(void)
     if (!a) return;
     {
         GVariant *st = g_action_get_state(a);
-        plugview_set_input_mask(g_variant_get_boolean(st) ? 0x3u : 0u);
+        plugview_set_input_mask(g_pv, g_variant_get_boolean(st) ? 0x3u : 0u);
         g_variant_unref(st);
     }
 }
@@ -2453,7 +2459,7 @@ static void on_plugin_loaded(void)
      * reverting to the keys on every load is indistinguishable from the
      * microphone not working. pestudio decides it the same way. */
     if (atomic_load_explicit(&g_src, memory_order_relaxed) != SRC_INPUT)
-        src_select(plugview_num_inputs() > 0 ? SRC_NOTES : SRC_SILENCE);
+        src_select(plugview_num_inputs(g_pv) > 0 ? SRC_NOTES : SRC_SILENCE);
     set_status();
 }
 
@@ -2558,13 +2564,13 @@ static void act_panic(GSimpleAction *a, GVariant *p, gpointer ud)
  * on, so these four plus the file commands are the whole window: find a
  * plug-in, pick a program, look at its editor, and get back to the keys. */
 static void act_focus_plugins(GSimpleAction *a, GVariant *p, gpointer ud)
-{ (void)a; (void)p; (void)ud; plugview_focus_list(); }
+{ (void)a; (void)p; (void)ud; plugview_focus_list(g_pv); }
 
 static void act_focus_programs(GSimpleAction *a, GVariant *p, gpointer ud)
-{ (void)a; (void)p; (void)ud; plugview_focus_programs(); }
+{ (void)a; (void)p; (void)ud; plugview_focus_programs(g_pv); }
 
 static void act_toggle_editor(GSimpleAction *a, GVariant *p, gpointer ud)
-{ (void)a; (void)p; (void)ud; plugview_toggle_editor(); }
+{ (void)a; (void)p; (void)ud; plugview_toggle_editor(g_pv); }
 
 /* Back to playing. Focus in a list means the letters are keyboard navigation
  * before they are notes, and Escape is where a hand goes to get out of
@@ -2838,7 +2844,7 @@ static void on_win_destroy(GtkWidget *w, gpointer u)
 {
     (void)w; (void)u;
     engine_park(&g_eng);
-    plugview_shutdown();
+    plugview_shutdown(g_pv);
 }
 
 static void activate(GtkApplication *app, gpointer ud)
@@ -2879,7 +2885,7 @@ static void activate(GtkApplication *app, gpointer ud)
         U.midibar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
 
         U.mode = gtk_stack_new();
-        U.plug = plugview_new(plug_park, plug_unpark, SR, g_period);
+        U.plug = plugview_pane(g_pv);
         gtk_stack_add_titled(GTK_STACK(U.mode), box, "engines", "Engines");
         gtk_stack_add_titled(GTK_STACK(U.mode), U.plug, "plugins", "Plug-ins");
         gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
@@ -3131,8 +3137,8 @@ static void activate(GtkApplication *app, gpointer ud)
      * widget let past. A plug-in's editor takes focus when one of its knobs is
      * turned, so it has to be told which keys to let past -- this is that map.
      * See plugview_set_note_key. */
-    plugview_set_note_key(key_note);
-    plugview_set_load_hook(on_plugin_loaded);
+    plugview_set_note_key(g_pv, key_note);
+    plugview_set_load_hook(g_pv, on_plugin_loaded);
     g_signal_connect(U.win, "notify::is-active", G_CALLBACK(on_win_active), NULL);
 
     g_signal_connect(U.instdd, "notify::selected", G_CALLBACK(on_inst_changed), NULL);
@@ -3158,7 +3164,7 @@ static void activate(GtkApplication *app, gpointer ud)
      * GtkStack takes that as a reason to show it. Last word wins, so this has
      * to have it. */
     gtk_stack_set_visible_child_name(GTK_STACK(U.mode), "plugins");
-    if (g_cycle_ms > 0) plugview_start_cycle(g_cycle_ms);
+    if (g_cycle_ms > 0) plugview_start_cycle(g_pv, g_cycle_ms);
 
     gtk_window_present(GTK_WINDOW(U.win));
 }
@@ -3234,15 +3240,6 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--backend") && i + 1 < argc) g_backend_want = argv[++i];
         else if (!strcmp(argv[i], "--cycle") && i + 1 < argc) g_cycle_ms = atoi(argv[++i]);
     }
-    /* Without --dir, ask plugview where to open. It knows the checkout's own
-     * corpora and the system's VST directories, and it only ever names one
-     * that exists -- where this used to build a path out of the executable's
-     * location unconditionally and scan it whether or not it was there. From
-     * an installed copy that path was /windows/VST2-64, so the window opened
-     * on nothing and said so about a directory nobody had asked for. */
-    if (base) snprintf(dir, sizeof dir, "%s", base);
-    else      snprintf(dir, sizeof dir, "%s", plugview_default_dir());
-
     pw_init(&argc, &argv);
     {   /* DW_PERIOD / DW_LATENCY: trade latency against underruns */
         const char *e;
@@ -3256,9 +3253,21 @@ int main(int argc, char **argv)
         }
         if ((e = getenv("DW_BACKEND"))) g_backend_want = e;
     }
+    /* The plug-in pane's instance, made before the scan below: scanning is one
+     * of its entry points now, and GTK is not up yet -- plugview_pane builds
+     * the widgets later, in activate(). */
+    g_pv = plugview_new(plug_park, plug_unpark, SR, g_period);
+    /* Without --dir, ask plugview where to open. It knows the checkout's own
+     * corpora and the system's VST directories, and it only ever names one
+     * that exists -- where this used to build a path out of the executable's
+     * location unconditionally and scan it whether or not it was there. From
+     * an installed copy that path was /windows/VST2-64, so the window opened
+     * on nothing and said so about a directory nobody had asked for. */
+    if (base) snprintf(dir, sizeof dir, "%s", base);
+    else      snprintf(dir, sizeof dir, "%s", plugview_default_dir(g_pv));
     g_eng.gain = 1.0;
     scan(dir);
-    plugview_scan(dir);
+    plugview_scan(g_pv, dir);
     add_juno();
     add_drumkits();
 
@@ -3289,5 +3298,6 @@ int main(int argc, char **argv)
     if (g_eng.pcm) { pthread_join(g_eng.thread, NULL); snd_pcm_close(g_eng.pcm); }
     engine_stop_pipewire();
     pw_deinit();
+    plugview_free(g_pv);        /* the window's teardown already shut it down */
     return status;
 }
