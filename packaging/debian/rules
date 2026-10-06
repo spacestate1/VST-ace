@@ -1,9 +1,9 @@
 #!/usr/bin/make -f
 #
-# Three build systems in one tree: c/ is a plain Makefile, and peload/ and gui/
-# are separate CMake projects (gui/ pulls peload/ in as a subdirectory for the
-# host library). debhelper's auto-detection expects one project per source
-# tree, so every step here is driven explicitly.
+# Three build systems in one tree: c/ is a plain Makefile, and peload/, gui/
+# and session/ are separate CMake projects (gui/ and session/ pull peload/ in
+# as a subdirectory for the host library). debhelper's auto-detection expects
+# one project per source tree, so every step here is driven explicitly.
 
 # The distribution's flags as they come, with LTO turned back off. Ubuntu
 # enables it by default, and this tree is not a candidate for it:
@@ -29,6 +29,7 @@ PKGDATADIR := /usr/share/vst-ace
 DESTDIR      := $(CURDIR)/debian/vst-ace
 BUILD_PELOAD := obj-peload
 BUILD_GUI    := obj-gui
+BUILD_SESSION := obj-session
 
 # Every step below is an explicit command rather than dh_auto_build, so the
 # parallelism dpkg was asked for has to be passed on by hand. Serial when
@@ -53,22 +54,25 @@ CMAKE_FLAGS := \
 override_dh_auto_configure:
 	cmake -B $(BUILD_PELOAD) -S peload $(CMAKE_FLAGS)
 	cmake -B $(BUILD_GUI)    -S gui    $(CMAKE_FLAGS)
+	cmake -B $(BUILD_SESSION) -S session $(CMAKE_FLAGS)
 
 override_dh_auto_build:
 	$(MAKE) $(MAKEJOBS) -C c \
 	    DW_PKGDEFS='-DDW_PKGLIBDIR=\"$(PKGLIBDIR)\" -DDW_PKGDATADIR=\"$(PKGDATADIR)\"'
 	cmake --build $(BUILD_PELOAD) $(PARALLEL)
 	cmake --build $(BUILD_GUI) $(PARALLEL) --target dwstudio
-# pestudio, dwstudio and peload32 are all skipped rather than failed when
+	cmake --build $(BUILD_SESSION) $(PARALLEL) --target studio
+# pestudio, dwstudio, studio and peload32 are all skipped rather than failed when
 # their toolkit is missing, so a package built without Qt6, GTK4 or the i386
 # multilib toolchain present would otherwise ship quietly incomplete. Insist
-# on all five here, where the missing build-dependency is still the obvious
+# on all six here, where the missing build-dependency is still the obvious
 # explanation.
 	test -x $(BUILD_PELOAD)/peload
 	test -x $(BUILD_PELOAD)/peserve
 	test -x $(BUILD_PELOAD)/pestudio
 	test -x $(BUILD_PELOAD)/peload32
 	test -x $(BUILD_GUI)/dwstudio
+	test -x $(BUILD_SESSION)/studio
 # peload32 has to be the complete one, not merely present. Its editor window
 # and its audio path are both optional in peload/CMakeLists.txt -- without
 # 32-bit X11 or PipeWire it is configured windowless or render-only and still
@@ -97,6 +101,7 @@ override_dh_auto_install:
 	install -D -m 0755 $(BUILD_PELOAD)/peserve  $(DESTDIR)$(PKGLIBDIR)/peserve
 	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
 	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
+	install -D -m 0755 $(BUILD_SESSION)/studio  $(DESTDIR)$(PKGLIBDIR)/studio
 	install -D -m 0755 c/build/va               $(DESTDIR)/usr/bin/va
 # peload32 goes in here too, i386 binary in an amd64 package and all.
 #
@@ -122,9 +127,9 @@ override_dh_auto_install:
 	install -d $(DESTDIR)$(PKGLIBDIR)/runtime32
 	install -D -m 0644 packaging/runtime-README \
 	    $(DESTDIR)$(PKGLIBDIR)/runtime/README
-# The three that are worth having on $$PATH, as symlinks rather than copies:
+# The four that are worth having on $$PATH, as symlinks rather than copies:
 # the helper lookup above depends on the real programs staying together.
-	for p in peload pestudio dwstudio; do \
+	for p in peload pestudio dwstudio studio; do \
 	    ln -sf ../lib/vst-ace/$$p $(DESTDIR)/usr/bin/$$p; \
 	done
 # The patch banks. Only the .json banks -- the generators beside them in the
@@ -136,11 +141,13 @@ override_dh_auto_install:
 	    $(DESTDIR)/usr/share/applications/pestudio.desktop
 	install -D -m 0644 packaging/dwstudio.desktop \
 	    $(DESTDIR)/usr/share/applications/dwstudio.desktop
-	for m in va peload pestudio dwstudio; do \
+	install -D -m 0644 packaging/studio.desktop \
+	    $(DESTDIR)/usr/share/applications/studio.desktop
+	for m in va peload pestudio dwstudio studio; do \
 	    install -D -m 0644 packaging/$$m.1 \
 	        $(DESTDIR)/usr/share/man/man1/$$m.1; \
 	done
 
 override_dh_auto_clean:
-	rm -rf $(BUILD_PELOAD) $(BUILD_GUI)
+	rm -rf $(BUILD_PELOAD) $(BUILD_GUI) $(BUILD_SESSION)
 	$(MAKE) -C c clean

@@ -1,0 +1,46 @@
+.TH STUDIO 1 "October 2026" "vst-ace" "User Commands"
+.SH NAME
+studio \- the session window: a tab per plug\-in, beside the tracker
+.SH SYNOPSIS
+.B studio
+.RI [ \-\-synth " plug\-in" "]... [" \-\-tracker "] [" \-\-song " file.trk] [" \-\-quit\-after " ms]"
+.SH DESCRIPTION
+.B studio
+is the vst\-ace session window. It opens on a blank canvas; File > New synth
+opens a tab hosting one plug\-in \(em the full pestudio host, with its
+programs, parameters, keyboard, patch banks and editor \(em and File > New
+tracker opens the pattern sequencer in a tab of its own. Only the tab in front
+answers the computer keyboard, and each synth tab gets its own audio stream
+and MIDI port, so several plug\-ins play at once.
+.PP
+Plug\-ins built for Windows, macOS and Linux all load as native code; there is
+no Wine and no emulation. They are hosted out of process by default, so one
+that faults costs a helper rather than the session.
+.PP
+The tracker tab is the same tracker the standalone binary runs, one per
+process; the windows a song's tracks play can be the synth tabs beside it.
+.SH OPTIONS
+A session can be named rather than clicked together. Each
+.B \-\-synth
+opens a synth tab with that plug\-in loaded,
+.B \-\-tracker
+opens the tracker tab, and
+.B \-\-song
+loads a song into it, opening the tab first if needed.
+.B \-\-quit\-after
+quits that many milliseconds later, for scripted runs. With no arguments the
+window opens on the blank canvas.
+.SH ENVIRONMENT
+.TP
+.B QT_QPA_PLATFORM
+Editors embed through an X11 window id, so this wants to be \fBxcb\fR under
+Wayland; XWayland is enough. Override it for a native Wayland window and no
+native editors.
+.TP
+.B PEHOST_ISOLATE
+Set to 0 to host in process rather than behind the helper.
+.SH SEE ALSO
+.BR va (1),
+.BR pestudio (1),
+.BR peload (1),
+.BR dwstudio (1).

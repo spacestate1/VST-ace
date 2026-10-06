@@ -54,12 +54,14 @@ underneath it, a Mach-O loader with an Objective-C runtime and a software Metal
 rasteriser, and a CFM/PEF interpreter for Classic Mac OS -- six hosts sharing
 one set of shims.
 
-Two windows are included. pestudio (Qt6) is a plug-in browser and player: pick
+Three windows are included. pestudio (Qt6) is a plug-in browser and player: pick
 a folder, pick a plug-in, and get its programs, every exposed parameter, a
 playable keyboard, a pitch wheel, patch banks, a recorder, and the plug-in's
 own editor -- blitted for Windows plug-ins, embedded as an X11 child window for
-native Linux ones. dwstudio (GTK4) drives the reimplemented engines: a Korg
-DW-8000, a 4-op FM synth, a Juno-6 and sample kits.
+native Linux ones. studio is the same host in a session window: a tab per
+plug-in beside the pattern tracker's tab. dwstudio (GTK4) drives the
+reimplemented engines: a Korg DW-8000, a 4-op FM synth, a Juno-6 and sample
+kits.
 
 The command line has the same hosts: va peload inspects and renders a plug-in
 without a window, and va play runs the DW-8000 engine with no plug-in loaded at
@@ -74,9 +76,10 @@ the plug-ins these hosts load are their authors' own.
 %autosetup
 
 %build
-# Three build systems in one tree: c/ is a plain Makefile, peload/ and gui/ are
-# separate CMake projects (gui/ pulls peload/ in for the host library). Each is
-# driven explicitly rather than through %%cmake, which assumes one per tree.
+# Three build systems in one tree: c/ is a plain Makefile, and peload/, gui/
+# and session/ are separate CMake projects (gui/ and session/ pull peload/ in
+# for the host library). Each is driven explicitly rather than through %%cmake,
+# which assumes one per tree.
 #
 # `va` is compiled knowing where it was installed, which is what lets it find
 # its helpers with no source tree above it -- see locate_tree() in c/src/dw.c.
@@ -100,13 +103,22 @@ cmake -B obj-gui -S gui \
     -DCMAKE_EXE_LINKER_FLAGS="%{build_ldflags}"
 cmake --build obj-gui --parallel --target dwstudio
 
-# pestudio and dwstudio are skipped rather than failed when their toolkit is
-# missing, so without this a package built without Qt6 or GTK4 would ship
-# quietly incomplete.
+cmake -B obj-session -S session \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=%{_prefix} \
+    -DCMAKE_C_FLAGS="%{build_cflags}" \
+    -DCMAKE_CXX_FLAGS="%{build_cxxflags}" \
+    -DCMAKE_EXE_LINKER_FLAGS="%{build_ldflags}"
+cmake --build obj-session --parallel --target studio
+
+# pestudio, dwstudio and studio are skipped rather than failed when their
+# toolkit is missing, so without this a package built without Qt6 or GTK4
+# would ship quietly incomplete.
 test -x obj-peload/peload
 test -x obj-peload/peserve
 test -x obj-peload/pestudio
 test -x obj-gui/dwstudio
+test -x obj-session/studio
 
 %install
 # The real programs go together in one private directory because that is where
@@ -116,6 +128,7 @@ install -D -m 0755 obj-peload/peload   %{buildroot}%{pkglibdir}/peload
 install -D -m 0755 obj-peload/peserve  %{buildroot}%{pkglibdir}/peserve
 install -D -m 0755 obj-peload/pestudio %{buildroot}%{pkglibdir}/pestudio
 install -D -m 0755 obj-gui/dwstudio    %{buildroot}%{pkglibdir}/dwstudio
+install -D -m 0755 obj-session/studio  %{buildroot}%{pkglibdir}/studio
 install -D -m 0755 c/build/va          %{buildroot}%{_bindir}/va
 
 # Where real Microsoft runtime DLLs go. Empty, because the redistributable is
@@ -128,7 +141,7 @@ install -D -m 0644 packaging/runtime-README %{buildroot}%{pkglibdir}/runtime/REA
 # -r, so the links are relative: an absolute one records the buildroot's idea
 # of the path and rpm warns about it. /proc/self/exe resolves either kind back
 # to pkglibdir, which is what the helper lookup depends on.
-for p in peload pestudio dwstudio; do
+for p in peload pestudio dwstudio studio; do
     ln -sfr %{buildroot}%{pkglibdir}/$p %{buildroot}%{_bindir}/$p
 done
 
@@ -143,14 +156,17 @@ install -D -m 0644 packaging/pestudio.desktop \
     %{buildroot}%{_datadir}/applications/pestudio.desktop
 install -D -m 0644 packaging/dwstudio.desktop \
     %{buildroot}%{_datadir}/applications/dwstudio.desktop
+install -D -m 0644 packaging/studio.desktop \
+    %{buildroot}%{_datadir}/applications/studio.desktop
 
-for m in va peload pestudio dwstudio; do
+for m in va peload pestudio dwstudio studio; do
     install -D -m 0644 packaging/$m.1 %{buildroot}%{_mandir}/man1/$m.1
 done
 
 %check
 desktop-file-validate %{buildroot}%{_datadir}/applications/pestudio.desktop
 desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
+desktop-file-validate %{buildroot}%{_datadir}/applications/studio.desktop
 
 %files
 %license LICENSE
@@ -159,11 +175,13 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %{_bindir}/peload
 %{_bindir}/pestudio
 %{_bindir}/dwstudio
+%{_bindir}/studio
 %dir %{pkglibdir}
 %{pkglibdir}/peload
 %{pkglibdir}/peserve
 %{pkglibdir}/pestudio
 %{pkglibdir}/dwstudio
+%{pkglibdir}/studio
 %dir %{pkglibdir}/runtime
 %dir %{pkglibdir}/runtime32
 %{pkglibdir}/runtime/README
@@ -171,10 +189,12 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/dwstudio.desktop
 %{pkgdatadir}/patches
 %{_datadir}/applications/pestudio.desktop
 %{_datadir}/applications/dwstudio.desktop
+%{_datadir}/applications/studio.desktop
 %{_mandir}/man1/va.1*
 %{_mandir}/man1/peload.1*
 %{_mandir}/man1/pestudio.1*
 %{_mandir}/man1/dwstudio.1*
+%{_mandir}/man1/studio.1*
 
 %changelog
 * Mon Sep 07 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.0-1

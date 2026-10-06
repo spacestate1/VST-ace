@@ -41,10 +41,13 @@ target_include_directories(trktest PRIVATE ${VA_ENGINE_DIR})   # wav.h, to write
 find_package(Qt6 COMPONENTS Widgets QUIET)
 if(Qt6_FOUND)
   set(CMAKE_AUTOMOC ON)
-  add_executable(tracker qt/main.cpp)
+  # trackerwidget.h is the whole UI as a widget a shell can embed; main.cpp is
+  # the standalone window around it. Listing the header puts it through moc --
+  # it holds every Q_OBJECT class the window uses.
+  add_executable(tracker qt/main.cpp qt/trackerwidget.h)
   target_link_libraries(tracker PRIVATE trkcore Qt6::Widgets)
   # The same window driven by a script, offscreen -- see uitest() in main.cpp.
-  add_executable(tracker-uitest qt/main.cpp)
+  add_executable(tracker-uitest qt/main.cpp qt/trackerwidget.h)
   target_compile_definitions(tracker-uitest PRIVATE TRACKER_UITEST)
   target_link_libraries(tracker-uitest PRIVATE trkcore Qt6::Widgets)
 else()

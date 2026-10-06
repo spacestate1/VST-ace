@@ -1093,7 +1093,7 @@ def check_desktop_files(ctx):
     if not shutil.which("desktop-file-validate"):
         return SKIP, "desktop-file-utils not installed"
     bad = []
-    for name in ("pestudio.desktop", "dwstudio.desktop",
+    for name in ("pestudio.desktop", "dwstudio.desktop", "studio.desktop",
                  os.path.join("appimage", "vst-ace.desktop")):
         p = rel("packaging", name)
         if not os.path.exists(p):

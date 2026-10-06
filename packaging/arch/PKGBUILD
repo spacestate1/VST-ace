@@ -62,9 +62,10 @@ build() {
     export VSTACE_VERSION="$pkgver"
     export VSTACE_GIT="${VSTACE_GIT:-}"
 
-    # Three build systems in one tree: c/ is a plain Makefile, and peload/ and
-    # gui/ are separate CMake projects (gui/ pulls peload/ in as a subdirectory
-    # for the host library). Each is driven explicitly.
+    # Three build systems in one tree: c/ is a plain Makefile, and peload/,
+    # gui/ and session/ are separate CMake projects (gui/ and session/ pull
+    # peload/ in as a subdirectory for the host library). Each is driven
+    # explicitly.
     #
     # CFLAGS and LDFLAGS are left to reach make through the environment, where
     # makepkg has already put them, rather than being passed on the command
@@ -94,14 +95,23 @@ build() {
         -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS"
     cmake --build obj-gui --target dwstudio
 
-    # pestudio and dwstudio are skipped rather than failed when their toolkit
-    # is missing, so without this a package built without Qt6 or GTK4 would
-    # ship quietly incomplete. Insist on them here, where the missing
+    cmake -B obj-session -S session \
+        -DCMAKE_BUILD_TYPE=None \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_C_FLAGS="$CFLAGS $CPPFLAGS" \
+        -DCMAKE_CXX_FLAGS="$CXXFLAGS $CPPFLAGS" \
+        -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS"
+    cmake --build obj-session --target studio
+
+    # pestudio, dwstudio and studio are skipped rather than failed when their
+    # toolkit is missing, so without this a package built without Qt6 or GTK4
+    # would ship quietly incomplete. Insist on them here, where the missing
     # dependency is still the obvious explanation.
     test -x obj-peload/peload
     test -x obj-peload/peserve
     test -x obj-peload/pestudio
     test -x obj-gui/dwstudio
+    test -x obj-session/studio
 
     # peload32 is not insisted on. Unlike Debian, where the i386 libraries are
     # ordinary build-dependencies, this one needs multilib enabled in
@@ -120,12 +130,13 @@ build() {
 check() {
     cd "$pkgname-$pkgver"
     # The tests proper need plug-in binaries, which are not ours to ship and
-    # are not in the tarball. What can be checked without them is that the two
+    # are not in the tarball. What can be checked without them is that the
     # desktop entries are valid -- they have been wrong before, naming the
     # launcher by a name it no longer had, which failed to start either window
     # from the desktop menu and was found by a user rather than by a build.
     desktop-file-validate packaging/pestudio.desktop
     desktop-file-validate packaging/dwstudio.desktop
+    desktop-file-validate packaging/studio.desktop
 }
 
 package() {
@@ -139,6 +150,7 @@ package() {
     install -Dm755 obj-peload/peserve  "$pkgdir$_pkglibdir/peserve"
     install -Dm755 obj-peload/pestudio "$pkgdir$_pkglibdir/pestudio"
     install -Dm755 obj-gui/dwstudio    "$pkgdir$_pkglibdir/dwstudio"
+    install -Dm755 obj-session/studio  "$pkgdir$_pkglibdir/studio"
     install -Dm755 c/build/va          "$pkgdir/usr/bin/va"
 
     # An i386 binary in an x86_64 package, deliberately -- namcap will say so.
@@ -160,9 +172,9 @@ package() {
     install -d "$pkgdir$_pkglibdir/runtime32"
     install -Dm644 packaging/runtime-README "$pkgdir$_pkglibdir/runtime/README"
 
-    # The three that are worth having on $PATH, as symlinks rather than copies:
+    # The four that are worth having on $PATH, as symlinks rather than copies:
     # the helper lookup above depends on the real programs staying together.
-    for p in peload pestudio dwstudio; do
+    for p in peload pestudio dwstudio studio; do
         ln -sf "../lib/$pkgname/$p" "$pkgdir/usr/bin/$p"
     done
 
@@ -176,8 +188,10 @@ package() {
         "$pkgdir/usr/share/applications/pestudio.desktop"
     install -Dm644 packaging/dwstudio.desktop \
         "$pkgdir/usr/share/applications/dwstudio.desktop"
+    install -Dm644 packaging/studio.desktop \
+        "$pkgdir/usr/share/applications/studio.desktop"
 
-    for m in va peload pestudio dwstudio; do
+    for m in va peload pestudio dwstudio studio; do
         install -Dm644 "packaging/$m.1" "$pkgdir/usr/share/man/man1/$m.1"
     done
 

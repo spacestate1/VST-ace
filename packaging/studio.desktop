@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=studio
+GenericName=Plug-in session host
+Comment=A session of plug-in synth tabs beside the pattern tracker
+Exec=va studio
+TryExec=va
+Icon=audio-card
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=VST;VST3;audio;plugin;synthesizer;tracker;
+StartupNotify=true

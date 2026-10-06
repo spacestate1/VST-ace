@@ -922,6 +922,8 @@ static void usage(void)
 "  va pe [dir|bank.json]   Qt6 window: load and play real plug-ins natively,\n"
 "                          no Wine -- Windows VST2 and VST3 at both widths,\n"
 "                          native Linux VST3, and each plug-in's own GUI\n"
+"  va studio               the session window: a tab per plug-in, each the\n"
+"                          full host, beside the pattern tracker's tab\n"
 "  va peload <plug>        the same hosts from the command line: --params,\n"
 "                          --render out.wav, --patch/--pick, --detect, --as\n"
 "  va peload32 <plug>      the i386 loader, for 32-bit Windows builds:\n"
@@ -1008,6 +1010,13 @@ int main(int argc, char **argv)
         setenv("QT_QPA_PLATFORM", "xcb", 0);   /* 0: only if unset */
         return exec_tool(dir, "pestudio", argc, argv, NULL, NULL);
     }
+    if (!strcmp(cmd, "studio")) {
+        snprintf(dir, sizeof dir, "%s/session", g_re);
+        /* Same coercion as `pe` above, same reason: the shell's synth tabs
+         * embed plug-in editors through X11 window ids. */
+        setenv("QT_QPA_PLATFORM", "xcb", 0);   /* 0: only if unset */
+        return exec_tool(dir, "studio", argc, argv, NULL, NULL);
+    }
     if (!strcmp(cmd, "peload") || !strcmp(cmd, "peload32")) {
         int is32 = !strcmp(cmd, "peload32");
         const char *sub = is32 ? "windows/VST2-32" : "windows/VST2-64";
@@ -1036,13 +1045,18 @@ int main(int argc, char **argv)
         snprintf(cdir, sizeof cdir, "%s/c", g_re);
         if ((rc = run(mk))) return rc;
 
-        /* Both windows, not just the Qt one. Whichever toolkit is missing
-         * fails its own build and is reported; the other still gets built,
+        /* All three windows, not just the Qt one. Whichever toolkit is missing
+         * fails its own build and is reported; the others still get built,
          * which is the point of doing them separately. */
         snprintf(dir,  sizeof dir,  "%s/peload", g_re);
         snprintf(gdir, sizeof gdir, "%s/gui", g_re);
         if (cmake_build(dir, "all"))       { fprintf(stderr, "va: peload failed to build\n");   failed = 1; }
         if (cmake_build(gdir, "dwstudio")) { fprintf(stderr, "va: dwstudio failed to build\n"); failed = 1; }
+        {
+            char sdir[PATH_MAX];
+            snprintf(sdir, sizeof sdir, "%s/session", g_re);
+            if (cmake_build(sdir, "studio")) { fprintf(stderr, "va: studio failed to build\n"); failed = 1; }
+        }
         return failed;
     }
 

@@ -2243,6 +2243,26 @@ public:
      * tests want callbacks() and peak(). */
     Engine *engine() { return &eng_; }
 
+    /* Whether this host's piano answers the computer keyboard.
+     *
+     * Every HostWidget installs an application-wide key filter, so with several
+     * of them in one window -- the studio shell's tabs -- each sees every key,
+     * and ownsEventObject() cannot tell them apart: the tabs share the one
+     * top-level window. The shell marks the tab in front live and the rest not;
+     * a host that is not live passes every event through untouched.
+     *
+     * Going not-live releases what the piano is holding, mirroring the
+     * WindowDeactivate case in eventFilter: a key held while its tab is switched
+     * away never delivers its key-up here, and the note would stick on.
+     * Default true, so a single host -- pestudio -- behaves exactly as before. */
+    void setKeysLive(bool on)
+    {
+        if (keysLive_ == on) return;
+        keysLive_ = on;
+        if (!on && piano_) { piano_->releaseAll(); updateKeyWatch(); }
+    }
+    bool keysLive() const { return keysLive_; }
+
     /* Forget the plug-in that was loading when the last session died.
      *
      * Reaching this means we are exiting under our own power, so whatever is
@@ -3303,6 +3323,10 @@ private slots:
         }
         pehost *h = eng_.host();
         loadedPath_ = paths_[row];
+        /* The widget's title follows the plug-in's name. pestudio's shell sets
+         * the frame's own title and never reads this; the studio window puts it
+         * on the tab, through windowTitleChanged. */
+        setWindowTitle(QString::fromLocal8Bit(pehost_name(h)));
         /* A plug-in with an input and nothing fed to it can only be silent,
          * which reads as a broken plug-in. Start it on the keys; one with no
          * input bus is left on silence, because anything fed to it would only
@@ -4117,6 +4141,10 @@ private:
 
     bool eventFilter(QObject *o, QEvent *ev) override
     {
+        /* Not the live tab: everything passes by untouched. Several of these
+         * filters share the application in a multi-host shell, and only the
+         * one whose tab is in front may answer keys -- see setKeysLive. */
+        if (!keysLive_) return QWidget::eventFilter(o, ev);
         switch (ev->type()) {
         case QEvent::KeyPress:
         case QEvent::KeyRelease: {
@@ -5555,6 +5583,7 @@ private:
     QPushButton  *panicBtn_ = nullptr;
     QString       saveDir_;      /* where the last take was saved */
     bool          pianoWasLive_ = true;  /* had focus before typing began */
+    bool          keysLive_ = true;      /* the shell's say -- setKeysLive() */
     QLabel       *recLabel_ = nullptr;
     QLabel       *patchLabel_;
     QDoubleSpinBox *tempoBox_ = nullptr;
