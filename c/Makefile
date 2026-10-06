@@ -10,7 +10,9 @@
 # rather than starting them as subprocesses.
 
 CC      ?= cc
-CFLAGS  ?= -O2 -std=c99 -pedantic -Wall -Wextra
+# -flto/-O3/-fno-math-errno are all bit-exact here: ISO C mode keeps
+# -ffp-contract=off, and none of them lets GCC reassociate floating point.
+CFLAGS  ?= -O3 -flto -fno-math-errno -std=c99 -pedantic -Wall -Wextra
 # snprintf() truncation cannot actually happen with these path lengths, but the
 # compiler has no way to prove it.
 CFLAGS  += -Wno-format-truncation

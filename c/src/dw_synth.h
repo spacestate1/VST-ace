@@ -59,6 +59,18 @@ typedef struct {
     dw_eg     eg_vcf, eg_vca;
     dw_filter filt;
     unsigned  age;
+    /* Memoised libm results, keyed on the exact input doubles: libm is a pure
+     * function of the input bits, so an equal key means the cached result is
+     * bit-identical to what recomputing would produce. The keys start at NaN
+     * (dw_synth_init), which never compares equal and so forces a first miss. */
+    double    ck_base1, cv_f1;    /* note_hz(), osc 1 */
+    double    ck_base2, cv_f2;    /* note_hz(), osc 2 */
+    double    ck_hz1,  ck_hz2;    /* dw_wavetable_mip() inputs (== cv_f1/cv_f2) */
+    int       cv_mip1, cv_mip2;
+    double    ck_trk,  cv_trk;    /* pow(2, kbd_track * pitch/12) */
+    double    ck_eg,   cv_eg;     /* pow(2, vcf envelope term)  */
+    double    ck_fcut, ck_fres;   /* last dw_filter_set() args; filt keeps the
+                                   * coefficients, so a hit skips the exp() */
 } dw_voice;
 
 typedef struct {

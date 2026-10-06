@@ -273,18 +273,29 @@ double dw_delay_process(dw_delay *d, double in)
     double mod, tap, frac, out;
     int    i0, i1;
 
-    mod = sin(2.0 * M_PI * d->mod_phase) * d->mod_depth;
+    /* The LFO phase is state and always advances, but its output only ever
+     * scales mod_depth, and a finite sin() times 0.0 is exactly 0.0 -- so at
+     * zero depth the sin() itself can be skipped. */
+    mod = (d->mod_depth == 0.0) ? 0.0
+                                : sin(2.0 * M_PI * d->mod_phase) * d->mod_depth;
     d->mod_phase += d->mod_inc;
     if (d->mod_phase >= 1.0) d->mod_phase -= 1.0;
 
-    tap = (double)d->write - (d->delay_samples + mod);
-    while (tap < 0.0)              tap += d->size;
-    while (tap >= (double)d->size) tap -= d->size;
+    if (d->level == 0.0 && d->feedback == 0.0) {
+        /* The tap value is only ever multiplied by level or feedback, so with
+         * both at zero the read and interpolation are dead. The write is the
+         * buffer's only input and must still happen. */
+        out = 0.0;
+    } else {
+        tap = (double)d->write - (d->delay_samples + mod);
+        while (tap < 0.0)              tap += d->size;
+        while (tap >= (double)d->size) tap -= d->size;
 
-    i0   = (int)tap;
-    frac = tap - (double)i0;
-    i1   = (i0 + 1 == d->size) ? 0 : i0 + 1;
-    out  = d->buf[i0] + frac * (d->buf[i1] - d->buf[i0]);
+        i0   = (int)tap;
+        frac = tap - (double)i0;
+        i1   = (i0 + 1 == d->size) ? 0 : i0 + 1;
+        out  = d->buf[i0] + frac * (d->buf[i1] - d->buf[i0]);
+    }
 
     d->buf[d->write] = (float)(in + out * d->feedback);
     if (++d->write == d->size) d->write = 0;

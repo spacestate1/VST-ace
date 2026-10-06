@@ -107,11 +107,13 @@ double dw_wavetable_read(const dw_wavetable *wt, int wave, int mip, double phase
     if (wave >= wt->nwaves) wave = wt->nwaves - 1;
 
     tab  = wt->tab + ((size_t)wave * wt->mips + mip) * ((size_t)wt->frame + 1);
+    /* The only caller (dw_synth_render) keeps phase in [0,1): it starts at 0
+     * and wraps right after each increment. frame is a power of two, so
+     * x < frame with no rounding-up corner, and i stays in [0, frame-1] with
+     * i+1 landing on the wrapped extra sample -- no clamp is needed. */
     x    = phase * (double)wt->frame;
     i    = (int)x;
     frac = x - (double)i;
-    if (i < 0) i = 0;
-    if (i >= wt->frame) i = wt->frame - 1;
 
     return tab[i] + frac * (tab[i + 1] - tab[i]);
 }

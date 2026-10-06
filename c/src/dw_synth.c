@@ -49,9 +49,16 @@ int dw_synth_init(dw_synth *s, const dw_wavetable *wt, double samplerate)
     s->rng        = 22222u;
 
     for (i = 0; i < DW_MAX_VOICES; i++) {
-        dw_eg_init(&s->voice[i].eg_vcf, samplerate);
-        dw_eg_init(&s->voice[i].eg_vca, samplerate);
-        dw_filter_init(&s->voice[i].filt, samplerate);
+        dw_voice *v = &s->voice[i];
+        dw_eg_init(&v->eg_vcf, samplerate);
+        dw_eg_init(&v->eg_vca, samplerate);
+        dw_filter_init(&v->filt, samplerate);
+        /* NaN keys: never equal to any real input, so every memo misses on
+         * its first use instead of returning a zeroed value. */
+        v->ck_base1 = v->ck_base2 = NAN;
+        v->ck_hz1   = v->ck_hz2   = NAN;
+        v->ck_trk   = v->ck_eg    = NAN;
+        v->ck_fcut  = v->ck_fres  = NAN;
     }
     dw_mg_init(&s->mg, samplerate);
     if (dw_delay_init(&s->delay_l, samplerate, 1.2)) return -1;
@@ -302,16 +309,46 @@ void dw_synth_render(dw_synth *s, double *out, int frames)
     const double *p = s->param;
     double porta_coef = (s->porta_time > 0.0)
         ? exp(-6.9 / (s->porta_time * s->samplerate)) : 0.0;
+    /* The loop writes through s (voice state, the rng, the MG, the delays),
+     * so the compiler cannot prove these reads of s->, p[] and dw_tune are
+     * invariant. None of them is written anywhere in this function; copy them
+     * to locals once. */
+    const double oct1_semis    = octave_semis[idx_of(p[DWP_OSC1_OCTAVE], 3)];
+    const double tune_cents    = s->tune_cents;
+    const double mg_osc_cents  = s->mg_osc_cents;
+    const double mg_vcf_amount = s->mg_vcf_amount;
+    const double osc2_offset   = s->osc2_offset_semi;
+    const double osc2_detune   = s->osc2_detune_cents;
+    const double cutoff_hz     = s->cutoff_hz;
+    const double kbd_track     = s->kbd_track;
+    const double eg_sign       = s->vcf_eg_sign;
+    const double eg_amount     = s->vcf_eg_amount;
+    const double eg_octaves    = dw_tune.vcf_eg_octaves;
+    const double vcf_eg_vel    = s->vcf_eg_vel;
+    const double vca_eg_vel    = s->vca_eg_vel;
+    const double resonance     = s->resonance;
+    const double osc1_gain     = s->osc1_gain;
+    const double osc2_gain     = s->osc2_gain;
+    const double noise_gain    = s->noise_gain;
+    const double samplerate    = s->samplerate;
+    const double out_gain      = s->voice_scale * s->volume;
+    const int    wave1 = s->wave1, wave2 = s->wave2;
+    const int    nvoices = s->nvoices;
+    const int    bend_osc1 = s->bend_osc1, bend_osc2 = s->bend_osc2;
     int n, i;
 
     for (n = 0; n < frames; n++) {
         double mg  = dw_mg_process(&s->mg);
+        /* The MG is shared by all voices, so its pitch and cutoff
+         * contributions are the same value for every voice in this sample. */
+        double mg_osc = mg * mg_osc_cents;
+        double mg_cut = pow(2.0, mg * mg_vcf_amount);
         double mix = 0.0;
         double l, r;
 
-        for (i = 0; i < s->nvoices; i++) {
+        for (i = 0; i < nvoices; i++) {
             dw_voice *v = &s->voice[i];
-            double e_vca, e_vcf, base, f1, f2, o, cut, vel_vca, vel_vcf;
+            double e_vca, e_vcf, base, f1, f2, o, cut, vel_vca, vel_vcf, ek;
 
             if (!v->active) continue;
 
@@ -326,42 +363,55 @@ void dw_synth_render(dw_synth *s, double *out, int frames)
 
             /* Oscillator 1 */
             base = v->pitch
-                 + octave_semis[idx_of(p[DWP_OSC1_OCTAVE], 3)]
-                 + (s->tune_cents + v->detune_cents + mg * s->mg_osc_cents) / 100.0
-                 + (s->bend_osc1 ? v->bend_level : 0.0);
-            f1 = note_hz(base);
+                 + oct1_semis
+                 + (tune_cents + v->detune_cents + mg_osc) / 100.0
+                 + (bend_osc1 ? v->bend_level : 0.0);
+            if (base != v->ck_base1) { v->ck_base1 = base; v->cv_f1 = note_hz(base); }
+            f1 = v->cv_f1;
 
             /* Oscillator 2 */
             base = v->pitch
-                 + octave_semis[idx_of(p[DWP_OSC1_OCTAVE], 3)] + s->osc2_offset_semi
-                 + (s->tune_cents + v->detune_cents + s->osc2_detune_cents
-                    + mg * s->mg_osc_cents) / 100.0
-                 + (s->bend_osc2 ? v->bend_level : 0.0);
-            f2 = note_hz(base);
+                 + oct1_semis + osc2_offset
+                 + (tune_cents + v->detune_cents + osc2_detune + mg_osc) / 100.0
+                 + (bend_osc2 ? v->bend_level : 0.0);
+            if (base != v->ck_base2) { v->ck_base2 = base; v->cv_f2 = note_hz(base); }
+            f2 = v->cv_f2;
 
-            o = dw_wavetable_read(s->wt, s->wave1, dw_wavetable_mip(s->wt, f1),
-                                  v->phase1) * s->osc1_gain
-              + dw_wavetable_read(s->wt, s->wave2, dw_wavetable_mip(s->wt, f2),
-                                  v->phase2) * s->osc2_gain
-              + noise(s) * s->noise_gain;
+            if (f1 != v->ck_hz1) { v->ck_hz1 = f1; v->cv_mip1 = dw_wavetable_mip(s->wt, f1); }
+            if (f2 != v->ck_hz2) { v->ck_hz2 = f2; v->cv_mip2 = dw_wavetable_mip(s->wt, f2); }
 
-            v->phase1 += f1 / s->samplerate;
-            v->phase2 += f2 / s->samplerate;
-            if (v->phase1 >= 1.0) v->phase1 -= floor(v->phase1);
-            if (v->phase2 >= 1.0) v->phase2 -= floor(v->phase2);
+            o = dw_wavetable_read(s->wt, wave1, v->cv_mip1, v->phase1) * osc1_gain
+              + dw_wavetable_read(s->wt, wave2, v->cv_mip2, v->phase2) * osc2_gain
+              + noise(s) * noise_gain;
+
+            v->phase1 += f1 / samplerate;
+            v->phase2 += f2 / samplerate;
+            /* Phase starts at 0 and only ever grows by f/sr with f > 0, so it
+             * is never negative here and truncation wraps exactly like floor(). */
+            if (v->phase1 >= 1.0) v->phase1 -= (double)(int)v->phase1;
+            if (v->phase2 >= 1.0) v->phase2 -= (double)(int)v->phase2;
 
             /* Filter: base cutoff, keyboard tracking, envelope, MG. */
-            vel_vcf = 1.0 - s->vcf_eg_vel * (1.0 - v->velocity);
-            cut  = s->cutoff_hz;
-            cut *= pow(2.0, s->kbd_track * (v->pitch / 12.0));
-            cut *= pow(2.0, s->vcf_eg_sign * s->vcf_eg_amount * e_vcf * vel_vcf
-                            * dw_tune.vcf_eg_octaves);
-            cut *= pow(2.0, mg * s->mg_vcf_amount);
-            dw_filter_set(&v->filt, cut, s->resonance);
+            vel_vcf = 1.0 - vcf_eg_vel * (1.0 - v->velocity);
+            ek = kbd_track * (v->pitch / 12.0);
+            if (ek != v->ck_trk) { v->ck_trk = ek; v->cv_trk = pow(2.0, ek); }
+            ek = eg_sign * eg_amount * e_vcf * vel_vcf * eg_octaves;
+            if (ek != v->ck_eg) { v->ck_eg = ek; v->cv_eg = pow(2.0, ek); }
+            cut  = cutoff_hz;
+            cut *= v->cv_trk;
+            cut *= v->cv_eg;
+            cut *= mg_cut;
+            /* Same arguments in means dw_filter_set() would recompute the
+             * coefficients the filter already holds; skip the exp(). */
+            if (cut != v->ck_fcut || resonance != v->ck_fres) {
+                dw_filter_set(&v->filt, cut, resonance);
+                v->ck_fcut = cut;
+                v->ck_fres = resonance;
+            }
 
             o = dw_filter_process(&v->filt, o);
 
-            vel_vca = 1.0 - s->vca_eg_vel * (1.0 - v->velocity);
+            vel_vca = 1.0 - vca_eg_vel * (1.0 - v->velocity);
             mix += o * e_vca * vel_vca;
         }
 
@@ -369,7 +419,7 @@ void dw_synth_render(dw_synth *s, double *out, int frames)
          * dramatically louder than one note; what is left over is soft-clipped
          * rather than hard-clipped, which is what the hardware's output stage
          * would do anyway. */
-        mix *= s->voice_scale * s->volume;
+        mix *= out_gain;
 
         l = mix + dw_delay_process(&s->delay_l, mix);
         r = mix + dw_delay_process(&s->delay_r, mix);

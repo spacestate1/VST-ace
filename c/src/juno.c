@@ -115,6 +115,11 @@ struct juno_synth {
     double      lfo_phase, lfo_inc, lfo_env;
     juno_chorus ch;
     double      pw;            /* current pulse width */
+    /* The HPF coefficient depends only on the patch's HPF position (sr never
+     * changes after create), so memoise it on the exact exp() argument rather
+     * than calling libm per voice-sample. NaN never compares equal, which
+     * forces a first miss. */
+    double      hpf_g, hpf_key;
 };
 
 /* PolyBLEP: removes the worst of the aliasing from the hard edges without a
@@ -135,6 +140,7 @@ juno_synth *juno_create(double sr)
     if (!s) return NULL;
     s->sr = sr;
     s->nv = 6;                       /* the Juno-6 is six-voice */
+    s->hpf_key = NAN;
     for (i = 0; i < JUNO_MAX_VOICES; i++) dw_filter_init(&s->v[i].lpf, sr);
     chorus_set(&s->ch, JUNO_CH_OFF, sr);
     return s;
@@ -305,8 +311,9 @@ void juno_render(juno_synth *s, double *out, int frames)
 
             /* non-resonant highpass ahead of the filter */
             if (p->hpf > 0) {
-                double g = 1.0 - exp(-2.0 * M_PI * HPF_HZ[p->hpf & 3] / s->sr);
-                v->hp_z += g * (o - v->hp_z);
+                double ek = -2.0 * M_PI * HPF_HZ[p->hpf & 3] / s->sr;
+                if (ek != s->hpf_key) { s->hpf_key = ek; s->hpf_g = 1.0 - exp(ek); }
+                v->hp_z += s->hpf_g * (o - v->hp_z);
                 o -= v->hp_z;
             } else {
                 o *= 1.35;                       /* position 0 boosts the bass */
