@@ -38,9 +38,11 @@ static const int k_lpbs[] = { 1, 2, 3, 4, 6, 8, 12, 16 };
 #define MAXDEST 128
 #define MAXSAMP (DK_MAX_KITS + TRK_TRACKS + 2)  /* every set, "none", and one not found */
 
-/* One tracker window, whole: the engine it plays, the editor state, and every
- * widget. main() makes one; a shell embedding the view would make one per
- * window. Every function below takes it as its first parameter.
+/* One tracker, whole: the engine it plays, the editor state, and every
+ * widget. tracker_view_new builds it as one widget a host packs; standalone,
+ * main() makes one and tracker_window_new wraps the view in a window. A
+ * shell makes one per view it embeds. Every function below takes it as its
+ * first parameter.
  *
  * The sample-set editor's state (E, further down) is still one-per-process:
  * it is a modal dialog of the window that opened it and keeps a pointer back
@@ -54,7 +56,10 @@ typedef struct {
     int         closing;
 
     GtkApplication *app;
-    GtkWidget  *win, *area, *scroll, *headscroll, *status;
+    GtkWidget  *win;                 /* the window around the view, standalone; NULL embedded */
+    GtkWidget  *view;                /* the tracker, whole, as one widget */
+    GSimpleActionGroup *ag;          /* the view's commands, under the "win" prefix */
+    GtkWidget  *area, *scroll, *headscroll, *status;
     GtkWidget  *cheatwin, *cheattext;  /* Help > Cheat Sheet, while it is open */
     GtkWidget  *bpm, *lpb, *pattern, *rows, *step, *follow, *editbox, *volume;
     GtkWidget  *parts, *part_name;   /* the Parts panel */
@@ -126,6 +131,14 @@ static void redraw(ui *U) { gtk_widget_queue_draw(U->area); }
 static void status(ui *U, const char *msg)
 {
     gtk_label_set_text(GTK_LABEL(U->status), msg);
+}
+
+/* The window the view sits in, to parent dialogs and transients to: U->win
+ * standalone, the host's window when the view is embedded. */
+static GtkWindow *parent_window(ui *U)
+{
+    GtkRoot *root = U->view ? gtk_widget_get_root(U->view) : NULL;
+    return GTK_IS_WINDOW(root) ? GTK_WINDOW(root) : NULL;
 }
 
 /* --------------------------------------------------------------- drawing */
@@ -362,7 +375,7 @@ static void on_cheat(GSimpleAction *a, GVariant *v, gpointer u)
     if (!U->cheatwin) {
         U->cheatwin = gtk_window_new();
         gtk_window_set_title(GTK_WINDOW(U->cheatwin), "Cheat Sheet");
-        gtk_window_set_transient_for(GTK_WINDOW(U->cheatwin), GTK_WINDOW(U->win));
+        gtk_window_set_transient_for(GTK_WINDOW(U->cheatwin), parent_window(U));
         gtk_window_set_default_size(GTK_WINDOW(U->cheatwin), 520, 640);
         U->cheattext = gtk_text_view_new();
         gtk_text_view_set_editable(GTK_TEXT_VIEW(U->cheattext), FALSE);
@@ -558,7 +571,7 @@ static void on_load_samples(GSimpleAction *a, GVariant *v, gpointer u)
     ui *U = u;
     (void)a; (void)v;
     gtk_file_dialog_set_title(d, "Load a sample set (a folder of WAVs)");
-    gtk_file_dialog_select_folder(d, GTK_WINDOW(U->win), NULL, on_samples_folder, U);
+    gtk_file_dialog_select_folder(d, parent_window(U), NULL, on_samples_folder, U);
     g_object_unref(d);
 }
 
@@ -897,7 +910,7 @@ static void on_edit_samples(GSimpleAction *a, GVariant *v, gpointer u)
 
     E.win = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(E.win), "Edit Sample Set");
-    gtk_window_set_transient_for(GTK_WINDOW(E.win), GTK_WINDOW(U->win));
+    gtk_window_set_transient_for(GTK_WINDOW(E.win), parent_window(U));
     gtk_window_set_modal(GTK_WINDOW(E.win), TRUE);
     gtk_window_set_default_size(GTK_WINDOW(E.win), 760, 520);
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
@@ -970,6 +983,7 @@ static void update_title(ui *U)
 {
     char title[4200];
     const char *base = U->path[0] ? strrchr(U->path, '/') : NULL;
+    if (!U->win) return;    /* embedded: the host names its own frames */
     snprintf(title, sizeof title, "%s — tracker (%s)",
              U->path[0] ? (base ? base + 1 : U->path) : "untitled", trk_client_name(U->e));
     gtk_window_set_title(GTK_WINDOW(U->win), title);
@@ -1387,7 +1401,7 @@ static void on_context(GtkGestureClick *g, int n, double x, double y, gpointer u
     g_menu_append_section(m, NULL, G_MENU_MODEL(a));
     g_menu_append_section(m, NULL, G_MENU_MODEL(b));
     {
-        GAction *pa = g_action_map_lookup_action(G_ACTION_MAP(U->win), "paste");
+        GAction *pa = g_action_map_lookup_action(G_ACTION_MAP(U->ag), "paste");
         if (pa) g_simple_action_set_enabled(G_SIMPLE_ACTION(pa), rows > 0 && U->ed.edit);
     }
     pop = gtk_popover_menu_new_from_model(G_MENU_MODEL(m));
@@ -1696,7 +1710,7 @@ static void save_as(ui *U, int close_after)
     {
         ui_ref *r = g_new(ui_ref, 1);
         r->U = U; r->n = close_after;
-        gtk_file_dialog_save(d, GTK_WINDOW(U->win), NULL, save_done, r);
+        gtk_file_dialog_save(d, parent_window(U), NULL, save_done, r);
     }
     g_object_unref(d);
 }
@@ -1726,7 +1740,7 @@ static void after_confirm(ui *U, after_t what)
     }
     {
         GtkFileDialog *d = song_dialog("Open song");
-        gtk_file_dialog_open(d, GTK_WINDOW(U->win), NULL, open_done, U);
+        gtk_file_dialog_open(d, parent_window(U), NULL, open_done, U);
         g_object_unref(d);
     }
 }
@@ -1759,7 +1773,7 @@ static void confirm_then(ui *U, after_t what)
     {
         ui_ref *r = g_new(ui_ref, 1);
         r->U = U; r->n = what;
-        gtk_alert_dialog_choose(d, GTK_WINDOW(U->win), NULL, confirm_done, r);
+        gtk_alert_dialog_choose(d, parent_window(U), NULL, confirm_done, r);
     }
     g_object_unref(d);
 }
@@ -1777,7 +1791,7 @@ static void show_keys(ui *U)
 {
     GtkAlertDialog *d = gtk_alert_dialog_new("tracker keys");
     gtk_alert_dialog_set_detail(d, k_keys_help);
-    gtk_alert_dialog_show(d, GTK_WINDOW(U->win));
+    gtk_alert_dialog_show(d, parent_window(U));
     g_object_unref(d);
 }
 
@@ -1999,7 +2013,29 @@ static gboolean refit_columns(gpointer u)
     return G_SOURCE_REMOVE;
 }
 
-static void build(ui *U, GtkApplication *app)
+/* Shown -- a window presented, or a notebook page switched to: the note keys
+ * live on the drawing area, so it takes the focus. A moment after the map:
+ * a notebook moving to a page pulls the focus onto its tab as the switch
+ * finishes, and only a grab after that sticks. */
+static gboolean grab_area_idle(gpointer u)
+{
+    ui *U = u;
+    if (gtk_widget_get_mapped(U->view))
+        gtk_widget_grab_focus(U->area);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_view_map(GtkWidget *w, gpointer u)
+{
+    (void)w;
+    g_idle_add(grab_area_idle, u);
+}
+
+/* The tracker, whole, as one widget a host packs -- standalone a window's
+ * child, in a shell a notebook page. The commands the menus and F1 name go
+ * on the view itself under the "win" prefix, so two views in one process
+ * (even one window) each dispatch their own. */
+GtkWidget *tracker_view_new(ui *U)
 {
     static const char *bnames[] = { "▶ Song", "▶ Pattern", "■ Stop", "Panic",
                                     "New", "Open…", "Save", "Save As…", "Keys" };
@@ -2010,6 +2046,18 @@ static void build(ui *U, GtkApplication *app)
         "Release every note on every track, playing or not (Escape)",
         "Start an empty song", "Open a song", "Save the song (to its file)",
         "Save the song to a new file", "What every key does" };
+    static const GActionEntry acts[] = {
+        { "keys",         on_keys,         NULL, NULL, NULL, {0} },
+        { "cheat",        on_cheat,        NULL, NULL, NULL, {0} },
+        { "load-samples", on_load_samples, NULL, NULL, NULL, {0} },
+        { "edit-samples", on_edit_samples, NULL, NULL, NULL, {0} },
+        { "copy",         on_copy,         NULL, NULL, NULL, {0} },
+        { "cut",          on_cut,          NULL, NULL, NULL, {0} },
+        { "paste",        on_paste,        NULL, NULL, NULL, {0} },
+        { "clear",        on_clear,        NULL, NULL, NULL, {0} },
+        { "select-column", on_selcol,      NULL, NULL, NULL, {0} },
+        { "select-all",   on_selall,       NULL, NULL, NULL, {0} },
+    };
     const char *lpbn[NLPB + 1], *chans[17];
     char lpbs[NLPB][16], chs[16][8];
     GtkWidget *boxes[TRK_TRACKS];
@@ -2021,28 +2069,30 @@ static void build(ui *U, GtkApplication *app)
     measure_font(U);
     for (i = 0; i < 16; i++) { snprintf(chs[i], sizeof chs[i], "ch %d", i + 1); chans[i] = chs[i]; }
     chans[16] = NULL;
-    U->win = gtk_application_window_new(app);
-    gtk_window_set_default_size(GTK_WINDOW(U->win), 1340, 760);
-    g_signal_connect(U->win, "close-request", G_CALLBACK(on_close), U);
 
-    v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    U->view = v = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_widget_set_margin_start(v, 6);
     gtk_widget_set_margin_end(v, 6);
     gtk_widget_set_margin_top(v, 6);
-    gtk_window_set_child(GTK_WINDOW(U->win), v);
+    U->ag = g_simple_action_group_new();
+    g_action_map_add_action_entries(G_ACTION_MAP(U->ag), acts, G_N_ELEMENTS(acts), U);
+    gtk_widget_insert_action_group(v, "win", G_ACTION_GROUP(U->ag));
+    /* F1, once an application accel on "win.cheat": a shortcut on the view
+     * fires wherever the focus is inside it, standalone or embedded. */
+    {
+        GtkEventController *sc = gtk_shortcut_controller_new();
+        gtk_shortcut_controller_add_shortcut(GTK_SHORTCUT_CONTROLLER(sc),
+            gtk_shortcut_new(gtk_keyval_trigger_new(GDK_KEY_F1, 0),
+                             gtk_named_action_new("win.cheat")));
+        gtk_widget_add_controller(v, sc);
+    }
 
     bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     for (i = 0; i < 9; i++) {
         GtkWidget *b;
         if (i == 8) {
             /* Help, where Keys was: Keys and the cheat sheet. */
-            static const GActionEntry acts[] = {
-                { "keys",  on_keys,  NULL, NULL, NULL, {0} },
-                { "cheat", on_cheat, NULL, NULL, NULL, {0} },
-            };
             GtkWidget *mb = gtk_menu_button_new();
-            g_action_map_add_action_entries(G_ACTION_MAP(U->win), acts, G_N_ELEMENTS(acts), U);
-            gtk_application_set_accels_for_action(app, "win.cheat", (const char *[]){ "F1", NULL });
             gtk_menu_button_set_label(GTK_MENU_BUTTON(mb), "Help");
             gtk_widget_set_tooltip_text(mb, "What every key does, and the cheat sheet (F1)");
             gtk_widget_set_focus_on_click(mb, FALSE);
@@ -2059,12 +2109,7 @@ static void build(ui *U, GtkApplication *app)
         if (i == 7) {
             /* Samples, beside the file buttons: load a set from anywhere,
              * or edit one. */
-            static const GActionEntry acts[] = {
-                { "load-samples", on_load_samples, NULL, NULL, NULL, {0} },
-                { "edit-samples", on_edit_samples, NULL, NULL, NULL, {0} },
-            };
             GtkWidget *mb = gtk_menu_button_new();
-            g_action_map_add_action_entries(G_ACTION_MAP(U->win), acts, G_N_ELEMENTS(acts), U);
             gtk_menu_button_set_label(GTK_MENU_BUTTON(mb), "Samples");
             gtk_widget_set_tooltip_text(mb, "Load a sample set from a folder, or edit one: "
                                             "which note plays which WAV");
@@ -2220,16 +2265,7 @@ static void build(ui *U, GtkApplication *app)
     g_signal_connect(click, "pressed", G_CALLBACK(on_click), U);
     gtk_widget_add_controller(U->area, GTK_EVENT_CONTROLLER(click));
     {   /* Dragging selects; right-click offers the clipboard. */
-        static const GActionEntry acts[] = {
-            { "copy", on_copy, NULL, NULL, NULL, {0} },
-            { "cut", on_cut, NULL, NULL, NULL, {0} },
-            { "paste", on_paste, NULL, NULL, NULL, {0} },
-            { "clear", on_clear, NULL, NULL, NULL, {0} },
-            { "select-column", on_selcol, NULL, NULL, NULL, {0} },
-            { "select-all", on_selall, NULL, NULL, NULL, {0} },
-        };
         GtkGesture *drag = gtk_gesture_drag_new(), *menu = gtk_gesture_click_new();
-        g_action_map_add_action_entries(G_ACTION_MAP(U->win), acts, G_N_ELEMENTS(acts), U);
         g_signal_connect(drag, "drag-update", G_CALLBACK(on_drag), U);
         gtk_widget_add_controller(U->area, GTK_EVENT_CONTROLLER(drag));
         gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(menu), GDK_BUTTON_SECONDARY);
@@ -2280,6 +2316,19 @@ static void build(ui *U, GtkApplication *app)
     U->play_pat = U->play_row = -1;
     g_timeout_add(33, follow_playback, U);
     g_timeout_add(2000, reroute, U);
+    g_signal_connect(v, "map", G_CALLBACK(on_view_map), U);
+    return v;
+}
+
+/* Standalone: the view in its own application window, with the window's
+ * size, its title (update_title, from the view's file flows), and the
+ * close-request save flow. */
+static void tracker_window_new(ui *U, GtkApplication *app)
+{
+    U->win = gtk_application_window_new(app);
+    gtk_window_set_default_size(GTK_WINDOW(U->win), 1340, 760);
+    g_signal_connect(U->win, "close-request", G_CALLBACK(on_close), U);
+    gtk_window_set_child(GTK_WINDOW(U->win), tracker_view_new(U));
 }
 
 #ifdef TRACKER_UITEST
@@ -2376,7 +2425,7 @@ static gboolean uitest(gpointer u)
         redraw(U);
     }
     /* Help > Cheat Sheet. */
-    g_action_group_activate_action(G_ACTION_GROUP(U->win), "cheat", NULL);
+    g_action_group_activate_action(G_ACTION_GROUP(U->ag), "cheat", NULL);
     pump(400);
     if (U->cheatwin) {
         shot_of(U->cheatwin, "g06-cheat.png");
@@ -2465,7 +2514,7 @@ static gboolean uitest(gpointer u)
 static void activate(GtkApplication *app, gpointer u)
 {
     ui *U = u;
-    build(U, app);
+    tracker_window_new(U, app);
     if (U->open) open_path(U, U->open);
     else reset_view(U);
     gtk_window_present(GTK_WINDOW(U->win));
