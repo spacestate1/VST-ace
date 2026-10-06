@@ -2604,6 +2604,16 @@ public:
                                 "channels -- the modulator on a vocoder -- so the "
                                 "raw voice does not pass through to the output");
         micVocoder_->setVisible(false);
+        /* The feed, on or off with one click. Off feeds silence whatever the
+         * dropdown says, and the dropdown keeps its choice, so back on is
+         * whatever was playing before. The dropdown alone could do this (it
+         * has "silence"), but silencing an effect to hear the dry plug-in and
+         * back is the ordinary A/B move, and picking a row twice is the long
+         * way round for it. */
+        srcOn_ = new QCheckBox("Effect in");
+        srcOn_->setChecked(true);
+        srcOn_->setToolTip("feed the chosen test signal to the effect's input;\n"
+                           "off feeds silence, and the dropdown keeps its choice");
         /* What an effect is fed. Silence is right for a synth and useless for an
          * effect, so the choice is exposed rather than assumed. */
         srcBox_ = new QComboBox;
@@ -2624,7 +2634,7 @@ public:
         bar->addWidget(recBtn_);
         bar->addWidget(recLabel_);
         bar->addStretch(1);
-        bar->addWidget(new QLabel("Effect in"));
+        bar->addWidget(srcOn_);
         bar->addWidget(srcBox_);
         bar->addSpacing(12);
         bar->addWidget(inLabel_);
@@ -2748,9 +2758,10 @@ public:
             inGain_->setToolTip(QString("microphone gain: +%1 dB").arg(db));
         });
         connect(micVocoder_, &QCheckBox::toggled, this, [this] { applyInputMask(); });
+        connect(srcOn_, &QCheckBox::toggled, this, [this] { applySource(); });
         connect(srcBox_, &QComboBox::currentIndexChanged, this, [this](int i) {
             const int src = srcBox_->itemData(i).toInt();
-            eng_.setSource(Engine::Source(src));
+            applySource();
             /* The mic meter appears with the source it measures. */
             micMeterOn_ = src == int(Engine::SrcInput);
             if (micMeterOn_) { eng_.inPeak(); refreshAudioInputs(); }
@@ -3366,12 +3377,18 @@ private slots:
          * then loading the plug-in you meant to use it with is the normal order
          * to do things in, and having the source quietly revert to the keys on
          * every load is indistinguishable from the microphone not working. */
-        if (srcBox_ && eng_.source() != Engine::SrcInput) {
+        /* The microphone check reads the dropdown, not the engine: with the
+         * Effect in toggle off the engine is fed silence whatever was chosen,
+         * and reading the engine here would "revert" a mic the user picked
+         * while muted -- the very override this is written not to do. */
+        if (srcBox_ && srcBox_->currentData().toInt() != int(Engine::SrcInput)) {
             int want = pehost_num_inputs(h) > 0 ? int(Engine::SrcNotes)
                                                 : int(Engine::SrcSilence);
             int ix = srcBox_->findData(want);
             if (ix >= 0 && ix != srcBox_->currentIndex()) srcBox_->setCurrentIndex(ix);
-            else eng_.setSource(Engine::Source(want));
+            /* The dropdown may already say the wanted source, in which case
+             * nothing fires -- and the feed must still honour the toggle. */
+            else applySource();
         }
         /* The mask lives on the plug-in handle; a fresh plug-in needs it sent. */
         applyInputMask();
@@ -3833,6 +3850,18 @@ private slots:
         if (!eng_.host()) return;
         pehost_set_input_mask(eng_.host(),
                               micVocoder_ && micVocoder_->isChecked() ? 0x3u : 0u);
+    }
+
+    /* What the engine is actually fed: the dropdown's choice while the Effect
+     * in toggle is on, silence while it is off. The toggle, the dropdown and
+     * the load-time default all land here, so the toggle is honoured every
+     * way the feed can change -- including loading a plug-in, which must not
+     * quietly turn the test sound back on. */
+    void applySource()
+    {
+        const int src = srcOn_->isChecked() ? srcBox_->currentData().toInt()
+                                            : int(Engine::SrcSilence);
+        eng_.setSource(Engine::Source(src));
     }
 
     void updateAudioInState()
@@ -5552,6 +5581,7 @@ private:
     QList<Entry>  all_;
     int           rootCount_ = 0;        /* how many folders the last scan walked */
     QComboBox    *srcBox_;
+    QCheckBox    *srcOn_;                /* the feed, on or off -- applySource() */
     QListWidget  *pluginList_, *programList_, *patchList_;
     QPushButton  *recBtn_ = nullptr;
     QPushButton  *panicBtn_ = nullptr;
