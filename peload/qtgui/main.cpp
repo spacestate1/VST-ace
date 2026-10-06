@@ -1023,6 +1023,7 @@ public:
             released++;
         }
         last_ = -1;
+        heldKey_.fill(false);
         if (released) {
             fprintf(stderr, "piano: released %d held note(s)\n", released);
             update();
@@ -1041,13 +1042,41 @@ public:
         int n = keyNote(qtKey);
         if (n < 0) return false;
         if (autoRepeat) return true;
-        if (down) { if (!isHeld(n)) { setHeld(n, true); emit noteOn(n, 100); } }
-        else      { if (isHeld(n))  { setHeld(n, false); emit noteOff(n); } }
+        /* heldKey_ is kept alongside held_ so the stuck-note watchdog can tell
+         * which notes a physical key owes a release for. The mouse and MIDI
+         * hold notes through setHeld() and never land here -- a mouse drag has
+         * no key whose state X could be asked about, and releasing one because
+         * some key is up would cut a note mid-drag. */
+        if (down) {
+            heldKey_[n - kLow] = true;
+            if (!isHeld(n)) { setHeld(n, true); emit noteOn(n, 100); }
+        } else {
+            heldKey_[n - kLow] = false;
+            if (isHeld(n)) { setHeld(n, false); emit noteOff(n); }
+        }
         return true;
     }
 
     bool isHeld(int note) const
     { return note >= kLow && note < kLow + kKeys && held_[note - kLow]; }
+
+    /* The subset of held notes a computer key is holding -- see routeKey. */
+    bool isKeyHeld(int note) const
+    { return note >= kLow && note < kLow + kKeys && heldKey_[note - kLow]; }
+    bool anyKeyHeld() const
+    { for (bool b : heldKey_) if (b) return true; return false; }
+
+    /* Reverse of keyNote: the note-row character that plays a note, or 0 when
+     * no key does. The watchdog needs it to turn a held note back into the
+     * physical key to ask X about. */
+    static int noteQtKey(int note)
+    {
+        static const char lo[] = "zsxdcvgbhnjm";
+        static const char hi[] = "q2w3er5t6y7u";
+        if (note >= 48 && note < 60) return lo[note - 48];
+        if (note >= 60 && note < 72) return hi[note - 60];
+        return 0;
+    }
 
 protected:
     void hideEvent(QHideEvent *e) override
@@ -1076,8 +1105,156 @@ protected:
 
 private:
     std::array<bool, kKeys> held_{};
+    std::array<bool, kKeys> heldKey_{};   /* the subset a computer key holds */
     int last_ = -1;
 };
+
+/* ------------------------------------------- stuck-note keyboard watchdog */
+
+/* Releases computer-key notes whose key-up never arrived.
+ *
+ * The release of a held note can go somewhere no host-side code can watch. A
+ * native plug-in's popup menu is a separate top-level window on the plug-in's
+ * own X connection, and plug-in toolkits move the X input focus to such
+ * windows; a key released there -- or lost to any grab, crash or focus
+ * transition -- reaches neither the application-wide Qt event filter nor the
+ * X key snoop, and the note sticks on. Chasing every window a release might
+ * land on is a losing game, so this asks about the key itself instead:
+ * XQueryKeymap reports the physical keyboard state regardless of focus or
+ * grabs, and a note whose key is physically up has been released whether or
+ * not the event saying so ever showed up.
+ *
+ * Only computer-key notes are watched: the mouse and MIDI hold notes without
+ * a physical key behind them, which is why Piano tracks them apart. The
+ * decision logic sits behind three std::function seams (plus a fourth for the
+ * keyboard-state query itself) and names neither Piano nor Qt widget types,
+ * so a test harness can drive it with a stubbed keyboard. */
+#ifdef PEHOST_HAVE_X11
+class KeyWatch {
+public:
+    KeyWatch();
+    bool available() const { return dpy_ != nullptr; }
+
+    /* One poll of the physical keyboard. Returns false when the caller should
+     * stop the timer: no computer-key note is held any more, or the display
+     * is gone. */
+    bool tick();
+
+    std::function<bool(int note)>  isKeyHeld;
+    std::function<int(int note)>   noteKey;    /* Piano::noteQtKey */
+    std::function<void(int qtKey)> release;    /* routeKey(qtKey, false, ...) */
+    /* The physical keyboard as XQueryKeymap's 32-byte bitmap of keycodes.
+     * Set by the constructor; stubbed by tests. */
+    std::function<bool(char *keys32)> query;
+
+private:
+    /* A key must read up on this many consecutive ticks before its note is
+     * released -- grace against a poll landing between the physical release
+     * and the ordinary release event that is about to end the note anyway. */
+    static const int kGrace = 2;
+    /* The char -> keycode map is re-read every this many ticks (~5 s at
+     * 150 ms) rather than on MappingNotify: the snoop that reloads its own
+     * keymap on MappingNotify is only installed while a native editor is
+     * attached, and a remap with no editor open would otherwise go unseen. */
+    static const int kRemapTicks = 33;
+
+    void loadMap();
+
+    Display *dpy_ = nullptr;
+    QHash<int, QVector<int>> kcs_;  /* note-row char -> keycodes carrying it */
+    QHash<int, int> up_;            /* note -> consecutive ticks read up */
+    int sinceMap_ = kRemapTicks;    /* forces a map load on the first tick */
+};
+#else
+/* No X11, no foreign X windows that could eat a release: nothing to watch,
+ * and the timer that would call tick() never starts. */
+class KeyWatch {
+public:
+    bool available() const { return false; }
+    bool tick() { return false; }
+    std::function<bool(int)>  isKeyHeld;
+    std::function<int(int)>   noteKey;
+    std::function<void(int)>  release;
+    std::function<bool(char *)> query;
+};
+#endif
+
+#ifdef PEHOST_HAVE_X11
+KeyWatch::KeyWatch()
+{
+    /* Only the xcb platform has the foreign-X-window problem this exists
+     * for, and only xcb has a Display to ask. On Wayland the release of a
+     * key always reaches the window that has focus, which is ours, so the
+     * watchdog is never needed and available() stays false. */
+    if (!QGuiApplication::platformName().startsWith(QLatin1String("xcb")))
+        return;
+    if (auto *x = qApp->nativeInterface<QNativeInterface::QX11Application>())
+        dpy_ = x->display();
+    if (dpy_)
+        query = [d = dpy_](char *keys32) { return XQueryKeymap(d, keys32) != 0; };
+}
+
+bool KeyWatch::tick()
+{
+    if (!dpy_ || !isKeyHeld || !noteKey || !release) return false;
+    bool any = false;
+    for (int n = 0; n < 128; n++) if (isKeyHeld(n)) { any = true; break; }
+    if (!any) { up_.clear(); return false; }
+
+    char keys[32];
+    if (!query || !query(keys)) {
+        /* The display is gone, so nothing more can be learned from it. Give
+         * up silently: the log line below exists so a user report can confirm
+         * this mechanism fired, and a dead display is not that. */
+        dpy_ = nullptr;
+        up_.clear();
+        return false;
+    }
+    if (++sinceMap_ >= kRemapTicks) loadMap();
+
+    for (int n = 0; n < 128; n++) {
+        if (!isKeyHeld(n)) { up_.remove(n); continue; }
+        const int k = noteKey(n);
+        const QVector<int> kcs = kcs_.value(k);
+        /* A char with no known keycode cannot be called up; treat it as down
+         * rather than release a note on a guess. */
+        bool down = kcs.isEmpty();
+        for (int kc : kcs)
+            if (keys[kc >> 3] & (1 << (kc & 7))) { down = true; break; }
+        if (down) { up_.remove(n); continue; }
+        if (++up_[n] < kGrace) continue;
+        up_.remove(n);
+        fprintf(stderr, "piano: key '%c' up but note %d held -- released "
+                        "(release event lost)\n", char(k), n);
+        release(k);
+    }
+    for (int n = 0; n < 128; n++) if (isKeyHeld(n)) return true;
+    return false;
+}
+
+void KeyWatch::loadMap()
+{
+    kcs_.clear();
+    sinceMap_ = 0;
+    int minKC = 0, maxKC = 0, per = 0;
+    XDisplayKeycodes(dpy_, &minKC, &maxKC);
+    KeySym *map = XGetKeyboardMapping(dpy_, minKC, maxKC - minKC + 1, &per);
+    if (!map) return;
+    /* Index 0 of each group is the unshifted keysym -- the same assumption
+     * the snoop's press path makes. For the letters and digits of the note
+     * rows the keysym is the ASCII char. A char can sit on more than one
+     * keycode; any of its keycodes down counts as the key down. */
+    for (int n = 0; n < 128; n++) {
+        const int k = noteKey(n);
+        if (!k) continue;
+        const KeySym want = KeySym(k);
+        for (int kc = minKC; kc <= maxKC; kc++)
+            if (map[(kc - minKC) * per] == want)
+                kcs_[k].append(kc);
+    }
+    XFree(map);
+}
+#endif
 
 /* ------------------------------------------------------------- pitch wheel */
 
@@ -2537,6 +2714,7 @@ public:
         connect(recBtn_, &QPushButton::clicked, this, &Window::toggleRecord);
         connect(panic, &QPushButton::clicked, this, [this] {
             if (piano_) piano_->releaseAll();
+            updateKeyWatch();
             if (eng_.host()) pehost_all_notes_off(eng_.host());
             eng_.allNotesOff();
             if (midi_) midi_->send(0xB0, 123, 0);
@@ -2575,7 +2753,20 @@ public:
          * repeats arrive as plain presses, which routeKey's held-note guard
          * makes harmless. */
         connect(editor_, &EditorHost::editorKey, this,
-                [this](int k, bool down) { piano_->routeKey(k, down, false); });
+                [this](int k, bool down) {
+                    piano_->routeKey(k, down, false);
+                    updateKeyWatch();
+                });
+
+        /* The stuck-note watchdog: while any computer-key note is held, poll
+         * the physical keyboard and release a note whose key is up even
+         * though its release event never arrived -- the release having gone
+         * to a plug-in popup or another window no host-side code can watch,
+         * which is otherwise a note stuck on for good. What the watchdog is
+         * for lives at the KeyWatch class; here is only who it asks. */
+        keyWatch_.isKeyHeld = [this](int n) { return piano_->isKeyHeld(n); };
+        keyWatch_.noteKey   = [](int n) { return Piano::noteQtKey(n); };
+        keyWatch_.release   = [this](int k) { piano_->routeKey(k, false, false); };
 
         connect(piano_, &Piano::noteOn, this, [this](int n, int v) {
             if (eng_.host()) pehost_note_on(eng_.host(), n, v);
@@ -2643,6 +2834,7 @@ public:
             /* Release first: once the filter moves, a note held on the old
              * channel has its note-off filtered out and would never stop. */
             if (piano_) piano_->releaseAll();
+            updateKeyWatch();
             eng_.withHost([](pehost *h) { pehost_release_all(h); });
             eng_.allNotesOff();
             if (piano_) for (int n = 0; n < 128; n++) piano_->setHeld(n, false);
@@ -3094,6 +3286,7 @@ private slots:
          * not know is sounding: a sustain pedal, a thru'd channel, anything the
          * plugin latched itself. */
         if (piano_) piano_->releaseAll();
+        updateKeyWatch();
         if (eng_.host()) pehost_all_notes_off(eng_.host());
         eng_.allNotesOff();
 
@@ -3894,6 +4087,28 @@ private:
         return false;
     }
 
+    /* Runs the stuck-note watchdog while -- and only while -- a computer key
+     * owes a note a release. Called from the places that route note keys, and
+     * after every releaseAll: the timer starts on the first key-held note and
+     * stops when the last is gone. Off the xcb platform available() is false
+     * and the timer never starts, because only there can a foreign X window
+     * eat a release. tick() also stops the timer itself when a poll finds
+     * nothing key-held left. */
+    void updateKeyWatch()
+    {
+        if (!piano_) return;
+        if (!keyWatchTimer_) {
+            keyWatchTimer_ = new QTimer(this);
+            connect(keyWatchTimer_, &QTimer::timeout, this, [this] {
+                if (!keyWatch_.tick()) keyWatchTimer_->stop();
+            });
+        }
+        if (piano_->anyKeyHeld() && keyWatch_.available())
+            keyWatchTimer_->start(150);
+        else
+            keyWatchTimer_->stop();
+    }
+
     bool eventFilter(QObject *o, QEvent *ev) override
     {
         switch (ev->type()) {
@@ -3917,7 +4132,11 @@ private:
              * no key-up will ever reach the piano, which is exactly the case
              * that makes a note stick for good. */
             if (isTyping()) {
-                if (piano_ && pianoWasLive_) { piano_->releaseAll(); pianoWasLive_ = false; }
+                if (piano_ && pianoWasLive_) {
+                    piano_->releaseAll();
+                    updateKeyWatch();
+                    pianoWasLive_ = false;
+                }
                 break;
             }
             pianoWasLive_ = true;
@@ -3982,15 +4201,21 @@ private:
              * Not over the editor: a key-up is deliberately still delivered
              * there so a note held while reaching into the plug-in's GUI does
              * not stick, and the plug-in is entitled to see it too. */
-            if (piano_ && piano_->routeKey(k->key(), down, k->isAutoRepeat()) &&
-                !inEditor)
-                return true;
+            if (piano_) {
+                const bool note = piano_->routeKey(k->key(), down,
+                                                   k->isAutoRepeat());
+                /* A routed press may be the first key-held note (start the
+                 * watchdog), a routed release the last (stop it). */
+                updateKeyWatch();
+                if (note && !inEditor) return true;
+            }
             break;
         }
         case QEvent::WindowDeactivate:
             /* The desktop took focus away: from here no key-up will ever arrive,
              * so anything still down would stick for good. */
             if (piano_) piano_->releaseAll();
+            updateKeyWatch();
             break;
         default:
             break;
@@ -5345,6 +5570,11 @@ private:
     QSlider      *gain_;
     QProgressBar *level_;
     Piano        *piano_;
+    /* Watches the physical keyboard while a computer-key note is held, and
+     * releases the note if the key comes up without its release event ever
+     * arriving -- see the class where it is defined. */
+    KeyWatch      keyWatch_;
+    QTimer       *keyWatchTimer_ = nullptr;
     PitchWheel   *wheel_ = nullptr;
     MidiIo       *midi_ = nullptr;
     QLabel       *midiPort_, *midiSources_;
