@@ -1,11 +1,13 @@
 /* See vstdirs.h. */
 #include "vstdirs.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -185,12 +187,102 @@ int vstdirs_add(const char *os, const char *dir)
     return vstdirs_save(dirs, n) ? -1 : 1;
 }
 
+/* A shared library by extension. */
+static int module_ext(const char *name)
+{
+    size_t l = strlen(name);
+
+    if (l > 3 && !strcasecmp(name + l - 3, ".so"))    return 1;
+    if (l > 4 && !strcasecmp(name + l - 4, ".dll"))   return 1;
+    if (l > 5 && !strcasecmp(name + l - 5, ".vst3"))  return 1;
+    if (l > 6 && !strcasecmp(name + l - 6, ".dylib")) return 1;
+    return 0;
+}
+
+/* The module in one directory of a bundle: the first library, or a file
+ * named after the bundle (a macOS module carries no extension), or -- an
+ * architecture directory holds essentially just the module -- the one
+ * regular file there. */
+static int first_module(const char *dir, const char *stem, char *out, size_t n)
+{
+    DIR           *d;
+    struct dirent *de;
+    char           fallback[VSTDIRS_PATHLEN];
+
+    fallback[0] = 0;
+    if (!(d = opendir(dir))) return -1;
+    while ((de = readdir(d))) {
+        char        p[VSTDIRS_PATHLEN];
+        struct stat st;
+        if (de->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+        if (stat(p, &st) || !S_ISREG(st.st_mode)) continue;
+        if (module_ext(de->d_name) ||
+            (stem && !strncmp(de->d_name, stem, strlen(stem)))) {
+            snprintf(out, n, "%s", p);
+            closedir(d);
+            return 0;
+        }
+        if (!fallback[0]) snprintf(fallback, sizeof fallback, "%s", p);
+    }
+    closedir(d);
+    if (fallback[0]) { snprintf(out, n, "%s", fallback); return 0; }
+    return -1;
+}
+
+/* The module a bundle directory runs, for identifying it. The standard
+ * layout is Contents/<arch>-<os>/<module>; a flat bundle keeps the library
+ * directly inside. -1 when this is no bundle, or none is found -- the id
+ * then describes the directory itself, which is the same only as itself. */
+static int bundle_module(const char *path, const struct stat *st,
+                         char *out, size_t n)
+{
+    const char *slash = strrchr(path, '/');
+    const char *base  = slash ? slash + 1 : path;
+    const char *dot   = strrchr(base, '.');
+    size_t      l     = strlen(base);
+    char        stem[256], contents[VSTDIRS_PATHLEN];
+    DIR           *d;
+    struct dirent *de;
+
+    if (!S_ISDIR(st->st_mode) || !dot) return -1;
+    if (!(l > 5  && !strcasecmp(base + l - 5,  ".vst3")) &&
+        !(l > 4  && !strcasecmp(base + l - 4,  ".vst")) &&
+        !(l > 10 && !strcasecmp(base + l - 10, ".component")))
+        return -1;
+    snprintf(stem, sizeof stem, "%.*s", (int)(dot - base), base);
+    snprintf(contents, sizeof contents, "%s/Contents", path);
+    if ((d = opendir(contents))) {
+        while ((de = readdir(d))) {
+            char        sub[VSTDIRS_PATHLEN];
+            struct stat sst;
+            if (de->d_name[0] == '.') continue;
+            snprintf(sub, sizeof sub, "%s/%s", contents, de->d_name);
+            if (stat(sub, &sst) || !S_ISDIR(sst.st_mode)) continue;
+            if (!first_module(sub, stem, out, n)) { closedir(d); return 0; }
+        }
+        closedir(d);
+    }
+    /* Flat: the library beside the bundle's resources. Only a library
+     * counts here -- the top level also holds everything else. */
+    if (first_module(path, NULL, out, n) == 0 && module_ext(strrchr(out, '/') + 1))
+        return 0;
+    return -1;
+}
+
 int vstdirs_identify(const char *path, vstdirs_id *id)
 {
     struct stat st;
+    char        mod[VSTDIRS_PATHLEN];
 
     memset(id, 0, sizeof *id);
     if (!path || stat(path, &st)) return -1;
+    /* A bundle directory has no bytes of its own worth comparing -- a copy
+     * has a different inode and that is all. Identify it by the module
+     * inside instead, so a copied plug-in is recognised the way a copied
+     * file already is. */
+    if (!bundle_module(path, &st, mod, sizeof mod) && !stat(mod, &st))
+        snprintf(id->mod, sizeof id->mod, "%s", mod);
     id->dev     = (unsigned long long)st.st_dev;
     id->ino     = (unsigned long long)st.st_ino;
     id->size    = (unsigned long long)st.st_size;
@@ -201,6 +293,10 @@ int vstdirs_identify(const char *path, vstdirs_id *id)
 int vstdirs_same_plugin(const char *a, const vstdirs_id *ia,
                         const char *b, const vstdirs_id *ib)
 {
+    /* What the ids describe: the module for a bundle, the candidate itself
+     * otherwise. */
+    const char *pa = ia->mod[0] ? ia->mod : a;
+    const char *pb = ib->mod[0] ? ib->mod : b;
     FILE *fa, *fb;
     char  ba[65536], bb[65536];
     int   same = 1;
@@ -212,11 +308,11 @@ int vstdirs_same_plugin(const char *a, const vstdirs_id *ia,
      * on a collection built from one template -- hundreds of plug-ins of the
      * same size -- where comparing contents pairwise would read the lot. */
     {
-        const char *na = strrchr(a, '/'), *nb = strrchr(b, '/');
-        if (strcmp(na ? na + 1 : a, nb ? nb + 1 : b)) return 0;
+        const char *na = strrchr(pa, '/'), *nb = strrchr(pb, '/');
+        if (strcmp(na ? na + 1 : pa, nb ? nb + 1 : pb)) return 0;
     }
-    if (!(fa = fopen(a, "rb"))) return 0;
-    if (!(fb = fopen(b, "rb"))) { fclose(fa); return 0; }
+    if (!(fa = fopen(pa, "rb"))) return 0;
+    if (!(fb = fopen(pb, "rb"))) { fclose(fa); return 0; }
     for (;;) {
         size_t na = fread(ba, 1, sizeof ba, fa);
         size_t nb = fread(bb, 1, sizeof bb, fb);
