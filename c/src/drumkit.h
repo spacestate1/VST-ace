@@ -9,12 +9,14 @@
  *   pad A#2 choke 1 gain -3 file Hat open.wav
  *
  * Notes are written as the tracker writes them (C-4 is MIDI 60) or as MIDI
- * numbers. Pads in one choke group cut each other off, the way a closed
- * hi-hat stops an open one. The file name is the rest of the line, spaces and
- * all. Without a kit.txt, every .wav is a pad, sorted by name, on consecutive
- * notes from DK_BASE_NOTE up -- C-4, where a tracker's keys start -- or from
- * low enough for them all to fit, in a set of more than 68. drumkit_write_map
- * writes exactly that mapping out as a kit.txt to start from.
+ * numbers; under C-0 the octave goes negative (C--1 is MIDI 0). Pads in one
+ * choke group cut each other off, the way a closed hi-hat stops an open one.
+ * The file name is the rest of the line, spaces and all. Without a kit.txt --
+ * or with one that names not one pad -- every .wav is a pad, sorted by name,
+ * on consecutive notes from DK_BASE_NOTE up -- C-4, where a tracker's keys
+ * start -- or from low enough for them all to fit, in a set of more than 68.
+ * drumkit_write_map writes exactly that mapping out as a kit.txt to start
+ * from.
  *
  * Samples are stereo, and resampled on the fly to the engine rate, which
  * matters because sample libraries are mostly 44.1 kHz while the engines here
@@ -59,19 +61,21 @@ typedef struct {
 } dk_map;
 
 /* The set in `dir` as its kit.txt says, or every .wav by name from C-4 up.
- * Returns how many pads. */
+ * A kit.txt that names no pad -- empty, or every line rejected -- falls back
+ * to the folder scan as if it were not there. Returns how many pads. */
 int         drumkit_map_read(dk_map *m, const char *dir);
 /* NULL when it can be saved, or what is wrong with it: two pads on a note. */
 const char *drumkit_map_check(const dk_map *m);
 /* As dir/kit.txt, replacing what is there. -1 with errno set on failure. */
 int         drumkit_map_save(const dk_map *m);
 drumkit    *drumkit_load_map(const dk_map *m, double samplerate);
-int         drumkit_note_parse(const char *s);           /* "C-4" or 60; -1 */
+int         drumkit_note_parse(const char *s);           /* "C-4" or 60 ("C--1" is 0); -1 */
 void        drumkit_note_name(int note, char *buf);      /* buf >= 5 */
 
 /* Loads the kit in `dir`: as its kit.txt says, or every .wav sorted by name.
  * A line of kit.txt that cannot be read, or names a file that will not load,
- * is reported on stderr and skipped; the rest of the kit still loads.
+ * is reported on stderr and skipped; the rest of the kit still loads. A
+ * kit.txt that yields no pad at all falls back to the folder scan.
  * Returns NULL if no sample loaded. */
 drumkit *drumkit_load(const char *dir, double samplerate);
 void     drumkit_free(drumkit *k);
@@ -84,7 +88,8 @@ double      drumkit_gain_db_of(const drumkit *k, int i);
 int         drumkit_mapped(const drumkit *k);           /* loaded from kit.txt */
 
 /* Writes the kit as it is loaded to dir/kit.txt. Refuses, returning -1 with
- * errno EEXIST, rather than replace one that is there. */
+ * errno EEXIST, rather than replace one that is there. A failed write leaves
+ * no file behind. */
 int drumkit_write_map(const drumkit *k, const char *dir);
 
 void drumkit_note_on(drumkit *k, int note, int velocity);

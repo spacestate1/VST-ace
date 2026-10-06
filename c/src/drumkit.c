@@ -55,7 +55,8 @@ static const char *const k_names[12] = {
     "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-"
 };
 
-/* "C-2", "C#2" (C-4 is 60, as the tracker has it), or a MIDI number. */
+/* "C-2", "C#2" (C-4 is 60, as the tracker has it), or a MIDI number. Notes
+ * under C-0 name the negative octave outright: "C--1" is MIDI 0. */
 static int parse_note(const char *s)
 {
     int i;
@@ -64,11 +65,15 @@ static int parse_note(const char *s)
         long v = strtol(s, &end, 10);
         return *end || v < 0 || v > 127 ? -1 : (int)v;
     }
-    if (strlen(s) != 3 || !isdigit((unsigned char)s[2])) return -1;
     for (i = 0; i < 12; i++)
         if (!strncasecmp(s, k_names[i], 2)) {
-            int n = (s[2] - '0' + 1) * 12 + i;
-            return n <= 127 ? n : -1;
+            char *end;
+            long oct, n;
+            if (s[2] != '-' && !isdigit((unsigned char)s[2])) return -1;
+            oct = strtol(s + 2, &end, 10);
+            if (end == s + 2 || *end) return -1;
+            n = (oct + 1) * 12 + i;
+            return n >= 0 && n <= 127 ? (int)n : -1;
         }
     return -1;
 }
@@ -245,7 +250,9 @@ int drumkit_map_read(dk_map *m, const char *dir)
 {
     memset(m, 0, sizeof *m);
     snprintf(m->dir, sizeof m->dir, "%s", dir);
-    if (map_file(m, dir) == 0) m->mapped = 1;
+    /* A kit.txt that names not one pad -- empty, or every line rejected --
+     * stands for nothing, so the folder scan runs as if it were not there. */
+    if (map_file(m, dir) == 0 && m->n) m->mapped = 1;
     else map_dir(m, dir);
     return m->n;
 }
@@ -327,7 +334,8 @@ static int map_print(const dk_map *m, FILE *f)
                "#\n"
                "#   pad <note> [gain <dB>] [choke <group>] file <name.wav>\n"
                "#\n"
-               "# Notes as the tracker writes them: C-4 is MIDI 60. Pads in one\n"
+               "# Notes as the tracker writes them: C-4 is MIDI 60, and under\n"
+               "# C-0 the octave goes negative, C--1 to B--1. Pads in one\n"
                "# choke group cut each other off, as a closed hi-hat stops an open one.\n"
                "# A file is named from this folder, or by a path of its own.\n\n",
             base && base[1] ? base + 1 : m->dir);
@@ -403,11 +411,15 @@ int drumkit_write_map(const drumkit *k, const char *dir)
     snprintf(path, sizeof path, "%s/%s", dir, DK_MAP_FILE);
     /* O_EXCL: a kit.txt already there may be someone's hand-made map. */
     if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644)) < 0) { free(m); return -1; }
-    if (!(f = fdopen(fd, "w"))) { close(fd); free(m); return -1; }
+    /* The open has made the file, so every failure from here unlinks it: a
+     * failed write leaves nothing that would block the next try with EEXIST
+     * or load as an empty map. */
+    if (!(f = fdopen(fd, "w"))) { close(fd); unlink(path); free(m); return -1; }
     rc = map_print(m, f);
     free(m);
-    if (rc) { fclose(f); unlink(path); return -1; }
-    return fclose(f) ? -1 : 0;
+    if (fclose(f)) rc = -1;
+    if (rc) { unlink(path); return -1; }
+    return 0;
 }
 
 void drumkit_set_gain(drumkit *k, double g) { if (k) k->gain = g; }
