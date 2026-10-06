@@ -1603,6 +1603,13 @@ public:
         loadKeymap();
         watch(host, false);
     }
+    /* Undoes start()/watch() by restoring each window's recorded prior mask
+     * verbatim. Subtracting the bits we added would be wrong here: those bits
+     * were possibly selected before we arrived -- Qt shares this X connection
+     * and its xcb backend selects KeyPress|KeyRelease on every native window
+     * it creates, so a subtract strips Qt's own key selection from the host
+     * window for good, and keys typed into it never reach Qt's event stream
+     * again. */
     void stop()
     {
         if (!dpy_) return;
@@ -1611,10 +1618,14 @@ public:
             /* A plugin window can be gone by the time the editor detaches;
              * a dead id just fails the call. */
             if (XGetWindowAttributes(dpy_, w, &a))
-                XSelectInput(dpy_, w, a.your_event_mask & ~(KeyPressMask |
-                             KeyReleaseMask | SubstructureNotifyMask));
+                XSelectInput(dpy_, w, priorMasks_.value(w, a.your_event_mask &
+                             ~(KeyPressMask | KeyReleaseMask |
+                               SubstructureNotifyMask)));
         }
         watched_.clear();
+        /* Drop the record too, so a later attach starts clean instead of
+         * resurrecting masks of windows from the previous editor. */
+        priorMasks_.clear();
         dpy_ = nullptr;
         if (map_) { XFree(map_); map_ = nullptr; }
         lastTime_ = lastType_ = 0;
@@ -1637,6 +1648,7 @@ public:
         case XCB_DESTROY_NOTIFY: {
             auto *d = static_cast<xcb_destroy_notify_event_t *>(message);
             watched_.remove(d->window);
+            priorMasks_.remove(d->window);
             break;
         }
         case XCB_MAPPING_NOTIFY:
@@ -1686,7 +1698,11 @@ private:
         if (!XGetWindowAttributes(dpy_, w, &a)) return;
         /* OR into the mask already there rather than replacing it: Qt and this
          * code are the same client on one X connection, and a bare
-         * XSelectInput would clobber the mask Qt's own windows rely on. */
+         * XSelectInput would clobber the mask Qt's own windows rely on. The
+         * pre-existing mask is recorded so stop() can hand it back exactly --
+         * the bits OR-ed in may have been Qt's own before we arrived, which a
+         * subtract on teardown cannot tell from ours. */
+        priorMasks_.insert(w, a.your_event_mask);
         long bits = SubstructureNotifyMask;
         if (keys) bits |= KeyPressMask | KeyReleaseMask;
         XSelectInput(dpy_, w, a.your_event_mask | bits);
@@ -1719,6 +1735,9 @@ private:
 
     Display *dpy_ = nullptr;
     QSet<unsigned long> watched_;
+    /* The your_event_mask each watched window had before watch() OR-ed into
+     * it, so stop() can restore it verbatim instead of subtracting bits. */
+    QHash<unsigned long, long> priorMasks_;
     KeySym *map_ = nullptr;
     int minKC_ = 0, perKC_ = 0;
     /* The last key event routed, for dropping its propagated copies. */
