@@ -44,10 +44,10 @@
 #define KIT_RESCAN_S  5.0            /* how stale the list of kits may get */
 
 /* Something for the audio thread to do, at a queue tick or as soon as it can
- * (a preview, a panic): start a sample on a track, fade out what a track is
- * playing, or silence everything. */
-enum { SEV_PLAY, SEV_AUDITION, SEV_FADE, SEV_SILENCE };
-typedef struct { unsigned tick; int asap, op, kit, note, vel; } sample_ev;
+ * (a preview, a panic): start a sample on a track, fade out what one track or
+ * everything is playing, or silence everything. */
+enum { SEV_PLAY, SEV_AUDITION, SEV_FADE, SEV_FADE_TRACK, SEV_SILENCE };
+typedef struct { unsigned tick; int asap, op, kit, note, vel, track; } sample_ev;
 
 typedef struct { char name[TRK_PATH_LEN]; drumkit *dk; } kit_slot;
 
@@ -108,6 +108,9 @@ struct trk_engine {
     int             nadded;
     sample_ev       sev[SEV_MAX];
     int             nsev;
+    /* Totals of what the audio thread has applied, for trktest: hits
+     * started, control ops done. Written under smx, as they are read. */
+    unsigned long   sev_played, sev_controlled;
     drumkit_place   places[DK_MAX_KITS];  /* every set there is, as last scanned */
     int             nplaces;
     double          scanned_at;
@@ -130,17 +133,29 @@ static double mono_now(void)
 
 static int is_sampled(const trk_track *k) { return k->samples[0] != 0; }
 
-/* Work for the audio thread. Dropped when the list is full: a missed hit, or
- * a release missed -- and every sample ends by itself, so nothing is left
- * sounding for good. */
+/* Work for the audio thread. A hit is dropped when the list is full: a
+ * missed hit, and every sample ends by itself, so nothing is left sounding
+ * for good. A control op never is -- hits stop one short of the top, and a
+ * control op finding even that slot taken evicts the oldest entry: a SILENCE
+ * lost to a full list would leave a panic ringing. */
 static void push_sample(trk_engine *e, unsigned tick, int asap, int op, int kit,
-                        int note, int vel)
+                        int note, int vel, int track)
 {
+    int control = op != SEV_PLAY && op != SEV_AUDITION;
     pthread_mutex_lock(&e->smx);
-    if (e->nsev < SEV_MAX) {
+    if (e->nsev >= (control ? SEV_MAX : SEV_MAX - 1)) {
+        if (!control) { pthread_mutex_unlock(&e->smx); return; }
+        if (e->nsev == SEV_MAX) {
+            /* An older control op holds the kept slot -- hits stop short of
+             * it. A stale silence superseded by a fresh one is harmless. */
+            memmove(e->sev, e->sev + 1, sizeof e->sev[0] * (SEV_MAX - 1));
+            e->nsev--;
+        }
+    }
+    {
         sample_ev *v = &e->sev[e->nsev++];
         v->tick = tick; v->asap = asap; v->op = op; v->kit = kit;
-        v->note = note; v->vel = vel;
+        v->note = note; v->vel = vel; v->track = track;
     }
     pthread_mutex_unlock(&e->smx);
 }
@@ -152,6 +167,18 @@ static void drop_samples(trk_engine *e, int all, unsigned tick)
     pthread_mutex_lock(&e->smx);
     for (i = j = 0; i < e->nsev; i++)
         if (!all && (e->sev[i].asap || e->sev[i].tick <= tick)) e->sev[j++] = e->sev[i];
+    e->nsev = j;
+    pthread_mutex_unlock(&e->smx);
+}
+
+/* One track's pending hits gone -- a muted track's queued hits would
+ * otherwise land after its fade. */
+static void drop_track_samples(trk_engine *e, int t)
+{
+    int i, j;
+    pthread_mutex_lock(&e->smx);
+    for (i = j = 0; i < e->nsev; i++)
+        if (e->sev[i].op != SEV_PLAY || e->sev[i].track != t) e->sev[j++] = e->sev[i];
     e->nsev = j;
     pthread_mutex_unlock(&e->smx);
 }
@@ -288,10 +315,24 @@ static void schedule_row(trk_engine *e)
         /* A sample set: the note picks the pad, and a hit plays out -- a
          * drum has no note to end, and a controller has nowhere to go. */
         if (is_sampled(k)) {
-            if (!k->mute && c->note <= 127 && e->track_kit[t] >= 0) {
+            if (k->mute) {
+                /* As the MIDI branch below releases a held note: a hit
+                 * already sounding would ring out under a track that says
+                 * it is silent, and hits queued ahead of the queue would
+                 * still land after the fade. */
+                if (e->held[t] >= 0 && e->track_kit[t] >= 0) {
+                    push_sample(e, e->next_tick, 0, SEV_FADE_TRACK, e->track_kit[t],
+                                0, 0, t);
+                    e->held[t] = -1;
+                }
+                drop_track_samples(e, t);
+                continue;
+            }
+            if (c->note <= 127 && e->track_kit[t] >= 0) {
                 int vel = c->vel != TRK_EMPTY ? c->vel : k->velocity;
                 push_sample(e, e->next_tick, 0, SEV_PLAY, e->track_kit[t], c->note,
-                            vel < 1 ? 1 : vel > 127 ? 127 : vel);
+                            vel < 1 ? 1 : vel > 127 ? 127 : vel, t);
+                e->held[t] = c->note;   /* may be sounding: what a mute fades */
             }
             continue;
         }
@@ -420,18 +461,35 @@ static void apply_due(trk_engine *e, const sample_ev *v)
     int i;
     switch (v->op) {
     case SEV_PLAY:
-        if (v->kit >= 0 && v->kit < e->nkit) drumkit_note_on(e->kit[v->kit].dk, v->note, v->vel);
+        if (v->kit >= 0 && v->kit < e->nkit && v->track >= 0) {
+            drumkit *dk = e->kit[v->kit].dk;
+            int slot = drumkit_slot_at(dk, v->note);
+            /* Grouped by track, not by pad: the track's next hit fades its
+             * last, and a mute can end one track's voices -- by group --
+             * while the other tracks on the same set play on. */
+            if (slot >= 0) {
+                drumkit_play(dk, slot, 1.0, v->vel, v->track);
+                e->sev_played++;
+            }
+        }
         break;
     case SEV_AUDITION:
         drumkit_note_on(e->aud, v->note, v->vel);
+        e->sev_played++;
         break;
     case SEV_FADE:
         for (i = 0; i < e->nkit; i++) drumkit_fade_all(e->kit[i].dk);
         drumkit_fade_all(e->aud);
+        e->sev_controlled++;
+        break;
+    case SEV_FADE_TRACK:
+        if (v->kit >= 0 && v->kit < e->nkit) drumkit_release(e->kit[v->kit].dk, v->track);
+        e->sev_controlled++;
         break;
     default:
         for (i = 0; i < e->nkit; i++) drumkit_all_off(e->kit[i].dk);
         drumkit_all_off(e->aud);
+        e->sev_controlled++;
         break;
     }
 }
@@ -955,12 +1013,8 @@ int trk_audition(trk_engine *e, const char *dir, const char *file, double gain_d
     pthread_mutex_lock(&e->smx);
     old = e->aud;
     e->aud = k;
-    if (e->nsev < SEV_MAX) {
-        sample_ev *v = &e->sev[e->nsev++];
-        memset(v, 0, sizeof *v);
-        v->asap = 1; v->op = SEV_AUDITION; v->note = 60; v->vel = vel;
-    }
     pthread_mutex_unlock(&e->smx);
+    push_sample(e, 0, 1, SEV_AUDITION, -1, 60, vel, -1);
     drumkit_free(old);
     return 0;
 }
@@ -986,7 +1040,7 @@ static void stop_locked(trk_engine *e, int send_stop)
     /* Hits still to come go, and what is sounding fades, as a held MIDI
      * note is released: a long sample should stop when the song does. */
     drop_samples(e, 1, 0);
-    push_sample(e, 0, 1, SEV_FADE, -1, 0, 0);
+    push_sample(e, 0, 1, SEV_FADE, -1, 0, 0, -1);
     e->npos = 0;
 }
 
@@ -1082,6 +1136,16 @@ void trk_set_bpm(trk_engine *e, double bpm)
     pthread_mutex_lock(&e->lock);
     e->song.bpm = bpm;
     set_tempo(e, bpm);
+    /* What is queued was laid down against the old tempo: the MIDI events
+     * carry absolute ticks and the kernel rescales them, but next_tick and
+     * the sample hits pending in sev were worked out from the old one --
+     * left as they are, the sample and MIDI tracks part by up to the
+     * lookahead on every change. Take the schedule back and lay it down
+     * again, as a re-route does. */
+    if (e->playing) {
+        rewind_locked(e);
+        top_up(e);
+    }
     pthread_mutex_unlock(&e->lock);
 }
 
@@ -1109,7 +1173,7 @@ void trk_preview(trk_engine *e, int t, int note, int vel)
          * whole hit, however quickly the key comes back up. */
         if (e->track_kit[t] >= 0)
             push_sample(e, 0, 1, SEV_PLAY, e->track_kit[t], note,
-                        vel >= 1 && vel <= 127 ? vel : e->song.track[t].velocity);
+                        vel >= 1 && vel <= 127 ? vel : e->song.track[t].velocity, t);
         pthread_mutex_unlock(&e->lock);
         return;
     }
@@ -1141,7 +1205,11 @@ void trk_panic(trk_engine *e)
     /* Playing on: what is queued is taken back first, or it would sound
      * after the releases below and be held by nothing. */
     if (e->playing) rewind_locked(e);
-    push_sample(e, 0, 1, SEV_SILENCE, -1, 0, 0);         /* every sample, now */
+    /* Pending sample hits go too, the due ones included -- rewind keeps
+     * those, but panic means nothing scheduled survives, however close to
+     * its time it was: "Panic cuts it dead." */
+    drop_samples(e, 1, 0);
+    push_sample(e, 0, 1, SEV_SILENCE, -1, 0, 0, -1);     /* every sample, now */
     for (t = 0; t < TRK_TRACKS; t++) {
         release_track(e, t);
         /* And every channel the track is set to now, even one it never
@@ -1291,3 +1359,15 @@ void trk_lock(trk_engine *e)   { pthread_mutex_lock(&e->lock); }
 void trk_unlock(trk_engine *e) { pthread_mutex_unlock(&e->lock); }
 const char *trk_client_name(trk_engine *e) { return e->name; }
 const char *trk_audio_status(trk_engine *e) { return e->audio_msg; }
+
+/* Instrumentation for trktest, which has no other window onto the sample
+ * queue: how much of it is pending, and the audio thread's running totals.
+ * Not in trk.h -- the windows have no use for it. */
+void trk_sample_stats(trk_engine *e, int *pending, int *played, int *controlled)
+{
+    pthread_mutex_lock(&e->smx);
+    if (pending)    *pending = e->nsev;
+    if (played)     *played = (int)e->sev_played;
+    if (controlled) *controlled = (int)e->sev_controlled;
+    pthread_mutex_unlock(&e->smx);
+}

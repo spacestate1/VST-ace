@@ -15,6 +15,12 @@
  *     loads and one that is not is reported, a sample track sends nothing
  *     over MIDI (the audio goes to ALSA's null device here), and a set
  *     edited and saved as kit.txt is what the track then plays;
+ *   - a tempo change while playing keeps the sample and MIDI tracks
+ *     together, on the new grid;
+ *   - panic with the pending sample list full still silences, and leaves
+ *     no scheduled hit pending;
+ *   - muting a sample track fades what it is sounding and drops its queued
+ *     hits, and unmuting resumes it;
  *   - a song saved and loaded is the same song.
  * Exit status is the number of failed checks. */
 #include "trk.h"
@@ -30,6 +36,10 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+
+/* engine.c's instrumentation for this test -- not in trk.h, the windows
+ * have no use for it. */
+void trk_sample_stats(trk_engine *e, int *pending, int *played, int *controlled);
 
 #define MAXEV 4096
 
@@ -411,6 +421,114 @@ int main(void)
         memset(s->track[4].samples, 0, sizeof s->track[4].samples);
         trk_unlock(e);
         trk_route(e);
+    }
+
+    printf("tempo change while playing\n");
+    /* Pattern 2: a MIDI beat on track 1 and a sample hit on track 4 on every
+     * row, so the two must land together -- before and after a tempo change. */
+    trk_lock(e);
+    s->pattern[2].rows = 8;
+    for (i = 0; i < 8; i++) {
+        s->pattern[2].cell[i][0].note = 64;
+        s->pattern[2].cell[i][3].note = 60;
+    }
+    trk_unlock(e);
+    pthread_mutex_lock(&g_mx); mark = g_nev; pthread_mutex_unlock(&g_mx);
+    {
+        int played0, played1, non = 0, late = 0;
+        double tc, on[64], worst = 0;
+        trk_sample_stats(e, NULL, &played0, NULL);
+        trk_play(e, TRK_PLAY_PATTERN, 2, 0);
+        usleep(400000);                          /* three rows at 120 bpm */
+        tc = now_s();
+        trk_set_bpm(e, 240);                     /* rows halve to 62.5 ms */
+        usleep(900000);
+        trk_stop(e);
+        usleep(150000);
+        trk_sample_stats(e, NULL, &played1, NULL);
+        pthread_mutex_lock(&g_mx);
+        n = g_nev;
+        for (i = mark; i < n; i++) {
+            const rec *x = &g_ev[i];
+            if (x->rx == 0 && x->ch == 0 && x->note == 64 && is_on(x) && non < 64) on[non++] = x->t;
+        }
+        check(non >= 12 && non <= 24, "rows keep coming across the tempo change");
+        for (i = 1; i < non; i++) {
+            double d;
+            if (on[i - 1] < tc + 0.15) continue; /* the change itself shortens one */
+            d = fabs((on[i] - on[i - 1]) - 0.0625);
+            if (d > worst) worst = d;
+            late++;
+        }
+        check(late >= 6 && worst < 0.003, "the beat grid follows the new tempo");
+        /* One hit started per row, as one note-on per row: the two queues
+         * stay together through the change (the output's own latency lets a
+         * hit trail its note-on by up to a row). */
+        check(abs(played1 - played0 - non) <= 2, "sample and MIDI tracks stay together");
+        check(all_released(mark, n), "nothing left sounding after a tempo change");
+        pthread_mutex_unlock(&g_mx);
+    }
+    trk_set_bpm(e, 120);
+
+    printf("panic with the sample list full\n");
+    {
+        int pending = 0, tries, c0, c1;
+        trk_sample_stats(e, NULL, NULL, &c0);
+        /* Preview hits land asap -- pushed faster than the audio thread
+         * drains them, the list fills to the top. */
+        for (tries = 0; tries < 5 && pending <= 100; tries++) {
+            for (i = 0; i < 4000; i++) trk_preview(e, 3, 60, 100);
+            trk_sample_stats(e, &pending, NULL, NULL);
+        }
+        check(pending > 100, "the pending list fills");
+        trk_panic(e);
+        usleep(300000);
+        trk_sample_stats(e, &pending, NULL, &c1);
+        check(c1 > c0, "the silence lands though the list was full");
+        check(pending == 0, "panic leaves no scheduled hit pending");
+    }
+
+    printf("muting a sample track\n");
+    pthread_mutex_lock(&g_mx); mark = g_nev; pthread_mutex_unlock(&g_mx);
+    {
+        int p0, p1, p2, c0, c1;
+        /* Fast, so the lookahead holds many queued hits: at 999 bpm and 16
+         * rows a beat a row is 15 ms and about eight sit pending. */
+        trk_lock(e);
+        s->lpb = 16;
+        trk_unlock(e);
+        trk_set_bpm(e, 999);
+        trk_play(e, TRK_PLAY_PATTERN, 2, 0);
+        usleep(300000);
+        /* Read after the play's own fade has long been applied, so only the
+         * mute's can count below. */
+        trk_sample_stats(e, NULL, &p0, &c0);
+        trk_lock(e);
+        s->track[3].mute = 1;
+        trk_unlock(e);
+        usleep(120000);
+        trk_sample_stats(e, NULL, &p1, NULL);
+        /* A row or so already due may land; the rest of the queue may not. */
+        check(p1 - p0 <= 3, "the track's queued hits are dropped at the mute");
+        usleep(300000);
+        trk_sample_stats(e, NULL, &p2, &c1);
+        check(c1 > c0, "muting fades what the track is sounding");
+        check(p2 == p1, "no hit lands while the track is muted");
+        trk_lock(e);
+        s->track[3].mute = 0;
+        trk_unlock(e);
+        usleep(300000);
+        trk_sample_stats(e, NULL, &p1, NULL);
+        check(p1 > p2, "unmuted, the track's hits land again");
+        trk_stop(e);
+        usleep(150000);
+        pthread_mutex_lock(&g_mx);
+        check(all_released(mark, g_nev), "nothing left sounding after the muting");
+        pthread_mutex_unlock(&g_mx);
+        trk_lock(e);
+        s->lpb = 4;
+        trk_unlock(e);
+        trk_set_bpm(e, 120);
     }
 
     printf("edit mode\n");

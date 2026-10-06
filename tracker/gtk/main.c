@@ -70,8 +70,13 @@ static struct {
     /* The character each held key went down as, by hardware keycode: a
      * repeat is dropped, and the release ends the note the press started
      * even if Shift has changed the character since ('2' going up as '@').
-     * Keycode 0 -- a backend that gives none -- is kept by character. */
+     * Keycode 0 -- a backend that gives none -- is kept by character, with
+     * the press's keyval beside it: the release's keyval is translated with
+     * the modifiers as they are THEN, so the character alone would not find
+     * the press back, and the slot -- and the key, to the repeat guard --
+     * would stay taken for the rest of the session. */
     unsigned char down[256 + 128];
+    guint        downkv[128];          /* the keyval that opened a per-character slot */
 } U;
 
 static int gutter(void)   { return U.cw * 4; }
@@ -1080,6 +1085,25 @@ static int translate(guint kv, GdkModifierType st)
     return -1;
 }
 
+/* Two keyvals that are one key under different modifiers -- '2' and '@' --
+ * map to the same keycode. How a release finds its press when Shift changed
+ * in between and there is no hardware code to go by. */
+static int same_key(guint a, guint b)
+{
+    GdkKeymapKey *ka, *kb;
+    int na, nb, i, j, same = 0;
+    GdkDisplay *d = gtk_widget_get_display(U.area);
+    if (!gdk_display_map_keyval(d, a, &ka, &na)) return 0;
+    if (gdk_display_map_keyval(d, b, &kb, &nb)) {
+        for (i = 0; i < na && !same; i++)
+            for (j = 0; j < nb && !same; j++)
+                same = ka[i].keycode == kb[j].keycode;
+        g_free(kb);
+    }
+    g_free(ka);
+    return same;
+}
+
 static gboolean on_key(GtkEventControllerKey *k, guint kv, guint code,
                        GdkModifierType st, gpointer u)
 {
@@ -1094,6 +1118,7 @@ static gboolean on_key(GtkEventControllerKey *k, guint kv, guint code,
         unsigned slot = code > 0 && code < 256 ? code : 256 + (unsigned)key;
         if (U.down[slot]) return TRUE;
         U.down[slot] = (unsigned char)key;
+        if (slot >= 256) U.downkv[key] = kv;   /* so the release finds it back */
     }
     /* On a sample-set track, what a typed note plays -- or that it plays
      * nothing, and where the set's samples are. */
@@ -1123,16 +1148,44 @@ static gboolean on_key(GtkEventControllerKey *k, guint kv, guint code,
 static void on_key_up(GtkEventControllerKey *k, guint kv, guint code,
                       GdkModifierType st, gpointer u)
 {
-    gunichar c = gdk_keyval_to_unicode(kv);
+    gunichar c = 0;
     (void)k; (void)st; (void)u;
     if (code > 0 && code < 256) {
         if (!U.down[code]) return;
         c = U.down[code];
         U.down[code] = 0;
     } else {
-        if (c <= 0x20 || c >= 0x7f) return;
-        c = g_unichar_tolower(c);
-        U.down[256 + c] = 0;
+        /* No keycode to go by: the press this release ends is the one this
+         * keyval -- or this key -- went down as. The release's own
+         * character is no guide: Shift may have changed since the press
+         * ('2' comes back up as '@'), and looking it up by character then
+         * clears nothing and leaves the press's slot held -- the repeat
+         * guard swallowing that key for the rest of the session. */
+        int at = -1, i, lone = -1, nheld = 0;
+        gunichar uc = gdk_keyval_to_unicode(kv);
+        if (uc > 0x20 && uc < 0x7f) c = g_unichar_tolower(uc);
+        for (i = 0; i < 128; i++) if (U.down[256 + i]) { lone = i; nheld++; }
+        for (i = 0; i < 128 && at < 0; i++)
+            if (U.down[256 + i] && U.downkv[i] == kv) at = i;
+        /* Shifted since the press: another keyval, but the same key -- the
+         * keycodes the two map to agree. */
+        for (i = 0; i < 128 && at < 0; i++)
+            if (U.down[256 + i] && same_key(U.downkv[i], kv)) at = i;
+        if (at < 0 && c && U.down[256 + c]) at = c;   /* as translated */
+        /* Every match failed: with just one fallback key held, this is its
+         * release -- a backend without keymap levels can pair nothing.
+         * Ending the wrong preview is harmless; a slot left held is not. */
+        if (at < 0 && nheld == 1) at = lone;
+        if (at >= 0) {
+            c = U.down[256 + at];
+            U.down[256 + at] = 0;
+            U.downkv[at] = 0;
+        } else {
+            /* A press this window never saw: released in another window, or
+             * before focus. The release-time character, as a last resort. */
+            if (!c) return;
+            U.down[256 + c] = 0;
+        }
     }
     trk_key_release(U.e, &U.ed, (int)c);
 }
@@ -1146,6 +1199,7 @@ static void on_focus_leave(GtkEventControllerFocus *f, gpointer u)
     for (t = 0; t < TRK_TRACKS; t++)
         if (U.ed.held[t]) { trk_preview_off(U.e, t); U.ed.held[t] = 0; }
     memset(U.down, 0, sizeof U.down);
+    memset(U.downkv, 0, sizeof U.downkv);
 }
 
 /* Where a point falls: track and row, track -1 for the row numbers. */
@@ -2277,6 +2331,17 @@ static gboolean uitest(gpointer u)
         on_key(NULL, GDK_KEY_q, 0, 0, NULL);
         on_key_up(NULL, GDK_KEY_q, 0, 0, NULL);
         check(U.ed.row == row + 1, "a held key writes once, not on every repeat");
+    }
+    {   /* Pressed as '2', released after Shift went down -- the release
+         * translates differently ('@' on a us layout), and must still find
+         * and clear the press, or the repeat guard above swallows that key
+         * for the rest of the session. */
+        int row = U.ed.row;
+        on_key(NULL, GDK_KEY_2, 0, 0, NULL);
+        on_key_up(NULL, GDK_KEY_at, 0, 0, NULL);
+        on_key(NULL, GDK_KEY_2, 0, 0, NULL);
+        on_key_up(NULL, GDK_KEY_2, 0, 0, NULL);
+        check(U.ed.row == row + 2, "a release translated differently still ends the press");
     }
     pump(300);
     shot("g02-typed.png");
