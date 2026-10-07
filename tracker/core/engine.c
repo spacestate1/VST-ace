@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +54,7 @@
 #define KIT_RESCAN_S  5.0            /* how stale the list of kits may get */
 #define TRK_SINKS     8              /* in-process destinations registered at once */
 #define SINK_Q        2048           /* events scheduled for one sink and not yet delivered */
+void trk_undo_push(trk_engine *e);            /* below: the editor's snapshot, before an edit */
 #define SINK_PERIOD   128            /* frames per delivered block: 2.7 ms at 48 kHz */
 
 /* An event queued for an in-process sink, against the same tick clock the
@@ -71,7 +73,7 @@ typedef struct {
 /* Something for the audio thread to do, at a queue tick or as soon as it can
  * (a preview, a panic): start a sample on a track, fade out what one track or
  * everything is playing, or silence everything. */
-enum { SEV_PLAY, SEV_AUDITION, SEV_FADE, SEV_FADE_TRACK, SEV_SILENCE };
+enum { SEV_PLAY, SEV_AUDITION, SEV_FADE, SEV_FADE_TRACK, SEV_SILENCE, SEV_CLICK };
 typedef struct { unsigned tick; int asap, op, kit, note, vel, track; } sample_ev;
 
 typedef struct { char name[TRK_PATH_LEN]; drumkit *dk; } kit_slot;
@@ -85,18 +87,52 @@ typedef struct {
     int      held[TRK_TRACKS], held_ch[TRK_TRACKS];
 } pos_mark;
 
+/* One thing played, as it was played: kept for the take's own MIDI file. */
+typedef struct { unsigned tick; unsigned char track, kind, chan, a, b; } take_ev;
+enum { TAKE_ON, TAKE_OFF, TAKE_CC };
+#define TAKE_MAX  (1u << 20)                     /* events kept: ~16 MB, an hour of dense playing */
+
 struct trk_engine {
     snd_seq_t      *seq;
     int             client;
     char            name[64];
     int             port[TRK_TRACKS];
     int             clock_port;
+    int             in_port;         /* "Record In": MIDI in, stamped with the queue's tick */
     int             queue;
 
     pthread_mutex_t lock;            /* the song, the play state and the seq handle */
     pthread_t       thread;
     int             quit;
     trk_song        song;
+
+    /* Undo: a whole-song snapshot taken just before each edit, the last
+     * TRK_UNDO_MAX kept, the oldest dropped over that. The snapshots are
+     * the song's own ~800 KB apiece, so the cap is a memory cap too.
+     * Under lock, as the song is. */
+    trk_song       *undo[TRK_UNDO_MAX];
+    int             nundo;
+    trk_song       *undo_spare;           /* a snapshot buffer kept for the next push */
+    trk_song       *redo[TRK_UNDO_MAX];   /* what undo took off, newest last */
+    int             nredo;
+
+    /* Recording. All under lock unless said. */
+    trk_rec_opts    ropt;
+    int             recording;            /* a take is running, count-in included */
+    unsigned        rec_first_tick;       /* the first row's tick; before it, the count-in */
+    unsigned        rec_lead;             /* the count-in's length in ticks, 0 for none */
+    int             rec_track;            /* where the MIDI input goes: the cursor's */
+    int             rec_note[TRK_TRACKS]; /* recorded on and not yet released, or -1 */
+    int             rec_pat[TRK_TRACKS], rec_row[TRK_TRACKS];   /* ... and where it went */
+    take_ev        *take;
+    size_t          ntake, captake;
+    double          take_bpm;
+    pthread_t       ithread;              /* reads the MIDI input */
+    int             ion, ipipe[2];
+    char            in_name[TRK_DEST_LEN];
+    /* The metronome's one voice, rendered by the audio thread; under smx. */
+    int             click_left, click_total;
+    double          click_ph, click_freq, click_amp;
 
     /* Routing as last made. */
     int             routed[TRK_TRACKS];
@@ -409,6 +445,13 @@ static void schedule_row(trk_engine *e)
         memcpy(m->held_ch, e->held_ch, sizeof m->held_ch);
     }
 
+    /* The click, on each beat while a take runs: the bar's first beat higher. */
+    if (e->recording && e->ropt.metronome) {
+        const int lpb = trk_lpb_ok(s->lpb) ? s->lpb : 4;
+        if (e->row % lpb == 0)
+            push_sample(e, e->next_tick, 0, SEV_CLICK, -1, e->row % (lpb * 4) == 0, 0, -1);
+    }
+
     for (t = 0; t < TRK_TRACKS; t++) {
         const trk_cell *c = &pt->cell[e->row][t];
         const trk_track *k = &s->track[t];
@@ -581,6 +624,13 @@ static void apply_due(trk_engine *e, const sample_ev *v)
         if (v->kit >= 0 && v->kit < e->nkit) drumkit_release(e->kit[v->kit].dk, v->track);
         e->sev_controlled++;
         break;
+    case SEV_CLICK:
+        /* A short sine burst, higher on the bar's first beat. */
+        e->click_total = e->click_left = KIT_RATE * 25 / 1000;
+        e->click_ph = 0.0;
+        e->click_freq = v->note ? 1600.0 : 1000.0;
+        e->click_amp = v->note ? 0.45 : 0.3;
+        break;
     default:
         for (i = 0; i < e->nkit; i++) drumkit_all_off(e->kit[i].dk);
         drumkit_all_off(e->aud);
@@ -648,6 +698,13 @@ static void *audio_main(void *ud)
                 if (!dk) continue;
                 drumkit_render(dk, tmp, b - a);
                 for (n = 0; n < (b - a) * 2; n++) mix[a * 2 + n] += tmp[n];
+            }
+            for (n = a; n < b && e->click_left > 0; n++, e->click_left--) {
+                const double env = (double)e->click_left / (double)e->click_total;
+                const double v = e->click_amp * env * sin(e->click_ph);
+                e->click_ph += 6.283185307179586 * e->click_freq / KIT_RATE;
+                mix[n * 2] += v;
+                mix[n * 2 + 1] += v;
             }
             a = b;
         }
@@ -1037,12 +1094,14 @@ void trk_remove_sink(trk_engine *e, int id)
     if (!e->sink[id].used) { pthread_mutex_unlock(&e->lock); return; }
     /* Tracks playing it go back to their windows: what they have sounding is
      * released first, while the sink is still there to hear it, and what was
-     * scheduled for it is taken back so nothing lands after the move. */
+     * scheduled for it is taken back so nothing lands after the move. The
+     * sink name saved in the song goes with the routing. */
     if (e->playing) rewind_locked(e);
     for (t = 0; t < TRK_TRACKS; t++)
         if (e->track_sink[t] == id) {
             release_track(e, t);
             e->track_sink[t] = -1;
+            memset(e->song.track[t].sink, 0, sizeof e->song.track[t].sink);
         }
     /* The releases just queued are only releases once they are delivered:
      * wait out the delivery thread's next passes before the slot is let go.
@@ -1073,11 +1132,25 @@ void trk_remove_sink(trk_engine *e, int id)
 
 void trk_sink_rename(trk_engine *e, int id, const char *name)
 {
+    int t;
     if (!e || id < 0 || id >= TRK_SINKS || !name) return;
+    pthread_mutex_lock(&e->lock);
     pthread_mutex_lock(&e->dmx);
-    if (e->sink[id].used)
+    if (e->sink[id].used) {
+        char nm[TRK_DEST_LEN];           /* bounced: the sink and the song are both e's */
         snprintf(e->sink[id].name, sizeof e->sink[id].name, "%s", name);
+        snprintf(nm, sizeof nm, "%s", e->sink[id].name);
+        /* Tracks playing it saved the old name: keep what a song saves
+         * naming the sink they actually play. Cleared whole first, as in
+         * trk_route_sink. */
+        for (t = 0; t < TRK_TRACKS; t++)
+            if (e->track_sink[t] == id) {
+                memset(e->song.track[t].sink, 0, sizeof e->song.track[t].sink);
+                strcpy(e->song.track[t].sink, nm);
+            }
+    }
     pthread_mutex_unlock(&e->dmx);
+    pthread_mutex_unlock(&e->lock);
 }
 
 void trk_route_sink(trk_engine *e, int t, int id)
@@ -1096,10 +1169,33 @@ void trk_route_sink(trk_engine *e, int t, int id)
             e->routed[t] = 0;
         }
         e->track_sink[t] = id;
+        /* The pick is part of the song now -- saved with the track, so the
+         * shell opens the same synth again when the song is opened. Routing
+         * back clears it. Cleared whole, so a reloaded song matches the live
+         * one byte for byte, as the front-ends' dirty check compares it. */
+        pthread_mutex_lock(&e->dmx);
+        memset(e->song.track[t].sink, 0, sizeof e->song.track[t].sink);
+        if (id >= 0) {
+            char nm[TRK_DEST_LEN];       /* bounced: the sink and the song are both e's */
+            snprintf(nm, sizeof nm, "%s", e->sink[id].name);
+            strcpy(e->song.track[t].sink, nm);
+        }
+        pthread_mutex_unlock(&e->dmx);
         if (e->playing) top_up(e);
     }
     pthread_mutex_unlock(&e->lock);
     if (id < 0) trk_route(e);            /* back to the window: reconnect it */
+}
+
+/* A song is about to take the place of the one in the engine: the tracks
+ * routed to in-process synths go back to their windows first, so the routing
+ * the engine holds and the sink names the new song carries agree. A shell
+ * routes them to synths again from those names. */
+void trk_unroute_sinks(trk_engine *e)
+{
+    int t;
+    for (t = 0; t < TRK_TRACKS; t++)
+        if (trk_sink_of(e, t) >= 0) trk_route_sink(e, t, -1);
 }
 
 int trk_sink_of(trk_engine *e, int t)
@@ -1309,6 +1405,7 @@ int trk_audition(trk_engine *e, const char *dir, const char *file, double gain_d
 static void stop_locked(trk_engine *e, int send_stop)
 {
     int t;
+    e->recording = 0;                   /* a take ends with the playing; its events stay to be saved */
     if (e->playing) {
         e->playing = 0;
         unschedule(e);
@@ -1331,12 +1428,13 @@ static void stop_locked(trk_engine *e, int send_stop)
     e->npos = 0;
 }
 
-void trk_play(trk_engine *e, int mode, int order, int row)
+/* Playing from a row, the first row `lead` ticks after the usual start: a
+ * count-in's worth of quiet in front of it. The caller holds the lock. */
+static void play_locked(trk_engine *e, int mode, int order, int row, unsigned lead)
 {
     snd_seq_event_t ev;
     int beats_rows = 0, i, sixteenths;
 
-    pthread_mutex_lock(&e->lock);
     stop_locked(e, 0);
     e->mode = mode == TRK_PLAY_SONG ? TRK_PLAY_SONG : TRK_PLAY_PATTERN;
     if (e->mode == TRK_PLAY_SONG) {
@@ -1362,7 +1460,7 @@ void trk_play(trk_engine *e, int mode, int order, int row)
      * time has passed goes out late -- the first beat out of step with
      * every one after it. */
     e->next_tick = (unsigned)(START_S * (e->song.bpm > 0 ? e->song.bpm : 120.0)
-                              / 60.0 * TRK_PPQ);
+                              / 60.0 * TRK_PPQ) + lead;
     e->next_clock = e->clock_base = e->next_tick;
 
     /* Where the song is, then go -- so a synced arpeggiator starts on the
@@ -1380,6 +1478,12 @@ void trk_play(trk_engine *e, int mode, int order, int row)
     snd_seq_drain_output(e->seq);
     e->playing = 1;
     top_up(e);
+}
+
+void trk_play(trk_engine *e, int mode, int order, int row)
+{
+    pthread_mutex_lock(&e->lock);
+    play_locked(e, mode, order, row, 0);
     pthread_mutex_unlock(&e->lock);
 }
 
@@ -1420,6 +1524,7 @@ void trk_position(trk_engine *e, int *order, int *pattern, int *row)
 
 void trk_set_bpm(trk_engine *e, double bpm)
 {
+    if (bpm != bpm) return;                 /* NaN is no tempo: the one there stays */
     if (bpm < 20.0) bpm = 20.0;
     if (bpm > 999.0) bpm = 999.0;
     pthread_mutex_lock(&e->lock);
@@ -1481,6 +1586,475 @@ void trk_preview_off(trk_engine *e, int t)
     pthread_mutex_unlock(&e->lock);
 }
 
+
+/* ------------------------------------------------------------- recording */
+
+static unsigned row_ticks(trk_engine *e)
+{
+    return (unsigned)(TRK_PPQ / (trk_lpb_ok(e->song.lpb) ? e->song.lpb : 4));
+}
+
+/* The row after (o, p, r) as the schedule would take it. */
+static void next_row_of(trk_engine *e, int o, int p, int r, int *no, int *np, int *nr)
+{
+    const trk_song *s = &e->song;
+    *no = o; *np = p; *nr = r + 1;
+    if (*nr >= s->pattern[p].rows) {
+        *nr = 0;
+        if (e->mode == TRK_PLAY_SONG) {
+            *no = o + 1 >= s->norder ? 0 : o + 1;
+            *np = s->order[*no];
+        }
+    }
+}
+
+/* Where a tick falls: the row scheduled at or before it, and, when the
+ * quantizing is to the nearest and the tick is in its second half, the row
+ * after. A tick just ahead of the take's first row -- a note struck a hair
+ * early on the downbeat -- takes that row; one further ahead (the count-in)
+ * is nobody's. Returns 0 when the tick has no row. */
+static int rec_place(trk_engine *e, unsigned tick, int *po, int *pp, int *pr)
+{
+    const unsigned rt = row_ticks(e);
+    unsigned i, n = e->npos < POS_RING ? e->npos : POS_RING;
+    const pos_mark *m = NULL;
+    int o, p, r;
+
+    for (i = 1; i <= n; i++) {
+        const pos_mark *c = &e->pos[(e->npos - i) % POS_RING];
+        if (c->tick <= tick) { m = c; break; }
+    }
+    if (!m) {
+        /* Ahead of every row we know: only the first row of this run, and
+         * only a little ahead of it, and only if rounding is allowed. */
+        if (n == 0 || e->npos > POS_RING) return 0;
+        m = &e->pos[(e->npos - n) % POS_RING];
+        if (e->ropt.quantize != TRK_REC_NEAREST || m->tick - tick > rt / 2) return 0;
+        *po = m->order; *pp = m->pattern; *pr = m->row;
+        return 1;
+    }
+    o = m->order; p = m->pattern; r = m->row;
+    if (e->ropt.quantize == TRK_REC_NEAREST && (tick - m->tick) * 2 >= rt)
+        next_row_of(e, o, p, r, &o, &p, &r);
+    if (p < 0 || p >= TRK_PATTERNS) return 0;
+    if (r >= e->song.pattern[p].rows) r = e->song.pattern[p].rows - 1;
+    *po = o; *pp = p; *pr = r;
+    return 1;
+}
+
+static void take_add(trk_engine *e, unsigned tick, int track, int kind, int chan, int a, int b)
+{
+    take_ev *v;
+    if (e->ntake >= TAKE_MAX) return;                 /* a flood from another client stops here */
+    if (e->ntake == e->captake) {
+        size_t c = e->captake ? e->captake * 2 : 1024;
+        take_ev *g = realloc(e->take, c * sizeof *g);
+        if (!g) return;                               /* a full take is dropped, never the key */
+        e->take = g; e->captake = c;
+    }
+    v = &e->take[e->ntake++];
+    v->tick = tick > e->rec_first_tick ? tick - e->rec_first_tick : 0;
+    v->track = (unsigned char)track; v->kind = (unsigned char)kind;
+    v->chan = (unsigned char)chan; v->a = (unsigned char)a; v->b = (unsigned char)b;
+}
+
+/* The keyboard's offset as ticks: positive places a note earlier. */
+static long offset_ticks(trk_engine *e)
+{
+    double bpm = e->bpm_now > 0 ? e->bpm_now : 120.0;
+    return (long)(e->ropt.offset_ms * bpm / 60000.0 * TRK_PPQ);
+}
+
+/* The note-on, note-off and controller of a take, each at its tick. Lock held. */
+static void record_on(trk_engine *e, unsigned tick, int t, int note, int vel)
+{
+    int o, p, r;
+    trk_cell *c;
+    if (!e->recording || !e->playing || t < 0 || t >= TRK_TRACKS || note < 0 || note > 127) return;
+    if (!rec_place(e, tick, &o, &p, &r)) return;
+    take_add(e, tick, t, TAKE_ON, e->song.track[t].channel & 15, note, vel >= 1 && vel <= 127 ? vel : e->song.track[t].velocity);
+    c = &e->song.pattern[p].cell[r][t];
+    c->note = (uint8_t)note;
+    c->vel = vel >= 1 && vel <= 127 ? (uint8_t)vel : TRK_EMPTY;
+    e->rec_note[t] = note; e->rec_pat[t] = p; e->rec_row[t] = r;
+}
+
+/* Release. The === goes to the row the release falls on -- or the next, if
+ * that is the note's own row: a note is at least a row long. Never over a
+ * cell with something in it. */
+static void record_off(trk_engine *e, unsigned tick, int t, int note)
+{
+    int o, p, r;
+    if (!e->recording || !e->playing || t < 0 || t >= TRK_TRACKS || note < 0 || note > 127) return;
+    if (e->rec_note[t] != note) return;
+    e->rec_note[t] = -1;
+    take_add(e, tick, t, TAKE_OFF, e->song.track[t].channel & 15, note, 0);
+    if (!e->ropt.note_off || !rec_place(e, tick, &o, &p, &r)) return;
+    if (p == e->rec_pat[t] && r == e->rec_row[t]) next_row_of(e, o, p, r, &o, &p, &r);
+    if (e->song.pattern[p].cell[r][t].note == TRK_EMPTY) {
+        e->song.pattern[p].cell[r][t].note = TRK_NOTE_OFF;
+        e->song.pattern[p].cell[r][t].vel = TRK_EMPTY;
+    }
+}
+
+static void record_cc(trk_engine *e, unsigned tick, int t, int cc, int val)
+{
+    int o, p, r;
+    if (!e->recording || !e->playing || t < 0 || t >= TRK_TRACKS || cc < 0 || cc > 127 || val < 0 || val > 127) return;
+    if (!rec_place(e, tick, &o, &p, &r)) return;
+    take_add(e, tick, t, TAKE_CC, e->song.track[t].channel & 15, cc, val);
+    e->song.pattern[p].cell[r][t].cc = (uint8_t)cc;
+    e->song.pattern[p].cell[r][t].val = (uint8_t)val;
+}
+
+/* The editor's, with the lock held (a key's). */
+int trk_recording_locked(trk_engine *e) { return e->recording && e->playing; }
+
+void trk_record_note_locked(trk_engine *e, int track, int note, int vel, int on)
+{
+    long t = (long)queue_tick(e) - offset_ticks(e);
+    unsigned tick = t > 0 ? (unsigned)t : 0;
+    if (on) record_on(e, tick, track, note, vel);
+    else record_off(e, tick, track, note);
+}
+
+/* A "stop here" typed while recording: === on the row now playing. */
+void trk_record_stopnote_locked(trk_engine *e, int track)
+{
+    int o, p, r;
+    unsigned tick = queue_tick(e);
+    if (track < 0 || track >= TRK_TRACKS) return;
+    if (!e->recording || !e->playing || !rec_place(e, tick, &o, &p, &r)) return;
+    e->song.pattern[p].cell[r][track].note = TRK_NOTE_OFF;
+    e->song.pattern[p].cell[r][track].vel = TRK_EMPTY;
+    e->rec_note[track] = -1;
+}
+
+void trk_record_note(trk_engine *e, int track, int note, int vel, int on)
+{
+    pthread_mutex_lock(&e->lock);
+    trk_record_note_locked(e, track, note, vel, on);
+    pthread_mutex_unlock(&e->lock);
+}
+
+void trk_record_defaults(trk_rec_opts *o)
+{
+    o->count_in = 1;
+    o->metronome = 1;
+    o->quantize = TRK_REC_NEAREST;
+    o->note_off = 1;
+    o->monitor = 1;
+    o->offset_ms = 0;
+}
+
+static void clamp_opts(trk_rec_opts *o)
+{
+    if (o->count_in < 0) o->count_in = 0;
+    if (o->count_in > 4) o->count_in = 4;
+    o->metronome = o->metronome != 0;
+    o->quantize = o->quantize == TRK_REC_ROW ? TRK_REC_ROW : TRK_REC_NEAREST;
+    o->note_off = o->note_off != 0;
+    o->monitor = o->monitor != 0;
+    if (o->offset_ms < -200) o->offset_ms = -200;
+    if (o->offset_ms > 200) o->offset_ms = 200;
+}
+
+void trk_record_set(trk_engine *e, const trk_rec_opts *o)
+{
+    trk_rec_opts c = *o;
+    clamp_opts(&c);
+    pthread_mutex_lock(&e->lock);
+    e->ropt = c;
+    pthread_mutex_unlock(&e->lock);
+}
+
+void trk_record_get(trk_engine *e, trk_rec_opts *o)
+{
+    pthread_mutex_lock(&e->lock);
+    *o = e->ropt;
+    pthread_mutex_unlock(&e->lock);
+}
+
+void trk_record_arm(trk_engine *e, int track)
+{
+    if (track < 0 || track >= TRK_TRACKS) return;
+    pthread_mutex_lock(&e->lock);
+    e->rec_track = track;
+    pthread_mutex_unlock(&e->lock);
+}
+
+int trk_recording(trk_engine *e)
+{
+    int r = 0;
+    pthread_mutex_lock(&e->lock);
+    if (e->recording && e->playing) r = e->rec_lead && queue_tick(e) < e->rec_first_tick ? 2 : 1;
+    pthread_mutex_unlock(&e->lock);
+    return r;
+}
+
+void trk_record_start(trk_engine *e, int mode, int order, int row)
+{
+    int t;
+    unsigned lead, beat0;
+    /* The click needs the audio output; asked for before the lock, as the
+     * sample sets ask. A machine without one still records, silently. */
+    if (e->ropt.metronome) audio_open(e);
+    pthread_mutex_lock(&e->lock);
+    lead = (unsigned)e->ropt.count_in * 4u * TRK_PPQ;
+    play_locked(e, mode, order, row, lead);
+    e->rec_first_tick = e->clock_base;          /* play_locked left the first row's tick here */
+    e->rec_lead = lead;
+    e->take_bpm = e->song.bpm;
+    e->ntake = 0;
+    for (t = 0; t < TRK_TRACKS; t++) e->rec_note[t] = -1;
+    trk_undo_push(e);                           /* one undo takes the whole take back out */
+    e->recording = 1;
+    /* The count-in's clicks: one a beat, ahead of the first row. */
+    beat0 = e->rec_first_tick - lead;
+    if (e->ropt.metronome) {
+        for (t = 0; t < e->ropt.count_in * 4; t++)
+            push_sample(e, beat0 + (unsigned)t * TRK_PPQ, 0, SEV_CLICK, -1, t % 4 == 0, 0, -1);
+        /* The rows already laid down when recording went on -- the first and
+         * the few the lookahead took with it -- were scheduled without their
+         * clicks: the ones on a beat get theirs here. */
+        {
+            const int lpb = trk_lpb_ok(e->song.lpb) ? e->song.lpb : 4;
+            unsigned k;
+            for (k = 0; k < e->npos && k < POS_RING; k++) {
+                const pos_mark *m = &e->pos[k];
+                if (m->row % lpb == 0)
+                    push_sample(e, m->tick, 0, SEV_CLICK, -1, m->row % (lpb * 4) == 0, 0, -1);
+            }
+        }
+    }
+    pthread_mutex_unlock(&e->lock);
+}
+
+/* ------------------------------------------------------------ the input */
+
+/* One event off the input port. A MIDI event carries the queue's tick the
+ * kernel stamped it with; one without (the queue was not running) is
+ * stamped now. */
+static void input_event(trk_engine *e, const snd_seq_event_t *ev)
+{
+    int on = 0, off = 0, cc = 0, note = 0, vel = 0, ccn = 0, ccv = 0, t, monitor;
+    unsigned tick;
+
+    switch (ev->type) {
+    case SND_SEQ_EVENT_NOTEON:
+        note = ev->data.note.note; vel = ev->data.note.velocity;
+        /* The kernel passes another client's bytes through as they are: a
+         * note is 0..127 only if this checks it. */
+        if (note > 127 || vel > 127) return;
+        if (vel > 0) on = 1; else off = 1;
+        break;
+    case SND_SEQ_EVENT_NOTEOFF:
+        note = ev->data.note.note; off = 1;
+        if (note > 127) return;
+        break;
+    case SND_SEQ_EVENT_CONTROLLER:
+        ccn = ev->data.control.param; ccv = ev->data.control.value; cc = 1;
+        if (ccn < 0 || ccn > 127 || ccv < 0 || ccv > 127) return;
+        break;
+    default:
+        return;
+    }
+    pthread_mutex_lock(&e->lock);
+    if ((ev->flags & SND_SEQ_TIME_STAMP_MASK) == SND_SEQ_TIME_STAMP_TICK &&
+        (ev->flags & SND_SEQ_TIME_MODE_MASK) == SND_SEQ_TIME_MODE_ABS)
+        tick = ev->time.tick;
+    else
+        tick = queue_tick(e);
+    t = e->rec_track;
+    monitor = e->ropt.monitor;
+    if (on) record_on(e, tick, t, note, vel);
+    else if (off) record_off(e, tick, t, note);
+    else if (cc) record_cc(e, tick, t, ccn, ccv);
+    pthread_mutex_unlock(&e->lock);
+    /* Heard as it is played, on the cursor's track. */
+    if (monitor && on) trk_preview(e, t, note, vel);
+    else if (monitor && off) trk_preview_off(e, t);
+}
+
+static void *input_main(void *ud)
+{
+    trk_engine *e = ud;
+    int n = snd_seq_poll_descriptors_count(e->seq, POLLIN);
+    struct pollfd *fds = calloc((size_t)n + 1, sizeof *fds);
+    if (!fds) return NULL;
+    snd_seq_poll_descriptors(e->seq, fds, (unsigned)n, POLLIN);
+    fds[n].fd = e->ipipe[0];
+    fds[n].events = POLLIN;
+    for (;;) {
+        int i, any = 0;
+        if (poll(fds, (nfds_t)n + 1, -1) < 0) continue;
+        if (fds[n].revents & POLLIN) break;
+        for (i = 0; i < n; i++) {
+            /* The sequencer going away reports an error and never a readable
+             * fd again: looping back to poll would spin on it at full speed.
+             * Recording from MIDI ends here; the keyboard goes on. */
+            if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                fprintf(stderr, "tracker: the MIDI input is gone -- recording from MIDI has stopped\n");
+                free(fds);
+                return NULL;
+            }
+            if (fds[i].revents & POLLIN) any = 1;
+        }
+        if (!any) continue;
+        while (snd_seq_event_input_pending(e->seq, 1) > 0) {
+            snd_seq_event_t *ev = NULL;
+            if (snd_seq_event_input(e->seq, &ev) < 0 || !ev) break;
+            input_event(e, ev);
+        }
+    }
+    free(fds);
+    return NULL;
+}
+
+int trk_input_list(trk_engine *e, char names[][TRK_DEST_LEN], int max)
+{
+    snd_seq_client_info_t *ci;
+    snd_seq_port_info_t *pi;
+    const unsigned need = SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ;
+    int n = 0;
+    snd_seq_client_info_alloca(&ci);
+    snd_seq_port_info_alloca(&pi);
+    snd_seq_client_info_set_client(ci, -1);
+    while (n < max && snd_seq_query_next_client(e->seq, ci) >= 0) {
+        const int c = snd_seq_client_info_get_client(ci);
+        if (c == e->client || c == SND_SEQ_CLIENT_SYSTEM) continue;
+        snd_seq_port_info_set_client(pi, c);
+        snd_seq_port_info_set_port(pi, -1);
+        while (n < max && snd_seq_query_next_port(e->seq, pi) >= 0) {
+            if ((snd_seq_port_info_get_capability(pi) & need) != need) continue;
+            if (snd_seq_port_info_get_capability(pi) & SND_SEQ_PORT_CAP_NO_EXPORT) continue;
+            snprintf(names[n++], TRK_DEST_LEN, "%s: %s", snd_seq_client_info_get_name(ci),
+                     snd_seq_port_info_get_name(pi));
+        }
+    }
+    return n;
+}
+
+int trk_input_connect(trk_engine *e, const char *name)
+{
+    snd_seq_client_info_t *ci;
+    snd_seq_port_info_t *pi;
+    const unsigned need = SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ;
+    int r = -1;
+
+    pthread_mutex_lock(&e->lock);
+    /* Whatever was connected lets go first. */
+    {
+        snd_seq_query_subscribe_t *q;
+        snd_seq_addr_t me = { (unsigned char)e->client, (unsigned char)e->in_port };
+        snd_seq_query_subscribe_alloca(&q);
+        snd_seq_query_subscribe_set_root(q, &me);
+        snd_seq_query_subscribe_set_type(q, SND_SEQ_QUERY_SUBS_WRITE);
+        int guard;
+        snd_seq_query_subscribe_set_index(q, 0);
+        for (guard = 0; guard < 64 && snd_seq_query_port_subscribers(e->seq, q) >= 0; guard++) {
+            const snd_seq_addr_t *from = snd_seq_query_subscribe_get_addr(q);
+            snd_seq_disconnect_from(e->seq, e->in_port, from->client, from->port);
+            snd_seq_query_subscribe_set_index(q, 0);
+        }
+    }
+    e->in_name[0] = 0;
+    if (!name || !*name) { pthread_mutex_unlock(&e->lock); return 0; }
+
+    snd_seq_client_info_alloca(&ci);
+    snd_seq_port_info_alloca(&pi);
+    snd_seq_client_info_set_client(ci, -1);
+    while (r < 0 && snd_seq_query_next_client(e->seq, ci) >= 0) {
+        const int c = snd_seq_client_info_get_client(ci);
+        if (c == e->client) continue;
+        snd_seq_port_info_set_client(pi, c);
+        snd_seq_port_info_set_port(pi, -1);
+        while (snd_seq_query_next_port(e->seq, pi) >= 0) {
+            char full[TRK_DEST_LEN];
+            if ((snd_seq_port_info_get_capability(pi) & need) != need) continue;
+            snprintf(full, sizeof full, "%s: %s", snd_seq_client_info_get_name(ci), snd_seq_port_info_get_name(pi));
+            if (strcmp(full, name)) continue;
+            if (snd_seq_connect_from(e->seq, e->in_port, c, snd_seq_port_info_get_port(pi)) >= 0) {
+                snprintf(e->in_name, sizeof e->in_name, "%s", name);
+                r = 0;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&e->lock);
+    return r;
+}
+
+const char *trk_input_connected(trk_engine *e) { return e->in_name; }
+
+/* ------------------------------------------------------------- the take */
+
+int trk_take_events(trk_engine *e)
+{
+    int n;
+    pthread_mutex_lock(&e->lock);
+    n = (int)e->ntake;
+    pthread_mutex_unlock(&e->lock);
+    return n;
+}
+
+int trk_take_export_midi(trk_engine *e, const char *path, char *err, size_t errn)
+{
+    trk_mev *ev[TRK_TRACKS] = { 0 };
+    int n[TRK_TRACKS] = { 0 }, t, rc = -1;
+    const char *names[TRK_TRACKS];
+    take_ev *copy = NULL;
+    size_t nt, i;
+    double bpm;
+    unsigned end = 0;
+    char nm[TRK_TRACKS][TRK_NAME_LEN];
+
+    pthread_mutex_lock(&e->lock);
+    nt = e->ntake;
+    bpm = e->take_bpm > 0 ? e->take_bpm : 120.0;
+    if (nt && (copy = malloc(nt * sizeof *copy))) memcpy(copy, e->take, nt * sizeof *copy);
+    for (t = 0; t < TRK_TRACKS; t++) snprintf(nm[t], sizeof nm[t], "%s", e->song.track[t].name);
+    pthread_mutex_unlock(&e->lock);
+    if (!nt) { snprintf(err, errn, "nothing has been recorded"); return -1; }
+    if (!copy) { snprintf(err, errn, "out of memory"); return -1; }
+
+    for (t = 0; t < TRK_TRACKS; t++) {
+        int open_at[128], k, cnt = 0;
+        trk_mev *list = NULL;
+        size_t cap = 0;
+        for (k = 0; k < 128; k++) open_at[k] = -1;
+        for (i = 0; i < nt; i++) {
+            const take_ev *v = &copy[i];
+            if (v->track != t || v->a > 127) continue;
+            if (v->tick > end) end = v->tick;
+            if (cnt + 1 > (int)cap) {
+                trk_mev *g;
+                cap = cap ? cap * 2 : 128;
+                if (!(g = realloc(list, cap * sizeof *g))) { free(list); snprintf(err, errn, "out of memory"); goto done; }
+                list = g;
+            }
+            if (v->kind == TAKE_ON) {
+                if (open_at[v->a] >= 0) list[open_at[v->a]].end = v->tick;       /* retriggered */
+                list[cnt] = (trk_mev){ 0, v->tick, v->tick, v->chan, v->a, v->b };
+                open_at[v->a] = cnt++;
+            } else if (v->kind == TAKE_OFF) {
+                if (open_at[v->a] >= 0) { list[open_at[v->a]].end = v->tick; open_at[v->a] = -1; }
+            } else {
+                list[cnt++] = (trk_mev){ 1, v->tick, v->tick, v->chan, v->a, v->b };
+            }
+        }
+        /* A key still down at the end of the take is held to its last tick. */
+        for (k = 0; k < 128; k++) if (open_at[k] >= 0) list[open_at[k]].end = end > list[open_at[k]].start ? end : list[open_at[k]].start + 1;
+        ev[t] = list; n[t] = cnt;
+        names[t] = nm[t];
+    }
+    rc = trk_midi_write(path, bpm, end + TRK_PPQ / 4, TRK_TRACKS, names, (trk_mev *const *)ev, n, err, errn);
+done:
+    for (t = 0; t < TRK_TRACKS; t++) free(ev[t]);
+    free(copy);
+    return rc;
+}
+
 void trk_panic(trk_engine *e)
 {
     int t;
@@ -1516,7 +2090,7 @@ trk_engine *trk_open(char *err, size_t errn)
     if (!e) { snprintf(err, errn, "out of memory"); return NULL; }
     /* Blocking: with the output pool full, a write waits rather than failing,
      * and a failed write can be the note-off. */
-    if (snd_seq_open(&e->seq, "default", SND_SEQ_OPEN_OUTPUT, 0) < 0) {
+    if (snd_seq_open(&e->seq, "default", SND_SEQ_OPEN_DUPLEX, 0) < 0) {
         snprintf(err, errn, "the ALSA sequencer is not available (is snd-seq loaded?)");
         free(e);
         return NULL;
@@ -1554,9 +2128,21 @@ trk_engine *trk_open(char *err, size_t errn)
         e->port[t] = snd_seq_create_simple_port(e->seq, pn, SND_SEQ_PORT_CAP_READ,
                          SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
         e->held[t] = e->prev_note[t] = -1;
+        if (e->port[t] < 0) {
+            snprintf(err, errn, "could not create a sequencer port (%s)", snd_strerror(e->port[t]));
+            snd_seq_close(e->seq);
+            free(e);
+            return NULL;
+        }
     }
     e->clock_port = snd_seq_create_simple_port(e->seq, "Clock", SND_SEQ_PORT_CAP_READ,
                         SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+    if (e->clock_port < 0) {
+        snprintf(err, errn, "could not create the clock port (%s)", snd_strerror(e->clock_port));
+        snd_seq_close(e->seq);
+        free(e);
+        return NULL;
+    }
 
     e->queue = snd_seq_alloc_named_queue(e->seq, "tracker");
     if (e->queue < 0) {
@@ -1565,6 +2151,25 @@ trk_engine *trk_open(char *err, size_t errn)
         free(e);
         return NULL;
     }
+    /* The MIDI input: writable and subscribable by anything, and every event
+     * that arrives is stamped with this queue's tick by the kernel -- the
+     * time it came in by the clock the song plays on, whatever the input
+     * thread's own scheduling does. */
+    e->in_port = snd_seq_create_simple_port(e->seq, "Record In",
+                     SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
+                     SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+    if (e->in_port >= 0) {
+        snd_seq_port_info_t *pi;
+        snd_seq_port_info_alloca(&pi);
+        if (snd_seq_get_port_info(e->seq, e->in_port, pi) >= 0) {
+            snd_seq_port_info_set_timestamping(pi, 1);
+            snd_seq_port_info_set_timestamp_real(pi, 0);
+            snd_seq_port_info_set_timestamp_queue(pi, e->queue);
+            snd_seq_set_port_info(e->seq, e->in_port, pi);
+        }
+    }
+    trk_record_defaults(&e->ropt);
+    e->rec_first_tick = 0;
     /* The queue's default timer is the system one, which steps at the
      * kernel's HZ -- 4 ms at 250 -- and every note lands on one of those
      * steps. A beat a few milliseconds out is audible against a drum
@@ -1607,6 +2212,12 @@ trk_engine *trk_open(char *err, size_t errn)
         free(e);
         return NULL;
     }
+    /* The input thread: without it the tracker records from the keyboard
+     * only, which is not an error. */
+    if (e->in_port >= 0 && pipe(e->ipipe) == 0) {
+        if (pthread_create(&e->ithread, NULL, input_main, e) == 0) e->ion = 1;
+        else { close(e->ipipe[0]); close(e->ipipe[1]); }
+    }
     return e;
 }
 
@@ -1619,6 +2230,13 @@ void trk_close(trk_engine *e)
     e->quit = 1;
     pthread_mutex_unlock(&e->lock);
     pthread_join(e->thread, NULL);
+    if (e->ion) {
+        char b = 1;
+        if (write(e->ipipe[1], &b, 1) < 0) { /* the thread polls on; closing the seq below ends it */ }
+        pthread_join(e->ithread, NULL);
+        close(e->ipipe[0]); close(e->ipipe[1]);
+    }
+    free(e->take);
     if (e->delivery_on) {
         /* As the ALSA side drains at stop: a few passes for the delivery
          * thread to hand the sinks their stop and releases before it goes. */
@@ -1637,6 +2255,9 @@ void trk_close(trk_engine *e)
     }
     for (i = 0; i < e->nkit; i++) drumkit_free(e->kit[i].dk);
     drumkit_free(e->aud);
+    while (e->nundo) free(e->undo[--e->nundo]);
+    while (e->nredo) free(e->redo[--e->nredo]);
+    free(e->undo_spare);
     pthread_mutex_destroy(&e->smx);
     pthread_mutex_destroy(&e->dmx);
     snd_seq_free_queue(e->seq, e->queue);
@@ -1648,6 +2269,139 @@ void trk_close(trk_engine *e)
 trk_song *trk_song_of(trk_engine *e) { return &e->song; }
 void trk_lock(trk_engine *e)   { pthread_mutex_lock(&e->lock); }
 void trk_unlock(trk_engine *e) { pthread_mutex_unlock(&e->lock); }
+
+/* Routing is runtime state, which a snapshot does not hold: the sink names
+ * in a restored song are put back to what the tracks are playing now, as
+ * trk_route_sink writes them. */
+static void sync_sink_names(trk_engine *e)
+{
+    int t;
+    pthread_mutex_lock(&e->dmx);
+    for (t = 0; t < TRK_TRACKS; t++) {
+        memset(e->song.track[t].sink, 0, sizeof e->song.track[t].sink);
+        if (e->track_sink[t] >= 0) {
+            char nm[TRK_DEST_LEN];
+            snprintf(nm, sizeof nm, "%s", e->sink[e->track_sink[t]].name);
+            strcpy(e->song.track[t].sink, nm);
+        }
+    }
+    pthread_mutex_unlock(&e->dmx);
+}
+
+static void redo_clear(trk_engine *e)
+{
+    while (e->nredo) free(e->redo[--e->nredo]);
+}
+
+/* A buffer for one more snapshot: the spare, or a new one. */
+static trk_song *snap_buf(trk_engine *e)
+{
+    trk_song *b = e->undo_spare;
+    e->undo_spare = NULL;
+    return b ? b : malloc(sizeof *b);
+}
+
+/* A snapshot of the song as it is onto one of the two stacks. Buffers are
+ * recycled, not freed and allocated again: at 800 KB each malloc is an mmap,
+ * and the page faults of a fresh one cost more under the engine lock than
+ * the copy does. A full stack gives up its oldest, which becomes the new
+ * snapshot's buffer. A malloc failure drops the entry, never the edit. */
+static void stack_push(trk_engine *e, trk_song **stack, int *n)
+{
+    trk_song *snap;
+    if (*n == TRK_UNDO_MAX) {
+        if (e->undo_spare) free(e->undo_spare);
+        e->undo_spare = stack[0];
+        memmove(stack, stack + 1, sizeof stack[0] * (TRK_UNDO_MAX - 1));
+        (*n)--;
+    }
+    snap = snap_buf(e);
+    if (!snap) return;
+    *snap = e->song;
+    stack[(*n)++] = snap;
+}
+
+/* A snapshot back into the song -- except what is live rather than edited:
+ * the tempo (the queue is running at it), the rows per beat and the volume.
+ * An undo of a cell edit that also took the tempo back to what it was then
+ * would show one tempo while the queue played another. */
+static void restore_keeping_live(trk_engine *e, const trk_song *snap)
+{
+    const double bpm = e->song.bpm;
+    const int lpb = e->song.lpb, volume = e->song.volume;
+    e->song = *snap;
+    e->song.bpm = bpm;
+    e->song.lpb = lpb;
+    e->song.volume = volume;
+}
+
+/* The buffer a restored snapshot came in goes back as the spare. */
+static void give_back(trk_engine *e, trk_song *snap)
+{
+    if (e->undo_spare) free(snap);
+    else e->undo_spare = snap;
+}
+
+/* The editor's edit points call this just before they change the song,
+ * under the lock. A new edit is a new branch: what could be redone is gone.
+ * Not in trk.h -- only the core snapshots. */
+void trk_undo_push(trk_engine *e)
+{
+    redo_clear(e);
+    stack_push(e, e->undo, &e->nundo);
+}
+
+/* The caller holds the lock -- trk_key's undo case does already. */
+int trk_undo_locked(trk_engine *e)
+{
+    trk_song *snap;
+    if (!e->nundo) return 0;
+    snap = e->undo[--e->nundo];
+    stack_push(e, e->redo, &e->nredo);        /* the song as it is, to redo to */
+    restore_keeping_live(e, snap);
+    give_back(e, snap);
+    sync_sink_names(e);
+    return 1;
+}
+
+int trk_redo_locked(trk_engine *e)
+{
+    trk_song *snap;
+    if (!e->nredo) return 0;
+    snap = e->redo[--e->nredo];
+    stack_push(e, e->undo, &e->nundo);        /* not trk_undo_push: that would clear the redo */
+    restore_keeping_live(e, snap);
+    give_back(e, snap);
+    sync_sink_names(e);
+    return 1;
+}
+
+int trk_undo(trk_engine *e)
+{
+    int r;
+    trk_lock(e);
+    r = trk_undo_locked(e);
+    trk_unlock(e);
+    return r;
+}
+
+int trk_redo(trk_engine *e)
+{
+    int r;
+    trk_lock(e);
+    r = trk_redo_locked(e);
+    trk_unlock(e);
+    return r;
+}
+
+/* Forget the history -- a song just started or loaded has none. */
+void trk_undo_clear(trk_engine *e)
+{
+    trk_lock(e);
+    while (e->nundo) free(e->undo[--e->nundo]);
+    redo_clear(e);
+    trk_unlock(e);
+}
 const char *trk_client_name(trk_engine *e) { return e->name; }
 const char *trk_audio_status(trk_engine *e) { return e->audio_msg; }
 

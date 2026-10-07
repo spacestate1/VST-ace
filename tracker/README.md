@@ -37,9 +37,10 @@ engine's delivery thread turns each event's queue tick into wall-clock time
 exactly as the queue's timestamps mean it and hands the tab a block at a
 time, and the tab's audio engine places every event on its own sample. One
 destination per track, as with a window: the track's window names wait in the
-song, and routing back reconnects them. Sink routing is runtime state -- a
-saved song carries no sink -- and a routed tab closing sends the track back
-to its window.
+song, and routing back reconnects them. The pick is saved with the song, as a
+`sink` line naming the tab, and the shells open that synth again -- at its
+default program; sounds are the session file's business -- when the song is
+opened. A routed tab closing sends the track back to its window.
 
 ## Samples
 
@@ -60,7 +61,8 @@ or that it plays none, and where the set's samples are -- and a note in the
 grid that its track's set has no sample on is drawn red. Each track keeps
 its own octave -- the "oct" box under its name, or `[ ]` and the toolbar's
 octave for the cursor's track -- so a drum track can sit at 4 while a bass
-track plays at 2.
+track plays at 2. Changing a track's octave moves the notes already typed
+on it with it, clamped at C-0 and G-9, so a part keeps sounding as it did.
 
 **Samples** (beside File) has the rest:
 
@@ -123,17 +125,27 @@ box beside **follow** shows edit mode; with it off the cursor's row is grey.
 | `z s x d c v g b h n j m` | notes, one octave |
 | `q 2 w 3 e r 5 t 6 y 7 u i 9 o 0 p` | the octave above |
 | `1` | note-off |
-| `` ` `` | edit mode on / off: off, note keys only play -- try keys out without writing anything |
 | Delete or `.` | clear the field, advance |
 | Insert / Backspace | push the track down / pull it up a row |
 | `0-9 a-f` | hex, in the velocity and controller fields |
-| `[` `]` | octave down / up, for the cursor's track -- each track has its own ("oct" under its name) |
+| `[` `]` | octave down / up, for the cursor's track -- each track has its own ("oct" under its name), and its notes move with it |
 | Shift + arrows | select a block of cells; a drag selects too, and the row numbers select whole rows |
 | Ctrl+C, Ctrl+X, Ctrl+V | copy, cut, paste -- paste puts the block down at the cursor, in any part |
 | Ctrl+A, Delete | select the whole pattern; clear what is selected |
+| Ctrl+Z | undo -- the last 50 edits: entry, clearing, insert/backspace, octave moves, cut/paste/clear, parts-list changes |
 | `-` `=` | previous / next pattern |
 | F5, F6, F8 | play song, play pattern, stop |
-| Space | play pattern / stop |
+| Space (or `` ` ``) | edit mode on / off -- off, the note keys only play and nothing is written |
+| Enter | play pattern / stop |
+| F7 | record -- see Recording below |
+| Shift+Enter | play the pattern from the cursor row |
+| Escape or F12 | panic |
+| keypad `*` `/` | octave up / down (as `[` `]`); with Ctrl, the edit step |
+| Ctrl+Y or Ctrl+Shift+Z | redo |
+| Ctrl+Shift+V | paste mix: only what the clipboard has, over what is there |
+| Ctrl+F1 / F2, Ctrl+F3 / F4 | transpose the selection (or the cell) down / up a semitone, an octave |
+| Shift+PgUp / PgDn | select a page of rows |
+| Alt+F9, Alt+F10, Alt+Shift+F9 | mute, solo, unmute all -- the cursor's track |
 | Escape | panic: release every note everywhere |
 
 A cell is `note vel cc val`: a note (or `===` to release), its velocity in
@@ -166,13 +178,18 @@ Plain text, one fact per line, written only for what is set:
     track 1 client pestudio
     track 1 port pestudio in
     track 2 samples drum-singles
+    track 3 sink this window: FB-7999   an in-process synth, as the shell named it
     order 0 0 1 1                     the parts, in order
     pattern 0 name Verse
     pattern 0 rows 16
     cell 0 0 1 C-2 .. .. ..          pattern row track note vel cc val
 
 Tracks name their window by ALSA client and port name, not number, so a song
-finds its windows again however many times they have been reopened.
+finds its windows again however many times they have been reopened. A track
+routed to an in-process synth saves the tab's name the same way, and the
+studio shells open that synth again -- at its default program; sounds are the
+session file's business -- when the song is opened. A file carrying `sink`
+lines is refused by builds from before they were first saved.
 
 ## Tests
 
@@ -186,5 +203,31 @@ timing, the clock, routing, that the ports refuse other subscribers, and that
 stop, panic and quitting leave nothing sounding -- plus the in-process sinks:
 delivery timing against the sink's own clock, clock and transport once per
 sink, preview, moving a track between a window and a sink, and a sink removed
-mid-song. The UI tests drive each window with real key events and save a
+mid-song -- and that a sink pick is written into the song file and parses
+back. The UI tests drive each window with real key events and save a
 picture at each step.
+
+## Recording
+
+**F7** (or the **● Rec** button) plays from the cursor row and writes what you
+play into the pattern, on the cursor's track. Press it again, or Stop, to end
+the take. The notes come from the computer keyboard, or from a MIDI keyboard
+connected to the tracker's **Record In** port (pick one under **Rec…**, or
+`aconnect <keyboard> "tracker:Record In"`).
+
+Timing is by the clock the song plays on. A MIDI event is stamped with the
+sequencer's own tick the moment it arrives, so where it lands does not depend
+on when a thread got to it; a computer key is stamped when the window hands it
+over, and the **keyboard timing offset** moves those earlier or later to make
+up for a slow keyboard or screen. A note goes to the row it falls on -- with
+**Nearest row**, a note struck a little before a row rounds up to it; **Row
+that is sounding** leaves it where it was struck. A key let go writes `===`
+on its row (a note is at least a row long), unless that is turned off.
+
+**Rec…** also sets a count-in (0-4 bars) and a metronome click on every beat
+(the bar's first beat higher), played through the tracker's own audio output;
+a machine without one records silently. One undo removes the whole take.
+
+**File > Export recorded take as MIDI** writes the take as it was played, at
+its exact times -- not rounded onto rows -- as a standard MIDI file at the
+song's tempo.

@@ -30,6 +30,7 @@ extern "C" {
 #define TRK_ROWS_MAX   256
 #define TRK_PATTERNS   100
 #define TRK_ORDER_MAX  256
+#define TRK_UNDO_MAX   50
 #define TRK_NAME_LEN   32
 #define TRK_DEST_LEN   128
 #define TRK_PATH_LEN   512
@@ -62,6 +63,12 @@ typedef struct {
      */
     char client[TRK_DEST_LEN];
     char port[TRK_DEST_LEN];
+    /* Or an in-process destination -- a synth this same program hosts --
+     * named as the shell named it when the song was saved. trk_route_sink
+     * keeps it current, and the song file carries it so the shell can open
+     * that synth again when the song is opened. Empty: the track plays its
+     * ALSA window. */
+    char sink[TRK_DEST_LEN];
     /* Or a sample set, which the tracker plays itself: a name from
      * trk_list_sample_sets ("drum-singles"), or a folder's path. The note
      * picks the sample, as the set's kit.txt says or from C-4 up. Set, it
@@ -92,6 +99,34 @@ int  trk_lpb_ok(int lpb);                        /* divides the queue's PPQ */
 int  trk_pattern_used(const trk_song *s, int p); /* any cell set */
 /* A part as a list shows it: its name, or "Part 3" for pattern 3. buf >= TRK_NAME_LEN + 8. */
 const char *trk_part_label(const trk_song *s, int p, char *buf);
+
+/* ---------------------------------------------------------- MIDI export */
+
+#define TRK_MIDI_PPQ 960             /* ticks per quarter note in everything below */
+
+/* One thing a track plays, placed in ticks from the song's start. A note is
+ * [start, end); a controller has no length (end == start). */
+typedef struct {
+    int      is_cc;
+    unsigned start, end;
+    int      chan;                   /* 0..15 */
+    int      a, b;                   /* note: pitch, velocity; cc: number, value */
+} trk_mev;
+
+/* What track t plays when the order list is played through once, as the
+ * engine would send it: one note per track, ended by the next note or a
+ * note-off (or at the song's end); a track playing a sample set plays each
+ * hit out for one row, as the engine does. Events are sorted by start.
+ * *out is malloc'd -- free() it; NULL with *n == 0 when the track plays
+ * nothing. Returns 0, or -1 on a bad track or no memory. Mute is not
+ * applied: the caller decides whether a muted track is wanted. */
+int      trk_song_events(const trk_song *s, int t, trk_mev **out, int *n);
+unsigned trk_song_ticks(const trk_song *s);      /* the order list's length */
+
+/* The song as a type 1 standard MIDI file: a tempo track, then one track per
+ * track that plays anything and is not muted, named as the song names it,
+ * on its own channel. 0, or -1 with a reason in err. */
+int      trk_song_export_midi(const trk_song *s, const char *path, char *err, size_t errn);
 
 /* "C-4", "C#4", "===" for a note-off, "..." for empty. buf >= 4. */
 const char *trk_note_name(int note, char *buf);
@@ -166,7 +201,10 @@ int  trk_audition(trk_engine *e, const char *dir, const char *file, double gain_
  * sequencer. A track routed to a sink plays there INSTEAD of its ALSA window
  * -- one destination per track, as with a window or a sample set; the window
  * its client/port name stays in the song, and routing back (-1) reconnects
- * it. Sink routing is runtime state: a saved song carries no sink.
+ * it. The pick is saved state: trk_route_sink copies the sink's name into
+ * the track's `sink` field and the song file carries it, so the shell opens
+ * the same synth again when the song is opened. Routing back, removing the
+ * sink and renaming it all keep the field true.
  *
  * Timing mirrors the sample sets: the scheduling thread queues every event
  * against the queue's tick clock, and a delivery thread turns the tick into
@@ -202,6 +240,10 @@ void trk_sink_rename(trk_engine *e, int id, const char *name);
 void trk_route_sink(trk_engine *e, int t, int id);
 /* The sink track t plays, or -1. */
 int  trk_sink_of(trk_engine *e, int t);
+/* Before a song replaces the one in the engine (open, new): every track routed
+ * to a sink goes back to its window, so the routing and the new song's sink
+ * names agree. */
+void trk_unroute_sinks(trk_engine *e);
 /* A sink's name, copied out; -1 when there is no such sink. */
 int  trk_sink_name(trk_engine *e, int id, char *buf, size_t n);
 
@@ -243,6 +285,65 @@ int  trk_order_move(trk_engine *e, int at, int by);
  * of that pattern, named "<its name> 2". */
 int  trk_pattern_new(trk_engine *e, int from);
 
+/* -------------------------------------------------------------- recording */
+
+/* Playing a take in: notes from the computer keyboard and from a MIDI input
+ * are written into the pattern as it plays, on the cursor's track, each on
+ * the row its time falls on.
+ *
+ * Timing: a MIDI event is stamped by the sequencer with the queue's own tick
+ * when it arrives, so it is placed by the clock the song is played on, not by
+ * when a thread got round to it. A computer key is stamped when the window
+ * hands it over (plus the offset below). Either way the tick is looked up
+ * against the rows as scheduled -- tempo changes and loops included. */
+enum { TRK_REC_NEAREST = 0,         /* a note goes to the nearest row: a little early rounds up */
+       TRK_REC_ROW };               /* ... or stays on the row that is sounding */
+
+typedef struct {
+    int count_in;                   /* bars of click before the take starts, 0..4 */
+    int metronome;                  /* a click on every beat while recording */
+    int quantize;                   /* TRK_REC_NEAREST or TRK_REC_ROW */
+    int note_off;                   /* write === where a key is let go */
+    int monitor;                    /* the MIDI input sounds the cursor's track as it is played */
+    int offset_ms;                  /* computer keys: placed this much earlier, -200..200 */
+} trk_rec_opts;
+
+void trk_record_defaults(trk_rec_opts *o);
+void trk_record_set(trk_engine *e, const trk_rec_opts *o);     /* clamps what is out of range */
+void trk_record_get(trk_engine *e, trk_rec_opts *o);
+
+/* As trk_play, with recording on after the count-in. The song's own undo
+ * step is taken first, so one undo removes the whole take. */
+void trk_record_start(trk_engine *e, int mode, int order, int row);
+/* 0: not recording; 1: recording; 2: counting in. Any stop ends it. */
+int  trk_recording(trk_engine *e);
+/* The track the MIDI input plays and records on -- the cursor's. */
+void trk_record_arm(trk_engine *e, int track);
+/* A note from the computer keyboard (vel < 1: the track's own velocity), as
+ * the window's keys deliver it. Ignored unless recording. */
+void trk_record_note(trk_engine *e, int track, int note, int vel, int on);
+
+/* MIDI inputs: the readable ports other programs offer, as "client: port".
+ * Connecting one routes it to this tracker's "Record In" port; "" lets go.
+ * Anything can also be connected with aconnect to that port. */
+int  trk_input_list(trk_engine *e, char names[][TRK_DEST_LEN], int max);
+int  trk_input_connect(trk_engine *e, const char *name);
+const char *trk_input_connected(trk_engine *e);
+
+/* The last take as it was played, before any quantizing: events with their
+ * exact ticks. Written as a standard MIDI file (type 1, the song's tempo,
+ * one track per track that was played). Returns the number of events kept,
+ * 0 when there is no take. */
+int  trk_take_events(trk_engine *e);
+int  trk_take_export_midi(trk_engine *e, const char *path, char *err, size_t errn);
+
+/* Writes tracks of events as a type 1 standard MIDI file: a tempo track and
+ * one track per entry of names/ev/n that has events, each ended at end_tick.
+ * trk_song_export_midi and the take export are both this. */
+int  trk_midi_write(const char *path, double bpm, unsigned end_tick, int ntracks,
+                    const char *const *names, trk_mev *const *ev, const int *n,
+                    char *err, size_t errn);
+
 /* ---------------------------------------------------------------- editor */
 
 /* Cursor and entry state. Kept here rather than in the windows so that what
@@ -263,6 +364,7 @@ typedef struct {
     int sel;                         /* a block is selected */
     int sel_r0, sel_t0, sel_r1, sel_t1;
     int held[TRK_TRACKS];            /* key char previewing on each track, or 0 */
+    int held_note[TRK_TRACKS];       /* ... and the note it is playing */
 } trk_editor;
 
 void trk_editor_init(trk_editor *ed);
@@ -278,7 +380,19 @@ enum {
     /* Selecting -- the arrows with Shift: the block from where it started to
      * the cursor -- and the clipboard. */
     TRK_K_SEL_UP, TRK_K_SEL_DOWN, TRK_K_SEL_LEFT, TRK_K_SEL_RIGHT,
-    TRK_K_SEL_ALL, TRK_K_COPY, TRK_K_CUT, TRK_K_PASTE
+    TRK_K_SEL_ALL, TRK_K_COPY, TRK_K_CUT, TRK_K_PASTE, TRK_K_UNDO,
+    /* From Furnace's defaults, where they fit: redo; transpose the selection
+     * (or the cell) a semitone or an octave; mute, solo and unmute the
+     * cursor's track; play the pattern from the cursor row; select a page at
+     * a time; paste over only what the clipboard has; the edit step. */
+    TRK_K_REDO,
+    TRK_K_TRANSPOSE_DOWN, TRK_K_TRANSPOSE_UP, TRK_K_TRANSPOSE_OCT_DOWN, TRK_K_TRANSPOSE_OCT_UP,
+    TRK_K_MUTE_TRACK, TRK_K_SOLO_TRACK, TRK_K_UNMUTE_ALL,
+    TRK_K_PLAY_FROM_CURSOR,
+    TRK_K_SEL_PGUP, TRK_K_SEL_PGDN,
+    TRK_K_PASTE_MIX,
+    TRK_K_STEP_UP, TRK_K_STEP_DOWN,
+    TRK_K_RECORD                     /* record: play, and write what is played in */
 };
 
 /* Feed one key press. Returns non-zero when the screen should be redrawn.
@@ -306,9 +420,32 @@ int  trk_paste(trk_engine *e, trk_editor *ed);
 int  trk_clear_block(trk_engine *e, trk_editor *ed);
 int  trk_clipboard(int *rows, int *tracks);
 
+/* Undo the last edit: cell entry and clearing, insert and backspace, an
+ * octave move, cut, paste and clear, the parts list, a pattern copy. Each
+ * edit point snapshots the whole song just before it changes, the last
+ * TRK_UNDO_MAX snapshots kept; transport, playback and the track header
+ * boxes are not edits. Returns 1 when something was restored. */
+int  trk_undo(trk_engine *e);
+/* Put back what the last undo took off. Any new edit clears what could be
+ * redone. Returns 1 when something was restored. */
+int  trk_redo(trk_engine *e);
+/* Forget the history -- a song just started or loaded has none. */
+void trk_undo_clear(trk_engine *e);
+
 /* The note a computer-keyboard key plays at an octave, or -1. Two rows,
  * tracker fashion: zsxdcvgbhnjm is one octave, q2w3er5t6y7u the next. */
 int  trk_key_note(int key, int octave);
+
+/* A track's octave, 0..9 (clamped). Changing it moves the track's existing
+ * notes with it, in every pattern, clamping at C-0 (12) and G-9 (127), so
+ * what was typed keeps sounding as it did. Returns the notes moved, -1 on
+ * a bad track. A track playing a sample set is left alone: its notes are
+ * the pads, and an octave move would only put them on other samples. */
+int  trk_track_set_octave(trk_engine *e, int track, int octave);
+
+/* Help > Columns: what each part of the screen is and what it changes, as
+ * plain text for a dialog in a fixed-width font. Both windows show it. */
+const char *trk_columns_help(void);
 
 /* The cheat sheet for track t, lines of at most `width` characters: for a
  * track playing a sample set, each sample with its note and the key that

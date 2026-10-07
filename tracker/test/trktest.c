@@ -21,6 +21,9 @@
  *     no scheduled hit pending;
  *   - muting a sample track fades what it is sounding and drops its queued
  *     hits, and unmuting resumes it;
+ *   - a track routed to a sink saves the sink's name: the pick is mirrored
+ *     into the song, survives a save and load, a hand-written sink line
+ *     parses, and routing back or removing the sink clears it;
  *   - a song saved and loaded is the same song.
  * Exit status is the number of failed checks. */
 #include "trk.h"
@@ -159,6 +162,45 @@ static int all_released(int from, int to)
     return bad == 0;
 }
 
+/* ------------------------------------------------------------ recording */
+
+/* Wait until the song is on row r, then `extra_ms` further into it. */
+static int wait_row(trk_engine *e, int r, int extra_ms)
+{
+    int i, o, p, row;
+    for (i = 0; i < 4000; i++) {
+        trk_position(e, &o, &p, &row);
+        if (row == r) {
+            struct timespec ts = { 0, extra_ms * 1000000L };
+            nanosleep(&ts, NULL);
+            return 1;
+        }
+        { struct timespec ts = { 0, 1000000L }; nanosleep(&ts, NULL); }
+    }
+    return 0;
+}
+
+static int find_client(snd_seq_t *s, const char *name)
+{
+    snd_seq_client_info_t *ci;
+    snd_seq_client_info_alloca(&ci);
+    snd_seq_client_info_set_client(ci, -1);
+    while (snd_seq_query_next_client(s, ci) >= 0)
+        if (!strcmp(snd_seq_client_info_get_name(ci), name)) return snd_seq_client_info_get_client(ci);
+    return -1;
+}
+
+static int find_port(snd_seq_t *s, int client, const char *name)
+{
+    snd_seq_port_info_t *pi;
+    snd_seq_port_info_alloca(&pi);
+    snd_seq_port_info_set_client(pi, client);
+    snd_seq_port_info_set_port(pi, -1);
+    while (snd_seq_query_next_port(s, pi) >= 0)
+        if (!strcmp(snd_seq_port_info_get_name(pi), name)) return snd_seq_port_info_get_port(pi);
+    return -1;
+}
+
 int main(void)
 {
     char err[256], path[] = "/tmp/trktest-XXXXXX";
@@ -237,7 +279,9 @@ int main(void)
                 if (snd_seq_connect_from(ra, 0, cl, snd_seq_port_info_get_port(pi)) == 0) refused = 0;
             }
         }
-        check(seen == TRK_TRACKS + 1 && refused,
+        /* Eight tracks, the clock, and Record In -- which is the one port meant to be
+         * written to, and is not readable at all. */
+        check(seen == TRK_TRACKS + 2 && refused,
               "another program cannot subscribe to the tracker's ports");
     }
     missing = trk_route(e);
@@ -391,6 +435,10 @@ int main(void)
         trk_route_sink(e, 1, id);
         check(trk_sink_of(e, 0) == id && trk_routed(e, 0), "track 1 routed to the sink");
         check(trk_route(e) == 0, "a sink-routed track is not a missing window");
+        trk_lock(e);
+        check(!strcmp(s->track[0].sink, "test sink") && !strcmp(s->track[1].sink, "test sink"),
+              "the pick is mirrored into the song, to be saved");
+        trk_unlock(e);
 
         pthread_mutex_lock(&g_mx); mark_r = g_nev; pthread_mutex_unlock(&g_mx);
         pthread_mutex_lock(&g_smx); mark_s = g_snev; pthread_mutex_unlock(&g_smx);
@@ -492,6 +540,9 @@ int main(void)
         trk_route_sink(e, 0, -1);
         trk_route_sink(e, 1, -1);
         check(trk_sink_of(e, 0) == -1, "routed back to the window");
+        trk_lock(e);
+        check(!s->track[0].sink[0] && !s->track[1].sink[0], "routing back clears the saved name");
+        trk_unlock(e);
         pthread_mutex_lock(&g_mx); mark_r = g_nev; pthread_mutex_unlock(&g_mx);
         pthread_mutex_lock(&g_smx); mark_s = g_snev; pthread_mutex_unlock(&g_smx);
         trk_play(e, TRK_PLAY_PATTERN, 0, 0);
@@ -519,6 +570,9 @@ int main(void)
         trk_remove_sink(e, id);
         check(trk_sink_of(e, 0) == -1, "removing the sink returns the track to its window");
         check(trk_sink_name(e, id, nm, sizeof nm) == -1, "the sink is gone");
+        trk_lock(e);
+        check(!s->track[0].sink[0], "removing the sink clears the saved name too");
+        trk_unlock(e);
         usleep(700000);
         trk_stop(e);
         usleep(250000);
@@ -538,6 +592,50 @@ int main(void)
         check(non >= 1, "the window takes over mid-song");
         pthread_mutex_unlock(&g_mx);
         check(trk_route(e) == 0, "routing is whole again afterwards");
+    }
+
+    printf("sink names in the song file\n");
+    {
+        char  spath[] = "/tmp/trktest-sink-XXXXXX";
+        trk_song *rt = malloc(sizeof *rt);
+        int   sid, fd = mkstemp(spath);
+        if (fd >= 0) close(fd);
+        sid = trk_add_sink(e, "lead synth", sink_cb, NULL);
+        trk_route_sink(e, 2, sid);
+        trk_lock(e);
+        n = trk_song_save(s, spath, err, sizeof err);
+        trk_unlock(e);
+        check(n == 0, "saved with a track on a sink");
+        if (n) printf("        %s\n", err);
+        n = trk_song_load(rt, spath, err, sizeof err);
+        check(n == 0, "loaded back");
+        if (n) printf("        %s\n", err);
+        check(n == 0 && !strcmp(rt->track[2].sink, "lead synth"),
+              "the sink name survives the round trip");
+        check(n == 0 && rt->track[1].sink[0] == 0, "a track on its window saves no sink");
+        trk_route_sink(e, 2, -1);
+        trk_remove_sink(e, sid);
+        free(rt);
+        unlink(spath);
+    }
+    {
+        char hpath[] = "/tmp/trktest-hand-XXXXXX";
+        int  fd = mkstemp(hpath);
+        FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+        trk_song *hw = malloc(sizeof *hw);
+        check(f != NULL, "a hand-written song file to parse");
+        if (f) {
+            fputs("tracker 1\nbpm 120\nlpb 4\n"
+                  "track 2 sink this window: FB-7999 bass\n"
+                  "order 0\n", f);
+            fclose(f);
+            n = trk_song_load(hw, hpath, err, sizeof err);
+            check(n == 0 && !strcmp(hw->track[1].sink, "this window: FB-7999 bass"),
+                  "a sink line with spaces in the name parses");
+            if (n) printf("        %s\n", err);
+        }
+        free(hw);
+        unlink(hpath);
     }
 
     printf("restart while playing, then close while playing\n");
@@ -765,7 +863,7 @@ int main(void)
         trk_preview_off(e, 1);
         check(trk_cheat_sheet(e, 3, 4, 20, sheet, sizeof sheet) == 2 && !strncmp(sheet, "z C-4 a\n", 8),
               "a sample track's cheat sheet lists its samples and keys");
-        check(trk_cheat_sheet(e, 0, 4, 30, sheet, sizeof sheet) == 5 && strstr(sheet, "C-4..B-4"),
+        check(trk_cheat_sheet(e, 0, 4, 30, sheet, sizeof sheet) == 6 && strstr(sheet, "C-4..B-4"),
               "a window track's lists the note keys");
     }
 
@@ -877,6 +975,624 @@ int main(void)
         trk_unlock(e);
         free(back);
         unlink(path);
+    }
+
+    printf("octave moves the notes\n");
+    {
+        trk_editor ed;
+        trk_song *snap = malloc(sizeof *snap);
+        int i, r, pf, want, moved;
+        trk_editor_init(&ed);
+        trk_lock(e);
+        *snap = *s;
+        for (pf = 0; pf < TRK_PATTERNS; pf++) {
+            int listed = 0;
+            for (i = 0; i < s->norder; i++) if (s->order[i] == pf) listed = 1;
+            if (!listed) break;
+        }
+        check(pf < TRK_PATTERNS, "a pattern no part lists, to move notes in");
+        /* Track 2 is at octave 3 from the edit checks above. */
+        s->pattern[0].cell[0][1].note = 60;
+        s->pattern[0].cell[1][1].note = TRK_NOTE_OFF;
+        s->pattern[0].cell[2][1].note = TRK_EMPTY;   /* a controller-only row */
+        s->pattern[0].cell[2][1].cc = 7;
+        s->pattern[0].cell[2][1].val = 100;
+        s->pattern[0].cell[3][1].note = 120;         /* past G-9 when raised */
+        s->pattern[0].cell[4][1].note = 13;          /* under C-0 when lowered */
+        s->pattern[0].cell[0][0].note = 60;          /* another track's note */
+        s->pattern[0].cell[0][2].note = 60;          /* a twin, for the direct call */
+        s->pattern[pf].cell[0][1].note = 60;
+        trk_unlock(e);
+        ed.track = 1;
+        trk_key(e, &ed, TRK_K_OCT_UP);
+        trk_lock(e);
+        check(s->track[1].octave == 4 &&
+              s->pattern[0].cell[0][1].note == 72 && s->pattern[pf].cell[0][1].note == 72,
+              "] moves the track's notes +12, in a partless pattern too");
+        check(s->pattern[0].cell[3][1].note == 127, "a note past G-9 clamps at it");
+        check(s->pattern[0].cell[1][1].note == TRK_NOTE_OFF &&
+              s->pattern[0].cell[2][1].note == TRK_EMPTY &&
+              s->pattern[0].cell[2][1].cc == 7 && s->pattern[0].cell[2][1].val == 100,
+              "note-off, empty and controller-only cells stay");
+        check(s->pattern[0].cell[0][0].note == 60 && s->pattern[0].cell[0][2].note == 60,
+              "the other tracks keep their notes");
+        trk_unlock(e);
+        trk_key(e, &ed, TRK_K_OCT_DOWN);
+        trk_lock(e);
+        check(s->track[1].octave == 3 &&
+              s->pattern[0].cell[0][1].note == 60 && s->pattern[pf].cell[0][1].note == 60,
+              "[ moves them back");
+        trk_unlock(e);
+        trk_key(e, &ed, TRK_K_OCT_DOWN);
+        trk_lock(e);
+        check(s->pattern[0].cell[4][1].note == 12, "a note under C-0 clamps at it");
+        trk_unlock(e);
+        /* The call a window's octave box makes: the same shift the keys
+         * gave track 2's twin, and it says how many notes moved. */
+        want = 0;
+        trk_lock(e);
+        for (i = 0; i < TRK_PATTERNS; i++)
+            for (r = 0; r < s->pattern[i].rows; r++)
+                if (s->pattern[i].cell[r][2].note <= 127) want++;
+        trk_unlock(e);
+        moved = trk_track_set_octave(e, 2, 5);
+        trk_lock(e);
+        check(moved == want && s->track[2].octave == 5 &&
+              s->pattern[0].cell[0][2].note == 72,
+              "trk_track_set_octave moves them the same and returns the count");
+        trk_unlock(e);
+        check(trk_track_set_octave(e, 2, 5) == 0, "no change, nothing moves");
+        check(trk_track_set_octave(e, TRK_TRACKS, 5) == -1, "a bad track is refused");
+        trk_lock(e);
+        *s = *snap;
+        trk_unlock(e);
+        free(snap);
+    }
+
+    printf("undo\n");
+    {
+        trk_editor ed;
+        trk_song *snap = malloc(sizeof *snap);
+        int i, n0, first;
+        trk_editor_init(&ed);
+        trk_undo_clear(e);
+        trk_lock(e);
+        *snap = *s;
+        /* Earlier checks left notes in pattern 0; entry only snapshots a
+         * cell it actually changes, so start from an empty one. */
+        memset(s->pattern[0].cell, TRK_EMPTY, sizeof s->pattern[0].cell);
+        trk_unlock(e);
+
+        /* Entry: two notes, taken back one at a time, then nothing left. */
+        ed.pattern = 0; ed.row = 0; ed.track = 0; ed.field = TRK_F_NOTE;
+        trk_key(e, &ed, 'z'); trk_key_release(e, &ed, 'z');
+        trk_key(e, &ed, 'x'); trk_key_release(e, &ed, 'x');
+        trk_lock(e);
+        check(s->pattern[0].cell[0][0].note == 60 && s->pattern[0].cell[1][0].note == 62,
+              "two notes typed");
+        trk_unlock(e);
+        check(trk_key(e, &ed, TRK_K_UNDO) == 1, "ctrl+z answers a redraw");
+        trk_lock(e);
+        check(s->pattern[0].cell[1][0].note == TRK_EMPTY && s->pattern[0].cell[0][0].note == 60,
+              "the last note is taken back");
+        trk_unlock(e);
+        check(trk_undo(e) == 1, "trk_undo too");
+        trk_lock(e);
+        check(s->pattern[0].cell[0][0].note == TRK_EMPTY, "and the first");
+        trk_unlock(e);
+        check(trk_undo(e) == 0 && trk_key(e, &ed, TRK_K_UNDO) == 0,
+              "an empty history says so");
+
+        /* One undo step per hex value, not per digit. */
+        ed.row = 2; ed.field = TRK_F_VEL;
+        trk_key(e, &ed, '4');
+        trk_key(e, &ed, '0');
+        trk_lock(e);
+        check(s->pattern[0].cell[2][0].vel == 0x40, "hex 4 0 into velocity");
+        trk_unlock(e);
+        check(trk_undo(e) == 1, "the value undone in one step");
+        trk_lock(e);
+        check(s->pattern[0].cell[2][0].vel == TRK_EMPTY, "both digits of it");
+        trk_unlock(e);
+
+        /* Insert and backspace. */
+        ed.row = 4; ed.field = TRK_F_NOTE;
+        trk_key(e, &ed, 'z'); trk_key_release(e, &ed, 'z');   /* row 4, advances to 5 */
+        ed.row = 4;
+        trk_key(e, &ed, TRK_K_INSERT);
+        trk_lock(e);
+        check(s->pattern[0].cell[4][0].note == TRK_EMPTY && s->pattern[0].cell[5][0].note == 60,
+              "insert pushed the note down");
+        trk_unlock(e);
+        trk_undo(e);
+        trk_lock(e);
+        check(s->pattern[0].cell[4][0].note == 60, "insert undone");
+        trk_unlock(e);
+        ed.row = 4;
+        trk_key(e, &ed, TRK_K_DELETE);
+        trk_lock(e);
+        check(s->pattern[0].cell[4][0].note == TRK_EMPTY, "delete cleared it");
+        trk_unlock(e);
+        trk_undo(e);
+        trk_lock(e);
+        check(s->pattern[0].cell[4][0].note == 60, "delete undone");
+        trk_unlock(e);
+        ed.row = 4;
+        trk_key(e, &ed, TRK_K_DELETE);               /* gone again, for what follows */
+
+        /* An octave move, notes and octave number together. */
+        ed.track = 1;                                /* at octave 3 from above */
+        trk_lock(e);
+        s->pattern[0].cell[0][1].note = 60;
+        trk_unlock(e);
+        trk_key(e, &ed, TRK_K_OCT_UP);
+        trk_lock(e);
+        check(s->track[1].octave == 4 && s->pattern[0].cell[0][1].note == 72,
+              "octave up moved the notes");
+        trk_unlock(e);
+        trk_undo(e);
+        trk_lock(e);
+        check(s->track[1].octave == 3 && s->pattern[0].cell[0][1].note == 60,
+              "undone, notes and octave number together");
+        trk_unlock(e);
+
+        /* Cut and paste. */
+        ed.track = 0;
+        trk_lock(e);
+        s->pattern[0].cell[0][0].note = 60;
+        s->pattern[0].cell[1][0].note = 62;
+        trk_unlock(e);
+        trk_select(&ed, 0, 0, 1, 0);
+        trk_cut(e, &ed);
+        trk_lock(e);
+        check(s->pattern[0].cell[0][0].note == TRK_EMPTY, "cut emptied the block");
+        trk_unlock(e);
+        trk_undo(e);
+        trk_lock(e);
+        check(s->pattern[0].cell[0][0].note == 60 && s->pattern[0].cell[1][0].note == 62,
+              "cut undone");
+        trk_unlock(e);
+
+        /* The parts list. */
+        trk_lock(e);
+        n0 = s->norder; first = s->order[0];
+        trk_unlock(e);
+        trk_order_insert(e, -1, 7);
+        trk_lock(e);
+        check(s->norder == n0 + 1 && s->order[0] == 7, "a part inserted at the front");
+        trk_unlock(e);
+        trk_undo(e);
+        trk_lock(e);
+        check(s->norder == n0 && s->order[0] == first, "the insert undone");
+        trk_unlock(e);
+
+        /* The ring holds TRK_UNDO_MAX: more edits than that drop the
+         * oldest, and draining it ends exactly there. */
+        trk_undo_clear(e);
+        trk_lock(e);
+        s->pattern[0].rows = 64;
+        s->track[0].octave = 4;
+        memset(s->pattern[0].cell, TRK_EMPTY, sizeof s->pattern[0].cell);
+        trk_unlock(e);
+        ed.track = 0; ed.row = 0; ed.field = TRK_F_NOTE; ed.step = 1; ed.digit = 0;
+        for (i = 0; i < TRK_UNDO_MAX + 5; i++) {
+            trk_key(e, &ed, 'z');
+            trk_key_release(e, &ed, 'z');
+        }
+        for (i = 0; i < TRK_UNDO_MAX; i++)
+            if (trk_undo(e) != 1) break;
+        check(i == TRK_UNDO_MAX, "fifty edits kept, fifty undos");
+        check(trk_undo(e) == 0, "the fifty-first is gone");
+        trk_lock(e);
+        check(s->pattern[0].cell[4][0].note == 60 && s->pattern[0].cell[5][0].note == TRK_EMPTY,
+              "the oldest five edits fell off the ring");
+        trk_unlock(e);
+
+        /* Clearing the history: a loaded song starts with none. */
+        trk_undo_clear(e);
+        check(trk_undo(e) == 0, "a cleared history stays empty");
+
+        /* Routing is not undone: the song's sink name follows the track's
+         * live routing, whichever way the snapshot read. */
+        {
+            int sid = trk_add_sink(e, "undo sink", sink_cb, NULL);
+            trk_key(e, &ed, TRK_K_EDIT);
+            trk_key(e, &ed, 'z');                    /* a snapshot, sink-less */
+            trk_route_sink(e, 0, sid);
+            trk_undo(e);
+            check(trk_sink_of(e, 0) == sid && !strcmp(s->track[0].sink, "undo sink"),
+                  "undo past a route keeps the song's sink true");
+            trk_route_sink(e, 0, -1);
+            check(s->track[0].sink[0] == 0, "routed back, no sink saved");
+            trk_remove_sink(e, sid);
+        }
+
+        trk_lock(e);
+        *s = *snap;
+        trk_unlock(e);
+        free(snap);
+    }
+
+    printf("recording\n");
+    {
+        trk_editor ed;
+        trk_song *keep = malloc(sizeof *keep);
+        trk_rec_opts o;
+        snd_seq_t *tx = NULL;
+        int tport = -1, tclient = -1, sent_ok = 0, got;
+        trk_editor_init(&ed);
+        trk_stop(e);
+        trk_undo_clear(e);
+        trk_lock(e);
+        *keep = *s;
+        memset(s->pattern[0].cell, TRK_EMPTY, sizeof s->pattern[0].cell);
+        s->pattern[0].rows = 16;
+        s->lpb = 4;
+        s->bpm = 120;                                 /* a row is 125 ms */
+        s->norder = 1; s->order[0] = 0;
+        { int t; for (t = 0; t < TRK_TRACKS; t++) { s->track[t].mute = 0; s->track[t].samples[0] = 0; s->track[t].velocity = 100; } }
+        trk_unlock(e);
+        trk_set_bpm(e, 120);
+        trk_record_defaults(&o);
+        o.count_in = 0; o.metronome = 0; o.monitor = 0;
+        trk_record_set(e, &o);
+
+        check(trk_recording(e) == 0 && trk_take_events(e) == 0, "not recording to begin with");
+        trk_record_note(e, 0, 60, 100, 1);
+        check(s->pattern[0].cell[0][0].note == TRK_EMPTY, "keys are ignored when not recording");
+
+        /* A take, from the computer keyboard's entry point. */
+        trk_record_arm(e, 0);
+        trk_record_start(e, TRK_PLAY_PATTERN, 0, 0);
+        check(trk_recording(e) == 1, "recording, no count-in");
+        wait_row(e, 2, 20);   trk_record_note(e, 0, 60, -1, 1);       /* early in row 2 */
+        wait_row(e, 3, 20);   trk_record_note(e, 0, 60, -1, 0);       /* let go early in row 3 */
+        wait_row(e, 5, 90);   trk_record_note(e, 0, 62, 80, 1);       /* late in row 5: row 6 */
+        wait_row(e, 7, 20);   trk_record_note(e, 0, 62, 80, 0);
+
+        /* The same from a MIDI source: another client writing to Record In. */
+        if (snd_seq_open(&tx, "default", SND_SEQ_OPEN_OUTPUT, 0) >= 0) {
+            snd_seq_set_client_name(tx, "trktest source");
+            tport = snd_seq_create_simple_port(tx, "out", SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ,
+                                               SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+            tclient = find_client(tx, trk_client_name(e));
+            if (tclient >= 0 && tport >= 0) {
+                int ip = find_port(tx, tclient, "Record In");
+                sent_ok = ip >= 0 && snd_seq_connect_to(tx, tport, tclient, ip) >= 0;
+            }
+        }
+        check(sent_ok, "the tracker has a Record In port to connect to");
+        if (sent_ok) {
+            snd_seq_event_t ev;
+            wait_row(e, 9, 20);
+            snd_seq_ev_clear(&ev); snd_seq_ev_set_source(&ev, tport); snd_seq_ev_set_subs(&ev);
+            snd_seq_ev_set_direct(&ev); snd_seq_ev_set_noteon(&ev, 0, 64, 90);
+            snd_seq_event_output_direct(tx, &ev);
+            wait_row(e, 10, 20);
+            snd_seq_ev_clear(&ev); snd_seq_ev_set_source(&ev, tport); snd_seq_ev_set_subs(&ev);
+            snd_seq_ev_set_direct(&ev); snd_seq_ev_set_noteoff(&ev, 0, 64, 0);
+            snd_seq_event_output_direct(tx, &ev);
+            wait_row(e, 12, 20);
+            snd_seq_ev_clear(&ev); snd_seq_ev_set_source(&ev, tport); snd_seq_ev_set_subs(&ev);
+            snd_seq_ev_set_direct(&ev); snd_seq_ev_set_controller(&ev, 0, 7, 99);
+            snd_seq_event_output_direct(tx, &ev);
+            /* Another client's bytes are passed through as they are: a note past 127
+             * must not reach the pattern or the take. */
+            wait_row(e, 13, 20);
+            snd_seq_ev_clear(&ev); snd_seq_ev_set_source(&ev, tport); snd_seq_ev_set_subs(&ev);
+            snd_seq_ev_set_direct(&ev); snd_seq_ev_set_noteon(&ev, 0, 200, 90);
+            snd_seq_event_output_direct(tx, &ev);
+            snd_seq_ev_set_noteon(&ev, 0, 255, 90);
+            snd_seq_event_output_direct(tx, &ev);
+            snd_seq_ev_set_noteoff(&ev, 0, 254, 0);
+            snd_seq_event_output_direct(tx, &ev);
+        }
+        wait_row(e, 14, 0);
+        trk_stop(e);
+        usleep(30000);
+
+        check(s->pattern[0].cell[2][0].note == 60 && s->pattern[0].cell[2][0].vel == TRK_EMPTY,
+              "a key early in a row lands on that row, at the track's own velocity");
+        check(s->pattern[0].cell[3][0].note == TRK_NOTE_OFF, "its release writes === on the row it falls on");
+        check(s->pattern[0].cell[6][0].note == 62 && s->pattern[0].cell[6][0].vel == 80,
+              "a key late in a row rounds up to the next, with its velocity");
+        check(s->pattern[0].cell[5][0].note == TRK_EMPTY, "and the row it was struck in stays empty");
+        check(s->pattern[0].cell[7][0].note == TRK_NOTE_OFF, "that release too");
+        if (sent_ok) {
+            check(s->pattern[0].cell[9][0].note == 64 && s->pattern[0].cell[9][0].vel == 90,
+                  "a MIDI note is placed by the tick the sequencer stamped it with");
+            check(s->pattern[0].cell[10][0].note == TRK_NOTE_OFF, "and its note-off");
+            check(s->pattern[0].cell[12][0].cc == 7 && s->pattern[0].cell[12][0].val == 99,
+                  "a MIDI controller goes into the cc columns");
+        }
+        { int r, bad = 0;
+          for (r = 0; r < 16; r++) {
+              const int n = s->pattern[0].cell[r][0].note;
+              if (n > 127 && n != TRK_NOTE_OFF && n != TRK_EMPTY) bad = 1;
+          }
+          check(!bad, "a MIDI note past 127 is dropped, not written into the pattern"); }
+        got = trk_take_events(e);
+        check(got >= 4, "the take kept every event as played");
+        {
+            char err[200] = "", path[256];
+            unsigned char *f; long len; FILE *fp; int i, ons = 0, tempo_ok = 0;
+            snprintf(path, sizeof path, "/tmp/trktest-take-%d.mid", (int)getpid());
+            check(trk_take_export_midi(e, path, err, sizeof err) == 0, "the take is written as a MIDI file");
+            fp = fopen(path, "rb");
+            f = fp ? malloc(65536) : NULL;
+            len = f ? (long)fread(f, 1, 65536, fp) : 0;
+            if (fp) fclose(fp);
+            unlink(path);
+            check(len > 22 && !memcmp(f, "MThd", 4) && f[9] == 1, "an SMF, type 1");
+            for (i = 0; i + 2 < len; i++) {
+                if (f[i] == 0x90 && (f[i + 1] == 60 || f[i + 1] == 62 || f[i + 1] == 64)) ons++;
+                if (f[i] == 0xFF && f[i + 1] == 0x51 && f[i + 2] == 3 && f[i + 3] == 0x07 && f[i + 4] == 0xA1) tempo_ok = 1;
+            }
+            check(ons >= 3, "the notes are in it");
+            check(tempo_ok, "at the song's tempo (120 BPM)");
+            free(f);
+        }
+        check(trk_undo(e) == 1 && s->pattern[0].cell[2][0].note == TRK_EMPTY && s->pattern[0].cell[6][0].note == TRK_EMPTY,
+              "one undo takes the whole take back out");
+
+        /* Quantizing to the row sounding keeps a late note where it is. */
+        o.quantize = TRK_REC_ROW; trk_record_set(e, &o);
+        trk_record_start(e, TRK_PLAY_PATTERN, 0, 0);
+        wait_row(e, 5, 90);   trk_record_note(e, 0, 65, -1, 1);
+        trk_stop(e);
+        check(s->pattern[0].cell[5][0].note == 65 && s->pattern[0].cell[6][0].note == TRK_EMPTY,
+              "quantize to the row sounding: a late note stays on its row");
+        trk_undo(e);
+
+        /* A count-in: the take starts after it, and keys before it are nobody's. */
+        o.quantize = TRK_REC_NEAREST; o.count_in = 1; trk_record_set(e, &o);
+        trk_set_bpm(e, 240);                          /* a bar is 1 s */
+        trk_record_start(e, TRK_PLAY_PATTERN, 0, 0);
+        check(trk_recording(e) == 2, "counting in");
+        usleep(200000);
+        trk_record_note(e, 0, 67, -1, 1);
+        usleep(900000);
+        check(trk_recording(e) == 1, "recording once the count-in is over");
+        trk_stop(e);
+        check(trk_recording(e) == 0, "stopping ends the take");
+        { int r, any = 0; for (r = 0; r < 16; r++) if (s->pattern[0].cell[r][0].note != TRK_EMPTY) any = 1;
+          check(!any, "a key struck during the count-in was not written"); }
+        trk_undo(e);
+
+        /* Options out of range are clamped. */
+        o.count_in = 99; o.offset_ms = -999; trk_record_set(e, &o);
+        trk_record_get(e, &o);
+        check(o.count_in == 4 && o.offset_ms == -200, "options are clamped");
+
+        if (tx) snd_seq_close(tx);
+        trk_set_bpm(e, 120);
+        trk_undo_clear(e);
+        trk_lock(e);
+        *s = *keep;
+        trk_unlock(e);
+        free(keep);
+    }
+
+    printf("robustness\n");
+    {
+        trk_song *a = malloc(sizeof *a), *b = malloc(sizeof *b);
+        char err[300] = "", path[256], tmp[300];
+        FILE *fp;
+        trk_editor ed;
+        trk_editor_init(&ed);
+        trk_stop(e);
+        trk_undo_clear(e);
+        trk_song_init(a);
+        snprintf(a->track[0].name, sizeof a->track[0].name, "two\nlines");
+        snprintf(a->track[1].client, sizeof a->track[1].client, "a client\rwith a break");
+        a->bpm = 123.456789;
+        snprintf(path, sizeof path, "/tmp/trktest-robust-%d.trk", (int)getpid());
+        check(trk_song_save(a, path, err, sizeof err) == 0, "a song with line breaks in its names saves");
+        check(trk_song_load(b, path, err, sizeof err) == 0, "and loads back, not as an unreadable file");
+        check(!strcmp(b->track[0].name, "two lines") && !strcmp(b->track[1].client, "a client with a break"),
+              "the breaks became spaces");
+        check(b->bpm == 123.456789, "the tempo keeps its digits");
+        fp = fopen(path, "w");
+        fprintf(fp, "tracker 1\nbpm nan\nlpb 4\n");
+        fclose(fp);
+        check(trk_song_load(b, path, err, sizeof err) != 0, "a tempo of nan is refused");
+        unlink(path); snprintf(tmp, sizeof tmp, "%s.new", path); unlink(tmp);
+
+        trk_set_bpm(e, 130);
+        trk_set_bpm(e, NAN);
+        check(trk_song_of(e)->bpm == 130, "set_bpm(nan) leaves the tempo as it was");
+
+        /* Undo is for edits: the tempo the queue runs at stays the live one. */
+        trk_lock(e);
+        memset(s->pattern[0].cell, TRK_EMPTY, sizeof s->pattern[0].cell);
+        s->pattern[0].cell[0][0].note = 60;
+        trk_unlock(e);
+        ed.edit = 1; ed.row = 0; ed.track = 0; ed.pattern = 0;
+        trk_set_bpm(e, 140);
+        trk_key(e, &ed, TRK_K_TRANSPOSE_UP);              /* a snapshot, at 140 */
+        trk_set_bpm(e, 100);
+        check(trk_undo(e) == 1 && s->pattern[0].cell[0][0].note == 60, "the edit is undone");
+        check(trk_song_of(e)->bpm == 100, "and the tempo is still the live one, not the snapshot's");
+        trk_undo_clear(e);
+
+        /* A song's path that cannot be written leaves nothing half-written behind. */
+        a->bpm = 120;
+        snprintf(path, sizeof path, "/tmp/trktest-nodir-%d/x.mid", (int)getpid());
+        check(trk_song_export_midi(a, path, err, sizeof err) != 0, "an export to a folder that is not there fails");
+        {
+            int id = trk_add_sink(e, "unroute sink", sink_cb, NULL);
+            trk_route_sink(e, 3, id);
+            check(trk_sink_of(e, 3) == id, "a track is routed to a sink");
+            trk_unroute_sinks(e);
+            check(trk_sink_of(e, 3) == -1 && s->track[3].sink[0] == 0,
+                  "before another song comes in, every track is back on its window");
+            trk_remove_sink(e, id);
+        }
+        trk_set_bpm(e, 120);
+        free(a); free(b);
+    }
+
+    printf("furnace keys\n");
+    {
+        trk_editor ed;
+        trk_song *keep = malloc(sizeof *keep);
+        int t;
+        trk_editor_init(&ed);
+        trk_undo_clear(e);
+        trk_lock(e);
+        *keep = *s;
+        memset(s->pattern[0].cell, TRK_EMPTY, sizeof s->pattern[0].cell);
+        s->pattern[0].rows = 16;
+        for (t = 0; t < TRK_TRACKS; t++) { s->track[t].mute = 0; s->track[t].samples[0] = 0; }
+        s->pattern[0].cell[0][0].note = 60;
+        s->pattern[0].cell[1][0].note = 64; s->pattern[0].cell[1][0].vel = 0x40;
+        s->pattern[0].cell[2][0].note = TRK_NOTE_OFF;
+        trk_unlock(e);
+        ed.edit = 1; ed.pattern = 0; ed.row = 0; ed.track = 0;
+
+        /* Redo puts back what undo took off; a new edit forgets it. */
+        trk_key(e, &ed, TRK_K_TRANSPOSE_UP);
+        check(s->pattern[0].cell[0][0].note == 61 && s->pattern[0].cell[1][0].note == 64,
+              "transpose moves the cell under the cursor a semitone");
+        trk_key(e, &ed, TRK_K_TRANSPOSE_OCT_DOWN);
+        check(s->pattern[0].cell[0][0].note == 49, "and an octave down");
+        trk_key(e, &ed, TRK_K_SEL_DOWN); trk_key(e, &ed, TRK_K_SEL_DOWN);
+        trk_key(e, &ed, TRK_K_TRANSPOSE_UP);
+        check(s->pattern[0].cell[0][0].note == 50 && s->pattern[0].cell[1][0].note == 65 &&
+              s->pattern[0].cell[2][0].note == TRK_NOTE_OFF, "the selection moves; a note-off stays");
+        check(trk_key(e, &ed, TRK_K_UNDO) == 1 && s->pattern[0].cell[1][0].note == 64, "undone");
+        check(trk_key(e, &ed, TRK_K_REDO) == 1 && s->pattern[0].cell[1][0].note == 65, "redone");
+        check(trk_key(e, &ed, TRK_K_REDO) == 0, "nothing more to redo");
+        trk_key(e, &ed, TRK_K_UNDO);
+        ed.sel = 0; ed.row = 0;
+        trk_key(e, &ed, TRK_K_TRANSPOSE_DOWN);                  /* a new branch */
+        check(trk_redo(e) == 0, "a new edit clears the redo");
+        {
+            const int before = s->pattern[0].cell[0][0].note;
+            ed.edit = 0;
+            trk_key(e, &ed, TRK_K_TRANSPOSE_UP);
+            check(s->pattern[0].cell[0][0].note == before, "edit off: transpose does nothing");
+        }
+        ed.edit = 1;
+        s->pattern[0].cell[0][0].note = 126;
+        trk_key(e, &ed, TRK_K_TRANSPOSE_OCT_UP);
+        check(s->pattern[0].cell[0][0].note == 127, "transpose stops at G-9");
+
+        /* Mute, solo, unmute. */
+        ed.track = 2;
+        trk_key(e, &ed, TRK_K_MUTE_TRACK);
+        check(s->track[2].mute && !s->track[1].mute, "mute the cursor's track");
+        trk_key(e, &ed, TRK_K_MUTE_TRACK);
+        check(!s->track[2].mute, "and back");
+        trk_key(e, &ed, TRK_K_SOLO_TRACK);
+        for (t = 0; t < TRK_TRACKS; t++) if (s->track[t].mute != (t != 2)) break;
+        check(t == TRK_TRACKS, "solo mutes every other track");
+        trk_key(e, &ed, TRK_K_SOLO_TRACK);
+        for (t = 0; t < TRK_TRACKS; t++) if (s->track[t].mute) break;
+        check(t == TRK_TRACKS, "soloing the one alone brings everyone back");
+        trk_key(e, &ed, TRK_K_MUTE_TRACK); trk_key(e, &ed, TRK_K_UNMUTE_ALL);
+        check(!s->track[2].mute, "unmute all");
+
+        /* Edit step from the keypad keys. */
+        ed.step = 1;
+        trk_key(e, &ed, TRK_K_STEP_UP);   check(ed.step == 2, "step up");
+        trk_key(e, &ed, TRK_K_STEP_DOWN); trk_key(e, &ed, TRK_K_STEP_DOWN); trk_key(e, &ed, TRK_K_STEP_DOWN);
+        check(ed.step == 0, "step down stops at 0");
+
+        /* Paste mix lays down only what the clipboard has. */
+        trk_lock(e);
+        memset(s->pattern[0].cell, TRK_EMPTY, sizeof s->pattern[0].cell);
+        s->pattern[0].cell[0][0].note = 60; s->pattern[0].cell[0][0].vel = 0x50;
+        s->pattern[0].cell[4][0].vel = 0x20;                     /* a velocity alone, no note */
+        trk_unlock(e);
+        ed.sel = 0; ed.row = 4; ed.track = 0;
+        trk_select(&ed, 4, 0, 4, 0);
+        trk_key(e, &ed, TRK_K_COPY);                              /* just that velocity */
+        ed.sel = 0; ed.row = 0; ed.track = 0;
+        trk_key(e, &ed, TRK_K_PASTE_MIX);
+        check(s->pattern[0].cell[0][0].note == 60 && s->pattern[0].cell[0][0].vel == 0x20,
+              "paste mix: the note stays, the clipboard's velocity goes over");
+        trk_key(e, &ed, TRK_K_UNDO);
+        trk_key(e, &ed, TRK_K_PASTE);
+        check(s->pattern[0].cell[0][0].note == TRK_EMPTY, "plain paste replaces the whole cell");
+
+        /* Selecting a page at a time. */
+        ed.sel = 0; ed.row = 0; ed.track = 0;
+        trk_key(e, &ed, TRK_K_SEL_PGDN);
+        {
+            int r0, t0, r1, t1;
+            check(trk_selection(&ed, &r0, &t0, &r1, &t1) && r0 == 0 && r1 == 15,
+                  "shift+page down selects a page of rows (to the pattern's end)");
+        }
+
+        trk_undo_clear(e);
+        trk_lock(e);
+        *s = *keep;
+        trk_unlock(e);
+        free(keep);
+    }
+
+    printf("midi export\n");
+    {
+        trk_song *m = malloc(sizeof *m);
+        trk_mev *ev;
+        int n, i, ons = 0, offs = 0;
+        unsigned char *f;
+        long len;
+        char err[200] = "", path[256];
+        FILE *fp;
+        trk_song_init(m);
+        m->bpm = 120; m->lpb = 4;
+        memset(m->pattern[0].cell, TRK_EMPTY, sizeof m->pattern[0].cell);
+        m->pattern[0].rows = 8;
+        m->track[0].velocity = 90; m->track[0].channel = 2;
+        m->pattern[0].cell[0][0].note = 60;                     /* default velocity */
+        m->pattern[0].cell[2][0].note = 64; m->pattern[0].cell[2][0].vel = 0x40;   /* ends the first */
+        m->pattern[0].cell[3][0].cc = 7;    m->pattern[0].cell[3][0].val = 100;
+        m->pattern[0].cell[4][0].note = TRK_NOTE_OFF;
+        m->pattern[0].cell[6][0].note = 67;                     /* held to the end */
+        m->pattern[0].cell[1][2].note = 36;                     /* a muted track */
+        m->track[2].mute = 1;
+        m->norder = 1; m->order[0] = 0;
+        check(trk_song_ticks(m) == 8u * (TRK_MIDI_PPQ / 4), "song length is rows * row ticks");
+        check(trk_song_events(m, 0, &ev, &n) == 0 && n == 4, "track 1: three notes and a controller");
+        if (n == 4) {
+            const unsigned row = TRK_MIDI_PPQ / 4;
+            check(ev[0].start == 0 && ev[0].end == 2 * row && ev[0].a == 60 && ev[0].b == 90 && ev[0].chan == 2,
+                  "a note ends where the next begins, default velocity, its channel");
+            check(ev[1].start == 2 * row && ev[1].end == 4 * row && ev[1].b == 0x40,
+                  "the next note ends at the note-off");
+            check(ev[2].is_cc && ev[2].start == 3 * row && ev[2].a == 7 && ev[2].b == 100, "the controller");
+            check(ev[3].start == 6 * row && ev[3].end == 8 * row, "a held note ends with the song");
+        }
+        free(ev);
+        m->track[1].samples[0] = 's'; m->track[1].samples[1] = 0;
+        m->pattern[0].cell[1][1].note = 36; m->pattern[0].cell[2][1].note = 38;
+        check(trk_song_events(m, 1, &ev, &n) == 0 && n == 2 &&
+              ev[0].end - ev[0].start == TRK_MIDI_PPQ / 4 && ev[1].start == 2 * (TRK_MIDI_PPQ / 4),
+              "a sample-set hit plays out for one row");
+        free(ev);
+        check(trk_song_events(m, TRK_TRACKS, &ev, &n) == -1, "a bad track is refused");
+
+        snprintf(path, sizeof path, "/tmp/trktest-%d.mid", (int)getpid());
+        check(trk_song_export_midi(m, path, err, sizeof err) == 0, "the file is written");
+        fp = fopen(path, "rb");
+        f = fp ? malloc(65536) : NULL;
+        len = f ? (long)fread(f, 1, 65536, fp) : 0;
+        if (fp) fclose(fp);
+        unlink(path);
+        check(len > 22 && !memcmp(f, "MThd", 4) && f[9] == 1, "an SMF, type 1");
+        /* tempo track, track 1, the sample track: the muted one is left out */
+        check(len > 22 && f[10] == 0 && f[11] == 3, "a tempo track and two playing tracks");
+        check(len > 22 && f[12] == (TRK_MIDI_PPQ >> 8) && f[13] == (TRK_MIDI_PPQ & 255), "the resolution");
+        for (i = 0; i + 2 < len; i++) {
+            if (f[i] == 0x92 && f[i + 1] == 60 && f[i + 2] == 90) ons++;
+            if (f[i] == 0x82 && f[i + 1] == 60) offs++;
+        }
+        check(ons == 1 && offs == 1, "the first note's on and off are in the track");
+        check(len > 22 && f[len - 3] == 0xFF && f[len - 2] == 0x2F && f[len - 1] == 0, "ends with end-of-track");
+        free(f);
+        free(m);
     }
 
     trk_close(e);                                /* while playing */

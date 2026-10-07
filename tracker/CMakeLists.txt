@@ -23,7 +23,7 @@ pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 
 # The drum kits are vst-ace's own sample engine, from c/src.
 set(VA_ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../c/src)
-add_library(trkcore STATIC core/song.c core/engine.c core/editor.c
+add_library(trkcore STATIC core/midiexport.c core/song.c core/engine.c core/editor.c
             ${VA_ENGINE_DIR}/drumkit.c ${VA_ENGINE_DIR}/wav.c ${VA_ENGINE_DIR}/dw_dsp.c)
 target_include_directories(trkcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core)
 # Public: the windows' sample-set editors read and write a set through

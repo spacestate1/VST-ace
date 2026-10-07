@@ -3,6 +3,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,6 +138,7 @@ const char *trk_cell_text(const trk_cell *c, char *buf)
  *   track 1 name Bass
  *   track 1 client pestudio 2
  *   track 1 port pestudio in
+ *   track 1 sink this window: FB-7999  an in-process synth, as the shell named it
  *   track 1 octave 3                 the note keys' octave on it, when not 4
  *   track 2 samples drum-singles     a sample set, which the tracker plays
  *   order 0 0 1 2
@@ -145,28 +147,42 @@ const char *trk_cell_text(const trk_cell *c, char *buf)
  *   cell 0 12 1 C-4 64 .. ..        pattern row track note vel cc val
  */
 
+/* A name goes into the file on a line of its own: a line break in it would end
+ * the line there and turn the rest into one the loader cannot read -- and the
+ * whole song with it. Names come from outside too (an ALSA client's name, a
+ * folder's), not only from what is typed. */
+static const char *one_line(const char *in, char *out, size_t n)
+{
+    size_t i;
+    for (i = 0; in[i] && i + 1 < n; i++) out[i] = (in[i] == '\n' || in[i] == '\r') ? ' ' : in[i];
+    out[i] = 0;
+    return out;
+}
+
 int trk_song_save(const trk_song *s, const char *path, char *err, size_t errn)
 {
     char  tmp[4096];
     FILE *f;
     int   t, p, r, i;
+    char  ln[TRK_PATH_LEN + 1];
 
     snprintf(tmp, sizeof tmp, "%s.new", path);
     if (!(f = fopen(tmp, "w"))) {
         snprintf(err, errn, "%s: %s", tmp, strerror(errno));
         return -1;
     }
-    fprintf(f, "tracker 1\nbpm %g\nlpb %d\n", s->bpm, s->lpb);
+    fprintf(f, "tracker 1\nbpm %.10g\nlpb %d\n", s->bpm, s->lpb);
     if (s->volume != 100) fprintf(f, "volume %d\n", s->volume);
     for (t = 0; t < TRK_TRACKS; t++) {
         const trk_track *k = &s->track[t];
         fprintf(f, "track %d channel %d velocity %d mute %d\n",
                 t + 1, k->channel + 1, k->velocity, k->mute ? 1 : 0);
-        fprintf(f, "track %d name %s\n", t + 1, k->name);
+        fprintf(f, "track %d name %s\n", t + 1, one_line(k->name, ln, sizeof ln));
         if (k->octave != 4) fprintf(f, "track %d octave %d\n", t + 1, k->octave);
-        if (k->samples[0]) fprintf(f, "track %d samples %s\n", t + 1, k->samples);
-        if (k->client[0]) fprintf(f, "track %d client %s\n", t + 1, k->client);
-        if (k->port[0])   fprintf(f, "track %d port %s\n", t + 1, k->port);
+        if (k->samples[0]) fprintf(f, "track %d samples %s\n", t + 1, one_line(k->samples, ln, sizeof ln));
+        if (k->client[0]) fprintf(f, "track %d client %s\n", t + 1, one_line(k->client, ln, sizeof ln));
+        if (k->port[0])   fprintf(f, "track %d port %s\n", t + 1, one_line(k->port, ln, sizeof ln));
+        if (k->sink[0])   fprintf(f, "track %d sink %s\n", t + 1, one_line(k->sink, ln, sizeof ln));
     }
     fprintf(f, "order");
     for (i = 0; i < s->norder; i++) fprintf(f, " %d", s->order[i]);
@@ -179,7 +195,7 @@ int trk_song_save(const trk_song *s, const char *path, char *err, size_t errn)
         for (i = 0; i < s->norder; i++) if (s->order[i] == p) listed = 1;
         if (!listed && !trk_pattern_used(s, p) && pt->rows == 64 && !pt->name[0]) continue;
         fprintf(f, "pattern %d rows %d\n", p, pt->rows);
-        if (pt->name[0]) fprintf(f, "pattern %d name %s\n", p, pt->name);
+        if (pt->name[0]) fprintf(f, "pattern %d name %s\n", p, one_line(pt->name, ln, sizeof ln));
         for (r = 0; r < pt->rows; r++)
             for (t = 0; t < TRK_TRACKS; t++) {
                 const trk_cell *c = &pt->cell[r][t];
@@ -253,7 +269,7 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
             ok = 1;
         } else if (!strcmp(w[0], "bpm") && n >= 2) {
             s->bpm = atof(w[1]);
-            if (s->bpm < 20.0 || s->bpm > 999.0) goto bad;
+            if (!(s->bpm >= 20.0 && s->bpm <= 999.0)) goto bad;      /* NaN is neither */
         } else if (!strcmp(w[0], "volume") && n >= 2) {
             s->volume = atoi(w[1]);
             if (s->volume < 0 || s->volume > 150) goto bad;
@@ -262,7 +278,8 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
             if (!trk_lpb_ok(s->lpb)) goto bad;
         } else if (!strcmp(w[0], "track") && n >= 3) {
             trk_track *k;
-            a = atoi(w[1]) - 1;
+            a = atoi(w[1]);
+            a = a > INT_MIN ? a - 1 : -1;               /* no overflow on a hostile number */
             if (a < 0 || a >= TRK_TRACKS) goto bad;
             k = &s->track[a];
             if (!strcmp(w[2], "name"))
@@ -271,6 +288,8 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
                 snprintf(k->client, sizeof k->client, "%s", after_words(line, 3));
             else if (!strcmp(w[2], "port"))
                 snprintf(k->port, sizeof k->port, "%s", after_words(line, 3));
+            else if (!strcmp(w[2], "sink"))
+                snprintf(k->sink, sizeof k->sink, "%s", after_words(line, 3));
             else if (!strcmp(w[2], "octave")) {
                 int o = n >= 4 ? atoi(w[3]) : -1;
                 if (n < 4 || o < 0 || o > 9) goto bad;
