@@ -239,7 +239,7 @@ A song starts with eight tracks and can have up to sixteen (`TRK_TRACKS` in
 adds an empty one after the cursor's; **- Track** takes the cursor's away, notes
 and all -- asked about first when it holds any, and Undo (Ctrl+Z) brings it
 back. The windows, sample sets and synth routes follow their tracks, and
-playback stops when tracks move. The grid scrolls sideways with its headers
+playback carries on (what was sounding is released). The grid scrolls sideways with its headers
 (the scroll bar under the grid), and the cursor keeps itself in view.
 
 A song of eight tracks is written exactly as before. Any other count adds a
@@ -250,3 +250,14 @@ output port per possible track (sixteen), whatever the song uses.
 Undo keeps, for each step, everything of the song except the patterns, and only
 the patterns that hold something -- tens of kilobytes where the whole song is
 over a megabyte now that it has room for sixteen tracks.
+
+## Audio output
+
+Sample-set tracks are played by the tracker's own audio. **Samples > Audio
+Output** lists where it can go -- the system default, PipeWire, JACK,
+PulseAudio (each where its ALSA plug-in is installed) and sound cards -- and
+clicking one switches to it, live, and remembers it
+(`~/.config/vst-ace/audio-output`; `TRK_PCM` still names a device when none is
+chosen). Synth tabs in the studio play through PipeWire, a separate path; it
+serves JACK programs through pipewire-jack and ALSA programs through
+pipewire-alsa.

@@ -1452,7 +1452,7 @@ int main(void)
         check(trk_track_insert(e, 1) == 0 && s->ntracks == 9, "a track is added");
         check(s->pattern[0].cell[0][0].note == 60 && s->pattern[0].cell[0][1].note == TRK_EMPTY &&
               s->pattern[0].cell[0][3].note == 62, "the new track is empty and the ones after it moved right");
-        check(!strcmp(s->track[3].name, "Lead") && !strcmp(s->track[1].name, "Track 2"), "with their names");
+        check(!strcmp(s->track[3].name, "Lead") && !strcmp(s->track[1].name, "Track 3"), "with their names; the new one takes the lowest number no track has (3: that one is called Lead)");
         check(trk_track_used(e, 3) && !trk_track_used(e, 1), "a track says whether it holds anything");
         check(trk_undo(e) == 1 && s->ntracks == 8 && s->pattern[0].cell[0][2].note == 62, "undone");
         check(trk_redo(e) == 1 && s->ntracks == 9, "redone");
@@ -1461,6 +1461,19 @@ int main(void)
               s->pattern[0].cell[0][0].note == TRK_EMPTY, "its notes go with it; the rest move left");
         check(trk_undo(e) == 1 && s->pattern[0].cell[0][0].note == 60 && s->ntracks == 9, "and it comes back with undo");
         trk_undo_clear(e);
+
+        /* Playing carries on through a change of tracks. */
+        trk_lock(e); trk_song_init(s); s->pattern[0].rows = 16; trk_unlock(e);
+        trk_set_bpm(e, 240);
+        trk_play(e, TRK_PLAY_PATTERN, 0, 0);
+        check(wait_row(e, 3, 5), "playing, to row 3");
+        check(trk_track_insert(e, 0) == 0 && trk_playing(e), "a track added while playing: still playing");
+        check(wait_row(e, 8, 5), "and the song goes on from where it was");
+        check(trk_track_remove(e, 0) == 0 && trk_playing(e) && wait_row(e, 12, 5), "a track taken away while playing: still playing, on");
+        trk_stop(e);
+        trk_set_bpm(e, 120);
+        trk_undo_clear(e);
+        trk_lock(e); trk_song_init(s); trk_unlock(e);
 
         /* The ends. */
         for (i = s->ntracks; i < TRK_TRACKS; i++) trk_track_insert(e, i);

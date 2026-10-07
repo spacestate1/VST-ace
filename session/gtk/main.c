@@ -1606,6 +1606,8 @@ static void act_trk_edit_samples(GSimpleAction *a, GVariant *p, gpointer u)
 { trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_edit_samples(v); }
 static void act_trk_keys(GSimpleAction *a, GVariant *p, gpointer u)
 { trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_show_keys(v); }
+static void act_trk_audio(GSimpleAction *a, GVariant *p, gpointer u)
+{ trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_audio_output(v); }
 static void act_trk_columns(GSimpleAction *a, GVariant *p, gpointer u)
 { trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_show_columns(v); }
 static void act_trk_cheat(GSimpleAction *a, GVariant *p, gpointer u)
@@ -2095,6 +2097,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "tracker-edit-samples", act_trk_edit_samples, NULL, NULL, NULL, {0} },
         { "tracker-keys",         act_trk_keys,         NULL, NULL, NULL, {0} },
         { "tracker-columns",      act_trk_columns,      NULL, NULL, NULL, {0} },
+        { "tracker-audio",        act_trk_audio,        NULL, NULL, NULL, {0} },
         { "tracker-cheat",        act_trk_cheat,        NULL, NULL, NULL, {0} },
     };
     GMenu *bar   = g_menu_new();
@@ -2177,6 +2180,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_samples_m = g_menu_new();
     g_menu_append(g_samples_m, "Load Sample Set…", "win.tracker-load-samples");
     g_menu_append(g_samples_m, "Edit Sample Set…", "win.tracker-edit-samples");
+    g_menu_append(g_samples_m, "Audio Output…", "win.tracker-audio");
     g_help_trk = g_menu_new();
     g_menu_append(g_help_trk, "Keys", "win.tracker-keys");
     g_menu_append(g_help_trk, "Columns", "win.tracker-columns");

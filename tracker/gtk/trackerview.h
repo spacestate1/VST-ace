@@ -64,6 +64,8 @@ void       trk_view_export_midi(trk_view *v);
  * menu bar says so before the widget is made: the toolbar then keeps only the
  * transport. The commands themselves, for that menu's actions. */
 void       trk_view_set_embedded(trk_view *v, int on);
+/* Samples > Audio Output: the window for choosing where the tracker's own audio goes. */
+void       trk_view_audio_output(trk_view *v);
 /* Recording: the last take as a MIDI file, and the options window. */
 void       trk_view_export_take(trk_view *v);
 void       trk_view_record_options(trk_view *v);

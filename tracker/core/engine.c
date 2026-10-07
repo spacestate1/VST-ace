@@ -38,6 +38,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <poll.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,8 @@
 #define TRK_SINKS     8              /* in-process destinations registered at once */
 #define SINK_Q        2048           /* events scheduled for one sink and not yet delivered */
 void trk_undo_push(trk_engine *e);            /* below: the editor's snapshot, before an edit */
+struct trk_engine;
+static void audio_conf_load(struct trk_engine *e);
 #define SINK_PERIOD   128            /* frames per delivered block: 2.7 ms at 48 kHz */
 
 /* An event queued for an in-process sink, against the same tick clock the
@@ -182,6 +185,7 @@ struct trk_engine {
     double          alat;                 /* seconds from a hit's time to its sound */
     double          bpm_now;              /* the queue's tempo, for the audio thread */
     char            audio_msg[160];
+    char            pcm_name[TRK_DEST_LEN];   /* the chosen output, "" for the default */
 
     /* In-process sinks. Changed under both locks, lock then dmx; the delivery
      * thread takes dmx alone, so it never waits on the scheduler -- the same
@@ -803,11 +807,25 @@ static void *delivery_main(void *ud)
     return NULL;
 }
 
-/* The output, opened the first time a track wants a kit. TRK_PCM names the
- * ALSA device, "default" when unset. */
+static void audio_close(trk_engine *e)
+{
+    if (!e->audio_on) return;
+    e->aquit = 1;
+    pthread_join(e->athread, NULL);
+    snd_pcm_drop(e->pcm);
+    snd_pcm_close(e->pcm);
+    e->pcm = NULL;
+    e->audio_on = 0;
+    e->aquit = 0;
+}
+
+/* The output, opened the first time a track wants a kit. The device is the
+ * one chosen in the Audio output window (kept in a file beside the folder
+ * lists), else TRK_PCM, else the system's "default" -- which on a PipeWire
+ * system is PipeWire's, and with pipewire-jack under it, reaches JACK too. */
 static int audio_open(trk_engine *e)
 {
-    const char *dev = getenv("TRK_PCM");
+    const char *dev = e->pcm_name[0] ? e->pcm_name : getenv("TRK_PCM");
     snd_pcm_uframes_t buf = 0, per = 0;
     int r;
 
@@ -2169,6 +2187,7 @@ trk_engine *trk_open(char *err, size_t errn)
     }
     trk_record_defaults(&e->ropt);
     e->rec_first_tick = 0;
+    audio_conf_load(e);                           /* the output chosen last time */
     /* The queue's default timer is the system one, which steps at the
      * kernel's HZ -- 4 ms at 250 -- and every note lands on one of those
      * steps. A beat a few milliseconds out is audible against a drum
@@ -2246,12 +2265,7 @@ void trk_close(trk_engine *e)
         pthread_mutex_unlock(&e->dmx);
         pthread_join(e->dthread, NULL);
     }
-    if (e->audio_on) {
-        e->aquit = 1;
-        pthread_join(e->athread, NULL);
-        snd_pcm_drop(e->pcm);
-        snd_pcm_close(e->pcm);
-    }
+    audio_close(e);
     for (i = 0; i < e->nkit; i++) drumkit_free(e->kit[i].dk);
     drumkit_free(e->aud);
     while (e->nundo) free(e->undo[--e->nundo]);
@@ -2262,6 +2276,129 @@ void trk_close(trk_engine *e)
     snd_seq_close(e->seq);
     pthread_mutex_destroy(&e->lock);
     free(e);
+}
+
+
+/* ------------------------------------------------------- audio output -- */
+
+static const char *audio_conf_path(char *buf, size_t n)
+{
+    const char *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
+    if (x && *x) snprintf(buf, n, "%s/vst-ace/audio-output", x);
+    else if (h && *h) snprintf(buf, n, "%s/.config/vst-ace/audio-output", h);
+    else return NULL;
+    return buf;
+}
+
+static void audio_conf_load(trk_engine *e)
+{
+    char path[1024], line[TRK_DEST_LEN + 8];
+    FILE *f;
+    if (!audio_conf_path(path, sizeof path) || !(f = fopen(path, "r"))) return;
+    if (fgets(line, sizeof line, f)) {
+        size_t l = strlen(line);
+        while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
+        snprintf(e->pcm_name, sizeof e->pcm_name, "%s", line);
+    }
+    fclose(f);
+}
+
+static void audio_conf_save(trk_engine *e)
+{
+    char path[1024], dir[1024], *slash, tmp[1100];
+    FILE *f;
+    if (!audio_conf_path(path, sizeof path)) return;
+    snprintf(dir, sizeof dir, "%s", path);
+    if ((slash = strrchr(dir, '/'))) {
+        char *q;
+        *slash = 0;
+        for (q = dir + 1; *q; q++) if (*q == '/') { *q = 0; mkdir(dir, 0700); *q = '/'; }
+        mkdir(dir, 0700);
+    }
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    if (!(f = fopen(tmp, "w"))) return;
+    fprintf(f, "%s\n", e->pcm_name);
+    if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
+}
+
+/* The playback devices ALSA offers that are worth choosing between: the
+ * system's default, the PipeWire and JACK plug-ins (present when
+ * pipewire-alsa and the JACK plug-in are installed), PulseAudio, and the
+ * hardware cards through plughw, which takes any rate and format. */
+int trk_audio_devices(char names[][TRK_DEST_LEN], char labels[][96], int max)
+{
+    void **hints = NULL, **h;
+    int n = 0, pass;
+    if (snd_device_name_hint(-1, "pcm", &hints) < 0) return 0;
+    for (pass = 0; pass < 2; pass++)
+        for (h = hints; *h && n < max; h++) {
+            char *name = snd_device_name_get_hint(*h, "NAME"), *desc = snd_device_name_get_hint(*h, "DESC"),
+                 *io = snd_device_name_get_hint(*h, "IOID");
+            int special, hw, dup = 0, i;
+            if (!name || (io && !strcmp(io, "Input"))) goto next;
+            special = !strcmp(name, "default") || !strcmp(name, "pipewire") || !strcmp(name, "jack") ||
+                      !strcmp(name, "pulse") || !strcmp(name, "sysdefault");
+            hw = !strncmp(name, "plughw:", 7);
+            if ((pass == 0) != special || (pass == 1 && !hw)) goto next;
+            for (i = 0; i < n; i++) if (!strcmp(names[i], name)) dup = 1;
+            if (dup) goto next;
+            snprintf(names[n], TRK_DEST_LEN, "%s", name);
+            if (!strcmp(name, "default"))        snprintf(labels[n], 96, "System default");
+            else if (!strcmp(name, "sysdefault")) snprintf(labels[n], 96, "ALSA default (sysdefault)");
+            else if (!strcmp(name, "pipewire"))  snprintf(labels[n], 96, "PipeWire");
+            else if (!strcmp(name, "jack"))      snprintf(labels[n], 96, "JACK");
+            else if (!strcmp(name, "pulse"))     snprintf(labels[n], 96, "PulseAudio");
+            else {
+                char *nl = desc ? strchr(desc, '\n') : NULL;
+                if (nl) *nl = 0;
+                snprintf(labels[n], 96, "ALSA: %s", desc ? desc : name);
+            }
+            n++;
+        next:
+            free(name); free(desc); free(io);
+        }
+    snd_device_name_free_hint(hints);
+    {   /* The usual choices first, in the order a person looks for them. */
+        static const char *const order[] = { "default", "pipewire", "jack", "pulse", "sysdefault" };
+        int i, j, k = 0;
+        for (j = 0; j < 5; j++)
+            for (i = k; i < n; i++)
+                if (!strcmp(names[i], order[j])) {
+                    char tn[TRK_DEST_LEN], tl[96];
+                    memcpy(tn, names[i], sizeof tn); memcpy(tl, labels[i], sizeof tl);
+                    memmove(names[k + 1], names[k], (size_t)(i - k) * TRK_DEST_LEN);
+                    memmove(labels[k + 1], labels[k], (size_t)(i - k) * 96);
+                    memcpy(names[k], tn, sizeof tn); memcpy(labels[k], tl, sizeof tl);
+                    k++;
+                    break;
+                }
+    }
+    return n;
+}
+
+const char *trk_audio_device(trk_engine *e) { return e->pcm_name; }
+
+/* Switch the sample output. "" is the default (TRK_PCM, else the system's).
+ * Switched live: the old device is let go of and the new one opened; if it will
+ * not open, the default is put back and the reason is in trk_audio_status.
+ * Returns 0, or -1 when the chosen device would not open. */
+int trk_audio_set_device(trk_engine *e, const char *name)
+{
+    const int was_on = e->audio_on;
+    int r = 0;
+    if (!name) name = "";
+    audio_close(e);
+    snprintf(e->pcm_name, sizeof e->pcm_name, "%s", name);
+    if (was_on && audio_open(e) != 0) {
+        char why[sizeof e->audio_msg];
+        snprintf(why, sizeof why, "%s", e->audio_msg);
+        e->pcm_name[0] = 0;
+        audio_open(e);
+        snprintf(e->audio_msg, sizeof e->audio_msg, "%s -- back on the default", why);
+        r = -1;
+    }
+    audio_conf_save(e);
+    return r;
 }
 
 trk_song *trk_song_of(trk_engine *e) { return &e->song; }
@@ -2422,15 +2559,24 @@ int trk_track_used(trk_engine *e, int t)
 }
 
 /* Tracks inserted and removed: the song's tracks and every pattern's cells
- * move together, the routing follows, and playback stops -- what was sounding
+ * move together and the routing follows. Playing goes on; what was sounding
  * is released first, so nothing is left held by a track that is no longer
  * where it was. */
 static void move_tracks_locked(trk_engine *e, int at, int dir)
 {
     trk_song *s = &e->song;
     int p, r, t;
-    if (e->playing) stop_locked(e, 1);
-    else for (t = 0; t < TRK_TRACKS; t++) release_track(e, t);
+    unsigned i, n;
+    /* Playback carries on: what was scheduled ahead is taken back (it was laid
+     * down against the tracks as they were), what is sounding is let go of, and
+     * the schedule resumes from the first row not yet played. The history the
+     * schedule rewinds to names the held notes by track number -- it is
+     * cleared, since the numbers have moved. */
+    if (e->playing) rewind_locked(e);
+    for (t = 0; t < TRK_TRACKS; t++) release_track(e, t);
+    n = e->npos < POS_RING ? e->npos : POS_RING;
+    for (i = 0; i < n; i++)
+        for (t = 0; t < TRK_TRACKS; t++) e->pos[(e->npos - 1 - i) % POS_RING].held[t] = -1;
     for (p = 0; p < TRK_PATTERNS; p++)
         for (r = 0; r < TRK_ROWS_MAX; r++) {
             trk_cell *row = s->pattern[p].cell[r];
@@ -2446,7 +2592,18 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
         memmove(&s->track[at + 1], &s->track[at], sizeof s->track[0] * (size_t)(TRK_TRACKS - 1 - at));
         memmove(&e->track_sink[at + 1], &e->track_sink[at], sizeof e->track_sink[0] * (size_t)(TRK_TRACKS - 1 - at));
         memset(&s->track[at], 0, sizeof s->track[at]);
-        snprintf(s->track[at].name, sizeof s->track[at].name, "Track %d", at + 1);
+        {   /* "Track N" for the lowest N no track has -- not the position, which
+             * would name an added track after one that is already there. */
+            int num, t2, used;
+            for (num = 1; num <= TRK_TRACKS + 1; num++) {
+                char want[32];
+                snprintf(want, sizeof want, "Track %d", num);
+                used = 0;
+                for (t2 = 0; t2 < TRK_TRACKS; t2++) if (t2 != at && !strcmp(s->track[t2].name, want)) used = 1;
+                if (!used) break;
+            }
+            snprintf(s->track[at].name, sizeof s->track[at].name, "Track %d", num);
+        }
         s->track[at].velocity = 100;
         s->track[at].octave = 4;
         e->track_sink[at] = -1;
@@ -2473,6 +2630,7 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
     }
     sync_sink_names(e);
     for (t = 0; t < TRK_TRACKS; t++) e->rec_note[t] = -1;
+    if (e->playing) top_up(e);
 }
 
 int trk_track_insert(trk_engine *e, int at)

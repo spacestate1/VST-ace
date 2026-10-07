@@ -40,6 +40,8 @@ static const char *k_keys_help =
     "  Ctrl+F3 / F4      the same, an octave\n"
     "\n"
     "Tracks\n"
+    "  Ctrl+Insert       add a track after the cursor's  (+ Track)\n"
+    "  Ctrl+Delete       remove the cursor's track  (- Track; asks if it has notes)\n"
     "  Alt+F9            mute the cursor's track\n"
     "  Alt+F10           solo it (again: everyone back)\n"
     "  Alt+Shift+F9      unmute all\n"
@@ -378,6 +380,8 @@ static void sync_from_song(ui *U)
 static void refresh_samples(ui *U);
 static void edit_shown(ui *U);
 static void sync_mutes(ui *U);
+static void on_track_add(GtkButton *b, gpointer u);
+static void on_track_remove(GtkButton *b, gpointer u);
 static void schedule_refit(ui *U);   /* defined beside refit_columns, below */
 
 /* Help > Cheat Sheet: for each track playing a sample set, every sample
@@ -1108,6 +1112,7 @@ static void samples_menu(GtkMenuButton *mb, gpointer u)
     (void)u;
     g_menu_append(m, "Load Sample Set…", "win.load-samples");
     g_menu_append(m, "Edit Sample Set…", "win.edit-samples");
+    g_menu_append(m, "Audio Output…", "win.audio-output");
     gtk_menu_button_set_menu_model(mb, G_MENU_MODEL(m));
     g_object_unref(m);
 }
@@ -1261,6 +1266,8 @@ static int translate(guint kv, GdkModifierType st)
         case GDK_KEY_F4: return TRK_K_TRANSPOSE_OCT_UP;
         case GDK_KEY_KP_Multiply: return TRK_K_STEP_UP;
         case GDK_KEY_KP_Divide:   return TRK_K_STEP_DOWN;
+        case GDK_KEY_Insert:      return TRK_K_TRACK_ADD;
+        case GDK_KEY_Delete:      return TRK_K_TRACK_REMOVE;
         default: break;
         }
     switch (kv) {
@@ -1326,6 +1333,8 @@ static gboolean on_key(GtkEventControllerKey *k, guint kv, guint code,
     if (kv == GDK_KEY_Escape || kv == GDK_KEY_F12) { trk_panic(U->e); return TRUE; }
     key = translate(kv, st);
     if (key < 0) return FALSE;
+    if (key == TRK_K_TRACK_ADD)    { on_track_add(NULL, U); return TRUE; }
+    if (key == TRK_K_TRACK_REMOVE) { on_track_remove(NULL, U); return TRUE; }
     /* A held key repeats; a note or a digit must not, or holding one down
      * writes it into every row the cursor passes. */
     if (key < 0x80) {
@@ -2159,7 +2168,7 @@ static void on_track_add(GtkButton *b, gpointer u)
     (void)b;
     if (trk_track_insert(U->e, U->ed.track + 1) == 0) {
         U->ed.track++;
-        snprintf(msg, sizeof msg, "track %d added -- playback stopped; undo takes it back", U->ed.track + 1);
+        snprintf(msg, sizeof msg, "track %d added -- Ctrl+Z takes it back", U->ed.track + 1);
         tracks_changed(U, msg);
     } else {
         snprintf(msg, sizeof msg, "no room: a song has at most %d tracks", TRK_TRACKS);
@@ -2172,7 +2181,7 @@ static void do_track_remove(ui *U, int t)
 {
     char msg[96];
     if (trk_track_remove(U->e, t) == 0) {
-        snprintf(msg, sizeof msg, "track %d removed -- playback stopped; undo brings it back", t + 1);
+        snprintf(msg, sizeof msg, "track %d removed -- Ctrl+Z brings it back", t + 1);
         tracks_changed(U, msg);
     } else {
         status(U, "a song keeps at least one track");
@@ -2212,6 +2221,90 @@ static void on_track_remove(GtkButton *b, gpointer u)
         gtk_alert_dialog_choose(d, parent_window(U), NULL, remove_answered, k);
     }
 }
+
+/* ---- Samples > Audio Output ---- */
+
+typedef struct {
+    ui *U;
+    GtkWidget *win, *list, *note;
+    char names[24][TRK_DEST_LEN], labels[24][96];
+    int n;
+} audio_dlg;
+
+static void audio_fill(audio_dlg *A)
+{
+    const char *cur = trk_audio_device(A->U->e);
+    const char *now = *cur ? cur : "default";
+    GtkWidget *c;
+    int i;
+    while ((c = gtk_widget_get_first_child(A->list))) gtk_list_box_remove(GTK_LIST_BOX(A->list), c);
+    for (i = 0; i < A->n; i++) {
+        char *label = g_strdup_printf("%s%s", A->labels[i], !strcmp(now, A->names[i]) ? "   ● in use" : "");
+        GtkWidget *row = gtk_list_box_row_new(), *l = gtk_label_new(label);
+        gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), l);
+        g_object_set_data(G_OBJECT(row), "idx", GINT_TO_POINTER(i + 1));
+        gtk_list_box_append(GTK_LIST_BOX(A->list), row);
+        g_free(label);
+    }
+}
+
+static void audio_row_activated(GtkListBox *b, GtkListBoxRow *row, gpointer u)
+{
+    audio_dlg *A = u;
+    const int i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "idx")) - 1;
+    int r;
+    (void)b;
+    if (i < 0 || i >= A->n) return;
+    r = trk_audio_set_device(A->U->e, !strcmp(A->names[i], "default") ? "" : A->names[i]);
+    gtk_label_set_text(GTK_LABEL(A->note), *trk_audio_status(A->U->e) ? trk_audio_status(A->U->e)
+                                           : r ? "that device would not open" : "switched");
+    status(A->U, gtk_label_get_text(GTK_LABEL(A->note)));
+    audio_fill(A);
+}
+
+static void audio_gone(GtkWidget *w, gpointer u) { (void)w; g_free(u); }
+
+static void show_audio_output(ui *U)
+{
+    audio_dlg *A = g_new0(audio_dlg, 1);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8), *info, *sw, *intro;
+    A->U = U;
+    A->n = trk_audio_devices(A->names, A->labels, 24);
+    A->win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(A->win), "Audio output");
+    gtk_window_set_transient_for(GTK_WINDOW(A->win), parent_window(U));
+    gtk_window_set_default_size(GTK_WINDOW(A->win), 520, 420);
+    gtk_widget_set_margin_start(box, 12); gtk_widget_set_margin_end(box, 12);
+    gtk_widget_set_margin_top(box, 12);   gtk_widget_set_margin_bottom(box, 12);
+    intro = gtk_label_new("Where sample-set tracks play. Click one to switch to it; the choice is kept.");
+    gtk_label_set_xalign(GTK_LABEL(intro), 0.0f);
+    gtk_box_append(GTK_BOX(box), intro);
+    A->list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(A->list), GTK_SELECTION_SINGLE);
+    g_signal_connect(A->list, "row-activated", G_CALLBACK(audio_row_activated), A);
+    sw = gtk_scrolled_window_new();
+    gtk_widget_set_vexpand(sw, TRUE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), A->list);
+    gtk_box_append(GTK_BOX(box), sw);
+    A->note = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(A->note), 0.0f);
+    gtk_label_set_wrap(GTK_LABEL(A->note), TRUE);
+    gtk_box_append(GTK_BOX(box), A->note);
+    info = gtk_label_new("Synth tabs in the studio play through PipeWire, which also serves JACK programs "
+                         "(pipewire-jack) and ALSA programs (pipewire-alsa). This list is for the tracker's own "
+                         "sample playback.");
+    gtk_label_set_xalign(GTK_LABEL(info), 0.0f);
+    gtk_label_set_wrap(GTK_LABEL(info), TRUE);
+    gtk_widget_add_css_class(info, "dim-label");
+    gtk_box_append(GTK_BOX(box), info);
+    audio_fill(A);
+    g_signal_connect(A->win, "destroy", G_CALLBACK(audio_gone), A);
+    gtk_window_set_child(GTK_WINDOW(A->win), box);
+    gtk_window_present(GTK_WINDOW(A->win));
+}
+
+static void on_audio_output(GSimpleAction *a, GVariant *v, gpointer u) { (void)a; (void)v; show_audio_output(u); }
 
 static void on_export_button(GtkButton *b, gpointer u) { (void)b; export_midi(u); }
 
@@ -2662,6 +2755,7 @@ static GtkWidget *tracker_view_new(ui *U)
         { "cheat",        on_cheat,        NULL, NULL, NULL, {0} },
         { "load-samples", on_load_samples, NULL, NULL, NULL, {0} },
         { "edit-samples", on_edit_samples, NULL, NULL, NULL, {0} },
+        { "audio-output", on_audio_output, NULL, NULL, NULL, {0} },
         { "copy",         on_copy,         NULL, NULL, NULL, {0} },
         { "undo",         on_undo,         NULL, NULL, NULL, {0} },
         { "cut",          on_cut,          NULL, NULL, NULL, {0} },
@@ -3250,6 +3344,7 @@ void trk_view_new_song(trk_view *v) { confirm_then(v, AFTER_NEW); }
 void trk_view_save(trk_view *v)     { do_save(v, 0); }
 void trk_view_save_as(trk_view *v)  { save_as(v, 0); }
 void trk_view_set_embedded(trk_view *v, int on) { ((ui *)v)->embedded = on; }
+void trk_view_audio_output(trk_view *v) { show_audio_output(v); }
 void trk_view_export_take(trk_view *v) { export_take(v); }
 void trk_view_record_options(trk_view *v) { show_rec_options(v); }
 void trk_view_load_samples(trk_view *v) { on_load_samples(NULL, NULL, v); }

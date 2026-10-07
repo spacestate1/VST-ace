@@ -396,7 +396,8 @@ enum {
     TRK_K_SEL_PGUP, TRK_K_SEL_PGDN,
     TRK_K_PASTE_MIX,
     TRK_K_STEP_UP, TRK_K_STEP_DOWN,
-    TRK_K_RECORD                     /* record: play, and write what is played in */
+    TRK_K_RECORD,                    /* record: play, and write what is played in */
+    TRK_K_TRACK_ADD, TRK_K_TRACK_REMOVE   /* the windows act on these: they may need to ask first */
 };
 
 /* Feed one key press. Returns non-zero when the screen should be redrawn.
@@ -435,8 +436,8 @@ int  trk_undo(trk_engine *e);
 int  trk_redo(trk_engine *e);
 /* Add an empty track at position `at` (the ones from there on move right) or
  * take the track at `at` away (the ones after it move left, its notes go with
- * it). The windows, sample sets and synth routes follow their tracks; playback
- * stops. One undo step each. Returns 0, or -1 when there is no room / only one
+ * it). The windows, sample sets and synth routes follow their tracks; playing
+ * carries on (what was sounding is released). One undo step each. Returns 0, or -1 when there is no room / only one
  * track is left. trk_track_used says whether a track holds anything, to ask
  * before it is removed. */
 int  trk_track_insert(trk_engine *e, int at);
@@ -459,6 +460,16 @@ int  trk_track_set_octave(trk_engine *e, int track, int octave);
 /* Help > Columns: what each part of the screen is and what it changes, as
  * plain text for a dialog in a fixed-width font. Both windows show it. */
 const char *trk_columns_help(void);
+
+/* The sample output (the tracker's own audio, for sample-set tracks). The
+ * devices ALSA offers worth choosing between -- the system default, PipeWire
+ * and JACK where their ALSA plug-ins are installed, PulseAudio, and each
+ * hardware card -- as ALSA names with labels to show. Choosing one switches the
+ * output live and is remembered; "" is the default. Synth tabs in the studio
+ * play through PipeWire, a separate path. */
+int         trk_audio_devices(char names[][TRK_DEST_LEN], char labels[][96], int max);
+const char *trk_audio_device(trk_engine *e);
+int         trk_audio_set_device(trk_engine *e, const char *name);
 
 /* The cheat sheet for track t, lines of at most `width` characters: for a
  * track playing a sample set, each sample with its note and the key that

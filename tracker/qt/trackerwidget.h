@@ -84,6 +84,8 @@ inline const char *kKeysHelp =
     "  Ctrl+F3 / F4      the same, an octave\n"
     "\n"
     "Tracks\n"
+    "  Ctrl+Insert       add a track after the cursor's  (+ Track)\n"
+    "  Ctrl+Delete       remove the cursor's track  (- Track; asks if it has notes)\n"
     "  Alt+F9            mute the cursor's track\n"
     "  Alt+F10           solo it (again: everyone back)\n"
     "  Alt+Shift+F9      unmute all\n"
@@ -165,6 +167,8 @@ signals:
     void editToggled();
     void mutesChanged();             // a key muted, soloed or unmuted tracks
     void stepChanged();              // a key changed the edit step
+    void trackAddRequested();        // Ctrl+Insert
+    void trackRemoveRequested();     // Ctrl+Delete
     void clipped(int key);           // copied, cut or pasted: for the status line
 
 protected:
@@ -278,6 +282,8 @@ protected:
         // A held key repeats; a note or a digit must not, or holding one down
         // writes it into every row the cursor passes.
         if (ev->isAutoRepeat() && k < 0x100) return;
+        if (k == TRK_K_TRACK_ADD)    { emit trackAddRequested(); return; }
+        if (k == TRK_K_TRACK_REMOVE) { emit trackRemoveRequested(); return; }
         const quint32 sc = ev->nativeScanCode();
         if (k < 0x80 && sc > 0 && sc < sizeof down_) down_[sc] = (unsigned char)k;
         // A note typed: which track, and which note, before the cursor moves on.
@@ -506,6 +512,8 @@ private:
             case Qt::Key_F4: return TRK_K_TRANSPOSE_OCT_UP;
             case Qt::Key_Asterisk: if (keypad) return TRK_K_STEP_UP; break;
             case Qt::Key_Slash:    if (keypad) return TRK_K_STEP_DOWN; break;
+            case Qt::Key_Insert:   return TRK_K_TRACK_ADD;
+            case Qt::Key_Delete:   return TRK_K_TRACK_REMOVE;
             default: break;
             }
         }
@@ -1147,6 +1155,8 @@ public:
             trk_unlock(e_);
             view_->update();
         });
+        connect(view_, &PatternView::trackAddRequested, this, [this] { addTrack(); });
+        connect(view_, &PatternView::trackRemoveRequested, this, [this] { removeTrack(); });
         connect(view_, &PatternView::stepChanged, this, [this] {
             step_->blockSignals(true);
             step_->setValue(ed_.step);
@@ -1328,7 +1338,7 @@ private:
     {
         if (trk_track_insert(e_, ed_.track + 1) == 0) {
             ed_.track++;
-            tracksChanged(QString("track %1 added -- playback stopped; undo takes it back").arg(ed_.track + 1));
+            tracksChanged(QString("track %1 added -- Ctrl+Z takes it back").arg(ed_.track + 1));
         } else {
             host_->showStatus(QString("no room: a song has at most %1 tracks").arg(TRK_TRACKS), 5000);
         }
@@ -1348,7 +1358,7 @@ private:
             return;
         }
         if (trk_track_remove(e_, t) == 0)
-            tracksChanged(QString("track %1 removed -- playback stopped; undo brings it back").arg(t + 1));
+            tracksChanged(QString("track %1 removed -- Ctrl+Z brings it back").arg(t + 1));
         else
             host_->showStatus("a song keeps at least one track", 5000);
         view_->setFocus();
@@ -1629,6 +1639,63 @@ private:
             dlg.exec();
             view_->setFocus();
         });
+        samplesMenu_->addSeparator();
+        samplesMenu_->addAction("&Audio Output…", this, [this] { showAudioOutput(); });
+    }
+
+    // Samples > Audio Output: where the tracker's own audio (sample-set
+    // tracks) goes -- the system default, PipeWire, JACK, PulseAudio or a
+    // sound card -- switched live and remembered. Choosing a row applies it.
+    void showAudioOutput()
+    {
+        QDialog d(this);
+        d.setWindowTitle("Audio output");
+        auto *v = new QVBoxLayout(&d);
+        v->addWidget(new QLabel("Where sample-set tracks play. Click one to switch to it; the choice is kept."));
+        auto *list = new QListWidget;
+        auto *note = new QLabel;
+        note->setWordWrap(true);
+        static char names[24][TRK_DEST_LEN], labels[24][96];
+        const int n = trk_audio_devices(names, labels, 24);
+        auto cur = [this] { return QString::fromUtf8(trk_audio_device(e_)); };
+        auto fill = [&] {
+            list->blockSignals(true);
+            list->clear();
+            const QString now = cur().isEmpty() ? QString("default") : cur();
+            for (int i = 0; i < n; i++) {
+                auto *it = new QListWidgetItem(QString::fromUtf8(labels[i]) +
+                                               (now == names[i] ? "   ● in use" : ""));
+                it->setData(Qt::UserRole, QString::fromUtf8(names[i]));
+                list->addItem(it);
+                if (now == names[i]) list->setCurrentItem(it);
+            }
+            list->blockSignals(false);
+        };
+        fill();
+        connect(list, &QListWidget::itemClicked, &d, [&](QListWidgetItem *it) {
+            const QByteArray name = it->data(Qt::UserRole).toString().toUtf8();
+            const bool def = name == "default";
+            const int r = trk_audio_set_device(e_, def ? "" : name.constData());
+            note->setText(QString::fromUtf8(trk_audio_status(e_)).isEmpty()
+                              ? (r ? "that device would not open" : "switched")
+                              : QString::fromUtf8(trk_audio_status(e_)));
+            fill();
+            host_->showStatus(note->text(), 5000);
+        });
+        v->addWidget(list, 1);
+        v->addWidget(note);
+        auto *info = new QLabel("Synth tabs in the studio play through PipeWire, which also serves JACK programs "
+                                "(pipewire-jack) and ALSA programs (pipewire-alsa). This list is for the tracker's own "
+                                "sample playback.");
+        info->setWordWrap(true);
+        info->setEnabled(false);
+        v->addWidget(info);
+        auto *close = new QPushButton("Close");
+        connect(close, &QPushButton::clicked, &d, &QDialog::accept);
+        v->addWidget(close, 0, Qt::AlignRight);
+        d.resize(520, 420);
+        d.exec();
+        view_->setFocus();
     }
 
     // Edit mode, said where it cannot be missed: off, the grid is not
