@@ -417,7 +417,11 @@ static void midi_drain(session *s, snd_seq_t *seq)
             break;
         case SND_SEQ_EVENT_PGMCHANGE:
             if (s->have_bank) {
-                s->prog = ev->data.control.value % s->bk.count;
+                /* value is signed: mask to the 7 bits MIDI has, as % would
+                 * hand bk.prog a negative index. */
+                int pg = ev->data.control.value & 127;
+                if (pg >= s->bk.count) break;
+                s->prog = pg;
                 dw_synth_set_program(&s->syn, s->bk.prog[s->prog].param);
                 printf("  preset %d: %s\n", s->prog, s->bk.prog[s->prog].name);
                 fflush(stdout);

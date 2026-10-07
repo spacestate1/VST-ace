@@ -75,6 +75,18 @@ void plugview_load_patch(plugview *pv, GtkWindow *parent);
  * the platform it holds. Persisted, and shared with pestudio -- one answer per
  * machine to "where are my plug-ins", not one per window. See vstdirs.h. */
 void plugview_edit_folders(plugview *pv, GtkWindow *parent);
+/* Make the folder holding the loaded plug-in one of the folders searched, kept
+ * between sessions. */
+void plugview_keep_folder(plugview *pv);
+/* The plug-ins found by the scan, in the order the browser lists them: for a
+ * shell's plug-in manager. `path` and the rest are owned by the view and valid
+ * until the next scan. */
+int  plugview_available_count(plugview *pv);
+void plugview_available(plugview *pv, int i, const char **path, const char **name,
+                        const char **kind, int *loadable);
+/* Scan the folders again and refill the browser -- after one was taken off
+ * the list, or put back. */
+void plugview_rescan(plugview *pv);
 
 /* Settings > Enter Key / Serial: type a registration key into the editor of
  * whatever is loaded. Some plug-ins do nothing until something has been typed

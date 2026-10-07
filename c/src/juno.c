@@ -151,6 +151,10 @@ void juno_destroy(juno_synth *s) { free(s); }
 void juno_set_patch(juno_synth *s, const juno_patch *p)
 {
     s->p = *p;
+    /* RANGE[] has three entries; a patch built outside juno_set_param may carry
+     * any int here. */
+    if (s->p.range < 0) s->p.range = 0;
+    if (s->p.range > 2) s->p.range = 2;
     /* APPROX: 0.05..25 Hz covers the panel sweep. */
     s->lfo_inc = (0.05 * pow(500.0, p->lfo_rate)) / s->sr;
     chorus_set(&s->ch, p->chorus, s->sr);
@@ -278,7 +282,7 @@ void juno_render(juno_synth *s, double *out, int frames)
             env = eg_run(&v->eg);
             if (!v->eg.stage && env <= 0.0) { v->active = 0; continue; }
 
-            hz = note_hz((double)v->note + RANGE[p->range & 3]
+            hz = note_hz((double)v->note + RANGE[p->range]
                          + lfo * p->dco_lfo * 0.5);
             v->inc = hz / s->sr;
             dt = v->inc;

@@ -41,6 +41,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The output stage: a NaN from a plug-in becomes silence rather than a burst,
+ * and past 0.95 the level rolls into the rail instead of hitting it -- the
+ * same in value and slope, never over 1. */
+static inline float out_soft(double v)
+{
+    double a;
+    if (v != v) return 0.0f;
+    a = v < 0 ? -v : v;
+    if (a > 0.95) {
+        a = 0.95 + 0.05 * tanh((a - 0.95) * 20.0);
+        v = v < 0 ? -a : a;
+    }
+    return (float)v;
+}
+
+
 #define SR       48000
 /* One PipeWire quantum (1024 frames at 48 kHz = 21.3 ms). The audio thread
  * cannot get realtime priority here -- `ulimit -r` is 0 and the user is not in
@@ -59,7 +75,7 @@ static int g_period     = 256;      /* 5.3 ms -- safe on PipeWire's RT thread */
 static int g_latency_us = 50000;    /* 50 ms   */
 #define MAX_INST    64
 #define MAX_BANKS   16
-#define EVQ        512          /* power of two */
+#define EVQ        2048         /* power of two */
 
 /* ------------------------------------------------------------- instruments */
 
@@ -190,12 +206,23 @@ static int grab_cb(const char *type, const char *name, int type_id,
         snprintf(b->type, sizeof b->type, "%s", type);
         in->nbanks++;
     } else if (!strcmp(type, "DSTDATA") && !strcmp(name, "WAVEDST")) {
+        free(in->wavedst);   /* a second WAVEDST would otherwise leak the first */
+        in->wavedst = NULL;
         if ((in->wavedst = malloc(size))) {
             memcpy(in->wavedst, data, size);
             in->wavedst_len = size;
         }
     }
     return 0;
+}
+
+/* The buffers an instrument that is not kept still owns. */
+static void instrument_discard(instrument *in)
+{
+    int i;
+    for (i = 0; i < in->nbanks; i++) free(in->banks[i].raw);
+    free(in->wavedst);
+    memset(in, 0, sizeof *in);
 }
 
 static int load_instrument(const char *path, instrument *in)
@@ -230,6 +257,9 @@ enum { EV_ON = 1, EV_OFF, EV_ALLOFF, EV_PROG, EV_PARAM };
 
 typedef struct { unsigned char type, a, b; float v; } ev_t;
 
+#define EV_RESERVE 64           /* slots only non-note-on events may use */
+static int audio_live(void);    /* defined with the backends */
+
 static ev_t             g_evq[EVQ];
 static _Atomic unsigned g_ev_head, g_ev_tail;      /* head: producer, tail: consumer */
 
@@ -237,7 +267,18 @@ static void ev_push_v(unsigned char type, unsigned char a, unsigned char b, floa
 {
     unsigned h = atomic_load_explicit(&g_ev_head, memory_order_relaxed);
     unsigned t = atomic_load_explicit(&g_ev_tail, memory_order_acquire);
-    if (((h + 1) & (EVQ - 1)) == (t & (EVQ - 1))) return;   /* full: drop */
+    unsigned used = (h - t) & (EVQ - 1);
+    /* With nothing consuming (no audio device, or the window up before the
+     * stream), the ring would fill and stay full; there is no one to replay
+     * for, so empty it. */
+    if (used >= EVQ - 1 && !audio_live()) {
+        atomic_store_explicit(&g_ev_tail, h, memory_order_release);
+        used = 0;
+    }
+    /* Full: drop. The last EV_RESERVE slots are kept for everything but a
+     * note-on, so a flood of note-ons can never cost the note-off that ends
+     * one (a stuck note) or an all-off. */
+    if (used >= EVQ - 1 || (type == EV_ON && used >= EVQ - EV_RESERVE)) return;
     g_evq[h & (EVQ - 1)] = (ev_t){ type, a, b, v };
     atomic_store_explicit(&g_ev_head, h + 1, memory_order_release);
 }
@@ -266,6 +307,7 @@ typedef struct {
 
     snd_pcm_t     *pcm;
     pthread_t      thread;
+    int            thread_started;   /* thread is a real pthread_t, to be joined */
     _Atomic int    running;
     _Atomic int    parked;      /* audio thread has stopped touching the engine */
     _Atomic int    park_req;
@@ -553,7 +595,7 @@ static void *audio_thread(void *ud)
     short  *pcm = malloc((size_t)PERIOD_MAX * 2 * sizeof *pcm);
     int i;
 
-    if (!buf || !pcm) return NULL;
+    if (!buf || !pcm) { free(buf); free(pcm); return NULL; }
     if (!g_teb_ready) { pehost_thread_init(); g_teb_ready = 1; }
 
     while (atomic_load_explicit(&e->running, memory_order_relaxed)) {
@@ -571,6 +613,7 @@ static void *audio_thread(void *ud)
 
         for (i = 0; i < g_period * 2; i++) {
             double v = buf[i] * e->gain * 32767.0;
+            if (v != v) v = 0.0;   /* (short)NaN is undefined; a plug-in can emit one */
             pcm[i] = (short)(v > 32767.0 ? 32767.0 : (v < -32768.0 ? -32768.0 : v));
         }
 
@@ -623,7 +666,7 @@ static void pw_on_process(void *ud)
         render_block(e, g_pw_buf, n);
         for (i = 0; i < n * 2; i++) {
             double v = g_pw_buf[i] * e->gain;
-            dst[i] = (float)(v > 1.0 ? 1.0 : (v < -1.0 ? -1.0 : v));
+            dst[i] = out_soft(v);
         }
     }
 
@@ -837,6 +880,13 @@ static int engine_start_pipewire(engine *e)
     return 0;
 }
 
+/* Whether anything is consuming the event ring. GTK thread only, like the
+ * code that starts and stops the backends. */
+static int audio_live(void)
+{
+    return g_eng.pcm != NULL || g_pw_stream != NULL;
+}
+
 /* Stop the audio callback touching engine state so the GTK thread can free and
  * rebuild it. Both backends acknowledge through `parked`; which one is live
  * decides whether there is anyone to wait for. Testing e->pcm alone used to
@@ -932,12 +982,24 @@ static int engine_start_audio(engine *e)
         return -1;
     }
     if (snd_pcm_set_params(e->pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                           2, SR, 1, (unsigned)g_latency_us) < 0)
+                           2, SR, 1, (unsigned)g_latency_us) < 0) {
+        /* Leaving pcm set would make engine_park() wait 500 ms for a thread
+         * that was never started, every time. */
+        snd_pcm_close(e->pcm);
+        e->pcm = NULL;
         return -1;
+    }
     fprintf(stderr, "audio: alsa, %d-frame blocks (%.1f ms), %d ms buffer\n",
             g_period, 1000.0 * g_period / SR, g_latency_us / 1000);
     atomic_store_explicit(&e->running, 1, memory_order_release);
-    pthread_create(&e->thread, NULL, audio_thread, e);
+    if (pthread_create(&e->thread, NULL, audio_thread, e)) {
+        atomic_store_explicit(&e->running, 0, memory_order_release);
+        snd_pcm_close(e->pcm);
+        e->pcm = NULL;
+        fprintf(stderr, "audio: could not start the ALSA thread\n");
+        return -1;
+    }
+    e->thread_started = 1;
     return 0;
 }
 
@@ -2104,15 +2166,15 @@ static gboolean poll_midi(gpointer u)
             int want = atomic_load_explicit(&g_midi_ch, memory_order_relaxed);
             if (want >= 0 && voice && ev->data.note.channel != want) continue;
         }
-        ch = voice ? ev->data.note.channel : 0;
+        ch = voice ? (ev->data.note.channel & 15) : 0;   /* the sequencer's field is a full byte */
 
         switch (ev->type) {
         case SND_SEQ_EVENT_NOTEON:
-            status = 0x90 | ch; d1 = ev->data.note.note; d2 = ev->data.note.velocity;
+            status = 0x90 | ch; d1 = ev->data.note.note & 0x7f; d2 = ev->data.note.velocity & 0x7f;
             if (d2 > 0) note_start(d1, d2, 0); else note_stop(d1, 0);
             break;
         case SND_SEQ_EVENT_NOTEOFF:
-            status = 0x80 | ch; d1 = ev->data.note.note;
+            status = 0x80 | ch; d1 = ev->data.note.note & 0x7f;
             note_stop(d1, 0);
             break;
         case SND_SEQ_EVENT_PITCHBEND: {
@@ -2146,7 +2208,7 @@ static gboolean poll_midi(gpointer u)
             status = 0xD0 | ch; d1 = ev->data.control.value & 0x7f;
             break;
         case SND_SEQ_EVENT_KEYPRESS:
-            status = 0xA0 | ch; d1 = ev->data.note.note; d2 = ev->data.note.velocity;
+            status = 0xA0 | ch; d1 = ev->data.note.note & 0x7f; d2 = ev->data.note.velocity & 0x7f;
             break;
         /* System realtime. No channel, which is why the filter above is for
          * voice messages only, and this is how a sequencer says what its tempo
@@ -2809,8 +2871,8 @@ static void scan(const char *dir)
         instrument in;
         if (!g_str_has_suffix(nm, ".dll")) continue;
         snprintf(path, sizeof path, "%s/%s", dir, nm);
-        if (!load_instrument(path, &in)) continue;
-        if (in.eng == ENG_NONE && !g_show_all) { skipped++; continue; }
+        if (!load_instrument(path, &in)) { instrument_discard(&in); continue; }
+        if (in.eng == ENG_NONE && !g_show_all) { skipped++; instrument_discard(&in); continue; }
         g_inst[g_ninst++] = in;
     }
     g_dir_close(d);
@@ -3296,7 +3358,8 @@ int main(int argc, char **argv)
      * loop is still calling render_block() at this point, and letting it run
      * into process teardown renders out of freed engine state. */
     atomic_store_explicit(&g_eng.running, 0, memory_order_release);
-    if (g_eng.pcm) { pthread_join(g_eng.thread, NULL); snd_pcm_close(g_eng.pcm); }
+    if (g_eng.thread_started) pthread_join(g_eng.thread, NULL);
+    if (g_eng.pcm) snd_pcm_close(g_eng.pcm);
     engine_stop_pipewire();
     pw_deinit();
     plugview_free(g_pv);        /* the window's teardown already shut it down */

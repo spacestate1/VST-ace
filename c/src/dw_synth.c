@@ -43,6 +43,7 @@ int dw_synth_init(dw_synth *s, const dw_wavetable *wt, double samplerate)
     int i;
 
     memset(s, 0, sizeof *s);
+    if (!(samplerate > 0.0 && samplerate <= 1e6)) return -1;   /* also rejects NaN */
     s->wt         = wt;
     s->samplerate = samplerate;
     s->nvoices    = 8;
@@ -78,7 +79,12 @@ void dw_synth_set_program(dw_synth *s, const double *param)
     int    set, i;
     double mgf, dtime;
 
-    memcpy(s->param, param, sizeof s->param);
+    /* Copy while sanitising: a NaN/inf (or absurd) value from a bad bank would
+     * otherwise reach the delay and oscillator maths. 0 is the default for the
+     * parameters that matter here (the delay ones all default to a valid 0). */
+    for (i = 0; i < DWP_COUNT; i++)
+        s->param[i] = isfinite(param[i]) ? clampd(param[i], -1e6, 1e6) : 0.0;
+    p = s->param;
 
     /* Waveform selectors are 1..16; Wavetable Set picks which bank of 16. */
     set = idx_of(p[DWP_WAVETABLE_SET], 2);
@@ -149,6 +155,17 @@ void dw_synth_set_program(dw_synth *s, const double *param)
      * 9 dB quieter than they need to be, since most playing is a handful of
      * notes rather than full polyphony -- so reserve most of it and let the
      * master soft-clip absorb the rare dense chord. */
+    /* A program that lowers the voice count must not leave voices above it
+     * active: the render loop never visits them, so they would stay busy. */
+    for (i = s->nvoices; i < DW_MAX_VOICES; i++) {
+        s->voice[i].active = 0;
+        s->voice[i].held   = 0;
+        s->voice[i].eg_vcf.stage = DW_EG_IDLE;
+        s->voice[i].eg_vca.stage = DW_EG_IDLE;
+        s->voice[i].eg_vcf.level = 0.0;
+        s->voice[i].eg_vca.level = 0.0;
+    }
+
     s->voice_scale = dw_tune.gain * 0.4 / sqrt((double)s->nvoices);
 
     /* APPROX: the delay is FB-7999's own addition, not a DW-8000 control, and
@@ -240,8 +257,12 @@ static dw_voice *pick_voice(dw_synth *s)
 
 void dw_synth_note_on(dw_synth *s, int note, int velocity)
 {
-    double from = (double)note - 69.0;
+    double from;
     int    i;
+
+    note = note < 0 ? 0 : (note > 127 ? 127 : note);
+    velocity = velocity < 0 ? 0 : (velocity > 127 ? 127 : velocity);
+    from = (double)note - 69.0;
 
     /* Portamento glides from whatever is currently sounding. */
     for (i = 0; i < s->nvoices; i++)
@@ -289,6 +310,10 @@ void dw_synth_all_off(dw_synth *s)
         s->voice[i].eg_vcf.level = 0.0;
         s->voice[i].eg_vca.level = 0.0;
     }
+    /* Stale echoes would otherwise survive a panic, and a non-finite sample
+     * in a feedback line would live on forever. */
+    dw_delay_clear(&s->delay_l);
+    dw_delay_clear(&s->delay_r);
 }
 
 int dw_synth_busy(const dw_synth *s)

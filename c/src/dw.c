@@ -112,6 +112,19 @@ static void installed_at(const char *lib, const char *data)
     corpus_root(g_vst, sizeof g_vst);
 }
 
+/* Whether something found by walking up from the binary is a place to run
+ * things from: owned by whoever is running this, or by root, and not writable
+ * by everyone. The walk reaches /tmp from an AppImage's mount point, and what
+ * is under /tmp is anybody's -- a planted "tools/" or "peload/" there would
+ * otherwise be taken for ours. */
+static int trusted_path(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (st.st_uid != geteuid() && st.st_uid != 0) return 0;
+    return !(st.st_mode & S_IWOTH);
+}
+
 /* Find the tree from the executable rather than the working directory -- the
  * point of a single binary is that it runs from anywhere, including a copy on
  * $PATH. Walking up looking for peload/pehost.c finds `re` whether this was
@@ -137,6 +150,10 @@ static int locate_tree(void)
         if (!exe[0]) break;
         snprintf(probe, sizeof probe, "%s/peload/pehost.c", exe);
         if (is_file(probe)) {
+            char pdir[PATH_MAX];
+            snprintf(pdir, sizeof pdir, "%s/peload", exe);
+            /* A source tree somebody else put on the way up is not ours. */
+            if (!trusted_path(probe) || !trusted_path(pdir) || !trusted_path(exe)) continue;
             snprintf(g_re, sizeof g_re, "%s", exe);
             if ((slash = strrchr(exe, '/')) && slash != exe) {
                 *slash = 0;
@@ -372,11 +389,20 @@ static void engine_close(engine *e)
 static double *render_program(engine *e, const bank_program *prog, const int *notes,
                               int nnotes, double gate, double total, size_t *frames_out)
 {
-    size_t  frames = (size_t)(total * SR);
-    size_t  gate_f = (size_t)(gate  * SR);
+    size_t  frames, gate_f;
     double *buf;
     int     i;
 
+    /* LEN and GATE come from the environment. An absurd LEN (1.9e14 s) made
+     * frames * 2 wrap, calloc return a small block and the render write past
+     * it; infinity is (size_t)UB. 10 minutes is far past any preset audition
+     * and keeps frames small enough for the (int) casts below. */
+    if (!(total > 0.0 && total <= 600.0) || !(gate >= 0.0)) {
+        fprintf(stderr, "va: LEN must be 0..600 seconds and GATE not negative\n");
+        return NULL;
+    }
+    frames = (size_t)(total * SR);
+    gate_f = gate > total ? frames : (size_t)(gate * SR);
     if (gate_f > frames) gate_f = frames;
     if (!(buf = calloc(frames * 2, sizeof *buf))) return NULL;
 

@@ -20,6 +20,16 @@
 /* A pad cut off -- by its choke group, or by being hit again -- fades over
  * this long rather than stopping dead, which clicks. */
 #define DK_FADE_S 0.004
+/* A hit comes in over this long, and its last stretch goes out over this
+ * long: a sample that starts or ends off zero (trimmed, or chopped from a
+ * longer one) would otherwise step -- a click -- at both ends. Short enough
+ * that a drum's transient is untouched. */
+#define DK_ATTACK_S 0.001
+/* What one set may hold in memory: the whole of its samples as floats. A
+ * kit.txt can name a hundred and twenty-eight files, and the same large one
+ * over and over. */
+#define DK_BUDGET   ((size_t)768 * 1024 * 1024)
+#define DK_TAIL_S   0.003
 
 typedef struct {
     char    name[DK_NAME_MAX];   /* the file name without .wav, for showing */
@@ -38,6 +48,7 @@ typedef struct {
     double rate;         /* 1: as recorded */
     double gain;
     double fade;         /* 1 while playing; falling to 0 once cut off */
+    double attack;       /* rising from 0 to 1 as the hit starts */
     int    cut;
 } dk_voice;
 
@@ -47,7 +58,8 @@ struct drumkit {
     int       slot_of[128];      /* note -> sample, or -1 */
     int       mapped;
     dk_voice  voice[DK_MAX_VOICES];
-    double    sr, gain, fade_step;
+    double    sr, gain, fade_step, attack_step;
+    size_t    pcm_bytes;          /* what the samples hold, against DK_BUDGET */
     unsigned  next;
 };
 
@@ -80,6 +92,7 @@ static int parse_note(const char *s)
 
 static void note_name(int note, char *buf)
 {
+    if (note < 0 || note > 127) { snprintf(buf, 5, "---"); return; }
     snprintf(buf, 5, "%s%d", k_names[note % 12], note / 12 - 1);
 }
 
@@ -92,8 +105,18 @@ static int by_name(const void *a, const void *b)
  * the editor's Add gives for a WAV from somewhere else. */
 static void pad_path(const char *dir, const char *file, char *out, size_t n)
 {
-    if (file[0] == '/') snprintf(out, n, "%s", file);
-    else                snprintf(out, n, "%s/%s", dir, file);
+    const char *q;
+    if (file[0] == '/') { snprintf(out, n, "%s", file); return; }
+    /* Relative, a set's own file: it stays in the set's folder. A "../" would
+     * take a kit.txt out of the folder it was dropped in. */
+    for (q = file; *q; ) {
+        const char *e = strchr(q, '/');
+        size_t l = e ? (size_t)(e - q) : strlen(q);
+        if (l == 2 && q[0] == '.' && q[1] == '.') { if (n) out[0] = 0; return; }
+        q += l;
+        if (*q == '/') q++;
+    }
+    snprintf(out, n, "%s/%s", dir, file);
 }
 
 /* One sample into the next slot. Returns 0 when it loaded. */
@@ -109,7 +132,13 @@ static int add_sample(drumkit *k, const char *dir, const dk_pad *p)
     if (k->n >= DK_MAX_SAMPLES || p->note < 0 || p->note > 127 || k->slot_of[p->note] >= 0)
         return -1;
     pad_path(dir, p->file, path, sizeof path);
-    if (wav_read_stereo(path, &pcm, &fr, &sr) || !fr) { free(pcm); return -1; }
+    if (!path[0] || wav_read_stereo(path, &pcm, &fr, &sr) || !fr) { free(pcm); return -1; }
+    if (fr > DK_BUDGET / (2 * sizeof *pcm) || k->pcm_bytes + fr * 2 * sizeof *pcm > DK_BUDGET) {
+        fprintf(stderr, "drumkit: %s would take the set past its memory budget -- skipped\n", path);
+        free(pcm);
+        return -1;
+    }
+    k->pcm_bytes += fr * 2 * sizeof *pcm;
 
     s = &k->sample[k->n];
     memset(s, 0, sizeof *s);
@@ -222,7 +251,7 @@ static int map_file(dk_map *m, const char *dir)
             if (!strcmp(w, "gain")) {
                 gain_db = strtod(v, &end);
                 if (*end && strcasecmp(end, "dB")) bad = 1;
-                if (gain_db < -60.0 || gain_db > 24.0) bad = 1;
+                if (!(gain_db >= -60.0 && gain_db <= 24.0)) bad = 1;     /* NaN is neither */
             } else if (!strcmp(w, "choke")) {
                 long c = strtol(v, &end, 10);
                 if (*end || c < 0 || c > 99) bad = 1;
@@ -262,10 +291,14 @@ drumkit *drumkit_load_map(const dk_map *m, double samplerate)
     drumkit *k;
     int i;
 
+    /* The rate divides into every step; zero, negative or NaN would send a
+     * voice's position backwards or to infinity. */
+    if (!(samplerate > 0.0 && samplerate <= 1e7)) return NULL;
     if (!(k = calloc(1, sizeof *k))) return NULL;
     k->sr = samplerate;
     k->gain = 1.0;
     k->fade_step = 1.0 / (DK_FADE_S * samplerate);
+    k->attack_step = 1.0 / (DK_ATTACK_S * samplerate);
     k->mapped = m->mapped;
     for (i = 0; i < 128; i++) k->slot_of[i] = -1;
     for (i = 0; i < m->n; i++)
@@ -523,7 +556,9 @@ void drumkit_note_on(drumkit *k, int note, int velocity)
 void drumkit_play(drumkit *k, int slot, double rate, int velocity, int group)
 {
     int i, pick = -1, choke;
-    if (!k || slot < 0 || slot >= k->n || !(rate > 0.0)) return;
+    if (!k || slot < 0 || slot >= k->n || !(rate > 0.0) || !(rate <= 1e6)) return;
+    if (velocity < 0) velocity = 0;
+    if (velocity > 127) velocity = 127;
     choke = k->sample[slot].choke;
 
     /* The same group hit again, and the pads in this one's choke group, fade
@@ -537,7 +572,20 @@ void drumkit_play(drumkit *k, int slot, double rate, int velocity, int group)
     }
     for (i = 0; i < DK_MAX_VOICES; i++)
         if (!k->voice[i].active) { pick = i; break; }
-    if (pick < 0) pick = (int)(k->next++ % DK_MAX_VOICES);
+    if (pick < 0) {
+        /* All busy: one has to go, and a voice taken mid-sound stops dead
+         * -- a click. The least audible one: a voice already fading out
+         * (the faintest first), else the one nearest the end of its sample,
+         * which is on its tail. */
+        double best = 1e300;
+        for (i = 0; i < DK_MAX_VOICES; i++) {
+            const dk_voice *v = &k->voice[i];
+            const dk_sample *vs = &k->sample[v->slot];
+            double left = (double)vs->frames - v->pos;          /* source frames to go; v is active, so slot is valid */
+            double score = v->cut ? v->fade * 1e-3 : left / (vs->step > 0 ? vs->step : 1.0);
+            if (score < best) { best = score; pick = i; }
+        }
+    }
 
     k->voice[pick].active = 1;
     k->voice[pick].slot   = slot;
@@ -546,6 +594,7 @@ void drumkit_play(drumkit *k, int slot, double rate, int velocity, int group)
     k->voice[pick].pos    = 0.0;
     k->voice[pick].gain   = (0.25 + 0.75 * (velocity / 127.0)) * k->sample[slot].gain;
     k->voice[pick].fade   = 1.0;
+    k->voice[pick].attack = 0.0;
     k->voice[pick].cut    = 0;
 }
 
@@ -604,17 +653,27 @@ void drumkit_render(drumkit *k, double *out, int frames)
             dk_voice  *v = &k->voice[i];
             dk_sample *s;
             size_t     i0;
-            double     f, g;
+            double     f, g, left;
             const float *a;
 
             if (!v->active) continue;
             s = &k->sample[v->slot];
+            /* pos starts at 0 and only grows; this also stops a NaN or
+             * negative one from wrapping through (size_t). */
+            if (!(v->pos >= 0.0 && v->pos < (double)s->frames)) { v->active = 0; continue; }
             i0 = (size_t)v->pos;
             if (i0 + 1 >= s->frames) { v->active = 0; continue; }
             if (v->cut && (v->fade -= k->fade_step) <= 0.0) { v->active = 0; continue; }
 
             f = v->pos - (double)i0;
             g = v->gain * v->fade;
+            if (v->attack < 1.0) {
+                if ((v->attack += k->attack_step) > 1.0) v->attack = 1.0;
+                g *= v->attack;
+            }
+            /* The last few ms of the sample, faded to nothing. */
+            left = ((double)s->frames - 1.0 - v->pos) / (s->step * v->rate * k->sr);
+            if (left < DK_TAIL_S) g *= left / DK_TAIL_S;
             a = s->pcm + 2 * i0;
             l += (a[0] + f * (a[2] - a[0])) * g;
             r += (a[1] + f * (a[3] - a[1])) * g;

@@ -106,12 +106,15 @@ double dw_wavetable_read(const dw_wavetable *wt, int wave, int mip, double phase
     if (wave < 0) wave = 0;
     if (wave >= wt->nwaves) wave = wt->nwaves - 1;
 
+    if (mip < 0) mip = 0;
+    if (mip >= wt->mips) mip = wt->mips - 1;
+
     tab  = wt->tab + ((size_t)wave * wt->mips + mip) * ((size_t)wt->frame + 1);
-    /* The only caller (dw_synth_render) keeps phase in [0,1): it starts at 0
-     * and wraps right after each increment. frame is a power of two, so
-     * x < frame with no rounding-up corner, and i stays in [0, frame-1] with
-     * i+1 landing on the wrapped extra sample -- no clamp is needed. */
+    /* dw_synth_render keeps phase in [0,1), so x < frame and i+1 lands on the
+     * wrapped extra sample. The guard is only for a non-finite or out-of-range
+     * phase, which would otherwise be (int)INT_MIN. */
     x    = phase * (double)wt->frame;
+    if (!(x >= 0.0 && x < (double)wt->frame)) x = 0.0;
     i    = (int)x;
     frac = x - (double)i;
 

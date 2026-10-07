@@ -25,16 +25,62 @@ What it handles, and what it does not:
 A DLL is only treated as a plug-in if it exports a VST entry point, which keeps
 an installer's own helper DLLs out of the results.
 """
-import argparse, os, re, shlex, shutil, struct, subprocess, sys, tempfile
+import argparse, os, re, shutil, signal, struct, subprocess, sys, tempfile, zlib
+
+# An unpacker that has not finished in this long is stuck, not slow.
+UNPACK_TIMEOUT = 600
+# The most one PE or one decompressed Payload is read into memory.
+MAX_READ = 256 * 1024 * 1024
+MAX_PAYLOAD = 1024 * 1024 * 1024
+
+# Why the last extract() said no, for the report ('' when it did not know).
+_why = ''
+
+
+def run_tool(cmd):
+    """Run an unpacker and return the CompletedProcess, or None when it could
+    not be run to completion (not installed, or past the timeout). stdin is
+    /dev/null so a tool that asks a question fails instead of waiting for it,
+    and the timeout is what keeps one bad installer from hanging the run."""
+    global _why
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, errors='replace',
+                              stdin=subprocess.DEVNULL, timeout=UNPACK_TIMEOUT)
+    except FileNotFoundError:
+        _why = '%s is not installed' % cmd[0]
+    except subprocess.TimeoutExpired:
+        _why = '%s did not finish in %d s' % (cmd[0], UNPACK_TIMEOUT)
+    except OSError as e:
+        _why = '%s could not be run: %s' % (cmd[0], e)
+    return None
+
+
+def copy_file(src, dst):
+    """copy2 that leaves nothing behind when it fails (a full disk leaves a
+    truncated file that would later be taken for the plug-in). True on success."""
+    try:
+        shutil.copy2(src, dst)
+        return True
+    except OSError:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        return False
 
 
 def pe_info(path):
     """(is_pe, is_64, exports, original_filename) for a file, cheaply."""
+    # The first 4 KB say whether this is a PE at all; the rest of the file is
+    # only read for the ones that are. An installer's tree is mostly data, and
+    # reading every file whole was reading gigabytes to throw them away.
     try:
-        d = open(path, 'rb').read()
-    except OSError:
-        return (False, False, set(), None)
-    if len(d) < 0x40 or d[:2] != b'MZ':
+        with open(path, 'rb') as fh:
+            d = fh.read(4096)
+            if len(d) < 0x40 or d[:2] != b'MZ':
+                return (False, False, set(), None)
+            d += fh.read(MAX_READ)
+    except (OSError, MemoryError):
         return (False, False, set(), None)
     try:
         pe = struct.unpack_from('<I', d, 0x3c)[0]
@@ -129,7 +175,8 @@ def bundle_binary(path):
             if not os.path.isfile(q):
                 continue
             try:
-                magic = open(q, 'rb').read(4)
+                with open(q, 'rb') as fh:
+                    magic = fh.read(4)
             except OSError:
                 continue
             # Mach-O in either byte order, a fat binary, or a PE.
@@ -145,7 +192,8 @@ def have(prog):
 
 def installer_kind(path):
     try:
-        head = open(path, 'rb').read(400000)
+        with open(path, 'rb') as fh:
+            head = fh.read(400000)
     except OSError:
         return 'unreadable'
     if path.lower().endswith('.msi'):
@@ -168,9 +216,8 @@ def installer_kind(path):
     # that mistake. Asking innoextract is authoritative and costs one process
     # on the handful of files that get this far.
     if have('innoextract'):
-        r = subprocess.run(['innoextract', '-l', '-s', path],
-                           capture_output=True, text=True)
-        if r.returncode == 0:
+        r = run_tool(['innoextract', '-l', '-s', path])
+        if r is not None and r.returncode == 0:
             return 'inno'
     return 'exe'
 
@@ -202,11 +249,90 @@ def copy_companions(srcdir, outdir, already):
         for f in files:
             src = os.path.join(root, f)
             rel = os.path.relpath(src, srcdir)
-            if src in already or is_scaffold(rel):
-                continue
+            if src in already or is_scaffold(rel) or os.path.islink(src):
+                continue                 # a link in an archive points where its author chose
             dst = os.path.join(outdir, rel)
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(src, dst)
+            if copy_file(src, dst):
+                n += 1
+    return n
+
+
+def safe_member(out, name):
+    """Where a member named `name` may go under `out`, or None.
+
+    A package is somebody else's file, and a cpio member's name is whatever its
+    author wrote: absolute, or climbing out with "..", or going through a link
+    an earlier member made. None of those are a place under `out`."""
+    name = name.replace('\\', '/')
+    parts = [q for q in name.split('/') if q not in ('', '.')]
+    if not parts or any(q == '..' for q in parts):
+        return None
+    dst = os.path.join(out, *parts)
+    root = os.path.realpath(out)
+    here = os.path.realpath(os.path.dirname(dst))
+    if here != root and not here.startswith(root + os.sep):
+        return None
+    return dst
+
+
+def cpio_extract(data, out):
+    """Unpack a cpio archive (the odc and newc formats a .pkg's Payload uses)
+    into `out`, and nowhere else. Regular files and directories only: a link
+    is how an archive writes outside itself, and a plug-in bundle's real files
+    are all there is of it without them. Returns the number of files written,
+    or -1 for a stream that is not cpio."""
+    pos, n, total = 0, 0, len(data)
+    while pos + 6 <= total:
+        magic = data[pos:pos + 6]
+        if magic == b'070707':                         # odc: 76-byte octal header
+            if pos + 76 > total:
+                return -1
+            f = data[pos:pos + 76]
+            try:
+                mode, size, namesize = int(f[18:24], 8), int(f[65:76], 8), int(f[59:65], 8)
+            except ValueError:
+                return -1
+            pos += 76
+            name = data[pos:pos + namesize - 1]
+            pos += namesize
+            body_at, pad = pos, 0
+        elif magic in (b'070701', b'070702'):          # newc: 110-byte hex header
+            if pos + 110 > total:
+                return -1
+            f = data[pos:pos + 110]
+            try:
+                mode, size, namesize = int(f[14:22], 16), int(f[54:62], 16), int(f[94:102], 16)
+            except ValueError:
+                return -1
+            pos += 110
+            name = data[pos:pos + namesize - 1]
+            pos += namesize
+            pos = (pos + 3) & ~3
+            body_at, pad = pos, 1
+        else:
+            return -1 if n == 0 and pos == 0 else n
+        if name == b'TRAILER!!!':
+            break
+        if size < 0 or body_at + size > total:
+            return -1
+        body = data[body_at:body_at + size]
+        pos = body_at + size
+        if pad:
+            pos = (pos + 3) & ~3
+        kind = mode & 0o170000
+        dst = safe_member(out, name.decode('utf-8', 'replace'))
+        if dst is None:
+            continue
+        if kind == 0o040000:
+            os.makedirs(dst, exist_ok=True)
+        elif kind == 0o100000:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            # Never through a link, never over one, no setuid and no owner.
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                         0o755 if mode & 0o111 else 0o644)
+            with os.fdopen(fd, 'wb') as fh:
+                fh.write(body)
             n += 1
     return n
 
@@ -219,38 +345,46 @@ def expand_payloads(tree):
     result is the layout the installer would have written: Library/Audio/
     Plug-Ins/VST3/Whatever.vst3, bundle directories intact.
     """
+    import gzip
     n = 0
     for root, _dirs, files in os.walk(tree):
         for f in files:
             if f != 'Payload':
                 continue
             src = os.path.join(root, f)
+            if os.path.islink(src):
+                continue
             out = os.path.join(root, '_payload')
             os.makedirs(out, exist_ok=True)
             try:
                 with open(src, 'rb') as fh:
-                    magic = fh.read(2)
-                cat = 'gzip -dc' if magic == b'\x1f\x8b' else 'cat'
-                r = subprocess.run('%s %s | cpio -idm --quiet' % (cat, shlex.quote(src)),
-                                   shell=True, cwd=out, capture_output=True)
-                if r.returncode == 0:
+                    raw = fh.read(MAX_PAYLOAD)
+                if raw[:2] == b'\x1f\x8b':
+                    # Bounded, so a small file cannot inflate into all of memory.
+                    z = zlib.decompressobj(31)
+                    data = z.decompress(raw, MAX_PAYLOAD)
+                    if z.unconsumed_tail:
+                        continue
+                else:
+                    data = raw
+                if cpio_extract(data, out) >= 0:
                     n += 1
-            except OSError:
-                pass
+            except (OSError, EOFError, zlib.error, MemoryError):
+                pass   # a corrupt or unwritable Payload is one sub-package lost, not the run
     return n
 
 
 def extract(path, into, kind):
     """7z reads MSI, NSIS, xar and the plain archives; Inno Setup needs its own."""
+    global _why
+    _why = ''
     if kind == 'inno':
         if not have('innoextract'):
             return False
-        r = subprocess.run(['innoextract', '-e', '-s', '-d', into, path],
-                           capture_output=True, text=True)
-        return r.returncode == 0
-    r = subprocess.run(['7z', 'x', '-y', '-o' + into, path],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
+        r = run_tool(['innoextract', '-e', '-s', '-d', into, path])
+        return r is not None and r.returncode == 0
+    r = run_tool(['7z', 'x', '-y', '-o' + into, path])
+    if r is None or r.returncode != 0:
         return False
     if kind in ('pkg', 'dmg'):
         expand_payloads(into)
@@ -310,8 +444,17 @@ def main():
     ap.add_argument('--dest', required=True, help='where the plug-ins go')
     ap.add_argument('--peload', default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'peload', 'build'))
-    ap.add_argument('--no-test', action='store_true')
+    ap.add_argument('--test', action='store_true',
+                    help='then load each plug-in and render a second of it. Off by '
+                         'default: that runs the plug-in, and an installer that '
+                         'unpacks files should not also run what it unpacked')
+    ap.add_argument('--no-test', action='store_true', help='(the default; kept for old callers)')
     a = ap.parse_args()
+    # SIGTERM's default ends the process without running a single finally, so
+    # the /tmp/vstinst-* tree would stay. Turning it into SystemExit runs them
+    # (and subprocess.run kills its child on the way out). The window's
+    # unpacker is stopped this way.
+    signal.signal(signal.SIGTERM, lambda _s, _f: sys.exit(128 + signal.SIGTERM))
     os.makedirs(a.dest, exist_ok=True)
 
     installed, skipped = [], []
@@ -328,7 +471,7 @@ def main():
         tmp = tempfile.mkdtemp(prefix='vstinst-')
         try:
             if not unpack(inst, tmp):
-                skipped.append((inst, 'nothing could extract it'))
+                skipped.append((inst, _why or 'nothing could extract it'))
                 continue
             out = os.path.join(a.dest, name)
             found = 0
@@ -355,12 +498,19 @@ def main():
                         dst = os.path.join(out, '%s-macos%s' % (stem, ext))
                         if os.path.exists(dst):
                             continue
-                    shutil.copytree(b, dst, symlinks=True)
-                    is64 = open(bundle_binary(b), 'rb').read(4) != b'\xce\xfa\xed\xfe'
+                    try:
+                        shutil.copytree(b, dst, symlinks=True)
+                    except OSError:               # disk full: no half a bundle
+                        shutil.rmtree(dst, ignore_errors=True)
+                        raise
+                    with open(bundle_binary(b), 'rb') as fh:
+                        is64 = fh.read(4) != b'\xce\xfa\xed\xfe'
                     installed.append((dst, '64' if is64 else '32'))
                     found += 1
                 for f in files:
                     p = os.path.join(root, f)
+                    if os.path.islink(p):
+                        continue
                     is_pe, is64, exports, orig = pe_info(p)
                     if not is_pe and not f.lower().endswith('.vst3'):
                         continue
@@ -369,6 +519,11 @@ def main():
                     # MSI payloads arrive under a database key with no
                     # extension; the PE knows what it was called.
                     target = f if '.' in f else (orig or (f + '.dll'))
+                    # The name inside the PE is the installer's author's word:
+                    # one file name, whatever it says.
+                    target = os.path.basename(target.replace('\\', '/'))
+                    if target in ('', '.', '..'):
+                        continue
                     os.makedirs(out, exist_ok=True)
                     dst = os.path.join(out, target)
                     # An installer usually carries both builds under one name.
@@ -381,7 +536,9 @@ def main():
                         if os.path.exists(os.path.join(out, alt)):
                             continue                  # already have this build
                         dst = os.path.join(out, alt)
-                    shutil.copy2(p, dst)
+                    if not copy_file(p, dst):
+                        skipped.append((inst, 'could not write %s' % target))
+                        continue
                     copied.add(p)
                     if root not in plugin_dirs:
                         plugin_dirs.append(root)
@@ -397,6 +554,10 @@ def main():
                     extra += copy_companions(d, out, copied)
                 if extra:
                     print('    %s: kept %d companion file(s)' % (name, extra))
+        except OSError as e:
+            # Disk full, a destination that cannot be written, an installer's
+            # tree that vanished: this installer is lost, the others are not.
+            skipped.append((inst, 'failed: %s' % e))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -408,7 +569,7 @@ def main():
         for p, why in skipped:
             print('    %-44s %s' % (os.path.basename(p)[:44], why))
 
-    if a.no_test or not installed:
+    if not a.test or a.no_test or not installed:
         return
     print('\nloading each one:')
     for p, width in installed:
@@ -418,9 +579,12 @@ def main():
         # that never returns is a line in the report, not an exception out of
         # the program -- which is what it was, and through the window it read
         # as "nothing came out" for an install that had worked.
+        wavdir = tempfile.mkdtemp(prefix='vstinst-wav-')
         try:
-            r = subprocess.run([exe, p, '--render', '/tmp/_vi.wav', '--secs', '1',
-                                '--note', '60'], capture_output=True, text=True,
+            r = subprocess.run([exe, p, '--render', os.path.join(wavdir, 'test.wav'),
+                                '--secs', '1', '--note', '60'],
+                               capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL,
                                timeout=180, errors='replace')
         except subprocess.TimeoutExpired:
             print('    HUNG %-38s no answer in 180 s' % os.path.basename(p)[:38])
@@ -428,6 +592,8 @@ def main():
         except OSError as e:
             print('    FAIL %-38s %s' % (os.path.basename(p)[:38], e))
             continue
+        finally:
+            shutil.rmtree(wavdir, ignore_errors=True)
         m = re.search(r'peak ([0-9.]+)', r.stdout)
         if m:
             print('    OK   %-38s peak %s' % (os.path.basename(p)[:38], m.group(1)))

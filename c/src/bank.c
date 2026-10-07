@@ -97,6 +97,13 @@ int bank_parse(bank *b, const unsigned char *data, size_t size)
         return -1;
     }
 
+    /* Every record is at least 4 bytes of name length plus a body byte, so a
+     * header that promises more programs than the chunk can hold is lying;
+     * without this a 4-billion count asks calloc for hundreds of GB. */
+    if (b->num_programs > clen / 5) {
+        fprintf(stderr, "bank: numPrograms %u does not fit the chunk\n", b->num_programs);
+        return -1;
+    }
     cap = (int)(b->num_programs ? b->num_programs : 64);
     if (!(b->prog = calloc((size_t)cap, sizeof *b->prog))) return -1;
 
@@ -198,6 +205,21 @@ int bank_parse(bank *b, const unsigned char *data, size_t size)
                 if (!(v == v && v > -1e7 && v < 1e7)) bad++;
             }
         if (bad) b->nparam = 0;
+    }
+
+    /* The check above only looks at the leading values. Everything else is
+     * consumed by dw_synth_set_program and the other engines, so scrub every
+     * slot: non-finite becomes 0, and the rest is clamped to the same modest
+     * range the leading check enforces. */
+    if (b->nparam) {
+        int i, j;
+        for (j = 0; j < n; j++)
+            for (i = 0; i < b->nparam; i++) {
+                double *v = &b->prog[j].param[i];
+                if (!(*v == *v))   *v = 0.0;
+                else if (*v < -1e7) *v = -1e7;
+                else if (*v > 1e7)  *v = 1e7;
+            }
     }
 
     if (off != clen)

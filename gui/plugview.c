@@ -263,6 +263,8 @@ struct plugview {
 
     /* --cycle: where the unattended walk over the whole list has got to. */
     int    cycle_ms, cycle_at, cycle_report;
+    int    unpacking;          /* an installer is being unpacked, off the main loop */
+    guint  cycle_src;          /* the --cycle timeout, so shutdown can remove it */
 
     /* Settings > Plug-in Folders, while the dialog is open. */
     struct {
@@ -614,6 +616,7 @@ static void scan_tree(plugview *pv, const char *dir)
                     snprintf(queue[tail++], sizeof queue[0], "%s", path);
                 continue;
             }
+            if (vstdirs_is_hidden(path)) continue;       /* taken off the list: File > Plug-ins */
             /* A candidate by shape still has to be one this host can run --
              * a 32-bit build without the helper, a PowerPC Mach-O. Listed
              * either way, with the reason when it cannot: a plug-in that is
@@ -2113,54 +2116,80 @@ static int installer_ext(const char *path)
     return 0;
 }
 
+/* Whether something found by walking up from the binary is a place to run
+ * things from: owned by whoever is running this, or by root, and not writable
+ * by everyone. The walk reaches /tmp from an AppImage's mount point, and what
+ * is under /tmp is anybody's -- a planted "tools/" there would otherwise be
+ * taken for ours. */
+static int trusted_path(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (st.st_uid != geteuid() && st.st_uid != 0) return 0;
+    return !(st.st_mode & S_IWOTH);
+}
+
+/* The installer's unpacker. An installed copy -- ../lib/vst-ace or
+ * ../share/vst-ace beside the binary -- is looked for first and is taken as
+ * it is. The development tree is found by walking up, and only what the user
+ * or root owns is taken from there. */
 static char *installer_tool(void)
 {
-    static const char *rel[] = { "tools/vst_install.py", "../tools/vst_install.py",
-                                 "../lib/vst-ace/vst_install.py",
-                                 "../share/vst-ace/vst_install.py" };
+    static const char *installed[] = { "../lib/vst-ace/vst_install.py",
+                                       "../share/vst-ace/vst_install.py" };
+    static const char *tree[] = { "tools/vst_install.py", "../tools/vst_install.py",
+                                  "../lib/vst-ace/vst_install.py",
+                                  "../share/vst-ace/vst_install.py" };
     char exe[1024];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     int up;
+    size_t i;
     if (n <= 0) return NULL;
     exe[n] = 0;
+    {   /* beside the binary, as installed */
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = 0;
+            for (i = 0; i < sizeof installed / sizeof installed[0]; i++) {
+                char *cand = g_strdup_printf("%s/%s", exe, installed[i]);
+                if (g_file_test(cand, G_FILE_TEST_IS_REGULAR)) return cand;
+                g_free(cand);
+            }
+            *slash = '/';
+        }
+    }
     for (up = 0; up < 6; up++) {
         char *slash = strrchr(exe, '/');
-        size_t i;
         if (!slash) break;
         *slash = 0;
-        for (i = 0; i < sizeof rel / sizeof rel[0]; i++) {
-            char *cand = g_strdup_printf("%s/%s", exe, rel[i]);
-            if (g_file_test(cand, G_FILE_TEST_IS_REGULAR)) return cand;
+        for (i = 0; i < sizeof tree / sizeof tree[0]; i++) {
+            char *cand = g_strdup_printf("%s/%s", exe, tree[i]);
+            char *dir = g_path_get_dirname(cand);
+            int ok = g_file_test(cand, G_FILE_TEST_IS_REGULAR) &&
+                     trusted_path(cand) && trusted_path(dir);
+            g_free(dir);
+            if (ok) return cand;
             g_free(cand);
         }
     }
     return NULL;
 }
 
-/* Unpack, and hand back the first plug-in that came out. NULL when nothing
- * did, with `why` saying what happened -- an installer that unpacks to nothing
- * and an installer that could not be read are different problems. */
-static char *unpack_installer(const char *path, char *why, size_t whyn)
-{
-    char *tool = installer_tool(), *out = NULL, *stdout_s = NULL, *dest;
-    char *argv[6];
-    int status = 0;
+/* Unpack an installer without holding the GTK main loop: the tool can run for
+ * minutes on a big one, and a synchronous wait froze the whole window --
+ * the keyboard, the meter, the editor -- until it finished. The tool runs as a
+ * GSubprocess and the answer comes back to unpack_done on the main loop. */
+typedef struct {
+    plugview *pv;
+    char     *dest;
+    GSubprocess *proc;
+} unpack_job;
 
-    if (!tool) {
-        g_strlcpy(why, "the installer unpacker (tools/vst_install.py) is not "
-                       "beside this program", whyn);
-        return NULL;
-    }
-    dest = g_strdup_printf("%s/.vst", g_get_home_dir());
-    argv[0] = (char *)"python3"; argv[1] = tool; argv[2] = (char *)path;
-    argv[3] = (char *)"--dest";  argv[4] = dest; argv[5] = NULL;
-    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL,
-                      &stdout_s, NULL, &status, NULL)) {
-        g_strlcpy(why, "python3 is needed to unpack an installer", whyn);
-        g_free(tool); g_free(dest);
-        return NULL;
-    }
-    /* The tool prints one indented path per plug-in, under a heading. */
+/* The plug-in the tool's output names first, or NULL. The tool prints one
+ * indented path per plug-in, under a heading. */
+static char *unpack_first_plugin(const char *stdout_s, const char *dest)
+{
+    char *out = NULL;
     if (stdout_s) {
         char **lines = g_strsplit(stdout_s, "\n", -1);
         int i, in_list = 0;
@@ -2174,9 +2203,197 @@ static char *unpack_installer(const char *path, char *why, size_t whyn)
         }
         g_strfreev(lines);
     }
-    if (!out) g_strlcpy(why, "nothing came out of it", whyn);
-    g_free(stdout_s); g_free(tool); g_free(dest);
     return out;
+}
+
+static void unpack_done(GObject *src, GAsyncResult *res, gpointer ud)
+{
+    unpack_job *job = ud;
+    plugview   *pv = job->pv;
+    char *stdout_s = NULL, *got;
+
+    g_subprocess_communicate_utf8_finish(G_SUBPROCESS(src), res, &stdout_s, NULL, NULL);
+    pv->unpacking = 0;
+    /* plugview_shutdown clears the widgets: a window closed mid-unpack gets no
+     * plug-in opened into it. */
+    if (pv->list) {
+        got = unpack_first_plugin(stdout_s, job->dest);
+        if (got) { open_path(pv, got); g_free(got); }
+        else plug_status(pv, "nothing came out of it");
+    }
+    g_free(stdout_s);
+    g_free(job->dest);
+    g_object_unref(job->proc);
+    g_free(job);
+}
+
+static void unpack_installer(plugview *pv, const char *path)
+{
+    char *tool = installer_tool(), *dest;
+    char *argv[6];
+    unpack_job *job;
+    GSubprocess *proc;
+
+    if (!tool) {
+        plug_status(pv, "the installer unpacker (tools/vst_install.py) is not "
+                        "beside this program");
+        return;
+    }
+    if (pv->unpacking) {
+        plug_status(pv, "an installer is already being unpacked");
+        g_free(tool);
+        return;
+    }
+    dest = g_strdup_printf("%s/.vst", g_get_home_dir());
+    argv[0] = (char *)"python3"; argv[1] = tool; argv[2] = (char *)path;
+    argv[3] = (char *)"--dest";  argv[4] = dest; argv[5] = NULL;
+    proc = g_subprocess_newv((const gchar * const *)argv,
+                             G_SUBPROCESS_FLAGS_STDOUT_PIPE, NULL);
+    g_free(tool);
+    if (!proc) {
+        plug_status(pv, "python3 is needed to unpack an installer");
+        g_free(dest);
+        return;
+    }
+    job = g_new0(unpack_job, 1);
+    job->pv = pv; job->dest = dest; job->proc = proc;
+    pv->unpacking = 1;
+    plug_status(pv, "unpacking the installer...");
+    g_subprocess_communicate_utf8_async(proc, NULL, NULL, unpack_done, job);
+}
+
+/* ---- keeping a plug-in: its folder made one of the folders searched ---- */
+
+/* The folders a system keeps plug-ins in already -- the ones nothing needs
+ * adding for. */
+static int in_standard_plugin_dir(const char *path)
+{
+    const char *home = g_get_home_dir();
+    char *dirs[16];
+    int n = 0, i, hit = 0;
+    char want[PATH_MAX];
+    const char *envs[] = { "VST_PATH", "VST3_PATH" };
+    if (!realpath(path, want)) return 0;
+    dirs[n++] = g_strdup_printf("%s/.vst", home);
+    dirs[n++] = g_strdup_printf("%s/.vst3", home);
+    dirs[n++] = g_strdup("/usr/lib/vst");
+    dirs[n++] = g_strdup("/usr/lib/vst3");
+    dirs[n++] = g_strdup("/usr/local/lib/vst");
+    dirs[n++] = g_strdup("/usr/local/lib/vst3");
+    for (i = 0; i < 2; i++) {
+        const char *e = g_getenv(envs[i]);
+        char **parts = e ? g_strsplit(e, ":", 0) : NULL;
+        int k;
+        for (k = 0; parts && parts[k] && n < 16; k++) if (*parts[k]) dirs[n++] = g_strdup(parts[k]);
+        g_strfreev(parts);
+    }
+    for (i = 0; i < n; i++) {
+        char root[PATH_MAX];
+        size_t l;
+        if (!hit && realpath(dirs[i], root)) {
+            l = strlen(root);
+            if (!strncmp(want, root, l) && (want[l] == '/' || l == 1)) hit = 1;
+        }
+        g_free(dirs[i]);
+    }
+    return hit;
+}
+
+/* "Don't ask again", and the plug-ins already declined, kept beside the
+ * folder list so they outlive the session. */
+static char *offers_file(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "vst-ace", "keep-offers", NULL);
+}
+
+static int offer_declined(const char *path)
+{
+    char *f = offers_file(), *txt = NULL;
+    int declined = 0;
+    if (g_file_get_contents(f, &txt, NULL, NULL)) {
+        char **lines = g_strsplit(txt, "\n", 0);
+        int i;
+        for (i = 0; lines[i]; i++)
+            if (!strcmp(lines[i], "*") || !strcmp(lines[i], path)) declined = 1;
+        g_strfreev(lines);
+        g_free(txt);
+    }
+    g_free(f);
+    return declined;
+}
+
+static void offer_remember(const char *what)
+{
+    char *f = offers_file(), *dir = g_path_get_dirname(f);
+    FILE *fp;
+    g_mkdir_with_parents(dir, 0700);
+    if ((fp = fopen(f, "a"))) { fprintf(fp, "%s\n", what); fclose(fp); }
+    g_free(dir);
+    g_free(f);
+}
+
+/* The folder a plug-in sits in: its own directory, for a file; the one
+ * holding it, for a bundle. */
+static char *folder_of(const char *path)
+{
+    char *d = g_path_get_dirname(path);
+    return d;
+}
+
+static void keep_folder(plugview *pv, const char *path)
+{
+    char *dir = folder_of(path);
+    int r = vstdirs_add(VSTDIRS_ANY, dir);
+    if (r < 0) plug_status(pv, "could not save the folder list to %s", vstdirs_file());
+    else {
+        plug_status(pv, r ? "%s is now one of your plug-in folders" : "%s is already one of your plug-in folders", dir);
+        if (r) rescan_all(pv);
+    }
+    g_free(dir);
+}
+
+typedef struct { plugview *pv; char *path; } keep_ask;
+
+static void keep_answered(GObject *src, GAsyncResult *res, gpointer u)
+{
+    keep_ask *k = u;
+    int b = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(src), res, NULL);
+    if (b == 2) keep_folder(k->pv, k->path);              /* Keep its folder */
+    else if (b == 1) offer_remember("*");                  /* Don't ask again */
+    else offer_remember(k->path);                          /* Just open it: not this one again */
+    g_object_unref(src);
+    g_free(k->path);
+    g_free(k);
+}
+
+/* A plug-in opened by hand from somewhere that is not a folder of plug-ins:
+ * offer to keep its folder, so it is listed every session. */
+static void offer_keep(plugview *pv, GtkWindow *parent, const char *path)
+{
+    static const char *buttons[] = { "Just open it", "Don't ask again", "Keep its folder", NULL };
+    GtkAlertDialog *d;
+    keep_ask *k;
+    char *dir, *msg;
+    if (!pv->host || strcmp(pv->loaded_path, path)) return;       /* it did not load */
+    if (vstdirs_contains(path) || in_standard_plugin_dir(path) || offer_declined(path)) return;
+    dir = folder_of(path);
+    msg = g_strdup_printf("%s is not in any of your plug-in folders", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+    d = gtk_alert_dialog_new("%s", msg);
+    {
+        char *detail = g_strdup_printf("Keep %s as one of your plug-in folders, and every plug-in in it is "
+                                       "listed each time you start. Plug-in Folders changes the list later.", dir);
+        gtk_alert_dialog_set_detail(d, detail);
+        g_free(detail);
+    }
+    gtk_alert_dialog_set_buttons(d, buttons);
+    gtk_alert_dialog_set_cancel_button(d, 0);
+    gtk_alert_dialog_set_default_button(d, 2);
+    k = g_new0(keep_ask, 1);
+    k->pv = pv;
+    k->path = g_strdup(path);
+    gtk_alert_dialog_choose(d, parent, NULL, keep_answered, k);
+    g_free(msg);
+    g_free(dir);
 }
 
 static void on_vst_chosen(GObject *src, GAsyncResult *res, gpointer ud)
@@ -2190,13 +2407,13 @@ static void on_vst_chosen(GObject *src, GAsyncResult *res, gpointer ud)
     g_object_unref(src);                         /* the ref taken in open_vst */
     if (!f) return;                              /* cancelled */
     if ((path = g_file_get_path(f))) {
-        if (installer_ext(path)) {
-            char why[256] = "";
-            char *got = unpack_installer(path, why, sizeof why);
-            if (got) { open_path(pv, got); g_free(got); }
-            else plug_status(pv, "%s", why[0] ? why : "nothing came out of it");
-        } else {
+        if (installer_ext(path)) unpack_installer(pv, path);
+        else {
             open_path(pv, path);
+            {
+                GtkRoot *rt = pv->root ? gtk_widget_get_root(pv->root) : NULL;
+                offer_keep(pv, rt && GTK_IS_WINDOW(rt) ? GTK_WINDOW(rt) : NULL, path);
+            }
         }
         g_free(path);
     }
@@ -2599,6 +2816,28 @@ void plugview_enter_key(plugview *pv, GtkWindow *parent)
     gtk_widget_grab_focus(entry);
 }
 
+/* Synth > Keep This Plug-in's Folder: the same as the offer, asked for. */
+void plugview_keep_folder(plugview *pv)
+{
+    if (!pv->host || !pv->loaded_path[0]) { plug_status(pv, "load a plug-in first"); return; }
+    keep_folder(pv, pv->loaded_path);
+}
+
+/* What the browser is listing, for a shell's plug-in manager. */
+int plugview_available_count(plugview *pv) { return pv->nplug; }
+
+void plugview_available(plugview *pv, int i, const char **path, const char **name,
+                        const char **kind, int *loadable)
+{
+    if (i < 0 || i >= pv->nplug) return;
+    if (path) *path = pv->plug[i].path;
+    if (name) *name = pv->plug[i].name;
+    if (kind) *kind = pv->plug[i].kind;
+    if (loadable) *loadable = pv->plug[i].loadable;
+}
+
+void plugview_rescan(plugview *pv) { rescan_all(pv); }
+
 void plugview_edit_folders(plugview *pv, GtkWindow *parent)
 {
     GtkWidget     *box, *sw, *btns, *lbl, *close;
@@ -2993,6 +3232,7 @@ static gboolean cycle_step(gpointer u)
     }
     if (pv->cycle_at >= pv->nplug) {
         fprintf(stderr, "plugview: cycle finished (%d plug-in(s))\n", pv->nplug);
+        pv->cycle_src = 0;
         return G_SOURCE_REMOVE;
     }
     {
@@ -3010,7 +3250,8 @@ void plugview_start_cycle(plugview *pv, int ms)
     pv->cycle_ms = ms > 0 ? ms : 1500;
     pv->cycle_at = 0;
     pv->cycle_report = -1;
-    g_timeout_add(pv->cycle_ms, cycle_step, pv);
+    if (pv->cycle_src) g_source_remove(pv->cycle_src);
+    pv->cycle_src = g_timeout_add(pv->cycle_ms, cycle_step, pv);
 }
 
 void plugview_shutdown(plugview *pv)
@@ -3025,6 +3266,9 @@ void plugview_shutdown(plugview *pv)
      * outlives this call is inert rather than merely unlikely to run. */
     if (pv->tick)  { g_source_remove(pv->tick);  pv->tick  = 0; }
     if (pv->meter) { g_source_remove(pv->meter); pv->meter = 0; }
+    /* --cycle's step selects rows and switches the stack, both of which are
+     * pointers cleared below. */
+    if (pv->cycle_src) { g_source_remove(pv->cycle_src); pv->cycle_src = 0; }
     /* And the editor fit a load queued for the next turn of the loop: a pane
      * closed straight after a load -- a session's tab whose plug-in did not
      * come back -- was freed before it ran, and it ran anyway. */

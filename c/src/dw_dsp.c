@@ -244,10 +244,18 @@ double dw_mg_process(dw_mg *m)
 int dw_delay_init(dw_delay *d, double samplerate, double max_seconds)
 {
     memset(d, 0, sizeof *d);
+    if (!(samplerate > 0.0 && samplerate <= 1e6 && max_seconds >= 0.0 && max_seconds <= 60.0))
+        return -1;
     d->samplerate = samplerate;
     d->size = (int)(samplerate * max_seconds) + 4;
     if (!(d->buf = calloc((size_t)d->size, sizeof *d->buf))) return -1;
     return 0;
+}
+
+void dw_delay_clear(dw_delay *d)
+{
+    if (d->buf) memset(d->buf, 0, (size_t)d->size * sizeof *d->buf);
+    d->write = 0;
 }
 
 void dw_delay_free(dw_delay *d)
@@ -259,13 +267,20 @@ void dw_delay_free(dw_delay *d)
 void dw_delay_set(dw_delay *d, double time_sec, double feedback,
                   double level, double mod_hz, double mod_depth_sec)
 {
+    /* A NaN here would reach (int)tap in dw_delay_process as INT_MIN. */
+    if (!isfinite(time_sec))      time_sec = 0.0;
+    if (!isfinite(feedback))      feedback = 0.0;
+    if (!isfinite(level))         level = 0.0;
+    if (!isfinite(mod_hz))        mod_hz = 0.0;
+    if (!isfinite(mod_depth_sec)) mod_depth_sec = 0.0;
     d->delay_samples = time_sec * d->samplerate;
-    if (d->delay_samples < 1.0) d->delay_samples = 1.0;
+    if (!(d->delay_samples >= 1.0)) d->delay_samples = 1.0;
     if (d->delay_samples > d->size - 4) d->delay_samples = d->size - 4;
     d->feedback  = feedback;
     d->level     = level;
     d->mod_inc   = mod_hz / d->samplerate;
     d->mod_depth = mod_depth_sec * d->samplerate;
+    if (!(fabs(d->mod_depth) <= d->size)) d->mod_depth = 0.0;   /* keeps the wrap loops short */
 }
 
 double dw_delay_process(dw_delay *d, double in)
@@ -292,12 +307,18 @@ double dw_delay_process(dw_delay *d, double in)
         while (tap >= (double)d->size) tap -= d->size;
 
         i0   = (int)tap;
+        if (i0 < 0 || i0 >= d->size) i0 = 0;   /* NaN tap, or modulation beyond the loops' reach */
         frac = tap - (double)i0;
         i1   = (i0 + 1 == d->size) ? 0 : i0 + 1;
         out  = d->buf[i0] + frac * (d->buf[i1] - d->buf[i0]);
     }
 
-    d->buf[d->write] = (float)(in + out * d->feedback);
+    /* A non-finite value written here recirculates through the feedback path
+     * for the rest of the session, so flush it. */
+    {
+        float w = (float)(in + out * d->feedback);
+        d->buf[d->write] = isfinite(w) ? w : 0.0f;
+    }
     if (++d->write == d->size) d->write = 0;
 
     return out * d->level;

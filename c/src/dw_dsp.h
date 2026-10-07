@@ -149,6 +149,7 @@ typedef struct {
 
 int    dw_delay_init(dw_delay *d, double samplerate, double max_seconds);
 void   dw_delay_free(dw_delay *d);
+void   dw_delay_clear(dw_delay *d);   /* silence the line */
 void   dw_delay_set(dw_delay *d, double time_sec, double feedback,
                     double level, double mod_hz, double mod_depth_sec);
 double dw_delay_process(dw_delay *d, double in);
