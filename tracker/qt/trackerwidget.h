@@ -36,6 +36,8 @@
 #include <QSpinBox>
 #include <QSlider>
 #include <QDialog>
+#include <QFormLayout>
+#include <QPointer>
 #include <QPlainTextEdit>
 #include <QListWidget>
 #include <QHeaderView>
@@ -62,22 +64,43 @@ inline const char *kKeysHelp =
     "  z s x d c v g b h n j m       notes, one octave\n"
     "  q 2 w 3 e r 5 t 6 y 7 u i 9 o 0 p   the octave above\n"
     "  1                 note-off\n"
-    "  `                 edit mode on / off (off: note keys only play)\n"
+    "  Space (or `)      edit mode on / off (off: note keys only play,\n"
+    "                    nothing is written)\n"
     "  Delete or .       clear and advance\n"
     "  Insert            push the track down a row\n"
     "  Backspace         pull the track up over this row\n"
     "  0-9 a-f           hex, in the velocity and controller fields\n"
-    "  [ ]               octave down / up\n"
+    "  [ ] or keypad / * octave down / up (a track's notes move with it)\n"
+    "  Ctrl+keypad / *   edit step down / up\n"
     "  - =               previous / next pattern\n"
     "\n"
+    "Selection and clipboard\n"
+    "  Shift+arrows      select      Shift+PgUp / PgDn   select a page\n"
+    "  Ctrl+A            select all\n"
+    "  Ctrl+C / X / V    copy / cut / paste\n"
+    "  Ctrl+Shift+V      paste mix: only what the clipboard has, over what is there\n"
+    "  Ctrl+Z / Ctrl+Y   undo / redo (Ctrl+Shift+Z too)\n"
+    "  Ctrl+F1 / F2      transpose selection (or cell) down / up a semitone\n"
+    "  Ctrl+F3 / F4      the same, an octave\n"
+    "\n"
+    "Tracks\n"
+    "  Alt+F9            mute the cursor's track\n"
+    "  Alt+F10           solo it (again: everyone back)\n"
+    "  Alt+Shift+F9      unmute all\n"
+    "\n"
     "Transport\n"
+    "  Enter             play pattern / stop\n"
+    "  Shift+Enter       play the pattern from the cursor row\n"
     "  F5  play song     F6  play pattern     F8  stop\n"
-    "  Space             play pattern / stop\n"
-    "  Escape            panic: release every note everywhere\n"
+    "  F7                record: play from the cursor row and write what you\n"
+    "                    play -- keys or a MIDI input -- on the cursor's track.\n"
+    "                    A count-in and click lead it in; F7 or F8 ends the take.\n"
+    "                    Rec... sets the count-in, click, quantizing and input.\n"
+    "  Escape or F12     panic: release every note everywhere\n"
     "\n"
     "Each track plays one window. Open vst-ace once per instrument, then pick\n"
     "the window under the track's name. A cell is note, velocity, controller\n"
-    "number and controller value; empty velocity uses the track's.\n";
+    "number and controller value; empty velocity uses the track's.";
 
 // --------------------------------------------------------------- the grid --
 
@@ -101,6 +124,7 @@ public:
     int gutter() const { return cw_ * 4; }
     int colWidth() const { return std::max(cw_ * (TRK_CELL_CHARS + 2), 210); }
     int rowHeight() const { return ch_; }
+    int charWidth() const { return cw_; }
 
     void updateSize()
     {
@@ -131,6 +155,8 @@ signals:
     void cursorMoved();
     void noteTyped(int track, int note);
     void editToggled();
+    void mutesChanged();             // a key muted, soloed or unmuted tracks
+    void stepChanged();              // a key changed the edit step
     void clipped(int key);           // copied, cut or pasted: for the status line
 
 protected:
@@ -147,6 +173,9 @@ protected:
         for (int t = 0; t < TRK_TRACKS; t++) sampled[t] = trk_sample_mask(e_, t, masks[t]);
         const QColor missing(220, 50, 47);
 
+        // What is drawn is copied out under the lock and drawn after it: the
+        // lock is the scheduling thread's and the note path's too, and a
+        // repaint of a few thousand drawText calls must not hold either up.
         trk_lock(e_);
         const trk_song *s = trk_song_of(e_);
         const trk_pattern *pt = &s->pattern[ed_->pattern];
@@ -156,6 +185,9 @@ protected:
 
         const int r0 = std::max(0, ev->rect().top() / ch_);
         const int r1 = std::min(pt->rows - 1, ev->rect().bottom() / ch_);
+        trk_cell cells[TRK_ROWS_MAX][TRK_TRACKS];
+        if (r1 >= r0) std::memcpy(cells[r0], pt->cell[r0], sizeof cells[0] * size_t(r1 - r0 + 1));
+        trk_unlock(e_);
         QColor beat = pal.color(QPalette::AlternateBase);
         QColor bar = pal.color(QPalette::Mid);
         bar.setAlpha(60);
@@ -188,7 +220,7 @@ protected:
             for (int t = 0; t < TRK_TRACKS; t++) {
                 const int x = gutter() + t * colWidth();
                 char txt[TRK_CELL_CHARS + 1];
-                trk_cell_text(&pt->cell[r][t], txt);
+                trk_cell_text(&cells[r][t], txt);
                 if (trk_selected(ed_, r, t))
                     p.fillRect(x - cw_ / 2, y, colWidth(), ch_, selTint);
                 if (r == ed_->row && t == ed_->track) {
@@ -212,7 +244,7 @@ protected:
                     if (c >= 4 && txt[c] != '.') col = dim.lighter(100);
                     // A note its track's sample set has no sample on plays
                     // nothing: red, so it is seen before it is not heard.
-                    const int nt = pt->cell[r][t].note;
+                    const int nt = cells[r][t].note;
                     if (c < 3 && sampled[t] && nt <= 127 && !(masks[t][nt >> 3] & (1u << (nt & 7))))
                         col = missing;
                     if (mutes & (1 << t)) col.setAlpha(col.alpha() / 3);
@@ -222,7 +254,6 @@ protected:
                 }
             }
         }
-        trk_unlock(e_);
 
         p.setPen(faint);
         for (int t = 0; t <= TRK_TRACKS; t++) {
@@ -250,10 +281,14 @@ protected:
             update();
             emit cursorMoved();
             if (writes && (k < 0x100 || k == TRK_K_DELETE || k == TRK_K_INSERT || k == TRK_K_BACKSPACE ||
-                           k == TRK_K_CUT || k == TRK_K_PASTE))
+                           k == TRK_K_CUT || k == TRK_K_PASTE || k == TRK_K_PASTE_MIX ||
+                           (k >= TRK_K_TRANSPOSE_DOWN && k <= TRK_K_TRANSPOSE_OCT_UP)))
                 emit edited();
-            if (k == TRK_K_COPY || k == TRK_K_CUT || k == TRK_K_PASTE) emit clipped(k);
+            if (k == TRK_K_UNDO || k == TRK_K_REDO) emit edited();
+            if (k == TRK_K_COPY || k == TRK_K_CUT || k == TRK_K_PASTE || k == TRK_K_PASTE_MIX) emit clipped(k);
             if (k == TRK_K_EDIT) emit editToggled();
+            if (k == TRK_K_MUTE_TRACK || k == TRK_K_SOLO_TRACK || k == TRK_K_UNMUTE_ALL) emit mutesChanged();
+            if (k == TRK_K_STEP_UP || k == TRK_K_STEP_DOWN) emit stepChanged();
         }
     }
 
@@ -373,6 +408,8 @@ protected:
         int crows = 0, ctracks = 0;
         trk_clipboard(&crows, &ctracks);
         QMenu m(this);
+        QAction *undo  = m.addAction("Undo", QKeySequence::Undo);
+        m.addSeparator();
         QAction *copy  = m.addAction("Copy", QKeySequence::Copy);
         QAction *cut   = m.addAction("Cut", QKeySequence::Cut);
         QAction *paste = m.addAction(crows ? QString("Paste %1 row%2 x %3 track%4")
@@ -388,7 +425,8 @@ protected:
         clear->setEnabled(ed_->edit);
         QAction *got = m.exec(ev->globalPos());
         if (!got) return;
-        if (got == copy)       key(TRK_K_COPY);
+        if (got == undo)       key(TRK_K_UNDO);
+        else if (got == copy)  key(TRK_K_COPY);
         else if (got == cut)   key(TRK_K_CUT);
         else if (got == paste) key(TRK_K_PASTE);
         else if (got == clear) { trk_clear_block(e_, ed_); emit edited(); }
@@ -417,13 +455,31 @@ private:
     static int translate(QKeyEvent *ev)
     {
         const bool ctrl = ev->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
+        const bool shift = ev->modifiers() & Qt::ShiftModifier;
+        const bool keypad = ev->modifiers() & Qt::KeypadModifier;
+        // Furnace's keys, where they fit: Ctrl+Y redo, Ctrl+Shift+V paste mix,
+        // Ctrl+F1-F4 transpose, Alt+F9/F10 mute and solo, Shift+PgUp/PgDn a
+        // page of selection, Shift+Enter play from the cursor, the keypad's *
+        // and / the octave (with Ctrl, the edit step).
+        if (ev->modifiers() & Qt::AltModifier) {
+            switch (ev->key()) {
+            case Qt::Key_F9:  return shift ? TRK_K_UNMUTE_ALL : TRK_K_MUTE_TRACK;
+            case Qt::Key_F10: return TRK_K_SOLO_TRACK;
+            default: break;
+            }
+        }
         // Shift with the arrows selects; Ctrl with C, X, V and A is the clipboard.
-        if (ev->modifiers() & Qt::ShiftModifier) {
+        if (shift) {
             switch (ev->key()) {
             case Qt::Key_Up:    return TRK_K_SEL_UP;
             case Qt::Key_Down:  return TRK_K_SEL_DOWN;
             case Qt::Key_Left:  return TRK_K_SEL_LEFT;
             case Qt::Key_Right: return TRK_K_SEL_RIGHT;
+            case Qt::Key_PageUp:   return TRK_K_SEL_PGUP;
+            case Qt::Key_PageDown: return TRK_K_SEL_PGDN;
+            case Qt::Key_Return: case Qt::Key_Enter:
+                if (!(ev->modifiers() & Qt::ControlModifier)) return TRK_K_PLAY_FROM_CURSOR;
+                break;
             default: break;
             }
         }
@@ -431,8 +487,16 @@ private:
             switch (ev->key()) {
             case Qt::Key_C: return TRK_K_COPY;
             case Qt::Key_X: return TRK_K_CUT;
-            case Qt::Key_V: return TRK_K_PASTE;
+            case Qt::Key_V: return shift ? TRK_K_PASTE_MIX : TRK_K_PASTE;
             case Qt::Key_A: return TRK_K_SEL_ALL;
+            case Qt::Key_Z: return shift ? TRK_K_REDO : TRK_K_UNDO;
+            case Qt::Key_Y: return TRK_K_REDO;
+            case Qt::Key_F1: return TRK_K_TRANSPOSE_DOWN;
+            case Qt::Key_F2: return TRK_K_TRANSPOSE_UP;
+            case Qt::Key_F3: return TRK_K_TRANSPOSE_OCT_DOWN;
+            case Qt::Key_F4: return TRK_K_TRANSPOSE_OCT_UP;
+            case Qt::Key_Asterisk: if (keypad) return TRK_K_STEP_UP; break;
+            case Qt::Key_Slash:    if (keypad) return TRK_K_STEP_DOWN; break;
             default: break;
             }
         }
@@ -452,8 +516,12 @@ private:
         case Qt::Key_Insert:    return TRK_K_INSERT;
         case Qt::Key_F5:        return TRK_K_PLAY_SONG;
         case Qt::Key_F6:        return TRK_K_PLAY_PATTERN;
+        case Qt::Key_F7:        return TRK_K_RECORD;
         case Qt::Key_F8:        return TRK_K_STOP;
-        case Qt::Key_Space:     return TRK_K_TOGGLE;
+        case Qt::Key_Space:     return TRK_K_EDIT;
+        case Qt::Key_Return: case Qt::Key_Enter: return TRK_K_TOGGLE;
+        case Qt::Key_Asterisk:  if (keypad) return TRK_K_OCT_UP; break;
+        case Qt::Key_Slash:     if (keypad) return TRK_K_OCT_DOWN; break;
         case Qt::Key_BracketLeft:  return TRK_K_OCT_DOWN;
         case Qt::Key_BracketRight: return TRK_K_OCT_UP;
         case Qt::Key_Minus:     return TRK_K_PAT_PREV;
@@ -731,6 +799,10 @@ public:
     // A track's destination picked one of midiSinks -- or a window again
     // (name empty). The shell makes the routing change.
     virtual void midiSinkPicked(int track, const QString &name) { (void)track; (void)name; }
+    // A song was just loaded into the engine (openPath succeeded). A shell
+    // with synth tabs reopens the ones the song's sink lines name; the
+    // default is nothing, the standalone's whole answer.
+    virtual void songOpened() {}
 };
 
 // ------------------------------------------------------------- the widget --
@@ -754,8 +826,15 @@ public:
         auto *playPat = new QPushButton("▶ Pattern");
         auto *stop = new QPushButton("■ Stop");
         auto *panic = new QPushButton("Panic");
+        recBtn_ = new QPushButton("● Rec");
+        auto *recOpt = new QPushButton("Rec…");
+        recBtn_->setToolTip("Record: play, and write the notes you play into the pattern, on the cursor's "
+                            "track (F7)");
+        recOpt->setToolTip("Recording options: count-in, metronome, quantizing, MIDI input");
+        recBtn_->setFocusPolicy(Qt::NoFocus);
+        recOpt->setFocusPolicy(Qt::NoFocus);
         playSong->setToolTip("Play the song from the order entry holding this pattern (F5)");
-        playPat->setToolTip("Loop this pattern (F6, or Space)");
+        playPat->setToolTip("Loop this pattern (F6)");
         stop->setToolTip("Stop and release every note (F8)");
         panic->setToolTip("Release every note on every track, playing or not (Escape)");
         bpm_ = new QDoubleSpinBox;
@@ -782,7 +861,7 @@ public:
         edit_->setToolTip("Keys write into the pattern. Off, note keys only play, to try "
                           "them out -- ` (backtick) turns it on and off");
         edit_->setFocusPolicy(Qt::NoFocus);
-        for (QWidget *w : std::initializer_list<QWidget *>{ playSong, playPat, stop, panic, bpm_, lpb_,
+        for (QWidget *w : std::initializer_list<QWidget *>{ playSong, playPat, stop, panic, recBtn_, recOpt, bpm_, lpb_,
                                                            pattern_, step_, follow_,
                                                            edit_ })
             bar->addWidget(w);
@@ -816,12 +895,14 @@ public:
         auto *hl = new QHBoxLayout(head);
         hl->setContentsMargins(0, 0, 0, 0);
         hl->setSpacing(0);
-        hl->addSpacing(view_->gutter());
+        /* The grid draws a track's left divider one character left of its
+         * text; a header spans divider to divider, so it sits over its column. */
+        hl->addSpacing(view_->gutter() - view_->charWidth());
         for (int t = 0; t < TRK_TRACKS; t++) {
             auto *box = new QWidget;
             box->setFixedWidth(view_->colWidth());
             auto *bl = new QVBoxLayout(box);
-            bl->setContentsMargins(0, 0, 6, 2);
+            bl->setContentsMargins(3, 0, 3, 2);
             bl->setSpacing(2);
             name_[t] = new QLineEdit;
             dest_[t] = new QComboBox;
@@ -872,9 +953,28 @@ public:
         scroll_->setWidget(view_);
         scroll_->setWidgetResizable(false);
         scroll_->setFocusProxy(view_);
+        // Frameless, like the header strip: a frame here would inset the grid
+        // by frameWidth() and leave the controls that far left of their
+        // columns for good.
+        scroll_->setFrameShape(QFrame::NoFrame);
         gridCol->addWidget(scroll_, 1);
         connect(scroll_->horizontalScrollBar(), &QScrollBar::valueChanged,
                 headScroll_->horizontalScrollBar(), &QScrollBar::setValue);
+        // Copying the value is not the whole of keeping the two together. The
+        // header has no scrollbars of its own while the grid has a vertical
+        // one, so the grid's viewport is narrower and its horizontal maximum
+        // larger: near the right edge the header's bar clamps first and the
+        // controls drift left of their columns. Following the grid bar's
+        // range means the header can always go exactly as far as the grid,
+        // and the reverse value connection keeps the pair in step whichever
+        // side a resize moves.
+        connect(scroll_->horizontalScrollBar(), &QScrollBar::rangeChanged,
+                headScroll_->horizontalScrollBar(), &QScrollBar::setRange);
+        connect(headScroll_->horizontalScrollBar(), &QScrollBar::valueChanged,
+                scroll_->horizontalScrollBar(), &QScrollBar::setValue);
+        headScroll_->horizontalScrollBar()->setRange(
+            scroll_->horizontalScrollBar()->minimum(),
+            scroll_->horizontalScrollBar()->maximum());
 
         // Menus, on the host's menu bar.
         QMenu *file = host_->addMenu("&File");
@@ -882,21 +982,18 @@ public:
         file->addAction("&Open…", QKeySequence::Open, this, &TrackerWidget::openSong);
         file->addAction("&Save", QKeySequence::Save, this, &TrackerWidget::save);
         file->addAction("Save &As…", QKeySequence::SaveAs, this, &TrackerWidget::saveAs);
+        file->addAction("&Export MIDI…", this, &TrackerWidget::exportMidi);
+        file->addAction("Export recorded &take as MIDI…", this, &TrackerWidget::exportTake);
         file->addSeparator();
         file->addAction("&Quit", QKeySequence::Quit, this, [this] { host_->requestQuit(); });
-        // Samples: the folder of WAVs the tracks' samples come from. Rebuilt
-        // each time it opens, so a folder dropped in since is there.
+        // Samples: the folder of WAVs the tracks' samples come from. Built
+        // once, here: the two commands are static, and a shell that merges
+        // menus attributes to this tab what exists when construction ends.
         samplesMenu_ = host_->addMenu("&Samples");
-        connect(samplesMenu_, &QMenu::aboutToShow, this, &TrackerWidget::rebuildSamplesMenu);
+        rebuildSamplesMenu();
         QMenu *help = host_->addMenu("&Help");
-        help->addAction("&Keys", this, [this] {
-            QMessageBox box(this);
-            box.setWindowTitle("tracker keys");
-            box.setText(QString::fromUtf8(kKeysHelp));
-            QFont f = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-            box.setFont(f);
-            box.exec();
-        });
+        help->addAction("&Keys", this, [this] { showText("tracker keys", QString::fromUtf8(kKeysHelp)); });
+        help->addAction("&Columns", this, [this] { showText("tracker columns", QString::fromUtf8(trk_columns_help())); });
         help->addAction("&Cheat Sheet", QKeySequence(Qt::Key_F1), this, &TrackerWidget::showCheat);
 
         // Wiring.
@@ -904,6 +1001,8 @@ public:
         connect(playPat, &QPushButton::clicked, this, [this] { key(TRK_K_PLAY_PATTERN); });
         connect(stop, &QPushButton::clicked, this, [this] { key(TRK_K_STOP); });
         connect(panic, &QPushButton::clicked, this, [this] { trk_panic(e_); view_->setFocus(); });
+        connect(recBtn_, &QPushButton::clicked, this, [this] { key(TRK_K_RECORD); showRec(); });
+        connect(recOpt, &QPushButton::clicked, this, [this] { showRecOptions(); });
         connect(bpm_, &QDoubleSpinBox::valueChanged, this, [this](double b) {
             if (loading_) return;
             trk_set_bpm(e_, b);
@@ -980,13 +1079,13 @@ public:
                 refreshDests(true);
                 view_->setFocus();
             });
-            // A track's octave, from its own box.
+            // A track's octave, from its own box. The call locks itself and
+            // moves the track's notes with the change, so the grid redraws.
             connect(oct_[t], &QComboBox::activated, this, [this, t](int o) {
-                trk_lock(e_);
-                trk_song_of(e_)->track[t].octave = o;
-                trk_unlock(e_);
+                trk_track_set_octave(e_, t, o);
                 if (t == ed_.track) ed_.octave = o;
                 QTimer::singleShot(0, this, &TrackerWidget::refreshCheat);
+                view_->update();
                 view_->setFocus();
             });
             connect(chan_[t], &QSpinBox::valueChanged, this, [this, t](int c) {
@@ -1010,10 +1109,26 @@ public:
             const QString size = QString("%1 row%2 x %3 track%4").arg(rows).arg(rows > 1 ? "s" : "")
                                      .arg(tracks).arg(tracks > 1 ? "s" : "");
             if (!ed_.edit && k != TRK_K_COPY)
-                host_->showStatus("edit is off -- ` to edit, then cut or paste", 4000);
+                host_->showStatus("edit is off -- Space to edit, then cut or paste", 4000);
             else
                 host_->showStatus((k == TRK_K_COPY ? "copied " : k == TRK_K_CUT ? "cut " : "pasted ")
                                          + size, 3000);
+        });
+        // A key muted or soloed tracks: the header boxes show the song's state.
+        connect(view_, &PatternView::mutesChanged, this, [this] {
+            trk_lock(e_);
+            for (int t = 0; t < TRK_TRACKS; t++) {
+                mute_[t]->blockSignals(true);
+                mute_[t]->setChecked(trk_song_of(e_)->track[t].mute);
+                mute_[t]->blockSignals(false);
+            }
+            trk_unlock(e_);
+            view_->update();
+        });
+        connect(view_, &PatternView::stepChanged, this, [this] {
+            step_->blockSignals(true);
+            step_->setValue(ed_.step);
+            step_->blockSignals(false);
         });
         connect(view_, &PatternView::editToggled, this, [this] {
             edit_->blockSignals(true);
@@ -1038,6 +1153,11 @@ public:
         esc->setShortcutContext(Qt::WindowShortcut);
         connect(esc, &QAction::triggered, this, [this] { trk_panic(e_); });
         addAction(esc);
+        auto *f12 = new QAction(this);                  // Furnace's panic key
+        f12->setShortcut(Qt::Key_F12);
+        f12->setShortcutContext(Qt::WindowShortcut);
+        connect(f12, &QAction::triggered, this, [this] { trk_panic(e_); });
+        addAction(f12);
 
         // Playback position, thirty times a second; routing every two, so a
         // window opened after the song was loaded is found and connected.
@@ -1063,6 +1183,8 @@ public:
             return false;
         }
         trk_stop(e_);
+        trk_undo_clear(e_);          /* a loaded song starts with no history */
+        trk_unroute_sinks(e_);       /* the engine's routing and the new song's sink names agree */
         trk_lock(e_);
         std::memcpy(trk_song_of(e_), tmp.get(), sizeof *tmp);
         trk_unlock(e_);
@@ -1076,6 +1198,7 @@ public:
         view_->updateSize();
         view_->update();
         updateTitle();
+        host_->songOpened();   // a shell reopens the synths the song names
         return true;
     }
 
@@ -1513,6 +1636,11 @@ private:
             trk_unlock(e_);
             const bool ok = trk_routed(e_, t);
             kits |= kit;
+            // A sample set picks its sample by the note itself, so the octave
+            // -- which would only move those notes onto other samples -- is off.
+            oct_[t]->setEnabled(!kit);
+            oct_[t]->setToolTip(kit ? "A sample set picks its sample by the note: the octave is fixed"
+                                    : "The octave the note keys play on this track");
             state_[t]->setText(!named ? "" : ok ? "●" : "○");
             state_[t]->setStyleSheet(ok ? "color: #3a3;" : "color: #c33;");
             state_[t]->setToolTip(!named ? ""
@@ -1528,9 +1656,141 @@ private:
         }
     }
 
+    // A help text in a window of its own: a fixed-width font and no wrapping,
+    // because the tables in it are aligned with spaces and a message box would
+    // wrap them out of line.
+    void showText(const QString &title, const QString &text)
+    {
+        QDialog d(this);
+        d.setWindowTitle(title);
+        auto *l = new QVBoxLayout(&d);
+        auto *t = new QPlainTextEdit;
+        t->setReadOnly(true);
+        t->setLineWrapMode(QPlainTextEdit::NoWrap);
+        t->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        t->setPlainText(text);
+        l->addWidget(t);
+        auto *ok = new QPushButton("Close");
+        connect(ok, &QPushButton::clicked, &d, &QDialog::accept);
+        l->addWidget(ok, 0, Qt::AlignRight);
+        QFontMetrics fm(t->font());
+        int w = 0;
+        for (const QString &ln : text.split('\n')) w = std::max(w, fm.horizontalAdvance(ln));
+        d.resize(std::min(w + 80, 1000), 600);
+        d.exec();
+    }
+
+    // The Rec button says what the engine is doing: lit while a take runs,
+    // and counting in while the click leads the take in.
+    void showRec()
+    {
+        const int rs = trk_recording(e_);
+        if (rs == recShown_) return;
+        recShown_ = rs;
+        recBtn_->setText(rs == 2 ? "● Count-in…" : rs ? "● Recording" : "● Rec");
+        recBtn_->setStyleSheet(rs ? "QPushButton { background: #c0392b; color: white; }" : "");
+        if (rs == 1) host_->showStatus("recording -- play the keys; F7 or Stop ends the take", 6000);
+    }
+
+    // Recording options: each change applies at once.
+    void showRecOptions()
+    {
+        if (recDlg_) { recDlg_->raise(); recDlg_->activateWindow(); return; }
+        auto *d = new QDialog(this);
+        d->setAttribute(Qt::WA_DeleteOnClose);
+        d->setWindowTitle("Recording options");
+        auto *form = new QFormLayout(d);
+        trk_rec_opts o;
+        trk_record_get(e_, &o);
+        auto *count = new QSpinBox;
+        count->setRange(0, 4);
+        count->setValue(o.count_in);
+        auto *metro = new QCheckBox;
+        metro->setChecked(o.metronome);
+        auto *quant = new QComboBox;
+        quant->addItems({ "Nearest row", "Row that is sounding" });
+        quant->setCurrentIndex(o.quantize);
+        auto *noteoff = new QCheckBox;
+        noteoff->setChecked(o.note_off);
+        auto *offset = new QSpinBox;
+        offset->setRange(-200, 200);
+        offset->setSuffix(" ms");
+        offset->setValue(o.offset_ms);
+        auto *input = new QComboBox;
+        input->addItem("(none)");
+        char names[64][TRK_DEST_LEN];
+        const int n = trk_input_list(e_, names, 64);
+        for (int i = 0; i < n; i++) {
+            input->addItem(QString::fromUtf8(names[i]));
+            if (!std::strcmp(names[i], trk_input_connected(e_))) input->setCurrentIndex(i + 1);
+        }
+        auto *monitor = new QCheckBox;
+        monitor->setChecked(o.monitor);
+        form->addRow("Count-in (bars)", count);
+        form->addRow("Metronome click", metro);
+        form->addRow("Notes go to", quant);
+        form->addRow("Write === when a key is let go", noteoff);
+        form->addRow("Keyboard timing offset", offset);
+        form->addRow("MIDI input", input);
+        form->addRow("Hear the MIDI input on the cursor's track", monitor);
+        auto *help = new QLabel(
+            "A note you play is written to the row it falls on. 'Nearest row' rounds a\n"
+            "note struck a little before the next row up to it. The offset places keyboard\n"
+            "notes earlier (positive) or later, to make up for a slow keyboard or screen.\n"
+            "A MIDI input is timed by the sequencer, so it needs no offset.");
+        help->setEnabled(false);
+        form->addRow(help);
+        auto apply = [this, count, metro, quant, noteoff, offset, monitor] {
+            trk_rec_opts c;
+            c.count_in = count->value();
+            c.metronome = metro->isChecked();
+            c.quantize = quant->currentIndex();
+            c.note_off = noteoff->isChecked();
+            c.monitor = monitor->isChecked();
+            c.offset_ms = offset->value();
+            trk_record_set(e_, &c);
+        };
+        connect(count, &QSpinBox::valueChanged, d, apply);
+        connect(offset, &QSpinBox::valueChanged, d, apply);
+        connect(metro, &QCheckBox::toggled, d, apply);
+        connect(noteoff, &QCheckBox::toggled, d, apply);
+        connect(monitor, &QCheckBox::toggled, d, apply);
+        connect(quant, &QComboBox::currentIndexChanged, d, apply);
+        connect(input, &QComboBox::activated, d, [this, input](int i) {
+            if (i == 0) { trk_input_connect(e_, ""); host_->showStatus("MIDI input: none", 3000); return; }
+            const QByteArray nm = input->itemText(i).toUtf8();
+            host_->showStatus(trk_input_connect(e_, nm.constData()) == 0
+                                  ? "MIDI input: " + input->itemText(i)
+                                  : QString("could not connect that MIDI input"), 4000);
+        });
+        recDlg_ = d;
+        d->show();
+    }
+
+    // File > Export recorded take: the notes as they were played, at their
+    // exact times, not as they were rounded onto rows.
+    void exportTake()
+    {
+        if (!trk_take_events(e_)) {
+            host_->showStatus("nothing has been recorded yet -- F7 records a take", 4000);
+            return;
+        }
+        QString p = QFileDialog::getSaveFileName(this, "Export recorded take", "take.mid",
+                                                 "MIDI files (*.mid);;All files (*)");
+        if (p.isEmpty()) return;
+        if (QFileInfo(p).suffix().isEmpty()) p += ".mid";
+        char err[512];
+        if (trk_take_export_midi(e_, p.toLocal8Bit().constData(), err, sizeof err)) {
+            QMessageBox::warning(this, "tracker", QString::fromLocal8Bit(err));
+            return;
+        }
+        host_->showStatus("Exported the take to " + p, 3000);
+    }
+
     void followPlayback()
     {
         int o, p, r;
+        showRec();
         trk_position(e_, &o, &p, &r);
         view_->setPlayRow(p, r);
         // The part playing, marked; and, following, the one being edited.
@@ -1561,6 +1821,7 @@ private:
 
     void cursorMoved()
     {
+        trk_record_arm(e_, ed_.track);     // the MIDI input plays and records on the cursor's track
         loading_ = true;
         pattern_->setValue(ed_.pattern);
         trk_lock(e_);
@@ -1606,6 +1867,8 @@ private:
     {
         if (!confirmDiscard()) return;
         trk_stop(e_);
+        trk_undo_clear(e_);          /* a new song starts with no history */
+        trk_unroute_sinks(e_);
         trk_lock(e_);
         trk_song_init(trk_song_of(e_));
         trk_unlock(e_);
@@ -1644,13 +1907,40 @@ private:
         return writeTo(p);
     }
 
+    // File > Export MIDI: the song as a standard MIDI file, one track per
+    // playing track, for a DAW to import. Not a save -- the song's own file,
+    // its dirty state and its title stay as they were.
+    void exportMidi()
+    {
+        QString base = path_.isEmpty() ? QString("song") : QFileInfo(path_).completeBaseName();
+        QString p = QFileDialog::getSaveFileName(this, "Export MIDI", base + ".mid",
+                                                 "MIDI files (*.mid);;All files (*)");
+        if (p.isEmpty()) return;
+        if (QFileInfo(p).suffix().isEmpty()) p += ".mid";
+        char err[512];
+        // A copy under the lock, the file written from it after: the lock is
+        // the scheduler's and the note path's.
+        auto snap = std::make_unique<trk_song>();
+        trk_lock(e_);
+        std::memcpy(snap.get(), trk_song_of(e_), sizeof(trk_song));
+        trk_unlock(e_);
+        const int r = trk_song_export_midi(snap.get(), p.toLocal8Bit().constData(), err, sizeof err);
+        if (r) {
+            QMessageBox::warning(this, "tracker", QString::fromLocal8Bit(err));
+            return;
+        }
+        host_->showStatus("Exported " + p, 3000);
+    }
+
     bool writeTo(const QString &p)
     {
         char err[512];
+        auto snap = std::make_unique<trk_song>();     // copied under the lock, written after
         trk_lock(e_);
-        const int r = trk_song_save(trk_song_of(e_), p.toLocal8Bit().constData(), err, sizeof err);
-        if (!r) std::memcpy(saved_.get(), trk_song_of(e_), sizeof(trk_song));
+        std::memcpy(snap.get(), trk_song_of(e_), sizeof(trk_song));
         trk_unlock(e_);
+        const int r = trk_song_save(snap.get(), p.toLocal8Bit().constData(), err, sizeof err);
+        if (!r) std::memcpy(saved_.get(), snap.get(), sizeof(trk_song));
         if (r) {
             QMessageBox::warning(this, "tracker", QString::fromLocal8Bit(err));
             return false;
@@ -1695,6 +1985,9 @@ private:
     QComboBox *dest_[TRK_TRACKS];
     QComboBox *sample_[TRK_TRACKS];
     QMenu     *samplesMenu_ = nullptr;
+    QPushButton *recBtn_ = nullptr;
+    int        recShown_ = 0;
+    QPointer<QDialog> recDlg_;
     QSpinBox *chan_[TRK_TRACKS];
     QComboBox *oct_[TRK_TRACKS];
     QCheckBox *mute_[TRK_TRACKS];

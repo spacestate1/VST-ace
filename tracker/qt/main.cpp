@@ -175,9 +175,28 @@ int uitest(trk_engine *e, TrackerWindow &w, const QString &outdir)
     check(trk_playing(e) && o >= 1, "F5 plays the song through the order list");
     check(ed->pattern == p, "the editor follows the pattern being played");
     shot("04-song.png");
-    press(v, Qt::Key_Space);
+    press(v, Qt::Key_Return);
     wait(100);
-    check(!trk_playing(e), "Space stops");
+    check(!trk_playing(e), "Enter stops");
+    {   // F7 records: the count-in first, then the take; Stop ends it.
+        trk_rec_opts o;
+        trk_record_get(e, &o);
+        o.count_in = 0; o.metronome = 0;
+        trk_record_set(e, &o);
+        press(v, Qt::Key_F7);
+        wait(150);
+        check(trk_recording(e) == 1, "F7 starts a take");
+        press(v, Qt::Key_F8);
+        wait(100);
+        check(trk_recording(e) == 0 && !trk_playing(e), "Stop ends it");
+    }
+    {   // Space is edit mode now: it toggles, and with it off the note keys only play.
+        const int was = ed->edit;
+        press(v, Qt::Key_Space);
+        check(ed->edit == !was, "Space toggles edit mode");
+        press(v, Qt::Key_Space);
+        check(ed->edit == was, "and back");
+    }
 
     std::printf("saving\n");
     const QString path = outdir + "/saved.trk";

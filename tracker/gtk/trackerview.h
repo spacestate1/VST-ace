@@ -48,9 +48,39 @@ GtkWidget *trk_view_widget(trk_view *v);
 int        trk_view_open(trk_view *v, const char *path);
 void       trk_view_reset(trk_view *v);
 
+/* The toolbar's song commands, for a shell's menus: the exact code paths the
+ * view's own New, Save and Save As buttons run, so an embedded view and the
+ * standalone behave alike. New song asks about unsaved changes first (the
+ * Save/Discard/Cancel flow, cancel is silence). Save writes the song's file,
+ * turning into Save As when it was never saved; Save As always asks for a
+ * file. */
+void       trk_view_new_song(trk_view *v);
+void       trk_view_save(trk_view *v);
+void       trk_view_save_as(trk_view *v);
+/* Export MIDI: asks for a .mid file and writes the song into it. Not a save. */
+void       trk_view_export_midi(trk_view *v);
+
+/* A shell that carries the view's file, samples and help commands in its own
+ * menu bar says so before the widget is made: the toolbar then keeps only the
+ * transport. The commands themselves, for that menu's actions. */
+void       trk_view_set_embedded(trk_view *v, int on);
+/* Recording: the last take as a MIDI file, and the options window. */
+void       trk_view_export_take(trk_view *v);
+void       trk_view_record_options(trk_view *v);
+void       trk_view_load_samples(trk_view *v);
+void       trk_view_edit_samples(trk_view *v);
+void       trk_view_show_keys(trk_view *v);
+void       trk_view_show_columns(trk_view *v);
+void       trk_view_show_cheat(trk_view *v);
+
 /* The shell's destinations; NULL takes them away again. The api struct is
  * copied. Refreshes the destination lists when the widget exists. */
 void       trk_view_set_sinks(trk_view *v, const trk_view_sinks *api, void *ud);
+
+/* Called after a song is loaded -- the view's own Open button and a shell's
+ * open alike -- so the shell can reopen the synths the song's sink lines
+ * name. Unset: nothing, the standalone's answer. */
+void       trk_view_set_song_opened(trk_view *v, void (*cb)(void *ud), void *ud);
 
 /* Mark the song as saved -- for a shell that wrote into it itself, as the Qt
  * shell does before routing a track for its scripted proof. */

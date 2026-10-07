@@ -20,18 +20,39 @@ static const char *k_keys_help =
     "  z s x d c v g b h n j m       notes, one octave\n"
     "  q 2 w 3 e r 5 t 6 y 7 u i 9 o 0 p   the octave above\n"
     "  1                 note-off\n"
-    "  `                 edit mode on / off (off: note keys only play)\n"
+    "  Space (or `)      edit mode on / off (off: note keys only play,\n"
+    "                    nothing is written)\n"
     "  Delete or .       clear and advance\n"
     "  Insert            push the track down a row\n"
     "  Backspace         pull the track up over this row\n"
     "  0-9 a-f           hex, in the velocity and controller fields\n"
-    "  [ ]               octave down / up\n"
+    "  [ ] or keypad / * octave down / up (a track's notes move with it)\n"
+    "  Ctrl+keypad / *   edit step down / up\n"
     "  - =               previous / next pattern\n"
     "\n"
+    "Selection and clipboard\n"
+    "  Shift+arrows      select      Shift+PgUp / PgDn   select a page\n"
+    "  Ctrl+A            select all\n"
+    "  Ctrl+C / X / V    copy / cut / paste\n"
+    "  Ctrl+Shift+V      paste mix: only what the clipboard has, over what is there\n"
+    "  Ctrl+Z / Ctrl+Y   undo / redo (Ctrl+Shift+Z too)\n"
+    "  Ctrl+F1 / F2      transpose selection (or cell) down / up a semitone\n"
+    "  Ctrl+F3 / F4      the same, an octave\n"
+    "\n"
+    "Tracks\n"
+    "  Alt+F9            mute the cursor's track\n"
+    "  Alt+F10           solo it (again: everyone back)\n"
+    "  Alt+Shift+F9      unmute all\n"
+    "\n"
     "Transport\n"
+    "  Enter             play pattern / stop\n"
+    "  Shift+Enter       play the pattern from the cursor row\n"
     "  F5  play song     F6  play pattern     F8  stop\n"
-    "  Space             play pattern / stop\n"
-    "  Escape            panic: release every note everywhere\n"
+    "  F7                record: play from the cursor row and write what you\n"
+    "                    play -- keys or a MIDI input -- on the cursor's track.\n"
+    "                    A count-in and click lead it in; F7 or F8 ends the take.\n"
+    "                    Rec... sets the count-in, click, quantizing and input.\n"
+    "  Escape or F12     panic: release every note everywhere\n"
     "\n"
     "Each track plays one window. Open vst-ace once per instrument, then pick\n"
     "the window under the track's name. A cell is note, velocity, controller\n"
@@ -67,6 +88,9 @@ struct trk_view {
     GtkWidget  *area, *scroll, *headscroll, *status;
     GtkWidget  *cheatwin, *cheattext;  /* Help > Cheat Sheet, while it is open */
     GtkWidget  *bpm, *lpb, *pattern, *rows, *step, *follow, *editbox, *volume;
+    GtkWidget  *recbtn;              /* the Rec button, lit while a take runs */
+    int         rec_shown;           /* what recbtn says: trk_recording's last answer */
+    GtkWidget  *recwin;              /* the recording options, while open */
     GtkWidget  *parts, *part_name;   /* the Parts panel */
     int         part_at, part_playing, filling_parts;
     int         drag_rows, drag_r, drag_t;   /* a drag selecting rows, or a block, and where it began */
@@ -107,8 +131,14 @@ struct trk_view {
      * what runs at the end is the shell's next step, and nothing closes. */
     void      (*embed_ensure)(void *ud);
     void       *embed_ensure_ud;
+    /* A song was just loaded (open_path succeeded): the shell reopens the
+     * synths its sink lines name. Unset standalone. */
+    void      (*song_opened)(void *ud);
+    void       *song_opened_ud;
 
     guint       t_follow, t_reroute; /* the view's timers, removed on destroy */
+    guint       t_refit;             /* a pending refit_columns, 0 when none is */
+    int         embedded;            /* in a shell: its menus carry the file, samples and help commands */
 };
 
 typedef struct trk_view ui;
@@ -181,6 +211,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
     double x1, y1, x2, y2;
     unsigned char masks[TRK_TRACKS][16];
     int sampled[TRK_TRACKS];
+    trk_cell cells[TRK_ROWS_MAX][TRK_TRACKS];   /* the visible rows, copied */
     PangoLayout *l;
     const trk_song *s;
     const trk_pattern *pt;
@@ -212,6 +243,9 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
      * song's lock is taken, which this call takes itself. */
     for (t = 0; t < TRK_TRACKS; t++) sampled[t] = trk_sample_mask(U->e, t, masks[t]);
 
+    /* What is drawn is copied out under the lock and drawn after it: the
+     * lock is the scheduling thread's and the note path's too, and a redraw
+     * of a few thousand Pango strings must not hold either up. */
     trk_lock(U->e);
     s = trk_song_of(U->e);
     pt = &s->pattern[U->ed.pattern];
@@ -221,6 +255,8 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
     if (r0 < 0) r0 = 0;
     r1 = (int)(y2 / U->ch);
     if (r1 > pt->rows - 1) r1 = pt->rows - 1;
+    if (r1 >= r0) memcpy(cells[r0], pt->cell[r0], sizeof cells[0] * (size_t)(r1 - r0 + 1));
+    trk_unlock(U->e);
 
     for (r = r0; r <= r1; r++) {
         const int y = r * U->ch;
@@ -242,7 +278,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
             const int on_cursor = r == U->ed.row && t == U->ed.track;
             char txt[TRK_CELL_CHARS + 1];
             int f;
-            trk_cell_text(&pt->cell[r][t], txt);
+            trk_cell_text(&cells[r][t], txt);
             if (trk_selected(&U->ed, r, t)) {
                 rgba sel = accent;
                 sel.a = 0.3;
@@ -261,7 +297,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
             for (f = 0; f < TRK_FIELDS; f++) {
                 const char *p = txt + start[f];
                 rgba c = p[0] == '.' ? faint : f == TRK_F_NOTE ? fg : dim;
-                const int nt = pt->cell[r][t].note;
+                const int nt = cells[r][t].note;
                 /* A note its track's sample set has no sample on plays
                  * nothing: red, so it is seen before it is not heard. */
                 if (f == TRK_F_NOTE && sampled[t] && nt <= 127 && !(masks[t][nt >> 3] & (1u << (nt & 7))))
@@ -273,7 +309,6 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
             }
         }
     }
-    trk_unlock(U->e);
 
     set(cr, faint);
     cairo_set_line_width(cr, 1);
@@ -323,6 +358,8 @@ static void sync_from_song(ui *U)
 
 static void refresh_samples(ui *U);
 static void edit_shown(ui *U);
+static void sync_mutes(ui *U);
+static void schedule_refit(ui *U);   /* defined beside refit_columns, below */
 
 /* Help > Cheat Sheet: for each track playing a sample set, every sample
  * with its note and the key that types it at the octave set now; then the
@@ -413,6 +450,8 @@ static void on_cheat(GSimpleAction *a, GVariant *v, gpointer u)
 }
 
 static void show_keys(ui *U);
+static void show_columns(ui *U);
+static void on_columns(GSimpleAction *a, GVariant *v, gpointer u) { ui *U = u; (void)a; (void)v; show_columns(U); }
 static void on_keys(GSimpleAction *a, GVariant *v, gpointer u) { ui *U = u; (void)a; (void)v; show_keys(U); }
 
 /* Help, last of the buttons: what every key does, and the cheat sheet. */
@@ -421,6 +460,7 @@ static void help_menu(GtkMenuButton *mb, gpointer u)
     GMenu *m = g_menu_new();
     (void)u;
     g_menu_append(m, "Keys", "win.keys");
+    g_menu_append(m, "Columns", "win.columns");
     g_menu_append(m, "Cheat Sheet", "win.cheat");
     gtk_menu_button_set_menu_model(mb, G_MENU_MODEL(m));
     g_object_unref(m);
@@ -436,6 +476,11 @@ static void update_states(ui *U)
         named = kit || trk_song_of(U->e)->track[t].client[0] != 0;
         trk_unlock(U->e);
         kits |= kit;
+        /* A sample set picks its sample by the note itself, so the octave
+         * -- which would only move those notes onto other samples -- is off. */
+        gtk_widget_set_sensitive(U->oct[t], !kit);
+        gtk_widget_set_tooltip_text(U->oct[t], kit ? "A sample set picks its sample by the note: the octave is fixed"
+                                                   : "The octave the note keys play on this track");
         gtk_label_set_markup(GTK_LABEL(U->state[t]),
                              !named ? "" : ok ? "<span foreground='#3a3'>●</span>"
                                               : "<span foreground='#c33'>○</span>");
@@ -544,6 +589,9 @@ static void refresh_dests(ui *U, int force)
     U->loading = 0;
     refresh_samples(U);
     update_states(U);
+    /* The models were (re)assigned here, possibly long after the first fit:
+     * what the closed boxes draw now is what the columns have to hold. */
+    schedule_refit(U);
 }
 
 /* Each track's sample-set box: every set there is, and whatever a track
@@ -1078,10 +1126,17 @@ static int write_to(ui *U, const char *path)
 {
     char err[512];
     int r;
+    /* A copy under the lock, the file written from it after: the lock is the
+     * scheduler's and the note path's, and a large song takes tens of
+     * milliseconds to write. */
+    trk_song *snap = malloc(sizeof *snap);
+    if (!snap) { status(U, "out of memory"); return -1; }
     trk_lock(U->e);
-    r = trk_song_save(trk_song_of(U->e), path, err, sizeof err);
-    if (!r) memcpy(U->saved, trk_song_of(U->e), sizeof(trk_song));
+    memcpy(snap, trk_song_of(U->e), sizeof *snap);
     trk_unlock(U->e);
+    r = trk_song_save(snap, path, err, sizeof err);
+    if (!r) memcpy(U->saved, snap, sizeof(trk_song));
+    free(snap);
     if (r) { status(U, err); return -1; }
     if (path != U->path) snprintf(U->path, sizeof U->path, "%s", path);
     update_title(U);
@@ -1104,6 +1159,8 @@ static int open_path(ui *U, const char *path)
         return -1;
     }
     trk_stop(U->e);
+    trk_undo_clear(U->e);   /* a loaded song starts with no history */
+    trk_unroute_sinks(U->e);   /* the engine's routing and the new song's sink names agree */
     trk_lock(U->e);
     memcpy(trk_song_of(U->e), tmp, sizeof *tmp);
     trk_unlock(U->e);
@@ -1113,6 +1170,7 @@ static int open_path(ui *U, const char *path)
     trk_set_bpm(U->e, tmp->bpm);
     free(tmp);
     reset_view(U);
+    if (U->song_opened) U->song_opened(U->song_opened_ud);
     return 0;
 }
 
@@ -1126,6 +1184,7 @@ static void cursor_moved(ui *U)
     double vv = gtk_adjustment_get_value(va), vp = gtk_adjustment_get_page_size(va);
     double hv = gtk_adjustment_get_value(ha), hp = gtk_adjustment_get_page_size(ha);
 
+    trk_record_arm(U->e, U->ed.track);   /* the MIDI input plays and records on the cursor's track */
     U->loading = 1;
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(U->pattern), U->ed.pattern);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(U->rows), cur_rows(U));
@@ -1148,21 +1207,41 @@ static void cursor_moved(ui *U)
 static int translate(guint kv, GdkModifierType st)
 {
     gunichar c;
-    /* Shift with the arrows selects; Ctrl with C, X, V and A is the clipboard. */
+    /* Shift with the arrows selects; Ctrl with C, X, V and A is the clipboard.
+     * Furnace's keys, where they fit: Ctrl+Y redo, Ctrl+Shift+V paste mix,
+     * Ctrl+F1-F4 transpose, Alt+F9/F10 mute and solo, Shift+PgUp/PgDn a page
+     * of selection, the keypad's * and / the octave. */
+    if (st & GDK_ALT_MASK)
+        switch (kv) {
+        case GDK_KEY_F9:  return (st & GDK_SHIFT_MASK) ? TRK_K_UNMUTE_ALL : TRK_K_MUTE_TRACK;
+        case GDK_KEY_F10: return TRK_K_SOLO_TRACK;
+        default: break;
+        }
     if (st & GDK_SHIFT_MASK)
         switch (kv) {
         case GDK_KEY_Up:    return TRK_K_SEL_UP;
         case GDK_KEY_Down:  return TRK_K_SEL_DOWN;
         case GDK_KEY_Left:  return TRK_K_SEL_LEFT;
         case GDK_KEY_Right: return TRK_K_SEL_RIGHT;
+        case GDK_KEY_Page_Up:   return TRK_K_SEL_PGUP;
+        case GDK_KEY_Page_Down: return TRK_K_SEL_PGDN;
+        case GDK_KEY_Return: case GDK_KEY_KP_Enter: if (!(st & GDK_CONTROL_MASK)) return TRK_K_PLAY_FROM_CURSOR; break;
         default: break;
         }
     if (st & GDK_CONTROL_MASK)
         switch (kv) {
         case GDK_KEY_c: case GDK_KEY_C: return TRK_K_COPY;
         case GDK_KEY_x: case GDK_KEY_X: return TRK_K_CUT;
-        case GDK_KEY_v: case GDK_KEY_V: return TRK_K_PASTE;
+        case GDK_KEY_v: case GDK_KEY_V: return (st & GDK_SHIFT_MASK) ? TRK_K_PASTE_MIX : TRK_K_PASTE;
         case GDK_KEY_a: case GDK_KEY_A: return TRK_K_SEL_ALL;
+        case GDK_KEY_z: case GDK_KEY_Z: return (st & GDK_SHIFT_MASK) ? TRK_K_REDO : TRK_K_UNDO;
+        case GDK_KEY_y: case GDK_KEY_Y: return TRK_K_REDO;
+        case GDK_KEY_F1: return TRK_K_TRANSPOSE_DOWN;
+        case GDK_KEY_F2: return TRK_K_TRANSPOSE_UP;
+        case GDK_KEY_F3: return TRK_K_TRANSPOSE_OCT_DOWN;
+        case GDK_KEY_F4: return TRK_K_TRANSPOSE_OCT_UP;
+        case GDK_KEY_KP_Multiply: return TRK_K_STEP_UP;
+        case GDK_KEY_KP_Divide:   return TRK_K_STEP_DOWN;
         default: break;
         }
     switch (kv) {
@@ -1181,8 +1260,12 @@ static int translate(guint kv, GdkModifierType st)
     case GDK_KEY_Insert:    return TRK_K_INSERT;
     case GDK_KEY_F5:        return TRK_K_PLAY_SONG;
     case GDK_KEY_F6:        return TRK_K_PLAY_PATTERN;
+    case GDK_KEY_F7:        return TRK_K_RECORD;
     case GDK_KEY_F8:        return TRK_K_STOP;
-    case GDK_KEY_space:     return TRK_K_TOGGLE;
+    case GDK_KEY_space:     return TRK_K_EDIT;
+    case GDK_KEY_Return: case GDK_KEY_KP_Enter: return TRK_K_TOGGLE;
+    case GDK_KEY_KP_Multiply: return TRK_K_OCT_UP;
+    case GDK_KEY_KP_Divide:   return TRK_K_OCT_DOWN;
     case GDK_KEY_bracketleft:  return TRK_K_OCT_DOWN;
     case GDK_KEY_bracketright: return TRK_K_OCT_UP;
     case GDK_KEY_minus:     return TRK_K_PAT_PREV;
@@ -1221,7 +1304,7 @@ static gboolean on_key(GtkEventControllerKey *k, guint kv, guint code,
     ui *U = u;
     int key;
     (void)k; (void)code;
-    if (kv == GDK_KEY_Escape) { trk_panic(U->e); return TRUE; }
+    if (kv == GDK_KEY_Escape || kv == GDK_KEY_F12) { trk_panic(U->e); return TRUE; }
     key = translate(kv, st);
     if (key < 0) return FALSE;
     /* A held key repeats; a note or a digit must not, or holding one down
@@ -1247,7 +1330,13 @@ static gboolean on_key(GtkEventControllerKey *k, guint kv, guint code,
         redraw(U);
         cursor_moved(U);
     }
-    if (key == TRK_K_COPY || key == TRK_K_CUT || key == TRK_K_PASTE) clip_status(U, key);
+    if (key == TRK_K_COPY || key == TRK_K_CUT || key == TRK_K_PASTE || key == TRK_K_PASTE_MIX) clip_status(U, key);
+    if (key == TRK_K_MUTE_TRACK || key == TRK_K_SOLO_TRACK || key == TRK_K_UNMUTE_ALL) sync_mutes(U);
+    if (key == TRK_K_STEP_UP || key == TRK_K_STEP_DOWN) {
+        U->loading = 1;
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(U->step), U->ed.step);
+        U->loading = 0;
+    }
     if (key == TRK_K_EDIT) {
         U->loading = 1;
         gtk_check_button_set_active(GTK_CHECK_BUTTON(U->editbox), U->ed.edit);
@@ -1310,6 +1399,7 @@ static void on_focus_leave(GtkEventControllerFocus *f, gpointer u)
     ui *U = u;
     int t;
     (void)f;
+    if (U->closing) return;      /* the tab is coming down: the engine may already be */
     for (t = 0; t < TRK_TRACKS; t++)
         if (U->ed.held[t]) { trk_preview_off(U->e, t); U->ed.held[t] = 0; }
     memset(U->down, 0, sizeof U->down);
@@ -1399,7 +1489,7 @@ static void clip_status(ui *U, int key)
     char msg[96];
     int rows = 0, tracks = 0;
     trk_clipboard(&rows, &tracks);
-    if (!U->ed.edit && key != TRK_K_COPY) { status(U, "edit is off -- ` to edit, then cut or paste"); return; }
+    if (!U->ed.edit && key != TRK_K_COPY) { status(U, "edit is off -- Space to edit, then cut or paste"); return; }
     snprintf(msg, sizeof msg, "%s %d row%s x %d track%s",
              key == TRK_K_COPY ? "copied" : key == TRK_K_CUT ? "cut" : "pasted",
              rows, rows > 1 ? "s" : "", tracks, tracks > 1 ? "s" : "");
@@ -1415,6 +1505,7 @@ static void grid_key(ui *U, int key)
 }
 
 static void on_copy(GSimpleAction *a, GVariant *v, gpointer u)  { ui *U = u; (void)a; (void)v; grid_key(U, TRK_K_COPY); }
+static void on_undo(GSimpleAction *a, GVariant *v, gpointer u)  { ui *U = u; (void)a; (void)v; grid_key(U, TRK_K_UNDO); }
 static void on_cut(GSimpleAction *a, GVariant *v, gpointer u)   { ui *U = u; (void)a; (void)v; grid_key(U, TRK_K_CUT); }
 static void on_paste(GSimpleAction *a, GVariant *v, gpointer u) { ui *U = u; (void)a; (void)v; grid_key(U, TRK_K_PASTE); }
 static void on_selall(GSimpleAction *a, GVariant *v, gpointer u){ ui *U = u; (void)a; (void)v; grid_key(U, TRK_K_SEL_ALL); }
@@ -1458,6 +1549,7 @@ static void on_context(GtkGestureClick *g, int n, double x, double y, gpointer u
     if (rows) snprintf(paste, sizeof paste, "Paste %d row%s x %d track%s",
                        rows, rows > 1 ? "s" : "", tracks, tracks > 1 ? "s" : "");
     else snprintf(paste, sizeof paste, "Paste");
+    g_menu_append(a, "Undo", "win.undo");
     g_menu_append(a, "Copy", "win.copy");
     g_menu_append(a, "Cut", "win.cut");
     g_menu_append(a, paste, "win.paste");
@@ -1487,10 +1579,24 @@ static void transport(ui *U, int key)
 
 /* ---------------------------------------------------------------- timers */
 
+/* The Rec button says what the engine is doing: lit while a take runs, and
+ * counting in while the click leads the take in. */
+static void show_rec(ui *U)
+{
+    const int rs = trk_recording(U->e);
+    if (!U->recbtn || rs == U->rec_shown) return;
+    U->rec_shown = rs;
+    gtk_button_set_label(GTK_BUTTON(U->recbtn), rs == 2 ? "● Count-in…" : rs ? "● Recording" : "● Rec");
+    if (rs) gtk_widget_add_css_class(U->recbtn, "destructive-action");
+    else gtk_widget_remove_css_class(U->recbtn, "destructive-action");
+    if (rs == 1) status(U, "recording -- play the keys; F7 or Stop ends the take");
+}
+
 static gboolean follow_playback(gpointer u)
 {
     ui *U = u;
     int o, p, r;
+    show_rec(U);
     trk_position(U->e, &o, &p, &r);
     /* The part playing, marked; and, following, the one being edited. */
     if (o != U->part_playing || (o >= 0 && U->ed.follow && o != U->part_at)) {
@@ -1577,7 +1683,11 @@ static void on_rows(GtkSpinButton *s, gpointer u)
 
 /* The cheat sheet a moment later, not here: the box is also set from inside
  * sync_from_song, which holds the song's lock. */
-static gboolean refresh_cheat_idle(gpointer u) { refresh_cheat(u); return G_SOURCE_REMOVE; }
+static gboolean refresh_cheat_idle(gpointer u)
+{
+    if (!((ui *)u)->closing) refresh_cheat(u);      /* queued before the view was freed */
+    return G_SOURCE_REMOVE;
+}
 static void on_step(GtkSpinButton *s, gpointer u)   { ui *U = u; U->ed.step = gtk_spin_button_get_value_as_int(s); }
 static void on_follow(GtkCheckButton *c, gpointer u) { ui *U = u; U->ed.follow = gtk_check_button_get_active(c); }
 
@@ -1657,11 +1767,14 @@ static void on_oct(GtkDropDown *d, GParamSpec *ps, gpointer u)
     int t = r->n, o = (int)gtk_drop_down_get_selected(d);
     (void)ps;
     if (U->loading) return;
-    trk_lock(U->e);
-    trk_song_of(U->e)->track[t].octave = o;
-    trk_unlock(U->e);
+    /* The core moves the octave and the track's existing notes together
+     * (±12 per step, clamped), under the engine lock. */
+    trk_track_set_octave(U->e, t, o);
     if (t == U->ed.track) U->ed.octave = o;
     g_idle_add(refresh_cheat_idle, U);
+    redraw(U);
+    /* "oct 9" draws wider than "oct 0", and the box is not ellipsized. */
+    schedule_refit(U);
     gtk_widget_grab_focus(U->area);
 }
 
@@ -1675,6 +1788,21 @@ static void on_chan(GtkDropDown *d, GParamSpec *ps, gpointer u)
     trk_lock(U->e);
     trk_song_of(U->e)->track[t].channel = (int)gtk_drop_down_get_selected(d) & 15;
     trk_unlock(U->e);
+    /* "ch 16" draws wider than "ch 1", and the box is not ellipsized. */
+    schedule_refit(U);
+}
+
+/* The mute boxes show the song's mute state; a key (mute, solo, unmute all)
+ * changes it behind them. */
+static void sync_mutes(ui *U)
+{
+    int t;
+    U->loading = 1;
+    trk_lock(U->e);
+    for (t = 0; t < TRK_TRACKS; t++)
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(U->mute[t]), trk_song_of(U->e)->track[t].mute);
+    trk_unlock(U->e);
+    U->loading = 0;
 }
 
 static void on_mute(GtkCheckButton *c, gpointer u)
@@ -1793,12 +1921,79 @@ static GtkFileDialog *song_dialog(const char *title)
 static void save_as(ui *U, int close_after)
 {
     GtkFileDialog *d = song_dialog("Save song");
-    gtk_file_dialog_set_initial_name(d, U->path[0] ? strrchr(U->path, '/') + 1 : "song.trk");
+    {   /* A song opened by a bare file name has no '/' in its path. */
+        const char *slash = strrchr(U->path, '/');
+        gtk_file_dialog_set_initial_name(d, !U->path[0] ? "song.trk" : slash ? slash + 1 : U->path);
+    }
     {
         ui_ref *r = g_new(ui_ref, 1);
         r->U = U; r->n = close_after;
         gtk_file_dialog_save(d, parent_window(U), NULL, save_done, r);
     }
+    g_object_unref(d);
+}
+
+/* File > Export MIDI: the song as a standard MIDI file, one track per
+ * playing track, for a DAW to import. Not a save: the song's own file, its
+ * dirty state and its title stay as they were. */
+static void export_done(GObject *src, GAsyncResult *res, gpointer u)
+{
+    ui *U = u;
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *p;
+    if (!f) return;
+    p = g_file_get_path(f);
+    if (p) {
+        char path[4096], err[256] = "";
+        const char *base = strrchr(p, '/');
+        int r;
+        snprintf(path, sizeof path, "%s%s", p, base && !strchr(base, '.') ? ".mid" : "");
+        trk_song *snap = malloc(sizeof *snap);        /* copied under the lock, written after */
+        if (snap) {
+            trk_lock(U->e);
+            memcpy(snap, trk_song_of(U->e), sizeof *snap);
+            trk_unlock(U->e);
+            r = trk_song_export_midi(snap, path, err, sizeof err);
+            free(snap);
+        } else {
+            r = -1;
+            snprintf(err, sizeof err, "out of memory");
+        }
+        if (r) {
+            char m[512];
+            snprintf(m, sizeof m, "export failed: %s", err);
+            status(U, m);
+        } else {
+            char m[4200];
+            snprintf(m, sizeof m, "Exported %s", path);
+            status(U, m);
+        }
+    }
+    g_free(p);
+    g_object_unref(f);
+}
+
+static void export_midi(ui *U)
+{
+    GtkFileDialog *d = gtk_file_dialog_new();
+    GtkFileFilter *ft = gtk_file_filter_new();
+    GListStore *fs = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    char name[512] = "song.mid", *dot;
+    gtk_file_dialog_set_title(d, "Export MIDI");
+    gtk_file_filter_set_name(ft, "MIDI files");
+    gtk_file_filter_add_pattern(ft, "*.mid");
+    g_list_store_append(fs, ft);
+    gtk_file_dialog_set_filters(d, G_LIST_MODEL(fs));
+    if (U->path[0]) {
+        const char *slash = strrchr(U->path, '/');
+        snprintf(name, sizeof name, "%s", slash ? slash + 1 : U->path);
+        if ((dot = strrchr(name, '.'))) *dot = 0;
+        strncat(name, ".mid", sizeof name - strlen(name) - 1);
+    }
+    gtk_file_dialog_set_initial_name(d, name);
+    gtk_file_dialog_save(d, parent_window(U), NULL, export_done, U);
+    g_object_unref(ft);
+    g_object_unref(fs);
     g_object_unref(d);
 }
 
@@ -1835,6 +2030,8 @@ static void after_confirm(ui *U, after_t what)
     if (what == AFTER_ENSURE) { ensure_confirmed(U); return; }
     if (what == AFTER_NEW) {
         trk_stop(U->e);
+        trk_undo_clear(U->e);   /* a new song starts with no history */
+        trk_unroute_sinks(U->e);
         trk_lock(U->e);
         trk_song_init(trk_song_of(U->e));
         trk_unlock(U->e);
@@ -1895,13 +2092,205 @@ static gboolean on_close(GtkWindow *w, gpointer u)
     return TRUE;
 }
 
-static void show_keys(ui *U)
+/* A help text in a window of its own, in a fixed-width font: the tables in
+ * it are aligned with spaces, and an alert dialog's proportional font would
+ * pull them out of line. */
+static void show_text(ui *U, const char *title, const char *text)
 {
-    GtkAlertDialog *d = gtk_alert_dialog_new("tracker keys");
-    gtk_alert_dialog_set_detail(d, k_keys_help);
-    gtk_alert_dialog_show(d, parent_window(U));
+    GtkWidget *win = gtk_window_new(), *sw = gtk_scrolled_window_new(), *l = gtk_label_new(text);
+    gtk_window_set_title(GTK_WINDOW(win), title);
+    gtk_window_set_transient_for(GTK_WINDOW(win), parent_window(U));
+    gtk_window_set_default_size(GTK_WINDOW(win), 700, 560);
+    gtk_widget_add_css_class(l, "monospace");
+    gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
+    gtk_label_set_selectable(GTK_LABEL(l), TRUE);
+    gtk_widget_set_margin_start(l, 14);
+    gtk_widget_set_margin_end(l, 14);
+    gtk_widget_set_margin_top(l, 12);
+    gtk_widget_set_margin_bottom(l, 12);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), l);
+    gtk_window_set_child(GTK_WINDOW(win), sw);
+    gtk_window_present(GTK_WINDOW(win));
+}
+
+static void show_columns(ui *U) { show_text(U, "tracker columns", trk_columns_help()); }
+static void show_keys(ui *U)    { show_text(U, "tracker keys", k_keys_help); }
+
+static void on_export_button(GtkButton *b, gpointer u) { (void)b; export_midi(u); }
+
+/* Export the last take as a MIDI file: the notes as they were played, at
+ * their exact times, not as they were rounded onto rows. */
+static void take_done(GObject *src, GAsyncResult *res, gpointer u)
+{
+    ui *U = u;
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *p;
+    if (!f) return;
+    p = g_file_get_path(f);
+    if (p) {
+        char path[4096], err[256] = "", m[4400];
+        const char *base = strrchr(p, '/');
+        snprintf(path, sizeof path, "%s%s", p, base && !strchr(base, '.') ? ".mid" : "");
+        if (trk_take_export_midi(U->e, path, err, sizeof err)) snprintf(m, sizeof m, "take not exported: %s", err);
+        else snprintf(m, sizeof m, "Exported the take to %s", path);
+        status(U, m);
+    }
+    g_free(p);
+    g_object_unref(f);
+}
+
+static void export_take(ui *U)
+{
+    GtkFileDialog *d;
+    GtkFileFilter *ft;
+    GListStore *fs;
+    if (!trk_take_events(U->e)) { status(U, "nothing has been recorded yet -- F7 records a take"); return; }
+    d = gtk_file_dialog_new();
+    ft = gtk_file_filter_new();
+    fs = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    gtk_file_dialog_set_title(d, "Export recorded take");
+    gtk_file_filter_set_name(ft, "MIDI files");
+    gtk_file_filter_add_pattern(ft, "*.mid");
+    g_list_store_append(fs, ft);
+    gtk_file_dialog_set_filters(d, G_LIST_MODEL(fs));
+    gtk_file_dialog_set_initial_name(d, "take.mid");
+    gtk_file_dialog_save(d, parent_window(U), NULL, take_done, U);
+    g_object_unref(ft);
+    g_object_unref(fs);
     g_object_unref(d);
 }
+
+/* ---- recording options: each change applies at once ---- */
+
+typedef struct {
+    ui *U;
+    GtkWidget *count, *metro, *quant, *noteoff, *monitor, *offset, *input;
+    char inputs[64][TRK_DEST_LEN];
+    int  ninputs, loading;
+} recopts;
+
+static void rec_apply(GtkWidget *w, gpointer u)
+{
+    recopts *R = u;
+    trk_rec_opts o;
+    (void)w;
+    if (R->loading) return;
+    o.count_in  = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(R->count));
+    o.metronome = gtk_check_button_get_active(GTK_CHECK_BUTTON(R->metro));
+    o.quantize  = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(R->quant));
+    o.note_off  = gtk_check_button_get_active(GTK_CHECK_BUTTON(R->noteoff));
+    o.monitor   = gtk_check_button_get_active(GTK_CHECK_BUTTON(R->monitor));
+    o.offset_ms = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(R->offset));
+    trk_record_set(R->U->e, &o);
+}
+
+static void rec_input_picked(GObject *d, GParamSpec *ps, gpointer u)
+{
+    recopts *R = u;
+    guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(d));
+    char m[TRK_DEST_LEN + 64];
+    (void)ps;
+    if (R->loading) return;
+    if (i == 0) { trk_input_connect(R->U->e, ""); status(R->U, "MIDI input: none"); return; }
+    if (i - 1 < (guint)R->ninputs && trk_input_connect(R->U->e, R->inputs[i - 1]) == 0)
+        snprintf(m, sizeof m, "MIDI input: %s", R->inputs[i - 1]);
+    else
+        snprintf(m, sizeof m, "could not connect that MIDI input");
+    status(R->U, m);
+}
+
+static void rec_window_gone(GtkWidget *w, gpointer u)
+{
+    recopts *R = u;
+    (void)w;
+    R->U->recwin = NULL;
+    g_free(R);
+}
+
+static GtkWidget *rec_row(GtkWidget *grid, int row, const char *label, GtkWidget *w)
+{
+    GtkWidget *l = gtk_label_new(label);
+    gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
+    gtk_grid_attach(GTK_GRID(grid), l, 0, row, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), w, 1, row, 1, 1);
+    return w;
+}
+
+static void show_rec_options(ui *U)
+{
+    recopts *R;
+    GtkWidget *win, *grid, *help;
+    static const char *const quant[] = { "Nearest row", "Row that is sounding", NULL };
+    const char **ins;
+    trk_rec_opts o;
+    int i;
+
+    if (U->recwin) { gtk_window_present(GTK_WINDOW(U->recwin)); return; }
+    R = g_new0(recopts, 1);
+    R->U = U;
+    R->loading = 1;
+    trk_record_get(U->e, &o);
+    R->ninputs = trk_input_list(U->e, R->inputs, 64);
+    ins = g_new0(const char *, (gsize)R->ninputs + 2);
+    ins[0] = "(none)";
+    for (i = 0; i < R->ninputs; i++) ins[i + 1] = R->inputs[i];
+
+    win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(win), "Recording options");
+    gtk_window_set_transient_for(GTK_WINDOW(win), parent_window(U));
+    grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 14);
+    gtk_widget_set_margin_start(grid, 16); gtk_widget_set_margin_end(grid, 16);
+    gtk_widget_set_margin_top(grid, 14);   gtk_widget_set_margin_bottom(grid, 14);
+
+    R->count = rec_row(grid, 0, "Count-in (bars)", gtk_spin_button_new_with_range(0, 4, 1));
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(R->count), o.count_in);
+    R->metro = rec_row(grid, 1, "Metronome click", gtk_check_button_new());
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(R->metro), o.metronome);
+    R->quant = rec_row(grid, 2, "Notes go to", gtk_drop_down_new_from_strings(quant));
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(R->quant), (guint)o.quantize);
+    R->noteoff = rec_row(grid, 3, "Write === when a key is let go", gtk_check_button_new());
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(R->noteoff), o.note_off);
+    R->offset = rec_row(grid, 4, "Keyboard timing offset (ms)", gtk_spin_button_new_with_range(-200, 200, 1));
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(R->offset), o.offset_ms);
+    R->input = rec_row(grid, 5, "MIDI input", gtk_drop_down_new_from_strings(ins));
+    R->monitor = rec_row(grid, 6, "Hear the MIDI input on the cursor's track", gtk_check_button_new());
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(R->monitor), o.monitor);
+    for (i = 0; i < R->ninputs; i++)
+        if (!strcmp(R->inputs[i], trk_input_connected(U->e))) gtk_drop_down_set_selected(GTK_DROP_DOWN(R->input), (guint)i + 1);
+    help = gtk_label_new("A note you play is written to the row it falls on. 'Nearest row' rounds a\n"
+                         "note struck a little before the next row up to it. The offset places keyboard\n"
+                         "notes earlier (positive) or later, to make up for a slow keyboard or screen.\n"
+                         "A MIDI input is timed by the sequencer, so it needs no offset.");
+    gtk_label_set_xalign(GTK_LABEL(help), 0.0f);
+    gtk_widget_add_css_class(help, "dim-label");
+    gtk_grid_attach(GTK_GRID(grid), help, 0, 7, 2, 1);
+
+    g_signal_connect(R->count, "value-changed", G_CALLBACK(rec_apply), R);
+    g_signal_connect(R->offset, "value-changed", G_CALLBACK(rec_apply), R);
+    g_signal_connect(R->metro, "toggled", G_CALLBACK(rec_apply), R);
+    g_signal_connect(R->noteoff, "toggled", G_CALLBACK(rec_apply), R);
+    g_signal_connect(R->monitor, "toggled", G_CALLBACK(rec_apply), R);
+    g_signal_connect(R->quant, "notify::selected", G_CALLBACK(rec_apply), R);
+    g_signal_connect(R->input, "notify::selected", G_CALLBACK(rec_input_picked), R);
+    g_signal_connect(win, "destroy", G_CALLBACK(rec_window_gone), R);
+    g_free((gpointer)ins);
+    gtk_window_set_child(GTK_WINDOW(win), grid);
+    U->recwin = win;
+    R->loading = 0;
+    gtk_window_present(GTK_WINDOW(win));
+}
+
+static void on_rec_button(GtkButton *b, gpointer u)
+{
+    ui *U = u;
+    (void)b;
+    trk_key(U->e, &U->ed, TRK_K_RECORD);
+    show_rec(U);
+    gtk_widget_grab_focus(U->area);
+}
+static void on_rec_options(GtkButton *b, gpointer u) { (void)b; show_rec_options(u); }
 
 static void on_button(GtkButton *b, gpointer u)
 {
@@ -2103,11 +2492,13 @@ static GtkWidget *build_parts(ui *U)
 }
 
 /* The grid's columns as wide as the headers really drew, so each header
- * sits over its own column. */
+ * sits over its own column. Grow-only: a header that drew narrower than the
+ * column was fitted for is not what the fit is for. */
 static gboolean refit_columns(gpointer u)
 {
     ui *U = u;
     int t, w = U->colw;
+    U->t_refit = 0;               /* it ran: schedule_refit can ask again */
     for (t = 0; t < TRK_TRACKS; t++) {
         int got = gtk_widget_get_width(U->headbox[t]);
         if (got + 6 > w) w = got + 6;
@@ -2121,6 +2512,18 @@ static gboolean refit_columns(gpointer u)
     return G_SOURCE_REMOVE;
 }
 
+/* The refit, once, however often it is asked for before it runs. A header
+ * box can outgrow its column only after something it holds changes -- the
+ * view first drawing under its theme (a theme's drop-downs measure narrower
+ * before they are styled than they draw), a destination model assigned after
+ * the first fit, a channel or octave picked whose closed box draws wider --
+ * and each of those asks. The 200 ms is the one the standalone always used,
+ * so a burst of asks settles into one re-measure. */
+static void schedule_refit(ui *U)
+{
+    if (!U->t_refit) U->t_refit = g_timeout_add(200, refit_columns, U);
+}
+
 /* Shown -- a window presented, or a notebook page switched to: the note keys
  * live on the drawing area, so it takes the focus. A moment after the map:
  * a notebook moving to a page pulls the focus onto its tab as the switch
@@ -2128,7 +2531,7 @@ static gboolean refit_columns(gpointer u)
 static gboolean grab_area_idle(gpointer u)
 {
     ui *U = u;
-    if (gtk_widget_get_mapped(U->view))
+    if (!U->closing && U->view && gtk_widget_get_mapped(U->view))
         gtk_widget_grab_focus(U->area);
     return G_SOURCE_REMOVE;
 }
@@ -2151,17 +2554,19 @@ static GtkWidget *tracker_view_new(ui *U)
                                     "New", "Open…", "Save", "Save As…", "Keys" };
     static const char *btips[] = {
         "Play the song from the order entry holding this pattern (F5)",
-        "Loop this pattern (F6, or Space)",
+        "Loop this pattern (F6)",
         "Stop and release every note (F8)",
         "Release every note on every track, playing or not (Escape)",
         "Start an empty song", "Open a song", "Save the song (to its file)",
         "Save the song to a new file", "What every key does" };
     static const GActionEntry acts[] = {
         { "keys",         on_keys,         NULL, NULL, NULL, {0} },
+        { "columns",      on_columns,      NULL, NULL, NULL, {0} },
         { "cheat",        on_cheat,        NULL, NULL, NULL, {0} },
         { "load-samples", on_load_samples, NULL, NULL, NULL, {0} },
         { "edit-samples", on_edit_samples, NULL, NULL, NULL, {0} },
         { "copy",         on_copy,         NULL, NULL, NULL, {0} },
+        { "undo",         on_undo,         NULL, NULL, NULL, {0} },
         { "cut",          on_cut,          NULL, NULL, NULL, {0} },
         { "paste",        on_paste,        NULL, NULL, NULL, {0} },
         { "clear",        on_clear,        NULL, NULL, NULL, {0} },
@@ -2200,6 +2605,9 @@ static GtkWidget *tracker_view_new(ui *U)
     bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     for (i = 0; i < 9; i++) {
         GtkWidget *b;
+        /* Embedded, the shell's menu bar has New, Open, Save, Save As, Export
+         * MIDI, Samples and Help; only the transport stays on the toolbar. */
+        if (U->embedded && i >= 4) continue;
         if (i == 8) {
             /* Help, where Keys was: Keys and the cheat sheet. */
             GtkWidget *mb = gtk_menu_button_new();
@@ -2215,7 +2623,28 @@ static GtkWidget *tracker_view_new(ui *U)
         gtk_widget_set_focus_on_click(b, FALSE);
         g_signal_connect(b, "clicked", G_CALLBACK(on_button), ui_ref_new(U, i, G_OBJECT(b)));
         gtk_box_append(GTK_BOX(bar), b);
-        if (i == 3) gtk_box_append(GTK_BOX(bar), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
+        if (i == 3) {
+            GtkWidget *rb = gtk_button_new_with_label("● Rec"), *ob = gtk_button_new_with_label("Rec…");
+            U->recbtn = rb;
+            gtk_widget_set_tooltip_text(rb, "Record: play, and write the notes you play into the pattern, on the "
+                                            "cursor's track (F7)");
+            gtk_widget_set_tooltip_text(ob, "Recording options: count-in, metronome, quantizing, MIDI input");
+            gtk_widget_set_focus_on_click(rb, FALSE);
+            gtk_widget_set_focus_on_click(ob, FALSE);
+            g_signal_connect(rb, "clicked", G_CALLBACK(on_rec_button), U);
+            g_signal_connect(ob, "clicked", G_CALLBACK(on_rec_options), U);
+            gtk_box_append(GTK_BOX(bar), rb);
+            gtk_box_append(GTK_BOX(bar), ob);
+            gtk_box_append(GTK_BOX(bar), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
+        }
+        if (i == 7) {
+            GtkWidget *eb = gtk_button_new_with_label("Export MIDI…");
+            gtk_widget_set_tooltip_text(eb, "Write the song as a MIDI file, one track per playing track, "
+                                            "to import into a DAW such as REAPER");
+            gtk_widget_set_focus_on_click(eb, FALSE);
+            g_signal_connect(eb, "clicked", G_CALLBACK(on_export_button), U);
+            gtk_box_append(GTK_BOX(bar), eb);
+        }
         if (i == 7) {
             /* Samples, beside the file buttons: load a set from anywhere,
              * or edit one. */
@@ -2272,14 +2701,17 @@ static GtkWidget *tracker_view_new(ui *U)
      * adjustment. */
     head = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gl = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_set_size_request(gl, gutter(U), -1);
+    /* The grid draws a track's left divider one character left of its text;
+     * a header spans divider to divider, so it sits over its column. */
+    gtk_widget_set_size_request(gl, gutter(U) - U->cw, -1);
     gtk_box_append(GTK_BOX(head), gl);
     for (t = 0; t < TRK_TRACKS; t++) {
         GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2), *row;
         GtkListItemFactory *fshort = gtk_signal_list_item_factory_new();
         GtkListItemFactory *flong = gtk_signal_list_item_factory_new();
         boxes[t] = box;
-        gtk_widget_set_margin_end(box, 6);
+        gtk_widget_set_margin_start(box, 3);
+        gtk_widget_set_margin_end(box, 3);
         U->name[t] = gtk_entry_new();
         gtk_editable_set_width_chars(GTK_EDITABLE(U->name[t]), 4);
         g_signal_connect(fshort, "setup", G_CALLBACK(dest_setup), GINT_TO_POINTER(1));
@@ -2442,7 +2874,9 @@ static void on_view_destroy(GtkWidget *w, gpointer u)
     U->closing = 1;
     if (U->t_follow) { g_source_remove(U->t_follow); U->t_follow = 0; }
     if (U->t_reroute) { g_source_remove(U->t_reroute); U->t_reroute = 0; }
+    if (U->t_refit) { g_source_remove(U->t_refit); U->t_refit = 0; }
     if (U->cheatwin) gtk_window_destroy(GTK_WINDOW(U->cheatwin));
+    if (U->recwin) gtk_window_destroy(GTK_WINDOW(U->recwin));
     if (E.U == U && E.win) gtk_window_destroy(GTK_WINDOW(E.win));
     U->view = NULL;
 }
@@ -2613,9 +3047,28 @@ static gboolean uitest(gpointer u)
     trk_position(U->e, &o, &p, &r);
     check(trk_playing(U->e) && o >= 1 && U->ed.pattern == p,
           "F5 plays through the order list, the editor following");
-    key(U, GDK_KEY_space);
+    key(U, GDK_KEY_Return);
     pump(100);
-    check(!trk_playing(U->e), "Space stops");
+    check(!trk_playing(U->e), "Enter stops");
+    {   /* F7 records: the take runs until Stop ends it. */
+        trk_rec_opts o;
+        trk_record_get(U->e, &o);
+        o.count_in = 0; o.metronome = 0;
+        trk_record_set(U->e, &o);
+        key(U, GDK_KEY_F7);
+        pump(150);
+        check(trk_recording(U->e) == 1, "F7 starts a take");
+        key(U, GDK_KEY_F8);
+        pump(100);
+        check(trk_recording(U->e) == 0 && !trk_playing(U->e), "Stop ends it");
+    }
+    {   /* Space is edit mode now: it toggles, and with it off the note keys only play. */
+        const int was = U->ed.edit;
+        key(U, GDK_KEY_space);
+        check(U->ed.edit == !was, "Space toggles edit mode");
+        key(U, GDK_KEY_space);
+        check(U->ed.edit == was, "and back");
+    }
 
     printf("saving\n");
     {
@@ -2656,12 +3109,34 @@ trk_view *trk_view_new(trk_engine *e)
 GtkWidget *trk_view_widget(trk_view *v)
 {
     ui *U = v;
-    if (!U->view) tracker_view_new(U);
+    if (!U->view) {
+        tracker_view_new(U);
+        /* The post-map fit, for every host: the headers are measured before
+         * the theme has styled them, and only the standalone used to get the
+         * second measurement. */
+        schedule_refit(U);
+    }
     return U->view;
 }
 
 int  trk_view_open(trk_view *v, const char *path) { return open_path(v, path); }
 void trk_view_reset(trk_view *v) { reset_view(v); }
+
+/* A shell menu's song commands: cases 4, 6 and 7 of on_button, so the toolbar
+ * and the host's menu can never drift apart. */
+void trk_view_new_song(trk_view *v) { confirm_then(v, AFTER_NEW); }
+void trk_view_save(trk_view *v)     { do_save(v, 0); }
+void trk_view_save_as(trk_view *v)  { save_as(v, 0); }
+void trk_view_set_embedded(trk_view *v, int on) { ((ui *)v)->embedded = on; }
+void trk_view_export_take(trk_view *v) { export_take(v); }
+void trk_view_record_options(trk_view *v) { show_rec_options(v); }
+void trk_view_load_samples(trk_view *v) { on_load_samples(NULL, NULL, v); }
+void trk_view_edit_samples(trk_view *v) { on_edit_samples(NULL, NULL, v); }
+void trk_view_show_keys(trk_view *v)    { on_keys(NULL, NULL, v); }
+void trk_view_show_columns(trk_view *v) { on_columns(NULL, NULL, v); }
+void trk_view_show_cheat(trk_view *v)   { on_cheat(NULL, NULL, v); }
+void trk_view_export_midi(trk_view *v) { export_midi(v); }
+
 int  trk_view_dirty(trk_view *v) { return dirty(v); }
 const char *trk_view_path(trk_view *v) { return ((ui *)v)->path; }
 
@@ -2680,6 +3155,13 @@ void trk_view_set_sinks(trk_view *v, const trk_view_sinks *api, void *ud)
     if (api) U->sinks = *api;
     U->sinks_ud = ud;
     if (U->view) refresh_dests(U, 1);
+}
+
+void trk_view_set_song_opened(trk_view *v, void (*cb)(void *ud), void *ud)
+{
+    ui *U = v;
+    U->song_opened = cb;
+    U->song_opened_ud = ud;
 }
 
 void trk_view_confirm_close(trk_view *v, void (*cb)(void *ud), void *ud)
@@ -2704,11 +3186,29 @@ void trk_view_ensure_saved(trk_view *v, void (*cb)(void *ud), void *ud)
     confirm_then(U, AFTER_ENSURE);
 }
 
+/* The view's memory, freed after whatever GTK still has queued for it has
+ * run. A shell removes the tab's page and frees the view in the same breath,
+ * but GTK finishes destroying the page's widgets later -- and until it has,
+ * its timers, idles and focus handlers hold this pointer. */
+static gboolean free_view_later(gpointer u)
+{
+    ui *U = u;
+    free(U->saved);
+    free(U);
+    return G_SOURCE_REMOVE;
+}
+
 void trk_view_free(trk_view *v)
 {
     ui *U = v;
-    free(U->saved);
-    free(U);
+    U->closing = 1;                       /* every callback that checks it stands down */
+    if (U->t_follow) { g_source_remove(U->t_follow); U->t_follow = 0; }
+    if (U->t_reroute) { g_source_remove(U->t_reroute); U->t_reroute = 0; }
+    if (U->t_refit) { g_source_remove(U->t_refit); U->t_refit = 0; }
+    /* Its widgets down now, rather than whenever GTK gets to it: the signal
+     * handlers that run while they go (focus leaving) see `closing`. */
+    if (U->view) g_object_run_dispose(G_OBJECT(U->view));
+    g_idle_add_full(G_PRIORITY_LOW, free_view_later, U, NULL);
 }
 
 void trk_view_standalone(trk_view *v, GtkApplication *app, const char *song)
@@ -2719,9 +3219,6 @@ void trk_view_standalone(trk_view *v, GtkApplication *app, const char *song)
     if (song) open_path(U, song);
     else reset_view(U);
     gtk_window_present(GTK_WINDOW(U->win));
-    /* Again once it is on screen: a theme's drop-downs measure narrower
-     * before they are styled than they draw. */
-    g_timeout_add(200, refit_columns, U);
     gtk_widget_grab_focus(U->area);
 }
 
