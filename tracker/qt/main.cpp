@@ -100,7 +100,7 @@ int uitest(trk_engine *e, TrackerWindow &w, const QString &outdir)
         se.grab().save(outdir + "/05-editor.png");
         std::printf("  picture: %s/05-editor.png\n", outdir.toLocal8Bit().constData());
         {   // Samples onto keys: a drop, a swap, and the key a drop lands on.
-            auto *kb = se.findChild<KeyMapWidget *>();
+            auto *kb = se.findChild<KeyList *>();
             auto *tb = se.findChild<QTableWidget *>();
             check(kb && tb && tb->rowCount() >= 2, "the editor has a keyboard over its list");
             if (kb && tb && tb->rowCount() >= 2) {
@@ -111,6 +111,13 @@ int uitest(trk_engine *e, TrackerWindow &w, const QString &outdir)
                       "dropping a sample on a taken key swaps the two");
                 emit kb->dropped(1, 100);
                 check(tb->item(1, 0)->text() == "E-7", "dropping on a free key moves the sample there");
+                const QString f1 = tb->item(1, 1)->data(Qt::UserRole).toString();
+                emit kb->chosen(90, f1);
+                check(tb->item(1, 0)->text() == "F#6", "choosing a sample from a key's drop-down moves it there");
+                const int rows = tb->rowCount();
+                emit kb->chosen(90, QString());
+                check(tb->rowCount() == rows - 1, "choosing none takes the sample off the key");
+                se.resize(1180, 720);
                 se.grab().save(outdir + "/05b-keymap.png");
                 (void)n0;
             }

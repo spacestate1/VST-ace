@@ -74,17 +74,19 @@ on it with it, clamped at C-0 and G-9, so a part keeps sounding as it did.
   ▶ to listen to one. **Save** writes the folder's `kit.txt`, and every
   track playing the set plays the new one at once.
 
-**Edit Sample Set** opens on a piano of the typing keys, each key showing
-the sample on it (Z, S, X ... P, from the octave in the box above it).
+**Edit Sample Set** opens on a vertical keyboard beside the list: every note
+the tracker reaches, highest at the top, scrolled. Each key shows its note and
+the typing key that plays it (for the octave in the box above), a drop-down
+for the sample on it, and a ▶ to hear it.
 
-- Click a key to hear its sample and pick its row in the list.
-- Drag a sample from the list onto a key to put it there. A sample already
-  on that key swaps to the dragged one's old key, so nothing is lost and no
-  two share a key.
-- Or pick a sample, press **Learn**, and click a key or press its typing key.
-- Right-click a key: put the picked sample on it, choose a WAV for it from
-  anywhere, or take its sample off.
-- Samples on keys outside the octaves shown are counted under the piano.
+- Pick a sample for a key from its drop-down -- every WAV in the set's folder
+  (subfolders too) is there, and "none" takes the sample off. A sample already
+  on another key moves, swapping with whatever was here.
+- Drag a sample from the list onto a key to put it there.
+- **Load a folder…** puts every WAV in a folder on keys one after another, from
+  the picked key (or after the last used one), skipping any already in the set.
+- Click a key and press typing keys to hear them; right-click a key to put the
+  picked sample on it, choose a WAV from anywhere, or take its sample off.
 
 Nothing changes for the tracks until **Save**.
 

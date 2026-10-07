@@ -32,7 +32,10 @@
 #include <QPainter>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QDirIterator>
 #include <QMimeData>
+#include <QSet>
+#include <QSplitter>
 #include <QScrollBar>
 #include <QSpinBox>
 #include <QSlider>
@@ -564,148 +567,204 @@ private:
     int dragR_ = 0, dragT_ = 0;                 // where it began
 };
 
-// A piano of the typing keys, for the set editor: every key shows the sample
-// on it, a click plays it, and a sample dragged from the list (or picked up
-// with Learn and a key press) lands on the key it is dropped on.
-class KeyMapWidget : public QWidget {
+// A combo that fills its list only when opened: there is one beside every key,
+// and a hundred and sixteen lists of every WAV in a folder are not worth keeping.
+class KeyCombo : public QComboBox {
     Q_OBJECT
 public:
-    explicit KeyMapWidget(QWidget *parent = nullptr) : QWidget(parent)
+    explicit KeyCombo(QWidget *parent = nullptr) : QComboBox(parent)
     {
-        setMinimumHeight(150);
+        setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        setMinimumContentsLength(18);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        setAcceptDrops(true);
-        setFocusPolicy(Qt::StrongFocus);
-        setMouseTracking(true);
+        setFocusPolicy(Qt::ClickFocus);
     }
-    static constexpr int kSpan = 29;           // the keys z..p reach
-    static const char *typingKeys() { return "zsxdcvgbhnjmq2w3er5t6y7ui9o0p"; }
-
-    void setOctave(int o) { octave_ = std::clamp(o, 0, 8); update(); }
-    int octave() const { return octave_; }
-    void setNames(const QHash<int, QString> &n) { names_ = n; update(); }
-    void setCurrent(int note) { cur_ = note; update(); }
-    int baseNote() const { return (octave_ + 1) * 12; }
-
-signals:
-    void played(int note);                     // clicked, or its typing key pressed
-    void dropped(int row, int note);           // a list row dropped on a key
-    void menuAt(int note, QPoint global);
-
+    void show_(const QString &text) { shown_ = text; clear(); addItem(text); }
 protected:
-    bool isBlack(int idx) const { int m = idx % 12; return m == 1 || m == 3 || m == 6 || m == 8 || m == 10; }
-    int whiteIndex(int idx) const   // white keys before this semitone
+    void showPopup() override { emit wantItems(this); QComboBox::showPopup(); }
+    void hidePopup() override
     {
-        static const int pre[12] = { 0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6 };
-        return (idx / 12) * 7 + pre[idx % 12];
+        QComboBox::hidePopup();
+        QTimer::singleShot(0, this, [this] { show_(shown_); });   // after `activated`
     }
-    QRectF keyRect(int idx) const
-    {
-        const double ww = double(width()) / 17.0, h = height();
-        if (isBlack(idx)) {
-            const double x = whiteIndex(idx) * ww;      // the boundary after its white
-            return QRectF(x - ww * 0.3, 0, ww * 0.6, h * 0.6);
-        }
-        return QRectF(whiteIndex(idx) * ww, 0, ww, h);
-    }
-    int keyAt(const QPointF &pt) const
-    {
-        for (int pass = 0; pass < 2; pass++)            // black keys sit on top
-            for (int i = 0; i < kSpan; i++)
-                if (isBlack(i) == (pass == 0) && keyRect(i).contains(pt)) {
-                    const int n = baseNote() + i;
-                    return n >= 0 && n <= 127 ? n : -1;
-                }
-        return -1;
-    }
+    void wheelEvent(QWheelEvent *ev) override { ev->ignore(); }    // scrolling the list, not a choice
+signals:
+    void wantItems(KeyCombo *);
+private:
+    QString shown_;
+};
 
-    void paintEvent(QPaintEvent *) override
+// One key of the vertical keyboard: the key itself, a drop-down for the sample
+// on it, and a button to hear it. A sample dragged from the list lands on the
+// row it is dropped on.
+class KeyRow : public QFrame {
+    Q_OBJECT
+public:
+    KeyRow(int note, QWidget *parent) : QFrame(parent), note_(note)
     {
-        QPainter p(this);
-        p.setRenderHint(QPainter::TextAntialiasing);
-        const QPalette &pal = palette();
-        for (int pass = 0; pass < 2; pass++)
-            for (int i = 0; i < kSpan; i++) {
-                if (isBlack(i) != (pass == 1)) continue;
-                const int n = baseNote() + i;
-                if (n > 127) continue;
-                const QRectF r = keyRect(i).adjusted(0.5, 0.5, -0.5, -0.5);
-                const bool has = names_.contains(n);
-                QColor fill = isBlack(i) ? QColor(50, 50, 55) : QColor(245, 245, 245);
-                if (has) fill = isBlack(i) ? QColor(35, 110, 170) : QColor(150, 205, 245);
-                if (n == cur_) fill = isBlack(i) ? QColor(210, 130, 20) : QColor(255, 205, 110);
-                p.setPen(QColor(90, 90, 90));
-                p.setBrush(fill);
-                p.drawRect(r);
-                const QColor ink = isBlack(i) && !has && n != cur_ ? QColor(220, 220, 220)
-                                   : (isBlack(i) ? QColor(255, 255, 255) : QColor(20, 20, 20));
-                p.setPen(ink);
-                QFont f = font();
-                f.setPointSizeF(std::max(7.0, f.pointSizeF() * 0.85));
-                p.setFont(f);
-                const QFontMetrics fm(f);
-                char nn[5];
-                drumkit_note_name(n, nn);
-                const QString key = QString(QChar(typingKeys()[i])).toUpper();
-                p.drawText(QRectF(r.left(), r.bottom() - fm.height() * 2 - 2, r.width(), fm.height()),
-                           Qt::AlignHCenter, key);
-                p.drawText(QRectF(r.left(), r.bottom() - fm.height() - 1, r.width(), fm.height()),
-                           Qt::AlignHCenter, QString::fromLatin1(nn));
-                if (has) {                              // the sample's name, up the key
-                    p.save();
-                    p.translate(r.center().x() + fm.ascent() / 2.0 - 1,
-                                r.bottom() - fm.height() * 2 - 6);
-                    p.rotate(-90);
-                    const double room = r.height() - fm.height() * 2 - 12;
-                    p.drawText(QPointF(0, 0), fm.elidedText(names_.value(n), Qt::ElideRight, int(room)));
-                    p.restore();
-                }
-            }
-        if (hasFocus()) { p.setPen(pal.color(QPalette::Highlight)); p.setBrush(Qt::NoBrush);
-                          p.drawRect(rect().adjusted(0, 0, -1, -1)); }
+        setAcceptDrops(true);
+        auto *h = new QHBoxLayout(this);
+        h->setContentsMargins(0, 0, 4, 0);
+        h->setSpacing(4);
+        key = new QLabel;
+        key->setFixedWidth(84);
+        key->setMinimumHeight(26);
+        h->addWidget(key);
+        combo = new KeyCombo;
+        h->addWidget(combo, 1);
+        play = new QPushButton("▶");
+        play->setFixedWidth(32);
+        play->setToolTip("Hear it");
+        h->addWidget(play);
     }
-
+    int note() const { return note_; }
+    QLabel *key;
+    KeyCombo *combo;
+    QPushButton *play;
+signals:
+    void dropped(int row, int note);
+    void menuAt(int note, QPoint global);
+    void picked(int note);
+protected:
     void mousePressEvent(QMouseEvent *ev) override
     {
-        setFocus();
-        const int n = keyAt(ev->position());
-        if (n < 0) return;
-        if (ev->button() == Qt::RightButton) emit menuAt(n, ev->globalPosition().toPoint());
-        else emit played(n);
-    }
-    void keyPressEvent(QKeyEvent *ev) override
-    {
-        if (ev->isAutoRepeat() || ev->modifiers() & (Qt::ControlModifier | Qt::AltModifier)) {
-            QWidget::keyPressEvent(ev); return;
-        }
-        const QString t = ev->text().toLower();
-        const int n = t.size() == 1 ? trk_key_note(t[0].toLatin1(), octave_) : -1;
-        if (n >= 0) emit played(n);
-        else QWidget::keyPressEvent(ev);
+        if (ev->button() == Qt::RightButton) emit menuAt(note_, ev->globalPosition().toPoint());
+        else emit picked(note_);
     }
     void dragEnterEvent(QDragEnterEvent *ev) override
     {
         if (ev->mimeData()->hasFormat("application/x-qabstractitemmodeldatalist")) ev->acceptProposedAction();
     }
-    void dragMoveEvent(QDragMoveEvent *ev) override
-    {
-        const int n = keyAt(ev->position());
-        cur_ = n; update();
-        if (n >= 0) ev->acceptProposedAction(); else ev->ignore();
-    }
     void dropEvent(QDropEvent *ev) override
     {
-        const int n = keyAt(ev->position());
         QByteArray d = ev->mimeData()->data("application/x-qabstractitemmodeldatalist");
         QDataStream ds(&d, QIODevice::ReadOnly);
         int row = -1, col = 0;
         if (!ds.atEnd()) ds >> row >> col;
-        if (n >= 0 && row >= 0) { ev->acceptProposedAction(); emit dropped(row, n); }
+        if (row >= 0) { ev->acceptProposedAction(); emit dropped(row, note_); }
+    }
+private:
+    int note_;
+};
+
+// The vertical keyboard of the set editor: every note the tracker reaches,
+// highest at the top like a piano roll, scrolled. The typing key that plays a
+// note is shown on it for the octave chosen.
+class KeyList : public QScrollArea {
+    Q_OBJECT
+public:
+    static constexpr int kLow = 12, kHigh = 127;
+    explicit KeyList(QWidget *parent = nullptr) : QScrollArea(parent)
+    {
+        setWidgetResizable(true);
+        setFocusPolicy(Qt::StrongFocus);
+        auto *inner = new QWidget;
+        auto *v = new QVBoxLayout(inner);
+        v->setContentsMargins(4, 4, 4, 4);
+        v->setSpacing(1);
+        for (int n = kHigh; n >= kLow; n--) {
+            auto *r = new KeyRow(n, inner);
+            rows_[n] = r;
+            v->addWidget(r);
+            connect(r, &KeyRow::picked, this, [this](int note) { setFocus(); emit played(note, false); });
+            connect(r->play, &QPushButton::clicked, this, [this, n] { emit played(n, true); });
+            connect(r, &KeyRow::dropped, this, &KeyList::dropped);
+            connect(r, &KeyRow::menuAt, this, &KeyList::menuAt);
+            connect(r->combo, &KeyCombo::wantItems, this, [this, n](KeyCombo *c) { fillChoices(c, n); });
+            connect(r->combo, &QComboBox::activated, this, [this, n, r](int i) {
+                emit chosen(n, r->combo->itemData(i).toString());
+            });
+        }
+        v->addStretch(1);
+        setWidget(inner);
+        restyle();
+    }
+    void setChoices(const QList<QPair<QString, QString>> &c) { choices_ = c; }   // file, label
+    void setOctave(int o) { octave_ = std::clamp(o, 0, 8); restyle(); }
+    int octave() const { return octave_; }
+    int current() const { return cur_; }
+    void setPads(const QHash<int, QString> &names)
+    {
+        pads_ = names;
+        restyle();
+    }
+    void setCurrent(int note, bool scroll = true)
+    {
+        cur_ = note;
+        restyle();
+        if (scroll && rows_.contains(note)) ensureWidgetVisible(rows_[note], 0, 40);
+    }
+    // Bring a note into view a little above the middle, once the rows have a size.
+    void scrollNear(int note)
+    {
+        QTimer::singleShot(0, this, [this, note] {
+            if (!rows_.contains(note)) return;
+            ensureWidgetVisible(rows_[std::min(kHigh, note + 8)], 0, 0);
+            ensureWidgetVisible(rows_[note], 0, 20);
+        });
+    }
+
+signals:
+    void played(int note, bool hear);        // a key picked, or its play button
+    void chosen(int note, QString file);     // the drop-down: "" takes the sample off
+    void dropped(int row, int note);
+    void menuAt(int note, QPoint global);
+
+protected:
+    void keyPressEvent(QKeyEvent *ev) override
+    {
+        if (ev->isAutoRepeat() || ev->modifiers() & (Qt::ControlModifier | Qt::AltModifier)) {
+            QScrollArea::keyPressEvent(ev); return;
+        }
+        const QString t = ev->text().toLower();
+        const int n = t.size() == 1 ? trk_key_note(t[0].toLatin1(), octave_) : -1;
+        if (n >= 0) { emit played(n, true); setCurrent(n); }
+        else QScrollArea::keyPressEvent(ev);
     }
 
 private:
+    static bool black(int n) { const int m = n % 12; return m == 1 || m == 3 || m == 6 || m == 8 || m == 10; }
+
+    void fillChoices(KeyCombo *c, int note)
+    {
+        c->clear();
+        c->addItem("— none —", QString());
+        for (const auto &p : choices_) c->addItem(p.second, p.first);
+        const QString have = pads_.value(note);
+        int at = 0;
+        for (int i = 1; i < c->count(); i++) if (c->itemText(i) == have) { at = i; break; }
+        c->setCurrentIndex(at);
+        c->view()->setMinimumWidth(360);
+    }
+
+    void restyle()
+    {
+        static const char *typing = "zsxdcvgbhnjmq2w3er5t6y7ui9o0p";
+        for (auto it = rows_.begin(); it != rows_.end(); ++it) {
+            const int n = it.key();
+            KeyRow *r = it.value();
+            char nn[5];
+            drumkit_note_name(n, nn);
+            const int idx = n - (octave_ + 1) * 12;
+            const QString letter = idx >= 0 && idx < 29 ? QString(QChar(typing[idx])).toUpper() : QString();
+            r->key->setText(QString("%1%2").arg(QString::fromLatin1(nn), -5).arg(letter));
+            const bool has = pads_.contains(n), cur = n == cur_;
+            QString bg = black(n) ? "#3a3a40" : "#f2f2f2", fg = black(n) ? "#eee" : "#111";
+            if (has) { bg = black(n) ? "#23709f" : "#96cdf5"; fg = black(n) ? "#fff" : "#111"; }
+            if (cur) { bg = black(n) ? "#d28214" : "#ffcd6e"; fg = black(n) ? "#fff" : "#111"; }
+            r->key->setStyleSheet(QString("background:%1;color:%2;border:1px solid #777;padding-left:6px;"
+                                          "font-family:monospace;").arg(bg, fg));
+            r->combo->blockSignals(true);
+            r->combo->show_(has ? pads_.value(n) : QString("—"));
+            r->combo->blockSignals(false);
+            r->play->setEnabled(has);
+        }
+    }
+
+    QMap<int, KeyRow *> rows_;
+    QHash<int, QString> pads_;
+    QList<QPair<QString, QString>> choices_;
     int octave_ = 4, cur_ = -1;
-    QHash<int, QString> names_;
 };
 
 // ------------------------------------------------------ the set editor --
@@ -722,7 +781,7 @@ public:
         : QDialog(parent), e_(e), map_(new dk_map)
     {
         setWindowTitle("Edit Sample Set");
-        resize(860, 700);
+        resize(1180, 720);
         auto *v = new QVBoxLayout(this);
         auto *top = new QHBoxLayout;
         sets_ = new QComboBox;
@@ -741,28 +800,32 @@ public:
         dir_->setTextInteractionFlags(Qt::TextSelectableByMouse);
         v->addWidget(dir_);
 
-        keys_ = new KeyMapWidget;
+        // Left, the keyboard; right, what each sample's gain and choke are.
+        auto *split = new QSplitter(Qt::Horizontal);
+        auto *left = new QWidget;
+        auto *lv = new QVBoxLayout(left);
+        lv->setContentsMargins(0, 0, 0, 0);
         auto *kbar = new QHBoxLayout;
-        kbar->addWidget(new QLabel("Keys from octave"));
+        kbar->addWidget(new QLabel("Typing keys from octave"));
         octave_ = new QSpinBox;
         octave_->setRange(0, 8);
         octave_->setValue(4);
         kbar->addWidget(octave_);
-        learn_ = new QPushButton("Learn");
-        learn_->setCheckable(true);
-        learn_->setToolTip("Pick a sample in the list, press Learn, then click a key "
-                           "or press its typing key: the sample moves onto it");
-        kbar->addWidget(learn_);
-        auto *hint = new QLabel("Click a key to hear it. Drag a sample from the list onto a key, "
-                                "or use Learn. Right-click a key for more.");
+        kbar->addStretch(1);
+        auto *loadDir = new QPushButton("Load a folder…");
+        loadDir->setToolTip("Put every WAV in a folder on keys, one after another, "
+                            "from the picked key (or after the last used one)");
+        kbar->addWidget(loadDir);
+        lv->addLayout(kbar);
+        auto *hint = new QLabel("Pick a sample for a key from its drop-down, or drag one from the "
+                                "list onto a key. Click a key and press typing keys to hear them. "
+                                "Right-click a key for more.");
         hint->setStyleSheet("color: #777;");
         hint->setWordWrap(true);
-        kbar->addWidget(hint, 1);
-        v->addLayout(kbar);
-        v->addWidget(keys_);
-        outside_ = new QLabel;
-        outside_->setStyleSheet("color: #777;");
-        v->addWidget(outside_);
+        lv->addWidget(hint);
+        keys_ = new KeyList;
+        lv->addWidget(keys_, 1);
+        split->addWidget(left);
 
         table_ = new QTableWidget(0, 5);
         table_->setDragEnabled(true);
@@ -771,7 +834,10 @@ public:
         table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
         table_->verticalHeader()->setVisible(false);
         table_->setSelectionBehavior(QAbstractItemView::SelectRows);
-        v->addWidget(table_, 1);
+        split->addWidget(table_);
+        split->setStretchFactor(0, 1);
+        split->setStretchFactor(1, 1);
+        v->addWidget(split, 1);
 
         auto *row = new QHBoxLayout;
         auto *add = new QPushButton("Add WAVs…");
@@ -798,14 +864,16 @@ public:
         connect(save, &QPushButton::clicked, this, &SetEditor::save);
         connect(close, &QPushButton::clicked, this, &QDialog::close);
         connect(table_, &QTableWidget::itemChanged, this, [this] { if (!filling_) dirty_ = true; refreshKeys(); });
-        connect(octave_, &QSpinBox::valueChanged, this, [this](int o) { keys_->setOctave(o); refreshKeys(); });
+        connect(octave_, &QSpinBox::valueChanged, this, [this](int o) { keys_->setOctave(o); });
+        connect(loadDir, &QPushButton::clicked, this, &SetEditor::loadFolder);
+        connect(keys_, &KeyList::chosen, this, &SetEditor::keyChosen);
         connect(table_, &QTableWidget::itemSelectionChanged, this, [this] {
             const int r = selectedRow();
             keys_->setCurrent(r >= 0 ? noteOfRow(r) : -1);
         });
-        connect(keys_, &KeyMapWidget::played, this, &SetEditor::keyPlayed);
-        connect(keys_, &KeyMapWidget::dropped, this, [this](int row, int note) { assignRow(row, note); });
-        connect(keys_, &KeyMapWidget::menuAt, this, &SetEditor::keyMenu);
+        connect(keys_, &KeyList::played, this, &SetEditor::keyPlayed);
+        connect(keys_, &KeyList::dropped, this, [this](int row, int note) { assignRow(row, note); });
+        connect(keys_, &KeyList::menuAt, this, &SetEditor::keyMenu);
 
         if (at >= 0) sets_->setCurrentIndex(at);
         if (sets_->count()) load(sets_->currentData().toString());
@@ -918,19 +986,109 @@ private:
     void refreshKeys()
     {
         QHash<int, QString> names;
-        int outside = 0;
-        const int lo = keys_->baseNote(), hi = lo + KeyMapWidget::kSpan;
         for (int r = 0; r < table_->rowCount(); r++) {
             const int n = noteOfRow(r);
             if (n < 0 || !table_->item(r, 1)) continue;
             names.insert(n, table_->item(r, 1)->text());
-            if (n < lo || n >= hi) outside++;
         }
-        keys_->setNames(names);
-        outside_->setText(outside ? QString("%1 sample%2 on keys outside these octaves -- change "
-                                            "\"Keys from octave\" to see them")
-                                        .arg(outside).arg(outside == 1 ? "" : "s")
-                                  : QString());
+        keys_->setPads(names);
+    }
+
+    // What the drop-downs offer: every WAV in the set's folder, and any pad
+    // that names one from elsewhere. File first (what is saved), then label.
+    void refreshChoices()
+    {
+        QList<QPair<QString, QString>> c;
+        QSet<QString> seen;
+        const QString dir = setDir();
+        if (!dir.isEmpty()) {
+            QDirIterator it(dir, { "*.wav", "*.WAV" }, QDir::Files, QDirIterator::Subdirectories);
+            QStringList rel;
+            while (it.hasNext()) rel << QDir(dir).relativeFilePath(it.next());
+            rel.sort(Qt::CaseInsensitive);
+            for (const QString &f : rel) { c << qMakePair(f, QFileInfo(f).completeBaseName()); seen.insert(f); }
+        }
+        for (int r = 0; r < table_->rowCount(); r++) {
+            if (!table_->item(r, 1)) continue;
+            const QString f = table_->item(r, 1)->data(Qt::UserRole).toString();
+            if (!seen.contains(f)) { c << qMakePair(f, table_->item(r, 1)->text()); seen.insert(f); }
+        }
+        keys_->setChoices(c);
+    }
+
+    int rowOfFile(const QString &f) const
+    {
+        for (int r = 0; r < table_->rowCount(); r++)
+            if (table_->item(r, 1) && table_->item(r, 1)->data(Qt::UserRole).toString() == f) return r;
+        return -1;
+    }
+
+    // The drop-down beside a key: this sample on this key. A sample that is
+    // already on another key moves (swapping with whatever is here); one that
+    // is not in the set yet is added, replacing what is here.
+    void keyChosen(int note, const QString &file)
+    {
+        const int here = rowOfNote(note);
+        char nn[5];
+        drumkit_note_name(note, nn);
+        if (file.isEmpty()) {
+            if (here >= 0) { table_->removeRow(here); dirty_ = true; refreshKeys(); }
+            return;
+        }
+        const int have = rowOfFile(file);
+        if (have >= 0) { assignRow(have, note); return; }
+        filling_ = true;
+        if (here >= 0) {
+            table_->item(here, 1)->setData(Qt::UserRole, file);
+            table_->item(here, 1)->setText(QFileInfo(file).completeBaseName());
+            table_->item(here, 1)->setToolTip(file);
+        } else {
+            addRow(note, file, 0.0, 0);
+        }
+        filling_ = false;
+        dirty_ = true;
+        refreshKeys();
+        status_->setText(QString("%1 is on %2 -- Save to keep it")
+                             .arg(QFileInfo(file).completeBaseName(), QString::fromLatin1(nn)));
+        const int r = rowOfNote(note);
+        if (r >= 0) audition(r);
+    }
+
+    // Every WAV of a folder onto keys, one after another.
+    void loadFolder()
+    {
+        const QString setdir = setDir();
+        if (setdir.isEmpty()) return;
+        const QString dir = QFileDialog::getExistingDirectory(this, "A folder of WAVs", setdir);
+        if (dir.isEmpty()) return;
+        QStringList files = QDir(dir).entryList({ "*.wav", "*.WAV" }, QDir::Files, QDir::Name | QDir::IgnoreCase);
+        const QString base = setdir + '/';
+        int note = keys_->current() >= 0 ? keys_->current() : DK_BASE_NOTE;
+        if (keys_->current() < 0)
+            for (int r = 0; r < table_->rowCount(); r++) note = std::max(note, noteOfRow(r) + 1);
+        int added = 0, first = -1, skipped = 0;
+        filling_ = true;
+        for (const QString &name : files) {
+            const QString full = QDir(dir).absoluteFilePath(name);
+            const QString f = full.startsWith(base) ? full.mid(base.size()) : full;
+            if (rowOfFile(f) >= 0) { skipped++; continue; }
+            while (note <= 127 && rowOfNote(note) >= 0) note++;
+            if (note > 127 || table_->rowCount() >= DK_MAX_SAMPLES) break;
+            if (first < 0) first = note;
+            addRow(note++, f, 0.0, 0);
+            added++;
+        }
+        filling_ = false;
+        if (added) dirty_ = true;
+        refreshChoices();
+        refreshKeys();
+        char nn[5] = "";
+        if (first >= 0) { drumkit_note_name(first, nn); keys_->setCurrent(first); }
+        status_->setText(added ? QString("added %1 WAV%2 from %3 starting at %4%5 -- Save to keep them")
+                                     .arg(added).arg(added == 1 ? "" : "s", dir, nn,
+                                          skipped ? QString(" (%1 already in the set)").arg(skipped) : "")
+                               : QString("nothing new in %1 (%2 WAV%3, %4 already in the set)")
+                                     .arg(dir).arg(files.size()).arg(files.size() == 1 ? "" : "s").arg(skipped));
     }
 
     // Put a sample on a note. A sample already there swaps to the one's old
@@ -957,21 +1115,14 @@ private:
         audition(row);
     }
 
-    void keyPlayed(int note)
+    void keyPlayed(int note, bool hear)
     {
-        if (learn_->isChecked()) {
-            const int r = selectedRow();
-            if (r >= 0) assignRow(r, note);
-            else status_->setText("pick a sample in the list first");
-            learn_->setChecked(false);
-            return;
-        }
         const int r = rowOfNote(note);
-        keys_->setCurrent(note);
+        keys_->setCurrent(note, false);
         if (r < 0) { table_->clearSelection(); return; }
         table_->selectRow(r);
-        keys_->setCurrent(note);
-        audition(r);
+        keys_->setCurrent(note, false);
+        if (hear) audition(r);
     }
 
     void keyMenu(int note, QPoint at)
@@ -981,7 +1132,7 @@ private:
         drumkit_note_name(note, nn);
         QMenu m;
         QAction *put = m.addAction(sel >= 0 ? QString("Put \"%1\" on %2").arg(table_->item(sel, 1)->text(), nn)
-                                            : QString("Put the selected sample on %1").arg(nn));
+                                            : QString("Put the picked sample on %1").arg(nn));
         put->setEnabled(sel >= 0);
         QAction *pick = m.addAction(QString("Choose a WAV for %1…").arg(nn));
         QAction *clear = m.addAction(QString("Take the sample off %1").arg(nn));
@@ -1022,7 +1173,9 @@ private:
         for (int i = 0; i < map_->n; i++) lowest = std::min(lowest, map_->pad[i].note);
         if (map_->n) octave_->setValue(std::clamp(lowest / 12 - 1, 0, 8));
         keys_->setOctave(octave_->value());
+        refreshChoices();
         refreshKeys();
+        if (map_->n) keys_->scrollNear(lowest);
     }
 
     void addWavs()
@@ -1044,6 +1197,7 @@ private:
             dirty_ = true;
             refreshKeys();
         }
+        refreshChoices();
     }
 
     void removeRows()
@@ -1095,10 +1249,8 @@ private:
     QComboBox *sets_;
     QLabel *dir_, *status_;
     QTableWidget *table_;
-    KeyMapWidget *keys_;
+    KeyList *keys_;
     QSpinBox *octave_;
-    QPushButton *learn_;
-    QLabel *outside_;
     QString name_;
     bool dirty_ = false, filling_ = false;
 };
