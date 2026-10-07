@@ -26,7 +26,8 @@
 extern "C" {
 #endif
 
-#define TRK_TRACKS     8
+#define TRK_TRACKS     16            /* the most a song can have; a song uses trk_song.ntracks of them */
+#define TRK_TRACKS_DEFAULT 8
 #define TRK_ROWS_MAX   256
 #define TRK_PATTERNS   100
 #define TRK_ORDER_MAX  256
@@ -80,14 +81,17 @@ typedef struct {
     int  mute;
 } trk_track;
 
+/* The patterns come last: an undo snapshot copies everything before them and
+ * then only the patterns that hold something (see engine.c). */
 typedef struct {
     double      bpm;
     int         lpb;                 /* rows per beat: one of trk_lpb_ok() */
     int         volume;              /* master, in percent, 0..150: what the tracker sounds itself */
+    int         ntracks;             /* tracks in use, 1..TRK_TRACKS: the grid shows this many */
+    int         norder;              /* >= 1 */
+    int         order[TRK_ORDER_MAX];
     trk_track   track[TRK_TRACKS];
     trk_pattern pattern[TRK_PATTERNS];
-    int         order[TRK_ORDER_MAX];
-    int         norder;              /* >= 1 */
 } trk_song;
 
 /* ------------------------------------------------------------------ song */
@@ -429,6 +433,15 @@ int  trk_undo(trk_engine *e);
 /* Put back what the last undo took off. Any new edit clears what could be
  * redone. Returns 1 when something was restored. */
 int  trk_redo(trk_engine *e);
+/* Add an empty track at position `at` (the ones from there on move right) or
+ * take the track at `at` away (the ones after it move left, its notes go with
+ * it). The windows, sample sets and synth routes follow their tracks; playback
+ * stops. One undo step each. Returns 0, or -1 when there is no room / only one
+ * track is left. trk_track_used says whether a track holds anything, to ask
+ * before it is removed. */
+int  trk_track_insert(trk_engine *e, int at);
+int  trk_track_remove(trk_engine *e, int at);
+int  trk_track_used(trk_engine *e, int t);
 /* Forget the history -- a song just started or loaded has none. */
 void trk_undo_clear(trk_engine *e);
 

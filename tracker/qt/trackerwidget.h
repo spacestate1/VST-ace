@@ -126,12 +126,20 @@ public:
     int rowHeight() const { return ch_; }
     int charWidth() const { return cw_; }
 
+    // How many tracks the song has: the grid, the headers and every hit test
+    // go by it, not by the most there is room for.
+    int nt() const
+    {
+        const int n = trk_song_of(e_)->ntracks;
+        return n < 1 ? 1 : n > TRK_TRACKS ? TRK_TRACKS : n;
+    }
+
     void updateSize()
     {
         trk_lock(e_);
         int rows = trk_song_of(e_)->pattern[ed_->pattern].rows;
         trk_unlock(e_);
-        setFixedSize(gutter() + TRK_TRACKS * colWidth() + cw_, rows * ch_ + 2);
+        setFixedSize(gutter() + nt() * colWidth() + cw_, rows * ch_ + 2);
     }
 
     void setEditing(bool on) { editing_ = on; update(); }
@@ -182,6 +190,7 @@ protected:
         const int lpb = s->lpb > 0 ? s->lpb : 4;
         int mutes = 0;
         for (int t = 0; t < TRK_TRACKS; t++) if (s->track[t].mute) mutes |= 1 << t;
+        const int ntr = nt();
 
         const int r0 = std::max(0, ev->rect().top() / ch_);
         const int r1 = std::min(pt->rows - 1, ev->rect().bottom() / ch_);
@@ -217,7 +226,7 @@ protected:
             p.setPen(r % lpb == 0 ? pal.color(QPalette::Text) : dim);
             p.drawText(cw_ / 2, y + asc_, QString::fromLatin1(num));
 
-            for (int t = 0; t < TRK_TRACKS; t++) {
+            for (int t = 0; t < ntr; t++) {
                 const int x = gutter() + t * colWidth();
                 char txt[TRK_CELL_CHARS + 1];
                 trk_cell_text(&cells[r][t], txt);
@@ -256,7 +265,7 @@ protected:
         }
 
         p.setPen(faint);
-        for (int t = 0; t <= TRK_TRACKS; t++) {
+        for (int t = 0; t <= ntr; t++) {
             const int x = gutter() + t * colWidth() - cw_;
             p.drawLine(x, ev->rect().top(), x, ev->rect().bottom());
         }
@@ -327,7 +336,7 @@ protected:
         trk_unlock(e_);
         *r = std::clamp(int(pos.y()) / ch_, 0, rows - 1);
         if (x < 0) { *t = -1; *field = 0; return true; }
-        *t = std::min(x / colWidth(), TRK_TRACKS - 1);
+        *t = std::min(x / colWidth(), nt() - 1);
         const int c = (x % colWidth()) / cw_;
         *field = c < 4 ? TRK_F_NOTE : c < 7 ? TRK_F_VEL : c < 10 ? TRK_F_CC : TRK_F_VAL;
         return true;
@@ -355,7 +364,7 @@ protected:
         if (t < 0) {
             rowDrag_ = true;
             dragR_ = (ev->modifiers() & Qt::ShiftModifier) && ed_->sel ? ed_->sel_r0 : r;
-            trk_select(ed_, dragR_, 0, r, TRK_TRACKS - 1);
+            trk_select(ed_, dragR_, 0, r, nt() - 1);
             ed_->row = r;
             ed_->track = 0;
         } else if (ev->modifiers() & Qt::ShiftModifier) {
@@ -378,7 +387,7 @@ protected:
         int t, r, field;
         if (!(ev->buttons() & Qt::LeftButton) || !cellAt(ev->position(), &t, &r, &field)) return;
         if (rowDrag_) {
-            trk_select(ed_, dragR_, 0, r, TRK_TRACKS - 1);
+            trk_select(ed_, dragR_, 0, r, nt() - 1);
             ed_->track = 0;
         } else if (cellDrag_) {
             if (t < 0) t = 0;
@@ -401,7 +410,7 @@ protected:
         int t, r, field;
         if (!cellAt(ev->pos(), &t, &r, &field)) return;
         if (t >= 0 && !trk_selected(ed_, r, t)) { trk_select_none(ed_); moveCursor(r, t, field); }
-        if (t < 0 && !trk_selected(ed_, r, 0)) { trk_select(ed_, r, 0, r, TRK_TRACKS - 1); ed_->track = 0; }
+        if (t < 0 && !trk_selected(ed_, r, 0)) { trk_select(ed_, r, 0, r, nt() - 1); ed_->track = 0; }
         update();
         emit cursorMoved();
 
@@ -878,6 +887,17 @@ public:
         bar->addSpacing(8);
         bar->addWidget(volLabel_);
         bar->addWidget(volume_);
+        bar->addSpacing(8);
+        auto *addTr = new QPushButton("+ Track");
+        auto *delTr = new QPushButton("− Track");
+        addTr->setToolTip("Add an empty track after the cursor's (up to 16)");
+        delTr->setToolTip("Remove the cursor's track, notes and all (undo brings it back)");
+        addTr->setFocusPolicy(Qt::NoFocus);
+        delTr->setFocusPolicy(Qt::NoFocus);
+        connect(addTr, &QPushButton::clicked, this, [this] { addTrack(); });
+        connect(delTr, &QPushButton::clicked, this, [this] { removeTrack(); });
+        bar->addWidget(addTr);
+        bar->addWidget(delTr);
         bar->addStretch(1);
         v->addLayout(bar);
 
@@ -892,6 +912,7 @@ public:
         // The grid, with the track headers above it scrolled sideways with it.
         view_ = new PatternView(e_, &ed_);
         auto *head = new QWidget;
+        headStrip_ = head;
         auto *hl = new QHBoxLayout(head);
         hl->setContentsMargins(0, 0, 0, 0);
         hl->setSpacing(0);
@@ -900,6 +921,7 @@ public:
         hl->addSpacing(view_->gutter() - view_->charWidth());
         for (int t = 0; t < TRK_TRACKS; t++) {
             auto *box = new QWidget;
+            headBox_[t] = box;
             box->setFixedWidth(view_->colWidth());
             auto *bl = new QVBoxLayout(box);
             bl->setContentsMargins(3, 0, 3, 2);
@@ -1222,10 +1244,13 @@ public:
         trk_unlock(e_);
     }
 
+    // For the window test: whether a track has its header showing.
+    bool headerVisible(int t) const { return t >= 0 && t < TRK_TRACKS && headBox_[t] && headBox_[t]->isVisibleTo(this); }
+
     // How wide the standalone window opens; a shell sizes the widget itself.
     int preferredWidth() const
     {
-        return std::min(1400, view_->gutter() + TRK_TRACKS * view_->colWidth() + 40);
+        return std::min(1400, view_->gutter() + view_->nt() * view_->colWidth() + 40);
     }
 
     // Ending the song session, as closing the standalone window does: asks
@@ -1271,7 +1296,62 @@ private:
         }
         trk_unlock(e_);
         loading_ = false;
+        showHeaders();
         refreshParts();
+    }
+
+    // A header over every track the song has, and none over the room left.
+    void showHeaders()
+    {
+        const int n = view_->nt();
+        for (int t = 0; t < TRK_TRACKS; t++)
+            if (headBox_[t]) headBox_[t]->setVisible(t < n);
+        if (headStrip_) headStrip_->setFixedWidth(view_->width());
+    }
+
+    // Everything that shows a track, again, after the tracks have moved.
+    void tracksChanged(const QString &msg)
+    {
+        if (ed_.track >= view_->nt()) ed_.track = view_->nt() - 1;
+        trk_select_none(&ed_);
+        view_->updateSize();
+        syncFromSong();
+        refreshDests(true);
+        refreshSamples();
+        view_->update();
+        cursorMoved();
+        host_->showStatus(msg, 5000);
+    }
+
+    // + Track: an empty one after the cursor's.
+    void addTrack()
+    {
+        if (trk_track_insert(e_, ed_.track + 1) == 0) {
+            ed_.track++;
+            tracksChanged(QString("track %1 added -- playback stopped; undo takes it back").arg(ed_.track + 1));
+        } else {
+            host_->showStatus(QString("no room: a song has at most %1 tracks").arg(TRK_TRACKS), 5000);
+        }
+        view_->setFocus();
+    }
+
+    // - Track: the cursor's, notes and all -- asked about first when it holds any.
+    void removeTrack()
+    {
+        const int t = ed_.track;
+        if (trk_track_used(e_, t) &&
+            QMessageBox::question(this, "Remove track",
+                                  QString("Remove track %1? Its notes go with it. Undo (Ctrl+Z) brings the track back.")
+                                      .arg(t + 1),
+                                  QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) {
+            view_->setFocus();
+            return;
+        }
+        if (trk_track_remove(e_, t) == 0)
+            tracksChanged(QString("track %1 removed -- playback stopped; undo brings it back").arg(t + 1));
+        else
+            host_->showStatus("a song keeps at least one track", 5000);
+        view_->setFocus();
     }
 
     // ---------------------------------------------------------------- parts
@@ -1981,6 +2061,8 @@ private:
     int partAt_ = 0;                      // the order entry being edited
     int partPlaying_ = -1;                // the one playing, as last shown
     bool fillingParts_ = false;
+    QWidget   *headStrip_ = nullptr;          // the header row, scrolled with the grid
+    QWidget   *headBox_[TRK_TRACKS] = {};      // a track's header: shown while the song has the track
     QLineEdit *name_[TRK_TRACKS];
     QComboBox *dest_[TRK_TRACKS];
     QComboBox *sample_[TRK_TRACKS];

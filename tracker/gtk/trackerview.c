@@ -169,10 +169,18 @@ static int cur_rows(ui *U)
     return r;
 }
 
+/* How many tracks the song has: the grid, the headers and every hit test go
+ * by it, not by the most there is room for. */
+static int ntr(ui *U)
+{
+    const int n = trk_song_of(U->e)->ntracks;
+    return n < 1 ? 1 : n > TRK_TRACKS ? TRK_TRACKS : n;
+}
+
 static void update_size(ui *U)
 {
     gtk_drawing_area_set_content_width(GTK_DRAWING_AREA(U->area),
-                                       gutter(U) + TRK_TRACKS * colwidth(U) + U->cw);
+                                       gutter(U) + ntr(U) * colwidth(U) + U->cw);
     gtk_drawing_area_set_content_height(GTK_DRAWING_AREA(U->area), cur_rows(U) * U->ch + 2);
 }
 
@@ -215,7 +223,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
     PangoLayout *l;
     const trk_song *s;
     const trk_pattern *pt;
-    int r, r0, r1, t, lpb, mutes = 0;
+    int r, r0, r1, t, lpb, mutes = 0, nt;
     ui *U = u; (void)h;
 
     gtk_widget_get_color(GTK_WIDGET(a), &fgc);
@@ -250,6 +258,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
     s = trk_song_of(U->e);
     pt = &s->pattern[U->ed.pattern];
     lpb = s->lpb > 0 ? s->lpb : 4;
+    nt = s->ntracks < 1 ? 1 : s->ntracks > TRK_TRACKS ? TRK_TRACKS : s->ntracks;
     for (t = 0; t < TRK_TRACKS; t++) if (s->track[t].mute) mutes |= 1 << t;
     r0 = (int)(y1 / U->ch);
     if (r0 < 0) r0 = 0;
@@ -271,7 +280,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
         set(cr, r % lpb == 0 ? fg : dim);
         text_at(cr, l, U->cw / 2.0, y + 1, num, -1);
 
-        for (t = 0; t < TRK_TRACKS; t++) {
+        for (t = 0; t < nt; t++) {
             static const int start[TRK_FIELDS] = { TRK_COL_NOTE, TRK_COL_VEL, TRK_COL_CC, TRK_COL_VAL };
             static const int len[TRK_FIELDS]   = { 3, 2, 2, 2 };
             const int x = gutter(U) + t * colwidth(U);
@@ -312,7 +321,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
 
     set(cr, faint);
     cairo_set_line_width(cr, 1);
-    for (t = 0; t <= TRK_TRACKS; t++) {
+    for (t = 0; t <= nt; t++) {
         const double x = gutter(U) + t * colwidth(U) - U->cw + 0.5;
         cairo_move_to(cr, x, y1);
         cairo_line_to(cr, x, y2);
@@ -326,6 +335,15 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
 static void refresh_parts(ui *U);
 static gboolean refresh_cheat_idle(gpointer u);
 static void clip_status(ui *U, int key);
+
+/* A header over every track the song has, and none over the room left. */
+static void show_headers(ui *U)
+{
+    const int nt = ntr(U);
+    int t;
+    if (!U->headbox[0]) return;
+    for (t = 0; t < TRK_TRACKS; t++) gtk_widget_set_visible(U->headbox[t], t < nt);
+}
 
 static void sync_from_song(ui *U)
 {
@@ -352,6 +370,7 @@ static void sync_from_song(ui *U)
     }
     trk_unlock(U->e);
     U->loading = 0;
+    show_headers(U);
     refresh_parts(U);
 }
 
@@ -1416,7 +1435,7 @@ static void cell_at(ui *U, double x, double y, int *t, int *r, int *field)
     x -= gutter(U);
     if (x < 0) { *t = -1; *field = 0; return; }
     *t = (int)x / colwidth(U);
-    if (*t > TRK_TRACKS - 1) *t = TRK_TRACKS - 1;
+    if (*t > ntr(U) - 1) *t = ntr(U) - 1;
     c = ((int)x % colwidth(U)) / U->cw;
     *field = c < 4 ? TRK_F_NOTE : c < 7 ? TRK_F_VEL : c < 10 ? TRK_F_CC : TRK_F_VAL;
 }
@@ -1446,7 +1465,7 @@ static void on_click(GtkGestureClick *g, int n, double x, double y, gpointer u)
     if (t < 0) {
         U->drag_rows = 1;
         U->drag_r = (st & GDK_SHIFT_MASK) && U->ed.sel ? U->ed.sel_r0 : r;
-        trk_select(&U->ed, U->drag_r, 0, r, TRK_TRACKS - 1);
+        trk_select(&U->ed, U->drag_r, 0, r, ntr(U) - 1);
         U->ed.track = 0;
     } else if (st & GDK_SHIFT_MASK) {
         if (!U->ed.sel) trk_select(&U->ed, U->ed.row, U->ed.track, U->ed.row, U->ed.track);
@@ -1473,7 +1492,7 @@ static void on_drag(GtkGestureDrag *g, double dx, double dy, gpointer u)
     if (dx * dx + dy * dy < 16) return;                 /* a click, not a drag */
     cell_at(U, x0 + dx, y0 + dy, &t, &r, &field);
     if (U->drag_rows) {
-        trk_select(&U->ed, U->drag_r, 0, r, TRK_TRACKS - 1);
+        trk_select(&U->ed, U->drag_r, 0, r, ntr(U) - 1);
         U->ed.track = 0;
     } else {
         if (t < 0) t = 0;
@@ -1541,7 +1560,7 @@ static void on_context(GtkGestureClick *g, int n, double x, double y, gpointer u
     gtk_widget_grab_focus(U->area);
     cell_at(U, x, y, &t, &r, &field);
     if (t >= 0 && !trk_selected(&U->ed, r, t)) { trk_select_none(&U->ed); move_cursor(U, r, t, field); }
-    if (t < 0 && !trk_selected(&U->ed, r, 0)) { trk_select(&U->ed, r, 0, r, TRK_TRACKS - 1); U->ed.track = 0; }
+    if (t < 0 && !trk_selected(&U->ed, r, 0)) { trk_select(&U->ed, r, 0, r, ntr(U) - 1); U->ed.track = 0; }
     redraw(U);
     cursor_moved(U);
 
@@ -2115,6 +2134,84 @@ static void show_text(ui *U, const char *title, const char *text)
 
 static void show_columns(ui *U) { show_text(U, "tracker columns", trk_columns_help()); }
 static void show_keys(ui *U)    { show_text(U, "tracker keys", k_keys_help); }
+
+/* ---- adding and removing tracks ---- */
+
+/* Everything that shows a track, again, after the tracks have moved. */
+static void tracks_changed(ui *U, const char *msg)
+{
+    if (U->ed.track >= ntr(U)) U->ed.track = ntr(U) - 1;
+    trk_select_none(&U->ed);
+    sync_from_song(U);
+    refresh_dests(U, 1);
+    refresh_samples(U);
+    update_size(U);
+    schedule_refit(U);
+    redraw(U);
+    cursor_moved(U);
+    status(U, msg);
+}
+
+static void on_track_add(GtkButton *b, gpointer u)
+{
+    ui *U = u;
+    char msg[96];
+    (void)b;
+    if (trk_track_insert(U->e, U->ed.track + 1) == 0) {
+        U->ed.track++;
+        snprintf(msg, sizeof msg, "track %d added -- playback stopped; undo takes it back", U->ed.track + 1);
+        tracks_changed(U, msg);
+    } else {
+        snprintf(msg, sizeof msg, "no room: a song has at most %d tracks", TRK_TRACKS);
+        status(U, msg);
+    }
+    gtk_widget_grab_focus(U->area);
+}
+
+static void do_track_remove(ui *U, int t)
+{
+    char msg[96];
+    if (trk_track_remove(U->e, t) == 0) {
+        snprintf(msg, sizeof msg, "track %d removed -- playback stopped; undo brings it back", t + 1);
+        tracks_changed(U, msg);
+    } else {
+        status(U, "a song keeps at least one track");
+    }
+    gtk_widget_grab_focus(U->area);
+}
+
+typedef struct { ui *U; int t; } rm_ask;
+
+static void remove_answered(GObject *src, GAsyncResult *res, gpointer u)
+{
+    rm_ask *k = u;
+    int b = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(src), res, NULL);
+    if (b == 1 && !k->U->closing) do_track_remove(k->U, k->t);
+    g_object_unref(src);
+    g_free(k);
+}
+
+static void on_track_remove(GtkButton *b, gpointer u)
+{
+    ui *U = u;
+    const int t = U->ed.track;
+    (void)b;
+    if (!trk_track_used(U->e, t)) { do_track_remove(U, t); return; }
+    {   /* It holds notes: ask first. */
+        static const char *buttons[] = { "Cancel", "Remove track", NULL };
+        GtkAlertDialog *d;
+        rm_ask *k = g_new0(rm_ask, 1);
+        char head[96];
+        k->U = U; k->t = t;
+        snprintf(head, sizeof head, "Remove track %d?", t + 1);
+        d = gtk_alert_dialog_new("%s", head);
+        gtk_alert_dialog_set_detail(d, "Its notes go with it. Undo (Ctrl+Z) brings the track back.");
+        gtk_alert_dialog_set_buttons(d, buttons);
+        gtk_alert_dialog_set_cancel_button(d, 0);
+        gtk_alert_dialog_set_default_button(d, 0);
+        gtk_alert_dialog_choose(d, parent_window(U), NULL, remove_answered, k);
+    }
+}
 
 static void on_export_button(GtkButton *b, gpointer u) { (void)b; export_midi(u); }
 
@@ -2694,6 +2791,17 @@ static GtkWidget *tracker_view_new(ui *U)
                                           "windows playing the MIDI tracks have their own)");
     gtk_box_append(GTK_BOX(bar), labelled("vol", U->volume));
     g_signal_connect(U->volume, "value-changed", G_CALLBACK(on_volume), U);
+    {   /* Tracks: one added after the cursor's, or the cursor's taken away. */
+        GtkWidget *add = gtk_button_new_with_label("+ Track"), *del = gtk_button_new_with_label("− Track");
+        gtk_widget_set_tooltip_text(add, "Add an empty track after the cursor's (up to 16)");
+        gtk_widget_set_tooltip_text(del, "Remove the cursor's track, notes and all (undo brings it back)");
+        gtk_widget_set_focus_on_click(add, FALSE);
+        gtk_widget_set_focus_on_click(del, FALSE);
+        g_signal_connect(add, "clicked", G_CALLBACK(on_track_add), U);
+        g_signal_connect(del, "clicked", G_CALLBACK(on_track_remove), U);
+        gtk_box_append(GTK_BOX(bar), add);
+        gtk_box_append(GTK_BOX(bar), del);
+    }
     gtk_box_append(GTK_BOX(v), bar);
 
 
@@ -3050,6 +3158,20 @@ static gboolean uitest(gpointer u)
     key(U, GDK_KEY_Return);
     pump(100);
     check(!trk_playing(U->e), "Enter stops");
+    {   /* Tracks added after the cursor's and taken away again. */
+        const int before = trk_song_of(U->e)->ntracks;
+        int i;
+        for (i = 0; i < 4; i++) on_track_add(NULL, U);
+        pump(100);
+        check(trk_song_of(U->e)->ntracks == before + 4, "four tracks added");
+        check(gtk_widget_get_visible(U->headbox[before + 3]) && !gtk_widget_get_visible(U->headbox[before + 4]),
+              "a header over each, none over the room left");
+        shot(U, "g08-tracks-added.png");
+        for (i = 0; i < 4; i++) { U->ed.track = trk_song_of(U->e)->ntracks - 1; on_track_remove(NULL, U); }
+        pump(100);
+        check(trk_song_of(U->e)->ntracks == before, "and taken away again");
+        U->ed.track = 0;
+    }
     {   /* F7 records: the take runs until Stop ends it. */
         trk_rec_opts o;
         trk_record_get(U->e, &o);

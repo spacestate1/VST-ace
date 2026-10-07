@@ -382,7 +382,7 @@ static int paste(trk_engine *e, trk_editor *ed, int mix)
     rows = s->pattern[ed->pattern].rows;
     /* Cut off at the pattern's last row and the last track. */
     h = clip.rows < rows - top ? clip.rows : rows - top;
-    w = clip.tracks < TRK_TRACKS - left ? clip.tracks : TRK_TRACKS - left;
+    w = clip.tracks < s->ntracks - left ? clip.tracks : s->ntracks - left;
     trk_undo_push(e);
     for (r = 0; r < h; r++)
         for (t = 0; t < w; t++) {
@@ -445,9 +445,11 @@ static uint8_t *field_ptr(trk_cell *c, int field)
 int trk_key(trk_engine *e, trk_editor *ed, int key)
 {
     trk_song *s = trk_song_of(e);
-    int rows, preview = -1, pvel = 0;
+    int rows, preview = -1, pvel = 0, nt;
 
     trk_lock(e);
+    nt = s->ntracks < 1 ? 1 : s->ntracks > TRK_TRACKS ? TRK_TRACKS : s->ntracks;
+    if (ed->track >= nt) ed->track = nt - 1;       /* tracks were taken away under the cursor */
     rows = rows_of(e, ed);
     if (ed->row >= rows) ed->row = rows - 1;
     /* Each track has its own octave: the note keys play the cursor's. */
@@ -469,11 +471,11 @@ int trk_key(trk_engine *e, trk_editor *ed, int key)
     case TRK_K_SEL_UP:    if (ed->row > 0) ed->row--;              ed->sel_r1 = ed->row; break;
     case TRK_K_SEL_DOWN:  if (ed->row < rows - 1) ed->row++;       ed->sel_r1 = ed->row; break;
     case TRK_K_SEL_LEFT:  if (ed->track > 0) ed->track--;          ed->sel_t1 = ed->track; break;
-    case TRK_K_SEL_RIGHT: if (ed->track < TRK_TRACKS - 1) ed->track++; ed->sel_t1 = ed->track; break;
+    case TRK_K_SEL_RIGHT: if (ed->track < nt - 1) ed->track++; ed->sel_t1 = ed->track; break;
     case TRK_K_SEL_PGUP:  ed->row = ed->row >= 16 ? ed->row - 16 : 0;           ed->sel_r1 = ed->row; break;
     case TRK_K_SEL_PGDN:  ed->row = ed->row + 16 < rows ? ed->row + 16 : rows - 1; ed->sel_r1 = ed->row; break;
     case TRK_K_SEL_ALL:
-        ed->sel = 1; ed->sel_r0 = 0; ed->sel_t0 = 0; ed->sel_r1 = rows - 1; ed->sel_t1 = TRK_TRACKS - 1;
+        ed->sel = 1; ed->sel_r0 = 0; ed->sel_t0 = 0; ed->sel_r1 = rows - 1; ed->sel_t1 = nt - 1;
         break;
     case TRK_K_COPY: case TRK_K_CUT: case TRK_K_PASTE: case TRK_K_PASTE_MIX:
         break;                                  /* below, unlocked */
@@ -487,20 +489,20 @@ int trk_key(trk_engine *e, trk_editor *ed, int key)
         ed->digit = 0;
         if (--ed->field < 0) {
             ed->field = TRK_FIELDS - 1;
-            ed->track = (ed->track + TRK_TRACKS - 1) % TRK_TRACKS;
+            ed->track = (ed->track + nt - 1) % nt;
         }
         break;
     case TRK_K_RIGHT:
         ed->digit = 0;
         if (++ed->field >= TRK_FIELDS) {
             ed->field = 0;
-            ed->track = (ed->track + 1) % TRK_TRACKS;
+            ed->track = (ed->track + 1) % nt;
         }
         break;
     case TRK_K_TAB:
-        ed->track = (ed->track + 1) % TRK_TRACKS;              ed->field = 0; break;
+        ed->track = (ed->track + 1) % nt;                      ed->field = 0; break;
     case TRK_K_BACKTAB:
-        ed->track = (ed->track + TRK_TRACKS - 1) % TRK_TRACKS; ed->field = 0; break;
+        ed->track = (ed->track + nt - 1) % nt;                 ed->field = 0; break;
 
     case TRK_K_EDIT: ed->edit = !ed->edit; ed->digit = 0; break;
 
@@ -546,13 +548,13 @@ int trk_key(trk_engine *e, trk_editor *ed, int key)
         break;
     case TRK_K_SOLO_TRACK: {
         int t, others_silent = 1;
-        for (t = 0; t < TRK_TRACKS; t++)
+        for (t = 0; t < nt; t++)
             if (t != ed->track && !s->track[t].mute) others_silent = 0;
         /* Soloing the one already alone brings everyone back. */
         if (others_silent && !s->track[ed->track].mute)
-            for (t = 0; t < TRK_TRACKS; t++) s->track[t].mute = 0;
+            for (t = 0; t < nt; t++) s->track[t].mute = 0;
         else
-            for (t = 0; t < TRK_TRACKS; t++) s->track[t].mute = t != ed->track;
+            for (t = 0; t < nt; t++) s->track[t].mute = t != ed->track;
         break;
     }
     case TRK_K_UNMUTE_ALL: {

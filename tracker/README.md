@@ -231,3 +231,22 @@ a machine without one records silently. One undo removes the whole take.
 **File > Export recorded take as MIDI** writes the take as it was played, at
 its exact times -- not rounded onto rows -- as a standard MIDI file at the
 song's tempo.
+
+## Tracks
+
+A song starts with eight tracks and can have up to sixteen (`TRK_TRACKS` in
+`core/trk.h` is the most; a song's own count is `trk_song.ntracks`). **+ Track**
+adds an empty one after the cursor's; **- Track** takes the cursor's away, notes
+and all -- asked about first when it holds any, and Undo (Ctrl+Z) brings it
+back. The windows, sample sets and synth routes follow their tracks, and
+playback stops when tracks move. The grid scrolls sideways with its headers
+(the scroll bar under the grid), and the cursor keeps itself in view.
+
+A song of eight tracks is written exactly as before. Any other count adds a
+`tracks N` line, which builds from before this change refuse; a file that uses a
+track past its count has that many tracks. The tracker's ALSA client has one
+output port per possible track (sixteen), whatever the song uses.
+
+Undo keeps, for each step, everything of the song except the patterns, and only
+the patterns that hold something -- tens of kilobytes where the whole song is
+over a megabyte now that it has room for sixteen tracks.

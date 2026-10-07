@@ -110,10 +110,9 @@ struct trk_engine {
      * TRK_UNDO_MAX kept, the oldest dropped over that. The snapshots are
      * the song's own ~800 KB apiece, so the cap is a memory cap too.
      * Under lock, as the song is. */
-    trk_song       *undo[TRK_UNDO_MAX];
+    struct snap   *undo[TRK_UNDO_MAX];
     int             nundo;
-    trk_song       *undo_spare;           /* a snapshot buffer kept for the next push */
-    trk_song       *redo[TRK_UNDO_MAX];   /* what undo took off, newest last */
+    struct snap   *redo[TRK_UNDO_MAX];   /* what undo took off, newest last */
     int             nredo;
 
     /* Recording. All under lock unless said. */
@@ -2257,7 +2256,6 @@ void trk_close(trk_engine *e)
     drumkit_free(e->aud);
     while (e->nundo) free(e->undo[--e->nundo]);
     while (e->nredo) free(e->redo[--e->nredo]);
-    free(e->undo_spare);
     pthread_mutex_destroy(&e->smx);
     pthread_mutex_destroy(&e->dmx);
     snd_seq_free_queue(e->seq, e->queue);
@@ -2288,58 +2286,90 @@ static void sync_sink_names(trk_engine *e)
     pthread_mutex_unlock(&e->dmx);
 }
 
-static void redo_clear(trk_engine *e)
-{
-    while (e->nredo) free(e->redo[--e->nredo]);
-}
+/* ---- undo: snapshots ----
+ *
+ * A snapshot is everything of the song that comes before its patterns, and
+ * then only the patterns that hold something: a pattern that is blank and of
+ * the default length is the same as no pattern, so it is not kept. Of the
+ * hundred patterns a song has room for, a few are usually used -- a snapshot
+ * is tens of kilobytes where the whole song is over a megabyte. */
+struct snap {
+    unsigned char hdr[offsetof(trk_song, pattern)];
+    int           npat;
+    struct { int idx; trk_pattern p; } pat[];
+};
 
-/* A buffer for one more snapshot: the spare, or a new one. */
-static trk_song *snap_buf(trk_engine *e)
+static int pattern_blank(const trk_pattern *p)
 {
-    trk_song *b = e->undo_spare;
-    e->undo_spare = NULL;
-    return b ? b : malloc(sizeof *b);
-}
-
-/* A snapshot of the song as it is onto one of the two stacks. Buffers are
- * recycled, not freed and allocated again: at 800 KB each malloc is an mmap,
- * and the page faults of a fresh one cost more under the engine lock than
- * the copy does. A full stack gives up its oldest, which becomes the new
- * snapshot's buffer. A malloc failure drops the entry, never the edit. */
-static void stack_push(trk_engine *e, trk_song **stack, int *n)
-{
-    trk_song *snap;
-    if (*n == TRK_UNDO_MAX) {
-        if (e->undo_spare) free(e->undo_spare);
-        e->undo_spare = stack[0];
-        memmove(stack, stack + 1, sizeof stack[0] * (TRK_UNDO_MAX - 1));
-        (*n)--;
+    static trk_pattern blank;
+    static int made;
+    if (!made) {
+        memset(&blank, 0, sizeof blank);
+        blank.rows = 64;
+        memset(blank.cell, TRK_EMPTY, sizeof blank.cell);
+        made = 1;
     }
-    snap = snap_buf(e);
-    if (!snap) return;
-    *snap = e->song;
-    stack[(*n)++] = snap;
+    return memcmp(p, &blank, sizeof blank) == 0;
+}
+
+static struct snap *snap_make(const trk_song *s)
+{
+    struct snap *k;
+    int p, n = 0;
+    for (p = 0; p < TRK_PATTERNS; p++) if (!pattern_blank(&s->pattern[p])) n++;
+    k = malloc(sizeof *k + (size_t)n * sizeof k->pat[0]);
+    if (!k) return NULL;
+    memcpy(k->hdr, s, sizeof k->hdr);
+    k->npat = 0;
+    for (p = 0; p < TRK_PATTERNS; p++)
+        if (!pattern_blank(&s->pattern[p])) {
+            k->pat[k->npat].idx = p;
+            k->pat[k->npat].p = s->pattern[p];
+            k->npat++;
+        }
+    return k;
 }
 
 /* A snapshot back into the song -- except what is live rather than edited:
  * the tempo (the queue is running at it), the rows per beat and the volume.
  * An undo of a cell edit that also took the tempo back to what it was then
  * would show one tempo while the queue played another. */
-static void restore_keeping_live(trk_engine *e, const trk_song *snap)
+static void snap_restore(trk_engine *e, const struct snap *k)
 {
-    const double bpm = e->song.bpm;
-    const int lpb = e->song.lpb, volume = e->song.volume;
-    e->song = *snap;
-    e->song.bpm = bpm;
-    e->song.lpb = lpb;
-    e->song.volume = volume;
+    trk_song *s = &e->song;
+    const double bpm = s->bpm;
+    const int lpb = s->lpb, volume = s->volume;
+    int p;
+    for (p = 0; p < TRK_PATTERNS; p++)
+        if (!pattern_blank(&s->pattern[p])) {
+            memset(&s->pattern[p], 0, sizeof s->pattern[p]);
+            s->pattern[p].rows = 64;
+            memset(s->pattern[p].cell, TRK_EMPTY, sizeof s->pattern[p].cell);
+        }
+    memcpy(s, k->hdr, sizeof k->hdr);
+    for (p = 0; p < k->npat; p++) s->pattern[k->pat[p].idx] = k->pat[p].p;
+    s->bpm = bpm;
+    s->lpb = lpb;
+    s->volume = volume;
 }
 
-/* The buffer a restored snapshot came in goes back as the spare. */
-static void give_back(trk_engine *e, trk_song *snap)
+static void redo_clear(trk_engine *e)
 {
-    if (e->undo_spare) free(snap);
-    else e->undo_spare = snap;
+    while (e->nredo) free(e->redo[--e->nredo]);
+}
+
+/* A snapshot of the song as it is onto one of the two stacks. A full stack
+ * gives up its oldest. A malloc failure drops the entry, never the edit. */
+static void stack_push(struct snap **stack, int *n, const trk_song *s)
+{
+    struct snap *k;
+    if (*n == TRK_UNDO_MAX) {
+        free(stack[0]);
+        memmove(stack, stack + 1, sizeof stack[0] * (TRK_UNDO_MAX - 1));
+        (*n)--;
+    }
+    if (!(k = snap_make(s))) return;
+    stack[(*n)++] = k;
 }
 
 /* The editor's edit points call this just before they change the song,
@@ -2348,32 +2378,131 @@ static void give_back(trk_engine *e, trk_song *snap)
 void trk_undo_push(trk_engine *e)
 {
     redo_clear(e);
-    stack_push(e, e->undo, &e->nundo);
+    stack_push(e->undo, &e->nundo, &e->song);
 }
 
 /* The caller holds the lock -- trk_key's undo case does already. */
 int trk_undo_locked(trk_engine *e)
 {
-    trk_song *snap;
+    struct snap *k;
     if (!e->nundo) return 0;
-    snap = e->undo[--e->nundo];
-    stack_push(e, e->redo, &e->nredo);        /* the song as it is, to redo to */
-    restore_keeping_live(e, snap);
-    give_back(e, snap);
+    k = e->undo[--e->nundo];
+    stack_push(e->redo, &e->nredo, &e->song);       /* the song as it is, to redo to */
+    snap_restore(e, k);
+    free(k);
     sync_sink_names(e);
     return 1;
 }
 
 int trk_redo_locked(trk_engine *e)
 {
-    trk_song *snap;
+    struct snap *k;
     if (!e->nredo) return 0;
-    snap = e->redo[--e->nredo];
-    stack_push(e, e->undo, &e->nundo);        /* not trk_undo_push: that would clear the redo */
-    restore_keeping_live(e, snap);
-    give_back(e, snap);
+    k = e->redo[--e->nredo];
+    stack_push(e->undo, &e->nundo, &e->song);       /* not trk_undo_push: that would clear the redo */
+    snap_restore(e, k);
+    free(k);
     sync_sink_names(e);
     return 1;
+}
+
+/* Whether any pattern has something on track t. */
+int trk_track_used(trk_engine *e, int t)
+{
+    int p, r, used = 0;
+    if (t < 0 || t >= TRK_TRACKS) return 0;
+    pthread_mutex_lock(&e->lock);
+    for (p = 0; p < TRK_PATTERNS && !used; p++)
+        for (r = 0; r < e->song.pattern[p].rows; r++) {
+            const trk_cell *c = &e->song.pattern[p].cell[r][t];
+            if (c->note != TRK_EMPTY || c->vel != TRK_EMPTY || c->cc != TRK_EMPTY || c->val != TRK_EMPTY) { used = 1; break; }
+        }
+    pthread_mutex_unlock(&e->lock);
+    return used;
+}
+
+/* Tracks inserted and removed: the song's tracks and every pattern's cells
+ * move together, the routing follows, and playback stops -- what was sounding
+ * is released first, so nothing is left held by a track that is no longer
+ * where it was. */
+static void move_tracks_locked(trk_engine *e, int at, int dir)
+{
+    trk_song *s = &e->song;
+    int p, r, t;
+    if (e->playing) stop_locked(e, 1);
+    else for (t = 0; t < TRK_TRACKS; t++) release_track(e, t);
+    for (p = 0; p < TRK_PATTERNS; p++)
+        for (r = 0; r < TRK_ROWS_MAX; r++) {
+            trk_cell *row = s->pattern[p].cell[r];
+            if (dir > 0) {
+                memmove(&row[at + 1], &row[at], sizeof row[0] * (size_t)(TRK_TRACKS - 1 - at));
+                memset(&row[at], TRK_EMPTY, sizeof row[0]);
+            } else {
+                memmove(&row[at], &row[at + 1], sizeof row[0] * (size_t)(TRK_TRACKS - 1 - at));
+                memset(&row[TRK_TRACKS - 1], TRK_EMPTY, sizeof row[0]);
+            }
+        }
+    if (dir > 0) {
+        memmove(&s->track[at + 1], &s->track[at], sizeof s->track[0] * (size_t)(TRK_TRACKS - 1 - at));
+        memmove(&e->track_sink[at + 1], &e->track_sink[at], sizeof e->track_sink[0] * (size_t)(TRK_TRACKS - 1 - at));
+        memset(&s->track[at], 0, sizeof s->track[at]);
+        snprintf(s->track[at].name, sizeof s->track[at].name, "Track %d", at + 1);
+        s->track[at].velocity = 100;
+        s->track[at].octave = 4;
+        e->track_sink[at] = -1;
+        s->ntracks++;
+    } else {
+        memmove(&s->track[at], &s->track[at + 1], sizeof s->track[0] * (size_t)(TRK_TRACKS - 1 - at));
+        memmove(&e->track_sink[at], &e->track_sink[at + 1], sizeof e->track_sink[0] * (size_t)(TRK_TRACKS - 1 - at));
+        memset(&s->track[TRK_TRACKS - 1], 0, sizeof s->track[0]);
+        snprintf(s->track[TRK_TRACKS - 1].name, sizeof s->track[0].name, "Track %d", TRK_TRACKS);
+        s->track[TRK_TRACKS - 1].velocity = 100;
+        s->track[TRK_TRACKS - 1].octave = 4;
+        e->track_sink[TRK_TRACKS - 1] = -1;
+        s->ntracks--;
+    }
+    /* The room past the last track is as a new song leaves it, so a song
+     * that has had tracks added and taken away is the song a file of it
+     * would load back as. */
+    for (t = s->ntracks; t < TRK_TRACKS; t++) {
+        memset(&s->track[t], 0, sizeof s->track[t]);
+        snprintf(s->track[t].name, sizeof s->track[t].name, "Track %d", t + 1);
+        s->track[t].velocity = 100;
+        s->track[t].octave = 4;
+        e->track_sink[t] = -1;
+    }
+    sync_sink_names(e);
+    for (t = 0; t < TRK_TRACKS; t++) e->rec_note[t] = -1;
+}
+
+int trk_track_insert(trk_engine *e, int at)
+{
+    int rc = -1;
+    pthread_mutex_lock(&e->lock);
+    if (at < 0) at = 0;
+    if (at > e->song.ntracks) at = e->song.ntracks;
+    if (e->song.ntracks < TRK_TRACKS) {
+        trk_undo_push(e);
+        move_tracks_locked(e, at, +1);
+        rc = 0;
+    }
+    pthread_mutex_unlock(&e->lock);
+    if (rc == 0) trk_route(e);                /* the windows and sample sets follow their tracks */
+    return rc;
+}
+
+int trk_track_remove(trk_engine *e, int at)
+{
+    int rc = -1;
+    pthread_mutex_lock(&e->lock);
+    if (at >= 0 && at < e->song.ntracks && e->song.ntracks > 1) {
+        trk_undo_push(e);
+        move_tracks_locked(e, at, -1);
+        rc = 0;
+    }
+    pthread_mutex_unlock(&e->lock);
+    if (rc == 0) trk_route(e);
+    return rc;
 }
 
 int trk_undo(trk_engine *e)

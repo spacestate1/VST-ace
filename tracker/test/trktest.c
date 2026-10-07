@@ -1432,6 +1432,98 @@ int main(void)
         free(a); free(b);
     }
 
+    printf("tracks\n");
+    {
+        trk_song *keep = malloc(sizeof *keep), *a = malloc(sizeof *a), *b = malloc(sizeof *b);
+        char err[300] = "", path[256], tmp[300];
+        int i, id;
+        trk_stop(e);
+        trk_undo_clear(e);
+        trk_lock(e);
+        *keep = *s;
+        trk_song_init(s);
+        trk_unlock(e);
+        check(s->ntracks == 8, "a new song has eight tracks");
+
+        /* Notes follow their tracks. */
+        s->pattern[0].cell[0][0].note = 60;
+        s->pattern[0].cell[0][2].note = 62;
+        snprintf(s->track[2].name, sizeof s->track[2].name, "Lead");
+        check(trk_track_insert(e, 1) == 0 && s->ntracks == 9, "a track is added");
+        check(s->pattern[0].cell[0][0].note == 60 && s->pattern[0].cell[0][1].note == TRK_EMPTY &&
+              s->pattern[0].cell[0][3].note == 62, "the new track is empty and the ones after it moved right");
+        check(!strcmp(s->track[3].name, "Lead") && !strcmp(s->track[1].name, "Track 2"), "with their names");
+        check(trk_track_used(e, 3) && !trk_track_used(e, 1), "a track says whether it holds anything");
+        check(trk_undo(e) == 1 && s->ntracks == 8 && s->pattern[0].cell[0][2].note == 62, "undone");
+        check(trk_redo(e) == 1 && s->ntracks == 9, "redone");
+        check(trk_track_remove(e, 0) == 0 && s->ntracks == 8, "a track is taken away");
+        check(s->pattern[0].cell[0][2].note == 62 && !strcmp(s->track[2].name, "Lead") &&
+              s->pattern[0].cell[0][0].note == TRK_EMPTY, "its notes go with it; the rest move left");
+        check(trk_undo(e) == 1 && s->pattern[0].cell[0][0].note == 60 && s->ntracks == 9, "and it comes back with undo");
+        trk_undo_clear(e);
+
+        /* The ends. */
+        for (i = s->ntracks; i < TRK_TRACKS; i++) trk_track_insert(e, i);
+        check(s->ntracks == TRK_TRACKS && trk_track_insert(e, 0) == -1, "no more than the maximum");
+        for (i = 0; i < TRK_TRACKS - 1; i++) trk_track_remove(e, 0);
+        check(s->ntracks == 1 && trk_track_remove(e, 0) == -1, "never fewer than one");
+        trk_lock(e); trk_song_init(s); trk_unlock(e);
+
+        /* A synth route moves with its track. */
+        id = trk_add_sink(e, "track-move sink", sink_cb, NULL);
+        trk_route_sink(e, 3, id);
+        trk_track_insert(e, 0);
+        check(trk_sink_of(e, 4) == id && trk_sink_of(e, 3) == -1 && !strcmp(s->track[4].sink, "track-move sink") && !s->track[3].sink[0],
+              "a track routed to a synth keeps it when tracks are added before it");
+        trk_track_remove(e, 0);
+        check(trk_sink_of(e, 3) == id, "and when they are taken away");
+        trk_route_sink(e, 3, -1);
+        trk_remove_sink(e, id);
+
+        /* The song file: a count other than eight is written, and read back. */
+        *a = *s;
+        a->ntracks = 12;
+        snprintf(a->track[10].name, sizeof a->track[10].name, "Eleven");
+        a->pattern[0].cell[3][10].note = 64;
+        snprintf(path, sizeof path, "/tmp/trktest-tracks-%d.trk", (int)getpid());
+        check(trk_song_save(a, path, err, sizeof err) == 0 && trk_song_load(b, path, err, sizeof err) == 0 &&
+              b->ntracks == 12 && !strcmp(b->track[10].name, "Eleven") && b->pattern[0].cell[3][10].note == 64,
+              "a song of twelve tracks saves and loads");
+        a->ntracks = 8;
+        a->pattern[0].cell[3][10].note = TRK_EMPTY;
+        trk_song_save(a, path, err, sizeof err);
+        { FILE *fp = fopen(path, "r"); char line[200]; int has = 0; while (fp && fgets(line, sizeof line, fp)) if (!strncmp(line, "tracks", 6)) has = 1; if (fp) fclose(fp);
+          check(!has, "a song of eight tracks has no tracks line, so older builds still read it"); }
+        {   /* A file that uses a track past its count has that many tracks. */
+            FILE *fp = fopen(path, "w");
+            fprintf(fp, "tracker 1\nbpm 120\nlpb 4\npattern 0 rows 4\ncell 0 1 12 C-4 .. .. ..\norder 0\n");
+            fclose(fp);
+            check(trk_song_load(b, path, err, sizeof err) == 0 && b->ntracks == 12, "a file that uses track 12 has twelve tracks");
+            fp = fopen(path, "w");
+            fprintf(fp, "tracker 1\ntracks 99\n");
+            fclose(fp);
+            check(trk_song_load(b, path, err, sizeof err) != 0, "a count past the maximum is refused");
+        }
+        unlink(path); snprintf(tmp, sizeof tmp, "%s.new", path); unlink(tmp);
+
+        /* The cursor never rests on a track that is not there. */
+        {
+            trk_editor ed;
+            trk_editor_init(&ed);
+            ed.track = 7; ed.edit = 1;
+            trk_lock(e); trk_song_init(s); trk_unlock(e);
+            trk_track_remove(e, 7);
+            trk_key(e, &ed, TRK_K_DOWN);
+            check(ed.track == 6, "a cursor on a removed track moves to the last one");
+            trk_key(e, &ed, TRK_K_TAB);
+            check(ed.track == 0, "Tab wraps at the song's track count, not the maximum");
+        }
+
+        trk_undo_clear(e);
+        trk_lock(e); *s = *keep; trk_unlock(e);
+        free(keep); free(a); free(b);
+    }
+
     printf("furnace keys\n");
     {
         trk_editor ed;
@@ -1485,11 +1577,11 @@ int main(void)
         trk_key(e, &ed, TRK_K_MUTE_TRACK);
         check(!s->track[2].mute, "and back");
         trk_key(e, &ed, TRK_K_SOLO_TRACK);
-        for (t = 0; t < TRK_TRACKS; t++) if (s->track[t].mute != (t != 2)) break;
-        check(t == TRK_TRACKS, "solo mutes every other track");
+        for (t = 0; t < s->ntracks; t++) if (s->track[t].mute != (t != 2)) break;
+        check(t == s->ntracks, "solo mutes every other track");
         trk_key(e, &ed, TRK_K_SOLO_TRACK);
-        for (t = 0; t < TRK_TRACKS; t++) if (s->track[t].mute) break;
-        check(t == TRK_TRACKS, "soloing the one alone brings everyone back");
+        for (t = 0; t < s->ntracks; t++) if (s->track[t].mute) break;
+        check(t == s->ntracks, "soloing the one alone brings everyone back");
         trk_key(e, &ed, TRK_K_MUTE_TRACK); trk_key(e, &ed, TRK_K_UNMUTE_ALL);
         check(!s->track[2].mute, "unmute all");
 

@@ -24,6 +24,7 @@ void trk_song_init(trk_song *s)
     s->bpm = 120.0;
     s->lpb = 4;
     s->volume = 100;
+    s->ntracks = TRK_TRACKS_DEFAULT;
     for (t = 0; t < TRK_TRACKS; t++) {
         snprintf(s->track[t].name, sizeof s->track[t].name, "Track %d", t + 1);
         s->track[t].channel  = 0;
@@ -133,6 +134,7 @@ const char *trk_cell_text(const trk_cell *c, char *buf)
  *   tracker 1
  *   bpm 120
  *   lpb 4
+ *   tracks 12                        how many tracks, when not eight
  *   volume 80                        master, in percent, when not 100
  *   track 1 channel 1 velocity 100 mute 0
  *   track 1 name Bass
@@ -173,7 +175,10 @@ int trk_song_save(const trk_song *s, const char *path, char *err, size_t errn)
     }
     fprintf(f, "tracker 1\nbpm %.10g\nlpb %d\n", s->bpm, s->lpb);
     if (s->volume != 100) fprintf(f, "volume %d\n", s->volume);
-    for (t = 0; t < TRK_TRACKS; t++) {
+    /* Only when it is not the usual: a song of eight tracks stays readable by
+     * every build that ever read one. */
+    if (s->ntracks != TRK_TRACKS_DEFAULT) fprintf(f, "tracks %d\n", s->ntracks);
+    for (t = 0; t < s->ntracks; t++) {
         const trk_track *k = &s->track[t];
         fprintf(f, "track %d channel %d velocity %d mute %d\n",
                 t + 1, k->channel + 1, k->velocity, k->mute ? 1 : 0);
@@ -244,7 +249,7 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
     trk_song *s = malloc(sizeof *s);
     char      line[1024];
     FILE     *f;
-    int       ln = 0, ok = 0;
+    int       ln = 0, ok = 0, hi = -1;           /* hi: the highest track the file mentions */
 
     if (!s) { snprintf(err, errn, "out of memory"); return -1; }
     if (!(f = fopen(path, "r"))) {
@@ -276,11 +281,15 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
         } else if (!strcmp(w[0], "lpb") && n >= 2) {
             s->lpb = atoi(w[1]);
             if (!trk_lpb_ok(s->lpb)) goto bad;
+        } else if (!strcmp(w[0], "tracks") && n >= 2) {
+            s->ntracks = atoi(w[1]);
+            if (s->ntracks < 1 || s->ntracks > TRK_TRACKS) goto bad;
         } else if (!strcmp(w[0], "track") && n >= 3) {
             trk_track *k;
             a = atoi(w[1]);
             a = a > INT_MIN ? a - 1 : -1;               /* no overflow on a hostile number */
             if (a < 0 || a >= TRK_TRACKS) goto bad;
+            if (a > hi) hi = a;
             k = &s->track[a];
             if (!strcmp(w[2], "name"))
                 snprintf(k->name, sizeof k->name, "%s", after_words(line, 3));
@@ -331,6 +340,7 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
             c -= 1;
             if (a < 0 || a >= TRK_PATTERNS || b < 0 || b >= TRK_ROWS_MAX ||
                 c < 0 || c >= TRK_TRACKS) goto bad;
+            if (c > hi) hi = c;
             note = parse_note(nt); iv = parse_hex2(v);
             icc = parse_hex2(cc);  ival = parse_hex2(val);
             if (note < 0 || iv < 0 || icc < 0 || ival < 0) goto bad;
@@ -348,6 +358,7 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
         return -1;
     }
     if (s->norder == 0) { s->order[0] = 0; s->norder = 1; }
+    if (s->ntracks < hi + 1) s->ntracks = hi + 1;       /* a track the file uses is a track the song has */
     memcpy(out, s, sizeof *s);
     free(s);
     return 0;

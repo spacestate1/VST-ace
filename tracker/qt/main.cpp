@@ -178,6 +178,31 @@ int uitest(trk_engine *e, TrackerWindow &w, const QString &outdir)
     press(v, Qt::Key_Return);
     wait(100);
     check(!trk_playing(e), "Enter stops");
+    {   // + Track / - Track: tracks are added after the cursor's and taken away again.
+        QPushButton *add = nullptr, *del = nullptr;
+        for (QPushButton *b : w.findChildren<QPushButton *>()) {
+            if (b->text() == "+ Track") add = b;
+            if (b->text() == "− Track") del = b;
+        }
+        check(add && del, "the toolbar has + Track and - Track");
+        if (add && del) {
+            const int before = trk_song_of(e)->ntracks;
+            for (int i = 0; i < 4; i++) add->click();
+            wait(100);
+            check(trk_song_of(e)->ntracks == before + 4, "four tracks added");
+            check(tw->headerVisible(before + 3) && !tw->headerVisible(before + 4), "a header over each, none over the room left");
+            shot("08-tracks-added.png");
+            ed->track = before + 1;                       // an empty one: no question asked
+            del->click();
+            wait(100);
+            check(trk_song_of(e)->ntracks == before + 3, "a track taken away");
+            trk_undo(e);                                  // back to before + 4 for the steps after
+            for (int i = 0; i < 4 && trk_song_of(e)->ntracks > before; i++) { ed->track = trk_song_of(e)->ntracks - 1; del->click(); }
+            ed->track = 0;
+            wait(100);
+            check(trk_song_of(e)->ntracks == before, "and back to where it was");
+        }
+    }
     {   // F7 records: the count-in first, then the take; Stop ends it.
         trk_rec_opts o;
         trk_record_get(e, &o);
