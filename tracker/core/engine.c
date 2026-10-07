@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -181,9 +182,11 @@ struct trk_engine {
     /* Their output. */
     snd_pcm_t      *pcm;
     pthread_t       athread;
-    int             audio_on, aquit, aperiod;
+    int             audio_on, aperiod;
+    _Atomic int     aquit;                /* stop flags: read by threads that do not hold the lock */
     double          alat;                 /* seconds from a hit's time to its sound */
-    double          bpm_now;              /* the queue's tempo, for the audio thread */
+    _Atomic double  bpm_now;              /* the queue's tempo, for the audio thread */
+    _Atomic int     vol_live;             /* song.volume as of the last unlock: the audio thread's copy */
     char            audio_msg[160];
     char            pcm_name[TRK_DEST_LEN];   /* the chosen output, "" for the default */
 
@@ -194,7 +197,8 @@ struct trk_engine {
     trk_sink        sink[TRK_SINKS];
     int             track_sink[TRK_TRACKS]; /* the sink a track plays, or -1: its window */
     pthread_t       dthread;
-    int             delivery_on, dquit;
+    int             delivery_on;
+    _Atomic int     dquit;
 };
 
 static double mono_now(void)
@@ -713,8 +717,8 @@ static void *audio_main(void *ud)
         }
         pthread_mutex_unlock(&e->smx);
 
-        {   /* The master volume: read without the lock, as one int is. */
-            const int vol = e->song.volume;
+        {   /* The master volume, from the copy published at unlock. */
+            const int vol = atomic_load_explicit(&e->vol_live, memory_order_relaxed);
             const double g = (vol < 0 ? 0 : vol > 150 ? 150 : vol) / 100.0;
             for (i = 0; i < P * 2; i++) mix[i] *= g;
         }
@@ -2218,6 +2222,7 @@ trk_engine *trk_open(char *err, size_t errn)
     snd_seq_set_queue_tempo(e->seq, e->queue, qt);
 
     trk_song_init(&e->song);
+    atomic_store(&e->vol_live, e->song.volume);
     pthread_mutex_init(&e->lock, NULL);
     pthread_mutex_init(&e->smx, NULL);
     pthread_mutex_init(&e->dmx, NULL);
@@ -2403,7 +2408,14 @@ int trk_audio_set_device(trk_engine *e, const char *name)
 
 trk_song *trk_song_of(trk_engine *e) { return &e->song; }
 void trk_lock(trk_engine *e)   { pthread_mutex_lock(&e->lock); }
-void trk_unlock(trk_engine *e) { pthread_mutex_unlock(&e->lock); }
+/* Everything that edits the song holds the lock, and the volume is the one
+ * field the audio thread wants without it: so it is published as the lock is
+ * let go, and read from here, rather than read raw off the song. */
+void trk_unlock(trk_engine *e)
+{
+    atomic_store_explicit(&e->vol_live, e->song.volume, memory_order_relaxed);
+    pthread_mutex_unlock(&e->lock);
+}
 
 /* Routing is runtime state, which a snapshot does not hold: the sink names
  * in a restored song are put back to what the tracks are playing now, as

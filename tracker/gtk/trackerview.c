@@ -4048,7 +4048,15 @@ void trk_view_free(trk_view *v)
     if (U->t_refit) { g_source_remove(U->t_refit); U->t_refit = 0; }
     /* Its widgets down now, rather than whenever GTK gets to it: the signal
      * handlers that run while they go (focus leaving) see `closing`. */
-    if (U->view) g_object_run_dispose(G_OBJECT(U->view));
+    if (U->view) {
+        /* Standalone, the window still holds it: let go first, or the dispose
+         * below is a widget freed with a parent. */
+        GtkWidget *view = U->view, *par = gtk_widget_get_parent(view);
+        g_object_ref(view);
+        if (par && GTK_IS_WINDOW(par)) gtk_window_set_child(GTK_WINDOW(par), NULL);
+        g_object_run_dispose(G_OBJECT(view));
+        g_object_unref(view);
+    }
     g_idle_add_full(G_PRIORITY_LOW, free_view_later, U, NULL);
 }
 

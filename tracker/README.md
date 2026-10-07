@@ -210,9 +210,14 @@ lines is refused by builds from before they were first saved.
 ## Tests
 
     tracker/build/trktest                                      # engine, no window
-    QT_QPA_PLATFORM=offscreen tracker/build/tracker-uitest song.trk outdir
-    gtk4-broadwayd :7 &
-    GDK_BACKEND=broadway BROADWAY_DISPLAY=:7 tracker/build/tracker-gtk-uitest song.trk outdir
+    tracker/test/run-uitests.sh [build-dir [picture-dir]]      # both windows
+
+`run-uitests.sh` gives the window tests what they need -- `test/uitest.trk`
+(track 1 pointed at an `aseqdump` client the script starts, track 3 at one
+that is not running), a broadway display for the GTK one, and a place for the
+pictures -- and exits with the number of failed checks. Run by hand, the
+tests take the song and a picture directory as arguments, and the two
+destination checks fail without that `aseqdump` client.
 
 `trktest` runs two ALSA receivers standing in for two windows and checks
 timing, the clock, routing, that the ports refuse other subscribers, and that

@@ -30,6 +30,7 @@
 #include "wav.h"
 #include "drumkit.h"
 
+#include <stdatomic.h>
 #include <alsa/asoundlib.h>
 #include <math.h>
 #include <pthread.h>
@@ -50,7 +51,7 @@ typedef struct { double t; int rx, type, ch, note, vel, param, value; } rec;
 
 static rec      g_ev[MAXEV];
 static int      g_nev;
-static volatile int g_stop;
+static _Atomic int g_stop;
 static pthread_mutex_t g_mx = PTHREAD_MUTEX_INITIALIZER;
 static int      g_fail;
 
@@ -1230,7 +1231,7 @@ int main(void)
         s->lpb = 4;
         s->bpm = 120;                                 /* a row is 125 ms */
         s->norder = 1; s->order[0] = 0;
-        { int t; for (t = 0; t < TRK_TRACKS; t++) { s->track[t].mute = 0; s->track[t].samples[0] = 0; s->track[t].velocity = 100; } }
+        { int t; for (t = 0; t < s->ntracks; t++) { s->track[t].mute = 0; s->track[t].samples[0] = 0; s->track[t].velocity = 100; } }
         trk_unlock(e);
         trk_set_bpm(e, 120);
         trk_record_defaults(&o);
