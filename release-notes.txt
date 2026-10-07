@@ -1,0 +1,271 @@
+vst-ace 0.3.0 -- release notes
+==============================
+
+  version   0.3.0
+  date      2026-09-07
+  tag       v0.3.0          on origin, at 2377625
+  commit    2377625         "0.3.0"
+
+Three commits since 0.2.0, and all of the work in two of them: the loader
+saying what it wanted when a plug-in will not load, and both windows
+becoming one thing you can actually play -- MIDI in and out, the same
+inputs, and no mouse required.
+
+
+WHAT IS DONE
+------------
+
+  [x] committed          2377625 on main (3 commits)
+  [x] pushed             origin/main = 2377625, was 83e0588
+  [x] tagged             refs/tags/v0.3.0 pushed
+  [x] regress            27 passed, 0 failed, 0 skipped (was 23: staging-tree,
+                         rpm-changelog, arch-pkgbuild and appimage are new)
+  [x] .deb built         on the ubuntu24.04 VM (192.168.122.130) from an
+                         rsync copy at 2377625, VSTACE_GIT passed by hand
+                         because the staged tree has no .git
+  [x] .deb verified      upgrades 0.2.0 -> 0.3.0 cleanly (apt --simulate),
+                         every dependency resolves, both .desktop files
+                         validate, the binaries carry "0.3.0" and "2377625",
+                         and the shipped peload rendered fb799964.dll out of
+                         an extracted tree -- 259 imports implemented, 1
+                         stubbed, 0 stubs reached
+  [ ] Debian 13 check    172.17.1.177 unreachable again -- connection timed
+                         out, as of 2026-09-07
+  [ ] GitHub Release     NOT created -- see PUBLISHING below
+  [x] .rpm built         on the silverblue43 VM (192.168.122.106) from an
+                         rsync copy at 2377625, VSTACE_GIT passed by hand.
+                         Fedora was three releases behind; it is current.
+  [x] .rpm verified      installs with dnf on Fedora 43, every dependency
+                         resolved, the four programs land on $PATH, and the
+                         shipped peload rendered fb799964.dll out of ~/vst --
+                         259 imports implemented, 1 stubbed, 0 stubs reached,
+                         peak 0.2073, the same numbers the .deb gave
+  [x] Arch package       new: packaging/arch/PKGBUILD and build-arch.sh,
+                         built on the workstation itself. Verified from an
+                         extracted copy -- the same 64-bit render, and
+                         fb7999.dll rendered through peload32, which this
+                         package carries because the box has multilib
+  [x] AppImage recipe    new: packaging/appimage/ and build-appimage.sh.
+                         Built here and verified on DISPLAY=:1 -- pestudio
+                         opened, scanned 372 plug-ins and loaded one;
+                         dwstudio opened, loaded blooo64.dll and metered
+                         audio out of it; `ln -s ...AppImage peload` rendered
+                         both a 64-bit and a 32-bit Windows VST2.
+  [ ] AppImage artifact  NOT built for release. The one in release/ was built
+                         here on Arch and wants glibc 2.43, so it runs almost
+                         nowhere. See OUTSTANDING.
+
+
+ARTIFACTS
+---------
+
+In release/ (untracked -- these never go in git):
+
+  vst-ace_0.3.0-1_amd64.deb           2.4M
+    sha256 584a73453ce883fbc785a42a804d6bbf674338e79bb7d588e36b277d4594a22a
+
+  vst-ace-dbgsym_0.3.0-1_amd64.ddeb   9.7M
+    sha256 d88d54326c1241d51d2d3318304dd1ccfa6df91f2336f228a000eda71a341d6b
+    Optional. Without it, a backtrace out of an installed copy is addresses
+    and nothing else.
+
+  vst-ace_0.3.0-1_amd64.changes
+  vst-ace_0.3.0-1_amd64.buildinfo
+
+  vst-ace-0.3.0-1.fc43.x86_64.rpm     1.8M
+    sha256 3f14e8cf8f9a9d43f1ed3cfbecea5a9058b711249d0b08a27042544526952f80
+    Fedora 40+. No peload32 in it, so 64-bit plug-ins only.
+
+  vst-ace-debuginfo-0.3.0-1.fc43.x86_64.rpm      5.6M
+  vst-ace-debugsource-0.3.0-1.fc43.x86_64.rpm    862K
+    Optional, the .ddeb's counterpart.
+
+  vst-ace-0.3.0-1-x86_64.pkg.tar.zst  3.5M
+    sha256 09d574b96f42a64bffa109bab60d0b645e85eb4e50f6e820a787ba8c1cbbac8f
+    Arch. Carries peload32. Larger than the other two because makepkg
+    compresses with zstd at its default level rather than xz.
+
+  vst-ace-0.3.0-x86_64.AppImage       73M
+    NOT FOR RELEASE. Built on this workstation, so it asks the host for
+    glibc 2.43 and starts on almost nothing. It is the proof the recipe
+    works, not the artifact; the one to publish comes off ubuntu24.04.
+    Big because it carries GTK 4 and Qt 6 and everything under them --
+    that is the whole trade an AppImage makes.
+
+Both windows report:  vst-ace 0.3.0 (2377625), built 2026-09-07
+
+The .deb carries peload32 as it has since 0.1.0 and the Arch package now
+carries it too; in both, the i386 libraries stay optional, so each installs
+on a host with no foreign architecture enabled. The .rpm has no peload32:
+Fedora has too little of a 32-bit development stack to build it against.
+
+
+PUBLISHING
+----------
+
+The tag already exists on origin and points at 2377625, the commit the
+package was built from -- attach to it, do not create a new one.
+
+  gh release create v0.3.0 \
+    release/vst-ace_0.3.0-1_amd64.deb \
+    release/vst-ace-0.3.0-1.fc43.x86_64.rpm \
+    release/vst-ace-0.3.0-1-x86_64.pkg.tar.zst \
+    --title "vst-ace 0.3.0" --notes "Ubuntu 24.04 / Debian 13+, Fedora 40+
+and Arch, all amd64.
+
+MIDI now goes both ways: play these from a tracker, and play a tracker from
+them. Both windows offer the same inputs and the same keyboard shortcuts.
+
+Install with apt, not dpkg -i -- apt pulls in GTK 4, Qt 6 and the rest:
+  sudo apt install ./vst-ace_0.3.0-1_amd64.deb
+If dpkg -i was already run, sudo apt install -f finishes it.
+
+  sudo dnf install ./vst-ace-0.3.0-1.fc43.x86_64.rpm
+  sudo pacman -U ./vst-ace-0.3.0-1-x86_64.pkg.tar.zst
+
+32-bit Windows VST2 plug-ins work once the i386 runtime is present. The .deb
+and the Arch package carry the helper; the .rpm does not.
+  sudo dpkg --add-architecture i386 && sudo apt update
+  sudo apt install libx11-6:i386 libfreetype6:i386 libasound2t64:i386 \
+                   libpipewire-0.3-0t64:i386
+  # Arch, multilib enabled first
+  sudo pacman -S lib32-glibc lib32-freetype2 lib32-libx11 lib32-pipewire \
+                 lib32-alsa-lib"
+
+gh is not installed on this workstation and there is no GH_TOKEN, so this
+step is done by hand -- or in the browser: Releases > Draft a new release >
+pick the existing v0.3.0 tag from the dropdown > drag all three in.
+
+
+WHAT CHANGED
+------------
+
+MIDI both ways
+
+  The out port existed in both windows and carried nothing. Everything
+  played locally goes out of it now -- notes, bend, all-notes-off -- and
+  thru echoes what arrives, so a tracker at the other end plays these and
+  is played by them. Incoming MIDI reaches the plug-in as the raw messages
+  it arrived as, where before only notes, bend and controller 123 got
+  through: wheels, pedals, aftertouch and song position now arrive. A
+  sequencer's clock drives the transport and the tempo box follows it.
+
+The same inputs in both windows
+
+  dwstudio gained what pestudio had: an audio device chooser, a line saying
+  whether anything is actually arriving, the input-channel mask re-sent on
+  every load, and the same four effect input sources -- silence, a sawtooth
+  per held key, noise, or the microphone. An effect with two inputs now
+  picks the keys by itself on load, so it makes a sound the moment it is
+  opened.
+
+Driven from the keyboard
+
+  Ctrl+F, Ctrl+G, Ctrl+E and Escape move between the plug-in list, the
+  programs, the editor and the keys; Ctrl+R rescans devices, Ctrl+T is
+  thru, Ctrl+H connects the out port to hardware, Ctrl+. is panic, and
+  Ctrl+Up and Ctrl+Down are the volume. Both windows, the same keys, all of
+  them on the menus.
+
+One window, not two halves
+
+  The Engines/Plug-ins switcher is gone and the plug-in pane is the window.
+  The engines stay as what sounds when nothing is loaded. Master volume
+  moved to a short bar directly over the keys in both windows.
+
+Playing while the editor has focus
+
+  Turning a knob in a plug-in's editor used to kill the computer keyboard
+  until the on-screen keys were clicked. The editor still forwards every
+  key to the plug-in and now lets the ones the piano claims through, so
+  tweak-then-play works the way round people actually do it.
+
+Saying what went wrong
+
+  A fault names the failing address from the ELF symbol table or the import
+  table, dumps the instruction bytes, and recognises a guest stack overflow
+  as one. A sampling profiler says which stub a slow load is sitting in --
+  which is how Marvel GEQ's 25-second load became 0.74s. A stand-in that
+  gets called reports itself, and the busiest ones are named, so a plug-in
+  that draws nothing says what it was missing.
+
+The loader
+
+  7223 ordinal imports resolve by number, generated from Wine's export
+  tables. Real VirtualProtect and VirtualQuery page bookkeeping, the
+  CharUpper, BSTR, SList and timer-queue families, CRT float maths, time
+  and stat, GDI+ regions and matrices, and a window layer that answers
+  GetFocus, EnumWindows, menus and dialog items. A dead 32-bit bridge or
+  out-of-process host is recovered rather than left silent. The Windows
+  corpus goes from 51 of 59 loading to 57.
+
+Also
+
+  peload --play runs a plug-in headless from a MIDI port to a PipeWire
+  sink. tools/vst_install.py unpacks .exe, .pkg and .dmg installers, so an
+  official installer can be opened as if it were a plug-in.
+
+
+OUTSTANDING
+-----------
+
+Debian 13 was not checked again -- 172.17.1.177 timed out, as it did for
+0.2.0. The Qt dependency alternatives in debian/shlibs.local exist because
+Ubuntu and Debian disagree about the t64 suffix, so this is still the check
+that matters for the other half of the audience. Once it answers:
+
+  scp release/vst-ace_0.3.0-1_amd64.deb 172.17.1.177:
+  ssh 172.17.1.177 'sudo apt install -y ./vst-ace_0.3.0-1_amd64.deb'  # asks
+                                                                      # for a
+                                                                      # password
+
+The .rpm is built. silverblue43 was already running and answers key auth at
+192.168.122.106, so it did not need starting by hand this time:
+
+  rsync -a --delete --exclude='release/' \
+    --exclude-from=packaging/source-excludes.txt ./ 192.168.122.106:vst-ace-src/
+  ssh 192.168.122.106 'cd vst-ace-src && \
+    VSTACE_GIT=2377625 bash packaging/build-rpm.sh 0.3.0'
+
+The Arch package needs no VM -- this workstation is the target -- so it is
+`bash packaging/build-arch.sh 0.3.0`, and it carries peload32 only because
+multilib is enabled here.
+
+Both were built from 2377625, before the packaging changes that came with
+them. Those changes touch staging and the recipes, not a line of what gets
+compiled, so the binaries in these three packages are the ones 2377625
+produces. A rebuild after committing would name the newer commit and
+produce the same programs.
+
+The AppImage has not been built for release. It can only usefully be built
+on the oldest distribution it is meant to run on, because glibc is the one
+library it cannot carry: built here it wants 2.43, built on ubuntu24.04 it
+wants 2.39 and runs on Ubuntu 24.04, Debian 13, Fedora 40 and Arch alike.
+That VM is shut off, and this workstation is not in the libvirt group, so
+starting it is a step only you can do:
+
+  sudo virsh -c qemu:///system start ubuntu24.04
+
+then the same rsync-and-build as the .deb, with:
+
+  bash packaging/build-appimage.sh 0.3.0
+
+It wants four tools that are not distribution packages -- linuxdeploy, its
+Qt and GTK plugins, appimagetool -- and fetches them into
+~/.cache/vst-ace/appimage-tools itself the first time.
+
+A NOTE ON THE THREE PACKAGES ALREADY BUILT
+
+They were built from 2377625, and the AppImage work changed c/src/dw.c:
+`va` now looks for its helpers relative to its own path before falling back
+to the one compiled in, which is what makes a mount point nobody knew at
+build time work. That is a code change rather than a packaging one, so the
+.deb, .rpm and Arch package in release/ predate it. They are correct as they
+stand -- the compiled-in path is exactly right for an installed package, and
+all three were tested that way -- but a release cut after this is committed
+should rebuild all four from the same commit, so every artifact names it.
+
+Shutting the build VMs down again:
+
+  ssh admin02@192.168.122.130 'sudo poweroff'   # ubuntu24.04, the .deb
+  ssh admin02@192.168.122.106 'sudo poweroff'   # silverblue43, the .rpm
