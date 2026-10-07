@@ -34,6 +34,7 @@
 #include "trackerview.h"
 #include "trk.h"
 #include "pehost.h"
+#include "vstdirs.h"
 #include "sessfile.h"
 
 #include <alsa/asoundlib.h>
@@ -41,11 +42,32 @@
 #include <spa/param/audio/format-utils.h>
 
 #include <gtk/gtk.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <math.h>
+
+/* The output stage: a NaN from a plug-in becomes silence rather than a burst,
+ * and past 0.95 the level rolls into the rail instead of hitting it -- the
+ * same in value and slope, never over 1. */
+static inline float out_soft(double v)
+{
+    double a;
+    if (v != v) return 0.0f;
+    a = v < 0 ? -v : v;
+    if (a > 0.95) {
+        a = 0.95 + 0.05 * tanh((a - 0.95) * 20.0);
+        v = v < 0 ? -a : a;
+    }
+    return (float)v;
+}
+
 
 #define SR         48000
 /* One PipeWire quantum, as dwstudio: the audio thread cannot get realtime
@@ -77,6 +99,9 @@ static synctab      g_tabs[MAXTABS];
 static trk_engine  *g_trk;
 static trk_view    *g_tracker;
 static GtkWidget   *g_tracker_page;
+/* The menu bar follows the tab in front -- see sync_menus. */
+static GMenu       *g_bar, *g_file_m, *g_synth_m, *g_samples_m, *g_help_m, *g_help_trk;
+static void sync_menus(GtkWidget *front);
 static synctab     *g_front;           /* the synth tab the keys play, if one is */
 
 static GtkWidget   *g_win, *g_notebook, *g_stack, *g_hint, *g_status;
@@ -193,7 +218,7 @@ static void pw_on_process(void *ud)
         render_block(g_pw_buf, n);
         for (i = 0; i < n * 2; i++) {
             double v = g_pw_buf[i];
-            dst[i] = (float)(v > 1.0 ? 1.0 : (v < -1.0 ? -1.0 : v));
+            dst[i] = out_soft(v);
         }
     }
 
@@ -417,6 +442,7 @@ static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num, gpointer
     (void)nb; (void)num; (void)u;
     release_tab(g_front);
     g_front = tab_of_page(page);
+    sync_menus(page);       /* the signal comes before the notebook's own current page moves */
 }
 
 static void on_win_active(GObject *o, GParamSpec *ps, gpointer u)
@@ -538,6 +564,11 @@ static void update_canvas(void)
 {
     gtk_stack_set_visible_child(GTK_STACK(g_stack),
         gtk_notebook_get_n_pages(GTK_NOTEBOOK(g_notebook)) ? g_notebook : g_hint);
+    {
+        GtkNotebook *nb = GTK_NOTEBOOK(g_notebook);
+        int cur = gtk_notebook_get_current_page(nb);
+        sync_menus(cur >= 0 ? gtk_notebook_get_nth_page(nb, cur) : NULL);
+    }
 }
 
 static void close_tab_page(GtkWidget *page);
@@ -623,6 +654,16 @@ static void close_synth_tab(synctab *tab)
 
 /* ------------------------------------------------------------- the tracker */
 
+static void reopen_song_synths(void);
+
+/* The view's song-opened hook: its Open button and the shell's open song
+ * paths alike land here, and every one of them reopens the song's synths. */
+static void song_opened_cb(void *ud)
+{
+    (void)ud;
+    reopen_song_synths();
+}
+
 static int open_tracker_tab(void)
 {
     char err[256];
@@ -642,8 +683,10 @@ static int open_tracker_tab(void)
         return 0;
     }
     g_tracker = trk_view_new(g_trk);
+    trk_view_set_embedded(g_tracker, 1);      /* the menu bar carries its commands */
     g_tracker_page = trk_view_widget(g_tracker);
     trk_view_set_sinks(g_tracker, &g_sink_api, NULL);
+    trk_view_set_song_opened(g_tracker, song_opened_cb, NULL);
     trk_view_reset(g_tracker);
     gtk_notebook_append_page(GTK_NOTEBOOK(g_notebook), g_tracker_page,
                              tab_title_widget("tracker", g_tracker_page, NULL));
@@ -695,6 +738,407 @@ static void close_tab_page(GtkWidget *page)
     if (tab) close_synth_tab(tab);
 }
 
+/* ------------------------------------------------- a song's own synths
+ *
+ * A track routed to a synth tab saves the tab's name with the song ("track N
+ * sink <name>"), and loading the song puts the name back into the track --
+ * but the tab it named is long gone, so without more the name only sits
+ * there and the track keeps its ALSA window. This is the more: each distinct
+ * name the song carries is found among the open tabs or, failing that,
+ * resolved to a plug-in path out of the same folders the browser scans,
+ * loaded in a tab of its own, and routed to. What a tab made this way plays
+ * is the plug-in's default program: the sound the track was mixed with lives
+ * in the session file, which the song knows nothing of. */
+
+static int is_dir(const char *p)
+{ struct stat st; return !stat(p, &st) && S_ISDIR(st.st_mode); }
+
+/* Where a name is looked up: the same folders plugview_scan walks, found the
+ * same way -- the corpora beside the binary, the system VST directories, and
+ * the folders the user set. plugview keeps the scan's list per pane and
+ * private to plugview.c, so the lookup walks the same places itself. Nothing
+ * is sniffed: the shape of a name (a .dll, a .vst3 bundle) is filter enough
+ * when what follows is an exact name match, and a path that will not load is
+ * caught by the load. */
+static int reopen_add_root(char roots[][1024], int n, int max, const char *path)
+{
+    /* PATH_MAX, not a size of our choosing, as in plugview: glibc's fortified
+     * realpath checks the buffer against it before resolving anything. */
+    char real[PATH_MAX];
+    int  i;
+
+    if (realpath(path, real)) path = real;
+    for (i = 0; i < n; i++) if (!strcmp(roots[i], path)) return n;
+    if (n >= max) return n;
+    snprintf(roots[n], 1024, "%s", path);
+    return n + 1;
+}
+
+static int reopen_roots(char roots[][1024], int max)
+{
+    /* The built-in corpora, as plugview's roots_discover: found by walking up
+     * from the executable. */
+    static const char *const corp[] = {
+        "windows/VST2-64", "windows/VST3",  "windows/VST2-32",
+        "linux/extracted", "macos/classic", "macos/VST2",
+        "macos/VST3",      "macos/AU",
+    };
+    /* The conventional system locations, as roots_add_standard. */
+    static const struct { const char *fmt; int home; } std[] = {
+        { "%s/.vst", 1 }, { "%s/.vst3", 1 },
+        { "/usr/lib/vst", 0 }, { "/usr/lib/vst3", 0 },
+        { "/usr/local/lib/vst", 0 }, { "/usr/local/lib/vst3", 0 },
+        { "/usr/lib/x86_64-linux-gnu/vst", 0 },
+        { "/usr/lib/x86_64-linux-gnu/vst3", 0 },
+    };
+    char    exe[1024];
+    ssize_t r = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    int     n = 0, i;
+
+    if (r > 0) {
+        int up;
+        exe[r] = 0;
+        for (up = 0; up < 6; up++) {
+            char *slash = strrchr(exe, '/');
+            if (!slash) break;
+            *slash = 0;
+            if (!exe[0]) break;
+            for (i = 0; i < (int)(sizeof corp / sizeof corp[0]); i++) {
+                char path[1024];
+                snprintf(path, sizeof path, "%s/%s", exe, corp[i]);
+                if (is_dir(path)) n = reopen_add_root(roots, n, max, path);
+            }
+        }
+    }
+    for (i = 0; i < (int)(sizeof std / sizeof std[0]); i++) {
+        char path[1024];
+        if (std[i].home) {
+            const char *home = getenv("HOME");
+            if (!home || !*home) continue;
+            snprintf(path, sizeof path, std[i].fmt, home);
+        } else {
+            snprintf(path, sizeof path, "%s", std[i].fmt);
+        }
+        if (is_dir(path)) n = reopen_add_root(roots, n, max, path);
+    }
+    /* VST_PATH and VST3_PATH are colon-separated, like PATH. */
+    {
+        static const char *const vars[] = { "VST_PATH", "VST3_PATH", NULL };
+        int v;
+        for (v = 0; vars[v]; v++) {
+            const char *e = getenv(vars[v]), *p;
+            if (!e || !*e) continue;
+            for (p = e; *p; ) {
+                const char *sep = strchr(p, ':');
+                size_t len = sep ? (size_t)(sep - p) : strlen(p);
+                char path[1024];
+                if (len && len < sizeof path) {
+                    memcpy(path, p, len);
+                    path[len] = 0;
+                    if (is_dir(path)) n = reopen_add_root(roots, n, max, path);
+                }
+                if (!sep) break;
+                p = sep + 1;
+            }
+        }
+    }
+    /* The folders the user set, from the file both windows share -- see
+     * vstdirs.h. */
+    {
+        vstdir dirs[VSTDIRS_MAX];
+        int nd = vstdirs_load(dirs, VSTDIRS_MAX);
+        for (i = 0; i < nd; i++)
+            if (is_dir(dirs[i].path)) n = reopen_add_root(roots, n, max, dirs[i].path);
+    }
+    return n;
+}
+
+/* The shapes plugview's scan lists, judged by name alone -- the content
+ * checks it also runs are for building a list to browse; here the name match
+ * below decides, and a false positive is caught by the load it leads to.
+ * Classic plug-ins carry no extension convention, so they are not matched
+ * this way at all: one of those is a "not found", not a guess. */
+static int plug_shape(const char *path, const char *nm, int isdir)
+{
+    size_t l = strlen(nm);
+
+    if (l > 5 && !g_ascii_strcasecmp(nm + l - 5, ".vst3")) return 1;
+    if (isdir)
+        return (l > 4  && !g_ascii_strcasecmp(nm + l - 4,  ".vst")) ||
+               (l > 10 && !g_ascii_strcasecmp(nm + l - 10, ".component"));
+    if (l > 4 && !g_ascii_strcasecmp(nm + l - 4, ".dll")) return 1;
+    if (l > 3 && !g_ascii_strcasecmp(nm + l - 3, ".so")) return !strstr(path, ".lv2/");
+    return 0;
+}
+
+/* Whether a scanned file is the plug-in a saved name asks for, the strict
+ * stages: the scan lists a plug-in under its file name while the song saved
+ * the name it reports, and for everything that names its file after itself
+ * the two differ only by the extension -- "Surge XT.vst3" is "Surge XT" --
+ * so the stem is compared beside the whole name, exactly first and then
+ * without case. The looser stages live in plug_near; nothing here places is
+ * guessed at, it falls through to them. */
+static int plug_named(const char *nm, const char *want, int ci)
+{
+    char stem[1024];
+    char *dot;
+
+    snprintf(stem, sizeof stem, "%s", nm);
+    if ((dot = strrchr(stem, '.')) && dot != stem) *dot = 0;
+    if (ci)
+        return !g_ascii_strcasecmp(nm, want) || !g_ascii_strcasecmp(stem, want);
+    return !strcmp(nm, want) || !strcmp(stem, want);
+}
+
+/* The name with its punctuation and case off, for the looser stages:
+ * "FB-7999" and "fb799964" have to meet. */
+static void bare_name(const char *s, char *out, size_t n)
+{
+    size_t w = 0;
+
+    for (; *s && w + 1 < n; s++)
+        if (g_ascii_isalnum(*s)) out[w++] = (char)g_ascii_tolower(*s);
+    out[w] = 0;
+}
+
+/* What one walk collects while looking for an exact match, in the order the
+ * stages are preferred: the first case-insensitive hit; the first
+ * punctuation-stripped one ("FB-7999" is fb7999.vst3); the shortest stem
+ * that is the name plus a tag of trailing digits ("blooo" is blooo64.dll);
+ * and the shortest that is the name behind a vendor's tag up front ("FM8" is
+ * NI FM8.dll). The shortest spelling wins as the least decorated -- the
+ * plug-in itself rather than its sibling editions. The same stages in the
+ * same order as the Qt shell's resolvePlugin, so a song resolves to the same
+ * plug-in in either window. */
+typedef struct {
+    const char *want;                /* the base name being resolved */
+    char        wbare[TRK_DEST_LEN]; /* it, punctuation-stripped */
+    char        ci[1024];            /* each stage's hit path, "" while none */
+    char        bare[1024];
+    char        tag[1024];
+    int         tag_len;
+    char        pre[1024];
+    int         pre_len;
+} plug_match;
+
+/* One candidate against the looser stages. */
+static void plug_near(plug_match *m, const char *path, const char *nm)
+{
+    char stem[1024], sbare[1024];
+    char *dot;
+    int  hl, wl, i;
+
+    if (!m->ci[0] && plug_named(nm, m->want, 1))
+        snprintf(m->ci, sizeof m->ci, "%s", path);
+    wl = (int)strlen(m->wbare);
+    if (!wl) return;
+    snprintf(stem, sizeof stem, "%s", nm);
+    if ((dot = strrchr(stem, '.')) && dot != stem) *dot = 0;
+    bare_name(stem, sbare, sizeof sbare);
+    hl = (int)strlen(sbare);
+    if (!m->bare[0] && !strcmp(sbare, m->wbare))
+        snprintf(m->bare, sizeof m->bare, "%s", path);
+    /* The name plus a tag of trailing digits: blooo64.dll is "Blooo". */
+    if (hl > wl && !strncmp(sbare, m->wbare, (size_t)wl)) {
+        for (i = wl; i < hl && g_ascii_isdigit(sbare[i]); i++) ;
+        if (i == hl && (!m->tag[0] || hl < m->tag_len)) {
+            snprintf(m->tag, sizeof m->tag, "%s", path);
+            m->tag_len = hl;
+        }
+    }
+    /* The name behind a vendor's tag up front: NI FM8.dll is "FM8". Names
+     * shorter than three letters are excepted -- too much ends in one. */
+    if (wl >= 3 && hl > wl && !strcmp(sbare + hl - wl, m->wbare) &&
+        (!m->pre[0] || hl < m->pre_len)) {
+        snprintf(m->pre, sizeof m->pre, "%s", path);
+        m->pre_len = hl;
+    }
+}
+
+/* One folder, walked as plugview's scan_tree walks it -- the tree, not just
+ * the top, because a native plug-in arrives as its own unpacked release with
+ * the bundle several levels down. The first exact match anywhere wins at
+ * once; everything else a candidate matches is collected in `m` for the
+ * stages to sort out when the whole walk is done. */
+static int find_in_tree(const char *dir, plug_match *m, char *out, size_t outn)
+{
+    char queue[512][1024];
+    int  head = 0, tail = 0, visited = 0;
+
+    if (!dir || !*dir) return 0;
+    snprintf(queue[tail++], sizeof queue[0], "%s", dir);
+    while (head < tail && visited < 512) {
+        char        base[1024];
+        GDir       *d;
+        const char *nm;
+
+        snprintf(base, sizeof base, "%s", queue[head++]);
+        visited++;
+        if (!(d = g_dir_open(base, 0, NULL))) continue;
+        while ((nm = g_dir_read_name(d))) {
+            char path[1024];
+            int  isdir;
+
+            if (nm[0] == '.') continue;
+            snprintf(path, sizeof path, "%s/%s", base, nm);
+            isdir = is_dir(path);
+            if (!plug_shape(path, nm, isdir)) {
+                if (isdir && tail < (int)(sizeof queue / sizeof queue[0]))
+                    snprintf(queue[tail++], sizeof queue[0], "%s", path);
+                continue;
+            }
+            if (plug_named(nm, m->want, 0)) {
+                snprintf(out, outn, "%s", path);
+                g_dir_close(d);
+                return 1;
+            }
+            plug_near(m, path, nm);
+        }
+        g_dir_close(d);
+    }
+    return 0;
+}
+
+/* The name a track saved, to the path of the plug-in that reported it. Every
+ * folder the scan would walk is tried, and the stages answer in order:
+ * exact, case-insensitive, punctuation-stripped, a tag of trailing digits,
+ * a vendor's tag up front. */
+static int find_plugin_path(const char *want, char *out, size_t outn)
+{
+    char roots[32][1024];
+    plug_match m;
+    int  nroot, i;
+
+    memset(&m, 0, sizeof m);
+    m.want = want;
+    bare_name(want, m.wbare, sizeof m.wbare);
+    nroot = reopen_roots(roots, (int)(sizeof roots / sizeof roots[0]));
+    for (i = 0; i < nroot; i++)
+        if (find_in_tree(roots[i], &m, out, outn))
+            return 1;
+    snprintf(out, outn, "%s",
+             m.ci[0]   ? m.ci   :
+             m.bare[0] ? m.bare :
+             m.tag[0]  ? m.tag  : m.pre);
+    return out[0] != 0;
+}
+
+/* "Blooo 2" back to "Blooo": the suffix unique_sink_name put on when two
+ * tabs reported one name. Only a trailing space and digits, and only when
+ * something came before them. */
+static void sink_base_name(const char *name, char *out, size_t n)
+{
+    size_t l = strlen(name), end = l;
+
+    snprintf(out, n, "%s", name);
+    while (l > 0 && g_ascii_isdigit(name[l - 1])) l--;
+    if (l < end && l > 1 && name[l - 1] == ' ') out[l - 1] = 0;
+}
+
+/* The song is loaded and its tracks name the synths they were playing. Bring
+ * those synths back: one a tab still has by exactly that name is reused, the
+ * rest are resolved, loaded in a tab each, and every track that named one is
+ * routed to it. A name nothing resolves keeps the track's ALSA fallback,
+ * untouched. */
+static void reopen_song_synths(void)
+{
+    char names[TRK_TRACKS][TRK_DEST_LEN];  /* the distinct sink names, first-seen */
+    int  tname[TRK_TRACKS];                /* each track's index into names, or -1 */
+    int  ids[TRK_TRACKS];                  /* the sink each name resolved to, or -1 */
+    char missing[TRK_TRACKS * TRK_DEST_LEN] = "";
+    char msg[4200];
+    int  nnames = 0, reopened = 0, t, i;
+
+    if (!g_trk) return;
+    trk_lock(g_trk);
+    for (t = 0; t < TRK_TRACKS; t++) {
+        const char *sn = trk_song_of(g_trk)->track[t].sink;
+        tname[t] = -1;
+        if (!*sn) continue;
+        for (i = 0; i < nnames; i++) if (!strcmp(names[i], sn)) break;
+        if (i == nnames) snprintf(names[nnames++], sizeof names[0], "%s", sn);
+        tname[t] = i;
+    }
+    trk_unlock(g_trk);
+    if (!nnames) return;      /* nothing sink-routed: nothing to do or to say */
+
+    for (i = 0; i < nnames; i++) {
+        char base[TRK_DEST_LEN], path[1024];
+        synctab *tab = NULL;
+
+        ids[i] = -1;
+        /* A tab already playing under exactly this name is the one the song
+         * meant -- no second instance of it is opened. Case is given the
+         * benefit of the doubt before a second one is, as the Qt shell's
+         * resolver does with its tab titles. */
+        for (t = 0; t < MAXTABS; t++)
+            if (g_tabs[t].used && g_tabs[t].sink_id >= 0 &&
+                !strcmp(g_tabs[t].sink_name, names[i])) {
+                ids[i] = g_tabs[t].sink_id;
+                break;
+            }
+        for (t = 0; ids[i] < 0 && t < MAXTABS; t++)
+            if (g_tabs[t].used && g_tabs[t].sink_id >= 0 &&
+                !g_ascii_strcasecmp(g_tabs[t].sink_name, names[i])) {
+                ids[i] = g_tabs[t].sink_id;
+                break;
+            }
+        if (ids[i] < 0) {
+            sink_base_name(names[i], base, sizeof base);
+            if (find_plugin_path(base, path, sizeof path) &&
+                (tab = add_synth_tab()) &&
+                plugview_load_path(tab->pv, path)) {
+                /* The load named the tab's sink after the plug-in
+                 * (ensure_sink via add_synth_tab, renamed by on_tab_loaded):
+                 * the song's full name when the uniquifier came out the same,
+                 * else the base name. The new tab answers first, or a wrong
+                 * resolution would capture an older tab's sink; a tab that
+                 * matches neither way resolved to the wrong plug-in and does
+                 * not stay. */
+                if (!strcmp(tab->sink_name, names[i]) || !strcmp(tab->sink_name, base)) {
+                    ids[i] = tab->sink_id;
+                } else {
+                    for (t = 0; t < MAXTABS; t++)
+                        if (g_tabs[t].used && g_tabs[t].sink_id >= 0 &&
+                            (!strcmp(g_tabs[t].sink_name, names[i]) ||
+                             !strcmp(g_tabs[t].sink_name, base))) {
+                            ids[i] = g_tabs[t].sink_id;
+                            break;
+                        }
+                }
+            }
+            if (ids[i] < 0) {
+                if (tab) close_synth_tab(tab);
+                snprintf(missing + strlen(missing), sizeof missing - strlen(missing),
+                         "%s%s", missing[0] ? ", " : "", names[i]);
+            }
+        }
+    }
+
+    /* Only now, with every tab that is coming made: each track that named a
+     * synth is routed to its sink. The names without an id keep what the
+     * track had. */
+    for (t = 0; t < TRK_TRACKS; t++)
+        if (tname[t] >= 0 && ids[tname[t]] >= 0)
+            trk_route_sink(g_trk, t, ids[tname[t]]);
+
+    /* The tabs opened one in front of the last; the song that asked for them
+     * is what was opened, so it is what should be showing. */
+    if (g_tracker_page)
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(g_notebook),
+            gtk_notebook_page_num(GTK_NOTEBOOK(g_notebook), g_tracker_page));
+
+    for (i = 0; i < nnames; i++)
+        if (ids[i] >= 0) reopened++;
+    snprintf(msg, sizeof msg,
+             "reopened %d synth(s) from the song (default programs -- saved "
+             "sounds live in the session file)", reopened);
+    if (missing[0])
+        snprintf(msg + strlen(msg), sizeof msg - strlen(msg),
+                 " -- not found: %s", missing);
+    status(msg);
+}
+
 static int open_song_path(const char *path)
 {
     if (!open_tracker_tab()) return 0;
@@ -704,6 +1148,8 @@ static int open_song_path(const char *path)
         status(msg);
         return 0;
     }
+    /* The tracks may name synth tabs they were playing; trk_view_open's
+     * song_opened hook (song_opened_cb) brings those back. */
     return 1;
 }
 
@@ -836,6 +1282,34 @@ static void close_all_tabs_now(void)
     if (g_tracker) tracker_close_ok(NULL);
 }
 
+/* A question that has to be answered before the next line runs: the dialog
+ * is asked and the main loop kept turning until it is. 1 for the second
+ * button, 0 for Cancel. */
+typedef struct { GMainLoop *loop; int answer; } sync_answer;
+
+static void sync_answered(GObject *src, GAsyncResult *res, gpointer u)
+{
+    sync_answer *a = u;
+    a->answer = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(src), res, NULL);
+    g_main_loop_quit(a->loop);
+}
+
+static int confirm_sync(const char *message, const char *detail, const char *yes)
+{
+    GtkAlertDialog *d = gtk_alert_dialog_new("%s", message);
+    const char *buttons[] = { "Cancel", yes, NULL };
+    sync_answer a = { g_main_loop_new(NULL, FALSE), -1 };
+    gtk_alert_dialog_set_detail(d, detail);
+    gtk_alert_dialog_set_buttons(d, buttons);
+    gtk_alert_dialog_set_cancel_button(d, 0);
+    gtk_alert_dialog_set_default_button(d, 0);
+    gtk_alert_dialog_choose(d, GTK_WINDOW(g_win), NULL, sync_answered, &a);
+    g_main_loop_run(a.loop);
+    g_main_loop_unref(a.loop);
+    g_object_unref(d);
+    return a.answer == 1;
+}
+
 /* Restore, in place of whatever was open: the tabs with their plug-ins and
  * sounds, then the song, then -- last, because they name the tabs -- the
  * routings. Anything that will not come back is said about and skipped, not
@@ -845,6 +1319,34 @@ static void restore_session(sess_file *s, const char *path)
     char msg[4200], trouble[2048] = "";
     synctab *made[MAXTABS];      /* the tab each saved synth came back as */
     int i, routed = 0;
+
+    /* A session names the plug-ins to load, and loading one runs it: a file
+     * somebody sent is not to choose what runs. The ones in folders set up
+     * for this program go ahead; any other is asked about first. */
+    if (!g_getenv("STUDIO_TRUST_SESSIONS")) {
+        GString *list = g_string_new(NULL);
+        int unknown = 0;
+        for (i = 0; i < s->nsynths && i < MAXTABS; i++) {
+            const char *pl = s->synths[i].plugin;
+            if (pl && *pl && !vstdirs_contains(pl)) {
+                g_string_append_printf(list, "%s\n", pl);
+                unknown++;
+            }
+        }
+        if (unknown) {
+            char head[160];
+            snprintf(head, sizeof head, "This session loads %d plug-in%s from outside the folders set up for studiogtk",
+                     unknown, unknown > 1 ? "s" : "");
+            g_string_append(list, "\nLoading a plug-in runs it.");
+            if (!confirm_sync(head, list->str, unknown > 1 ? "Load them" : "Load it")) {
+                g_string_free(list, TRUE);
+                sess_free(s);
+                status("session not opened -- its plug-ins were not approved");
+                return;
+            }
+        }
+        g_string_free(list, TRUE);
+    }
 
     close_all_tabs_now();
     g_session_path[0] = 0;
@@ -1057,6 +1559,77 @@ static void act_open_song(GSimpleAction *a, GVariant *p, gpointer u)
     g_object_unref(d);
 }
 
+/* A new song is worth opening the tracker tab for, exactly as Open song
+ * does -- the tab comes up (or comes to the front) and the view's own New
+ * flow runs, unsaved-changes question included. */
+static void act_new_song(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    (void)a; (void)p; (void)u;
+    if (open_tracker_tab()) trk_view_new_song(g_tracker);
+}
+
+/* Saving, unlike New, does not create the tab: with no tracker there is no
+ * song to save, so the menu answers the way the Synth menu answers when the
+ * front tab is not a synth. */
+static trk_view *tracker_or_status(void)
+{
+    if (!g_tracker) status("there is no tracker tab");
+    return g_tracker;
+}
+
+static void act_save_song(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    trk_view *v;
+    (void)a; (void)p; (void)u;
+    if ((v = tracker_or_status())) trk_view_save(v);
+}
+
+static void act_save_song_as(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    trk_view *v;
+    (void)a; (void)p; (void)u;
+    if ((v = tracker_or_status())) trk_view_save_as(v);
+}
+
+static void act_export_midi(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    trk_view *v;
+    (void)a; (void)p; (void)u;
+    if ((v = tracker_or_status())) trk_view_export_midi(v);
+}
+
+static void act_export_take(GSimpleAction *a, GVariant *p, gpointer u)
+{ trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_export_take(v); }
+static void act_trk_load_samples(GSimpleAction *a, GVariant *p, gpointer u)
+{ trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_load_samples(v); }
+static void act_trk_edit_samples(GSimpleAction *a, GVariant *p, gpointer u)
+{ trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_edit_samples(v); }
+static void act_trk_keys(GSimpleAction *a, GVariant *p, gpointer u)
+{ trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_show_keys(v); }
+static void act_trk_columns(GSimpleAction *a, GVariant *p, gpointer u)
+{ trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_show_columns(v); }
+static void act_trk_cheat(GSimpleAction *a, GVariant *p, gpointer u)
+{ trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_show_cheat(v); }
+
+/* One menu bar for every tab: File always; Synth only with a synth tab in
+ * front, Samples only with the tracker in front; Help always, with the
+ * tracker's Keys and Cheat Sheet ahead of About when the tracker is. The
+ * bar's model is edited in place and the widget follows it. */
+static void sync_menus(GtkWidget *front)
+{
+    int is_tracker = front && front == g_tracker_page;
+    int is_synth = front && !is_tracker;
+    if (!g_bar) return;
+    g_menu_remove_all(g_bar);
+    g_menu_append_submenu(g_bar, "File", G_MENU_MODEL(g_file_m));
+    if (is_synth)   g_menu_append_submenu(g_bar, "Synth", G_MENU_MODEL(g_synth_m));
+    if (is_tracker) g_menu_append_submenu(g_bar, "Samples", G_MENU_MODEL(g_samples_m));
+    g_menu_remove_all(g_help_m);
+    if (is_tracker) g_menu_append_section(g_help_m, NULL, G_MENU_MODEL(g_help_trk));
+    g_menu_append(g_help_m, "About studiogtk", "win.about");
+    g_menu_append_submenu(g_bar, "Help", G_MENU_MODEL(g_help_m));
+}
+
 static void act_quit(GSimpleAction *a, GVariant *p, gpointer u)
 { (void)a; (void)p; (void)u; gtk_window_close(GTK_WINDOW(g_win)); }
 
@@ -1158,6 +1731,266 @@ static void act_plugin_folders(GSimpleAction *a, GVariant *p, gpointer u)
 { synctab *t; (void)a; (void)p; (void)u;
   if ((t = synth_or_status())) plugview_edit_folders(t->pv, GTK_WINDOW(g_win)); }
 
+/* File > Plug-in folders: the same dialog, from whichever tab is in front --
+ * and with none open, from a new synth tab, which is what the dialog's
+ * rescans land in. A setting is not to be out of reach until a synth is. */
+static void act_plugin_folders_any(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    synctab *t = g_front;
+    int i;
+    (void)a; (void)p; (void)u;
+    for (i = 0; !t && i < MAXTABS; i++) if (g_tabs[i].used) t = &g_tabs[i];
+    if (!t) t = add_synth_tab();
+    if (t) plugview_edit_folders(t->pv, GTK_WINDOW(g_win));
+}
+
+/* ------------------------------------------------------- plug-in manager --
+ *
+ * File > Plug-ins: every plug-in the scan found, in one list -- loaded into a
+ * new tab, unloaded (the tab that holds it is closed), or taken off the list.
+ * Taking one off does not delete its file: the path goes in the hidden list
+ * and the scans skip it, until it is put back. */
+
+typedef struct {
+    GtkWidget *win, *list, *search, *loadb, *unloadb, *removeb, *show_removed, *note;
+    int        removed_view;                 /* the list shows what was taken off */
+} plugmgr;
+
+static plugmgr *g_pm;
+
+/* The pane whose scan the list reads: any synth tab will do, they all scan the
+ * same folders. */
+static synctab *any_synth_tab(int make)
+{
+    int i;
+    for (i = 0; i < MAXTABS; i++) if (g_tabs[i].used) return &g_tabs[i];
+    return make ? add_synth_tab() : NULL;
+}
+
+static synctab *tab_holding(const char *path)
+{
+    int i;
+    for (i = 0; i < MAXTABS; i++)
+        if (g_tabs[i].used && !strcmp(plugview_loaded_path(g_tabs[i].pv), path)) return &g_tabs[i];
+    return NULL;
+}
+
+static const char *pm_selected_path(void)
+{
+    GtkListBoxRow *row = gtk_list_box_get_selected_row(GTK_LIST_BOX(g_pm->list));
+    return row ? g_object_get_data(G_OBJECT(row), "path") : NULL;
+}
+
+static void pm_sync_buttons(void)
+{
+    const char *p = pm_selected_path();
+    int loaded = p && tab_holding(p);
+    gtk_widget_set_sensitive(g_pm->loadb, p && !g_pm->removed_view);
+    gtk_widget_set_sensitive(g_pm->unloadb, loaded && !g_pm->removed_view);
+    gtk_widget_set_sensitive(g_pm->removeb, p != NULL);
+    gtk_button_set_label(GTK_BUTTON(g_pm->removeb), g_pm->removed_view ? "Put back" : "Remove from list");
+}
+
+static void pm_refill(void)
+{
+    synctab *t = any_synth_tab(0);
+    const char *needle = gtk_editable_get_text(GTK_EDITABLE(g_pm->search));
+    GtkWidget *c;
+    int i, shown = 0, total = 0;
+    char note[160];
+
+    while ((c = gtk_widget_get_first_child(g_pm->list))) gtk_list_box_remove(GTK_LIST_BOX(g_pm->list), c);
+
+    if (g_pm->removed_view) {
+        static char hid[512][VSTDIRS_PATHLEN];
+        int n = vstdirs_hidden_list(hid, 512);
+        for (i = 0; i < n; i++) {
+            const char *base = strrchr(hid[i], '/');
+            char *label;
+            GtkWidget *row, *l;
+            total++;
+            if (*needle && !g_strrstr(hid[i], needle)) continue;
+            label = g_strdup_printf("%s   (%s)", base ? base + 1 : hid[i], hid[i]);
+            l = gtk_label_new(label);
+            gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
+            row = gtk_list_box_row_new();
+            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), l);
+            g_object_set_data_full(G_OBJECT(row), "path", g_strdup(hid[i]), g_free);
+            gtk_list_box_append(GTK_LIST_BOX(g_pm->list), row);
+            g_free(label);
+            shown++;
+        }
+        snprintf(note, sizeof note, "%d of %d plug-ins taken off the list", shown, total);
+    } else if (t) {
+        int n = plugview_available_count(t->pv);
+        for (i = 0; i < n; i++) {
+            const char *path = NULL, *name = NULL, *kind = NULL;
+            int loadable = 0;
+            char *label, *esc;
+            GtkWidget *row, *l;
+            plugview_available(t->pv, i, &path, &name, &kind, &loadable);
+            total++;
+            if (*needle && !g_strrstr(name, needle) && !g_strrstr(path, needle)) continue;
+            esc = g_markup_escape_text(name, -1);
+            label = g_strdup_printf("%s%s%s%s%s", tab_holding(path) ? "<b>● " : "", esc,
+                                    tab_holding(path) ? "</b>   loaded" : "",
+                                    kind && *kind ? "   <small>" : "", "");
+            if (kind && *kind) {
+                char *k = g_markup_escape_text(kind, -1), *tmp = g_strdup_printf("%s%s</small>", label, k);
+                g_free(label); g_free(k); label = tmp;
+            }
+            l = gtk_label_new(NULL);
+            gtk_label_set_markup(GTK_LABEL(l), label);
+            gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
+            if (!loadable) gtk_widget_set_opacity(l, 0.55);
+            row = gtk_list_box_row_new();
+            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), l);
+            gtk_widget_set_tooltip_text(row, path);
+            g_object_set_data_full(G_OBJECT(row), "path", g_strdup(path), g_free);
+            gtk_list_box_append(GTK_LIST_BOX(g_pm->list), row);
+            g_free(label); g_free(esc);
+            shown++;
+        }
+        snprintf(note, sizeof note, "%d of %d plug-ins available", shown, total);
+    } else {
+        snprintf(note, sizeof note, "no list yet -- open a synth tab to scan");
+    }
+    gtk_label_set_text(GTK_LABEL(g_pm->note), note);
+    pm_sync_buttons();
+}
+
+static void pm_on_search(GtkEditable *e, gpointer u) { (void)e; (void)u; if (g_pm) pm_refill(); }
+static void pm_on_select(GtkListBox *b, GtkListBoxRow *r, gpointer u) { (void)b; (void)r; (void)u; if (g_pm) pm_sync_buttons(); }
+
+static void pm_on_load(GtkButton *b, gpointer u)
+{
+    const char *p = pm_selected_path();
+    synctab *tab;
+    (void)b; (void)u;
+    if (!p) return;
+    if ((tab = tab_holding(p))) {                         /* already open: bring it forward */
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(g_notebook),
+            gtk_notebook_page_num(GTK_NOTEBOOK(g_notebook), tab->pane));
+        return;
+    }
+    if (!(tab = add_synth_tab())) return;
+    if (!plugview_load_path(tab->pv, p)) {
+        close_synth_tab(tab);
+        status("that plug-in could not be loaded");
+    }
+    pm_refill();
+}
+
+static void pm_on_unload(GtkButton *b, gpointer u)
+{
+    const char *p = pm_selected_path();
+    synctab *tab;
+    (void)b; (void)u;
+    if (p && (tab = tab_holding(p))) close_synth_tab(tab);
+    pm_refill();
+}
+
+static void pm_rescan_all(void)
+{
+    int i;
+    for (i = 0; i < MAXTABS; i++) if (g_tabs[i].used) plugview_rescan(g_tabs[i].pv);
+}
+
+static void pm_on_remove(GtkButton *b, gpointer u)
+{
+    char *p = g_strdup(pm_selected_path());
+    (void)b; (void)u;
+    if (!p) return;
+    if (g_pm->removed_view) vstdirs_unhide(p);
+    else vstdirs_hide(p);
+    pm_rescan_all();
+    pm_refill();
+    g_free(p);
+}
+
+static void pm_on_rescan(GtkButton *b, gpointer u) { (void)b; (void)u; pm_rescan_all(); pm_refill(); }
+
+static void pm_on_toggle(GtkCheckButton *c, gpointer u)
+{
+    (void)u;
+    g_pm->removed_view = gtk_check_button_get_active(c);
+    pm_refill();
+}
+
+static void pm_gone(GtkWidget *w, gpointer u) { (void)w; (void)u; g_free(g_pm); g_pm = NULL; }
+
+static void act_plugin_manager(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    GtkWidget *box, *sw, *row, *close;
+    (void)a; (void)p; (void)u;
+    if (g_pm) { gtk_window_present(GTK_WINDOW(g_pm->win)); return; }
+    if (!any_synth_tab(1)) return;                        /* the scan lives in a synth pane */
+    g_pm = g_new0(plugmgr, 1);
+    g_pm->win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(g_pm->win), "Plug-ins");
+    gtk_window_set_transient_for(GTK_WINDOW(g_pm->win), GTK_WINDOW(g_win));
+    gtk_window_set_default_size(GTK_WINDOW(g_pm->win), 640, 520);
+    g_signal_connect(g_pm->win, "destroy", G_CALLBACK(pm_gone), NULL);
+
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(box, 12); gtk_widget_set_margin_end(box, 12);
+    gtk_widget_set_margin_top(box, 12);   gtk_widget_set_margin_bottom(box, 12);
+    g_pm->search = gtk_search_entry_new();
+    gtk_editable_set_text(GTK_EDITABLE(g_pm->search), "");
+    g_signal_connect(g_pm->search, "search-changed", G_CALLBACK(pm_on_search), NULL);
+    gtk_box_append(GTK_BOX(box), g_pm->search);
+
+    g_pm->list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g_pm->list), GTK_SELECTION_SINGLE);
+    g_signal_connect(g_pm->list, "row-selected", G_CALLBACK(pm_on_select), NULL);
+    sw = gtk_scrolled_window_new();
+    gtk_widget_set_vexpand(sw, TRUE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), g_pm->list);
+    gtk_box_append(GTK_BOX(box), sw);
+
+    g_pm->note = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(g_pm->note), 0.0f);
+    gtk_widget_add_css_class(g_pm->note, "dim-label");
+    gtk_box_append(GTK_BOX(box), g_pm->note);
+
+    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    g_pm->loadb = gtk_button_new_with_label("Load");
+    g_pm->unloadb = gtk_button_new_with_label("Unload");
+    g_pm->removeb = gtk_button_new_with_label("Remove from list");
+    gtk_widget_set_tooltip_text(g_pm->unloadb, "Closes the tab that has this plug-in open");
+    gtk_widget_set_tooltip_text(g_pm->removeb, "Takes it off the list. The file stays where it is; "
+                                               "Show removed lets you put it back");
+    g_signal_connect(g_pm->loadb, "clicked", G_CALLBACK(pm_on_load), NULL);
+    g_signal_connect(g_pm->unloadb, "clicked", G_CALLBACK(pm_on_unload), NULL);
+    g_signal_connect(g_pm->removeb, "clicked", G_CALLBACK(pm_on_remove), NULL);
+    gtk_box_append(GTK_BOX(row), g_pm->loadb);
+    gtk_box_append(GTK_BOX(row), g_pm->unloadb);
+    gtk_box_append(GTK_BOX(row), g_pm->removeb);
+    g_pm->show_removed = gtk_check_button_new_with_label("Show removed");
+    g_signal_connect(g_pm->show_removed, "toggled", G_CALLBACK(pm_on_toggle), NULL);
+    gtk_box_append(GTK_BOX(row), g_pm->show_removed);
+    {
+        GtkWidget *rescan = gtk_button_new_with_label("Rescan");
+        GtkWidget *spacer = gtk_label_new("");
+        g_signal_connect(rescan, "clicked", G_CALLBACK(pm_on_rescan), NULL);
+        gtk_widget_set_hexpand(spacer, TRUE);
+        gtk_box_append(GTK_BOX(row), spacer);
+        gtk_box_append(GTK_BOX(row), rescan);
+    }
+    close = gtk_button_new_with_label("Close");
+    g_signal_connect_swapped(close, "clicked", G_CALLBACK(gtk_window_destroy), g_pm->win);
+    gtk_box_append(GTK_BOX(row), close);
+    gtk_box_append(GTK_BOX(box), row);
+
+    gtk_window_set_child(GTK_WINDOW(g_pm->win), box);
+    pm_refill();
+    gtk_window_present(GTK_WINDOW(g_pm->win));
+}
+
+static void act_keep_folder(GSimpleAction *a, GVariant *p, gpointer u)
+{ synctab *t; (void)a; (void)p; (void)u;
+  if ((t = synth_or_status())) plugview_keep_folder(t->pv); }
+
 static void act_enter_key(GSimpleAction *a, GVariant *p, gpointer u)
 { synctab *t; (void)a; (void)p; (void)u;
   if ((t = synth_or_status())) plugview_enter_key(t->pv, GTK_WINDOW(g_win)); }
@@ -1234,7 +2067,12 @@ static GtkWidget *build_menubar(GtkApplication *app)
     static const GActionEntry entries[] = {
         { "new-synth",   act_new_synth,   NULL, NULL, NULL, {0} },
         { "new-tracker", act_new_tracker, NULL, NULL, NULL, {0} },
+        { "new-song",    act_new_song,    NULL, NULL, NULL, {0} },
         { "open-song",   act_open_song,   NULL, NULL, NULL, {0} },
+        { "save-song",   act_save_song,   NULL, NULL, NULL, {0} },
+        { "save-song-as", act_save_song_as, NULL, NULL, NULL, {0} },
+        { "export-midi",  act_export_midi,  NULL, NULL, NULL, {0} },
+        { "export-take",  act_export_take,  NULL, NULL, NULL, {0} },
         { "open-session",    act_open_session,    NULL, NULL, NULL, {0} },
         { "save-session",    act_save_session,    NULL, NULL, NULL, {0} },
         { "save-session-as", act_save_session_as, NULL, NULL, NULL, {0} },
@@ -1246,10 +2084,18 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "save-patch",  act_save_patch,  NULL, NULL, NULL, {0} },
         { "open-patch",  act_open_patch,  NULL, NULL, NULL, {0} },
         { "plugin-folders", act_plugin_folders, NULL, NULL, NULL, {0} },
+        { "plugin-folders-any", act_plugin_folders_any, NULL, NULL, NULL, {0} },
+        { "keep-folder", act_keep_folder, NULL, NULL, NULL, {0} },
+        { "plugin-manager", act_plugin_manager, NULL, NULL, NULL, {0} },
         { "enter-key",   act_enter_key,   NULL, NULL, NULL, {0} },
         { "toggle-editor", act_toggle_editor, NULL, NULL, NULL, {0} },
         { "panic",       act_panic,       NULL, NULL, NULL, {0} },
         { "about",       act_about,       NULL, NULL, NULL, {0} },
+        { "tracker-load-samples", act_trk_load_samples, NULL, NULL, NULL, {0} },
+        { "tracker-edit-samples", act_trk_edit_samples, NULL, NULL, NULL, {0} },
+        { "tracker-keys",         act_trk_keys,         NULL, NULL, NULL, {0} },
+        { "tracker-columns",      act_trk_columns,      NULL, NULL, NULL, {0} },
+        { "tracker-cheat",        act_trk_cheat,        NULL, NULL, NULL, {0} },
     };
     GMenu *bar   = g_menu_new();
     GMenu *file  = g_menu_new();
@@ -1282,6 +2128,10 @@ static GtkWidget *build_menubar(GtkApplication *app)
                                           (const char *[]){ "<Control>s", NULL });
     gtk_application_set_accels_for_action(app, "win.open-patch",
                                           (const char *[]){ "<Control>p", NULL });
+    /* Save song wanted Ctrl+S, but that is Save Patch's: an application
+     * accel names one action, so the song takes the shifted chord. */
+    gtk_application_set_accels_for_action(app, "win.save-song",
+                                          (const char *[]){ "<Control><Shift>s", NULL });
     gtk_application_set_accels_for_action(app, "win.plugin-folders",
                                           (const char *[]){ "<Control>d", NULL });
     gtk_application_set_accels_for_action(app, "win.enter-key",
@@ -1294,15 +2144,22 @@ static GtkWidget *build_menubar(GtkApplication *app)
 
     g_menu_append(file, "New synth…",  "win.new-synth");
     g_menu_append(file, "New tracker", "win.new-tracker");
+    g_menu_append(file, "New song",    "win.new-song");
     g_menu_append(file, "Open song…",  "win.open-song");
+    g_menu_append(file, "Save song",     "win.save-song");
+    g_menu_append(file, "Save song as…", "win.save-song-as");
+    g_menu_append(file, "Export song as MIDI…", "win.export-midi");
+    g_menu_append(file, "Export recorded take as MIDI…", "win.export-take");
     g_menu_append(sess, "Open session…",    "win.open-session");
     g_menu_append(sess, "Save session",     "win.save-session");
     g_menu_append(sess, "Save session as…", "win.save-session-as");
     g_menu_append_section(file, NULL, G_MENU_MODEL(sess));
+    g_menu_append(sect, "Plug-ins…", "win.plugin-manager");
+    g_menu_append(sect, "Plug-in folders…", "win.plugin-folders-any");
     g_menu_append(sect, "Close tab",   "win.close-tab");
     g_menu_append(sect, "Quit",        "win.quit");
     g_menu_append_section(file, NULL, G_MENU_MODEL(sect));
-    g_menu_append_submenu(bar, "File", G_MENU_MODEL(file));
+    g_file_m = file;
 
     g_menu_append(synth, "Open VST…",   "win.open-vst");
     g_menu_append(synth, "Reload Plug-in", "win.reload-plugin");
@@ -1310,19 +2167,28 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append(synth, "Save Patch…", "win.save-patch");
     g_menu_append(synth, "Open Patch…", "win.open-patch");
     g_menu_append(s2, "Plug-in Folders…", "win.plugin-folders");
+    g_menu_append(s2, "Keep This Plug-in's Folder", "win.keep-folder");
     g_menu_append(s2, "Enter Key / Serial…", "win.enter-key");
     g_menu_append_section(synth, NULL, G_MENU_MODEL(s2));
     g_menu_append(synth, "Parameters / Editor", "win.toggle-editor");
     g_menu_append(synth, "All Notes Off", "win.panic");
-    g_menu_append_submenu(bar, "Synth", G_MENU_MODEL(synth));
+    g_synth_m = synth;
 
-    g_menu_append(help, "About studiogtk", "win.about");
-    g_menu_append_submenu(bar, "Help", G_MENU_MODEL(help));
+    g_samples_m = g_menu_new();
+    g_menu_append(g_samples_m, "Load Sample Set…", "win.tracker-load-samples");
+    g_menu_append(g_samples_m, "Edit Sample Set…", "win.tracker-edit-samples");
+    g_help_trk = g_menu_new();
+    g_menu_append(g_help_trk, "Keys", "win.tracker-keys");
+    g_menu_append(g_help_trk, "Columns", "win.tracker-columns");
+    g_menu_append(g_help_trk, "Cheat Sheet", "win.tracker-cheat");
+    g_help_m = help;
+    g_bar = bar;
+    sync_menus(NULL);                    /* no tab yet: File and Help */
 
     w = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(bar));
     gtk_widget_set_halign(w, GTK_ALIGN_START);
-    g_object_unref(help); g_object_unref(s2); g_object_unref(synth);
-    g_object_unref(sect); g_object_unref(sess); g_object_unref(file); g_object_unref(bar);
+    g_object_unref(s2);
+    g_object_unref(sect); g_object_unref(sess);   /* the rest are kept: sync_menus re-adds them */
     return w;
 }
 

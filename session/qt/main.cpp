@@ -69,13 +69,15 @@ public:
         setWindowTitle("studio -- vst-ace session");
         resize(1280, 800);
 
-        /* The File and Help menus the window itself owns. Everything else on
-         * the menu bar belongs to a tab -- see addMenu. */
+        /* The File and Help menus the window itself owns. The tabs' menus
+         * merge into these by title -- see addMenu -- and unlike a tab's
+         * share they never leave the bar and are never hidden by syncMenus. */
         QMenu *file = menuBar()->addMenu("&File");
         file->addAction("New &synth...", this, &SessionShell::newSynth);
         newTracker_ = file->addAction("New &tracker", this, &SessionShell::newTracker);
-        file->addAction("&Open song...", this, &SessionShell::openSong);
-        file->addSeparator();
+        openSongAct_ = file->addAction("&Open song...", this, &SessionShell::openSong);
+        /* Where a tab's own File items go -- see attributeMenus. */
+        fileAnchor_ = file->addSeparator();
         file->addAction("Op&en session...", this, &SessionShell::openSession);
         file->addAction("&Save session", this, &SessionShell::saveSession);
         file->addAction("Save session &as...", this, &SessionShell::saveSessionAs);
@@ -83,10 +85,18 @@ public:
         reloadAct_ = file->addAction("&Reload plug-in", this, &SessionShell::reloadPlugin);
         reloadAct_->setEnabled(false);
         file->addSeparator();
+        /* Plug-in folders from the window itself: a setting is not to be out of
+         * reach until a synth tab is in front. */
+        file->addAction("&Plug-ins...", this, &SessionShell::pluginManager);
+        file->addAction("Plug-in &folders...", this, &SessionShell::pluginFolders);
+        file->addSeparator();
         QAction *quit = file->addAction("&Quit", QKeySequence::Quit, this, &QWidget::close);
 
         QMenu *help = menuBar()->addMenu("&Help");
-        help->addAction("&About studio", this, &SessionShell::about);
+        helpAnchor_ = help->addAction("&About studio", this, &SessionShell::about);
+        fileMenu_ = file;
+        helpMenu_ = help;
+        shellMenus_ << file << help;
 
         /* No tabs at start: the canvas opens blank, with the way in said on
          * it. The stack is the hint page until the first tab exists. */
@@ -134,6 +144,8 @@ public:
     bool openTracker() { return addTrackerTab() != nullptr; }
     bool openSongPath(const QString &path)
     {
+        /* openPath tells the host -- songOpened below -- so the tracker
+         * tab's own File > Open takes the same road as this one. */
         TrackerWidget *t = addTrackerTab();
         return t && t->openPath(path);
     }
@@ -157,6 +169,27 @@ public:
             fflush(stderr);
             return false;
         }
+        /* A session names the plug-ins to load, and loading one runs it: a
+         * file somebody sent is not to choose what runs. The ones in folders
+         * set up for this program go ahead; any other is asked about. */
+        {
+            QStringList unknown;
+            for (int i = 0; i < s->nsynths && i < 16; i++) {
+                const char *pl = s->synths[i].plugin;
+                if (pl && *pl && !vstdirs_contains(pl)) unknown << QString::fromLocal8Bit(pl);
+            }
+            if (!unknown.isEmpty() && !qEnvironmentVariableIsSet("STUDIO_TRUST_SESSIONS") &&
+                QMessageBox::question(this, "Open session",
+                    QString("This session loads %1 plug-in%2 from outside the folders "
+                            "set up for studio. Loading a plug-in runs it.\n\n%3\n\nLoad %4?")
+                        .arg(unknown.size()).arg(unknown.size() > 1 ? "s" : "")
+                        .arg(unknown.join("\n"), unknown.size() > 1 ? "them" : "it"),
+                    QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) {
+                sess_free(s);
+                statusBar()->showMessage("session not opened -- its plug-ins were not approved", 5000);
+                return false;
+            }
+        }
         if (!closeAllTabs()) {
             sess_free(s);
             statusBar()->showMessage("session not opened -- the song was kept", 5000);
@@ -168,7 +201,12 @@ public:
         sessionPath_.clear();
         QStringList trouble;
         QList<HostWidget *> made;            /* the tab each saved synth came back as */
-        for (int i = 0; i < s->nsynths; i++) {
+        /* A file is not to choose how many windows and helper processes open:
+         * the GTK shell stops at MAXTABS, and so does this. */
+        static const int kMaxSynthTabs = 16;
+        if (s->nsynths > kMaxSynthTabs)
+            trouble << QString("%1 synths past the %2-tab limit").arg(s->nsynths - kMaxSynthTabs).arg(kMaxSynthTabs);
+        for (int i = 0; i < s->nsynths && i < kMaxSynthTabs; i++) {
             made << nullptr;
             if (!s->synths[i].plugin || !*s->synths[i].plugin) continue;
             const QString plugin = QString::fromLocal8Bit(s->synths[i].plugin);
@@ -330,17 +368,149 @@ public:
     void showStatus(const QString &msg, int ms) override { statusMessage(msg, ms); }
     void requestQuit() override { close(); }
 
-    /* A tab's menus are added where it asks, while it is being constructed:
-     * building_ marks that window, and the menus collected go to the tab once
-     * it exists, so closing the tab can take them off the bar again. They stay
-     * put while the tab lives rather than following the current tab -- a menu
-     * that appears and disappears as tabs are switched is where actions go to
-     * be lost. */
+    /* The menus of every tab share one menu bar, merged by title: a tab
+     * asking for "File" gets the window's own File menu, "About" lands in
+     * "Help", and only a title nobody has yet -- "Settings", "Samples" --
+     * opens a new menu. What a tab added to a merged menu is remembered per
+     * tab (see attributeMenus), and syncMenus shows exactly the current
+     * tab's share, so there is one File menu whose contents follow the tab
+     * in front -- and one live Ctrl+O, Ctrl+S and Ctrl+Q at a time, since a
+     * background tab's actions are disabled as well as invisible. */
     QMenu *addMenu(const QString &title) override
     {
-        QMenu *m = menuBar()->addMenu(title);
-        if (building_) pendingMenus_ << m;
+        const QString key = menuKey(title);
+        const QList<QAction *> bar = menuBar()->actions();
+        for (QAction *a : bar) {
+            QMenu *m = a->menu();
+            if (m && menuKey(m->title()) == key) {
+                noteHandout(m);
+                return m;
+            }
+        }
+        /* A tab's own menu goes before Help, which stays last as a menu bar
+         * has it: File, Samples, Help -- not File, Help, Samples. */
+        QMenu *m = new QMenu(title, menuBar());
+        menuBar()->insertMenu(helpMenu_ ? helpMenu_->menuAction() : nullptr, m);
+        noteHandout(m);
         return m;
+    }
+
+    /* Titles compare without the accelerator marker, and the host's "About"
+     * is the shell's "Help". */
+    static QString menuKey(QString title)
+    {
+        title.remove('&');
+        if (title == "About") title = QStringLiteral("Help");
+        return title;
+    }
+
+    /* While a tab is being built, each menu handed out is remembered with
+     * the action count it had at hand-out: everything past that index when
+     * construction finishes is this tab's. Only the first hand-out per
+     * build counts -- a menu a tab asks for twice is still one span. */
+    void noteHandout(QMenu *m)
+    {
+        if (!building_) return;
+        for (const auto &p : pendingStarts_)
+            if (p.first == m) return;
+        pendingStarts_.append({ m, m->actions().count() });
+    }
+
+    /* Called once a tab's constructor has run: everything a handed-out menu
+     * gained past its snapshot is attributed to the tab. The tab's own Quit
+     * is dropped on the way -- the window's File > Quit already closes the
+     * shell, which is what both widgets' Quit did all along: the tracker's
+     * goes through requestQuit, the host's closes its top-level window, and
+     * both arrive at this window's closeEvent. */
+    void attributeMenus(QWidget *tab)
+    {
+        QList<QPair<QMenu *, QAction *>> acts;
+        for (const auto &p : pendingStarts_) {
+            QMenu *m = p.first;
+            /* A copy: the Quit drop below edits the menu being walked. */
+            const QList<QAction *> all = m->actions();
+            for (int i = p.second; i < all.count(); i++) {
+                QAction *a = all.at(i);
+                if (a->shortcut() == QKeySequence(QKeySequence::Quit) &&
+                    QString(a->text()).remove('&') == "Quit") {
+                    m->removeAction(a);
+                    delete a;
+                    continue;
+                }
+                acts.append({ m, a });
+            }
+        }
+        pendingStarts_.clear();
+        arrangeShare(acts, qobject_cast<TrackerWidget *>(tab) != nullptr);
+        actionsOf_[tab] = acts;
+    }
+
+    /* A tab's items arrive at the end of the merged menus, which for File is
+     * after Quit. They are moved to where they belong: a tab's File items go
+     * after the window's New and Open and before the session group, its Help
+     * items ahead of About, and the separator it left before Quit is
+     * dropped. The
+     * tracker's song commands are named for what they act on, because beside
+     * "New synth" a bare "New" says nothing. */
+    void arrangeShare(QList<QPair<QMenu *, QAction *>> &acts, bool tracker)
+    {
+        static const QHash<QString, QString> songNames = {
+            { "New", "New song" }, { "Open…", "Open song…" }, { "Save", "Save song" },
+            { "Save As…", "Save song as…" }, { "Export MIDI…", "Export song as MIDI…" },
+        };
+        /* Separators closing a tab's File items are the tab's own Quit gap. */
+        for (int i = acts.count() - 1; i >= 0; i--) {
+            QMenu *m = acts.at(i).first;
+            QAction *a = acts.at(i).second;
+            if (m != fileMenu_) continue;
+            if (!a->isSeparator()) break;
+            m->removeAction(a);
+            delete a;
+            acts.removeAt(i);
+        }
+        for (const auto &p : acts) {
+            QMenu *m = p.first;
+            QAction *a = p.second;
+            if (m == fileMenu_) {
+                if (tracker) {
+                    const auto it = songNames.constFind(QString(a->text()).remove('&'));
+                    if (it != songNames.constEnd()) a->setText(it.value());
+                }
+                m->insertAction(fileAnchor_, a);
+            } else if (helpMenu_ && m == helpMenu_) {
+                m->insertAction(helpAnchor_, a);
+            }
+        }
+    }
+
+    /* The menu bar follows the tab in front: each tab's actions show only
+     * while it is current, and are disabled besides, so a background tab's
+     * shortcuts answer nothing. A merged menu with nobody showing leaves
+     * the bar until some tab has something visible in it again; the shell's
+     * own File and Help stay always. Tab moves need nothing here --
+     * visibility is keyed on the widget, not the index. */
+    void syncMenus()
+    {
+        QWidget *cur = tabs_->currentWidget();
+        /* The tracker in front has its own Open song; one is enough. */
+        if (openSongAct_) openSongAct_->setVisible(!(tracker_ && cur == tracker_));
+        for (auto it = actionsOf_.constBegin(); it != actionsOf_.constEnd(); ++it) {
+            const bool on = it.key() == cur;
+            for (const auto &p : it.value()) {
+                p.second->setVisible(on);
+                p.second->setEnabled(on);
+            }
+        }
+        const QList<QAction *> bar = menuBar()->actions();
+        for (QAction *a : bar) {
+            QMenu *m = a->menu();
+            if (!m || shellMenus_.contains(m)) continue;
+            bool any = false;
+            const QList<QAction *> acts = m->actions();
+            for (QAction *ma : acts)
+                if (ma->isVisible()) { any = true; break; }
+            a->setVisible(any);
+        }
     }
 
     /* -- TrackerHost: the synth tabs as in-process tracker destinations ---- */
@@ -361,6 +531,9 @@ public:
         for (const SinkEntry &s : sinks_)
             if (s.name == name) { trk_route_sink(trkEngine_, track, s.id); return; }
     }
+    /* A song was loaded -- the shell's Open, the tracker tab's own, or the
+     * command line -- so the synths its sink lines name come back too. */
+    void songOpened() override { reopenSongSynths(); }
 
 protected:
     void closeEvent(QCloseEvent *e) override
@@ -399,12 +572,11 @@ private:
         if (sawHost_) HostWidget::clearCrashMarker();
         sawHost_ = true;
         /* Menus are built inside the constructor, before there is a widget to
-         * own them -- collected under building_ and handed over after. */
+         * own them -- collected under building_ and attributed after. */
         building_ = true;
         auto *h = new HostWidget(this);
         building_ = false;
-        menusOf_[h] = pendingMenus_;
-        pendingMenus_.clear();
+        attributeMenus(h);
 
         const int ix = tabs_->addTab(h, title.isEmpty() ? QString("synth") : title);
         /* Which plug-in is loaded, on the tab. HostWidget sets its widget
@@ -420,6 +592,7 @@ private:
         ensureSink(h);               // a destination the tracker can play directly
         tabs_->setCurrentIndex(ix);
         updateCanvas();
+        syncMenus();        /* currentChanged can fire before the attribution */
         return h;
     }
 
@@ -446,8 +619,7 @@ private:
         building_ = true;
         auto *t = new TrackerWidget(trkEngine_, this);
         building_ = false;
-        menusOf_[t] = pendingMenus_;
-        pendingMenus_.clear();
+        attributeMenus(t);
         tracker_ = t;
         const int ix = tabs_->addTab(t, t->windowTitle());
         connect(t, &QWidget::windowTitleChanged, this, [this, t](const QString &s) {
@@ -459,16 +631,264 @@ private:
          * so a second tab would only be two faces of one song. */
         newTracker_->setEnabled(false);
         updateCanvas();
+        syncMenus();        /* currentChanged can fire before the attribution */
         return t;
     }
 
     void newSynth() { addSynthTab(); }
+    /* File > Plug-in folders: the dialog of the synth tab in front or, failing
+     * that, any other -- and with none open, a new one, which is where its
+     * rescans land. */
+    /* The tab holding this plug-in, or none. */
+    HostWidget *hostHolding(const QString &path)
+    {
+        for (int i = 0; i < tabs_->count(); i++) {
+            auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
+            if (h && h->loadedPluginPath() == path) return h;
+        }
+        return nullptr;
+    }
+
+    HostWidget *anyHost(bool make)
+    {
+        HostWidget *h = qobject_cast<HostWidget *>(tabs_->currentWidget());
+        for (int i = 0; !h && i < tabs_->count(); i++) h = qobject_cast<HostWidget *>(tabs_->widget(i));
+        return h ? h : (make ? addSynthTab() : nullptr);
+    }
+
+    /* File > Plug-ins: every plug-in the scan found, in one list -- loaded into
+     * a new tab, unloaded (the tab that holds it is closed), or taken off the
+     * list. Taking one off does not delete its file: the path goes in the
+     * hidden list and the scans skip it, until it is put back. */
+    void pluginManager()
+    {
+        if (pluginMgr_) { pluginMgr_->raise(); pluginMgr_->activateWindow(); return; }
+        if (!anyHost(true)) return;               // the scan lives in a synth tab
+        auto *d = new QDialog(this);
+        d->setAttribute(Qt::WA_DeleteOnClose);
+        d->setWindowTitle("Plug-ins");
+        d->resize(640, 520);
+        auto *v = new QVBoxLayout(d);
+        auto *search = new QLineEdit;
+        search->setPlaceholderText("Search");
+        search->setClearButtonEnabled(true);
+        auto *list = new QListWidget;
+        auto *note = new QLabel;
+        note->setEnabled(false);
+        auto *row = new QHBoxLayout;
+        auto *load = new QPushButton("Load");
+        auto *unload = new QPushButton("Unload");
+        auto *remove = new QPushButton("Remove from list");
+        unload->setToolTip("Closes the tab that has this plug-in open");
+        remove->setToolTip("Takes it off the list. The file stays where it is; "
+                           "Show removed lets you put it back");
+        auto *showRemoved = new QCheckBox("Show removed");
+        auto *rescan = new QPushButton("Rescan");
+        auto *close = new QPushButton("Close");
+        for (QWidget *w : std::initializer_list<QWidget *>{ load, unload, remove, showRemoved })
+            row->addWidget(w);
+        row->addStretch(1);
+        row->addWidget(rescan);
+        row->addWidget(close);
+        v->addWidget(search);
+        v->addWidget(list, 1);
+        v->addWidget(note);
+        v->addLayout(row);
+
+        auto selected = [list]() -> QString {
+            QListWidgetItem *it = list->currentItem();
+            return it ? it->data(Qt::UserRole).toString() : QString();
+        };
+        auto sync = [=] {
+            const QString p = selected();
+            load->setEnabled(!p.isEmpty() && !showRemoved->isChecked());
+            unload->setEnabled(!p.isEmpty() && !showRemoved->isChecked() && hostHolding(p));
+            remove->setEnabled(!p.isEmpty());
+            remove->setText(showRemoved->isChecked() ? "Put back" : "Remove from list");
+        };
+        auto refill = [=] {
+            const QString needle = search->text();
+            list->clear();
+            int shown = 0, total = 0;
+            if (showRemoved->isChecked()) {
+                std::unique_ptr<char[][VSTDIRS_PATHLEN]> hid(new char[512][VSTDIRS_PATHLEN]);
+                const int n = vstdirs_hidden_list(hid.get(), 512);
+                for (int i = 0; i < n; i++) {
+                    const QString p = QString::fromLocal8Bit(hid[i]);
+                    total++;
+                    if (!needle.isEmpty() && !p.contains(needle, Qt::CaseInsensitive)) continue;
+                    auto *it = new QListWidgetItem(QFileInfo(p).fileName() + "   (" + p + ")");
+                    it->setData(Qt::UserRole, p);
+                    list->addItem(it);
+                    shown++;
+                }
+                note->setText(QString("%1 of %2 plug-ins taken off the list").arg(shown).arg(total));
+            } else if (HostWidget *h = anyHost(false)) {
+                for (const HostWidget::PluginRef &e : h->availablePlugins()) {
+                    total++;
+                    if (!needle.isEmpty() && !e.label.contains(needle, Qt::CaseInsensitive) &&
+                        !e.path.contains(needle, Qt::CaseInsensitive)) continue;
+                    const bool loaded = hostHolding(e.path) != nullptr;
+                    auto *it = new QListWidgetItem((loaded ? "● " : "") + e.label + (loaded ? "   loaded" : ""));
+                    it->setData(Qt::UserRole, e.path);
+                    it->setToolTip(e.path);
+                    if (!e.loadable) it->setForeground(Qt::gray);
+                    if (loaded) { QFont f = it->font(); f.setBold(true); it->setFont(f); }
+                    list->addItem(it);
+                    shown++;
+                }
+                note->setText(QString("%1 of %2 plug-ins available").arg(shown).arg(total));
+            } else {
+                note->setText("no list yet -- open a synth tab to scan");
+            }
+            sync();
+        };
+        auto rescanAll = [this] {
+            for (int i = 0; i < tabs_->count(); i++)
+                if (auto *h = qobject_cast<HostWidget *>(tabs_->widget(i))) h->rescanPlugins();
+        };
+        connect(search, &QLineEdit::textChanged, d, refill);
+        connect(showRemoved, &QCheckBox::toggled, d, refill);
+        connect(list, &QListWidget::currentRowChanged, d, sync);
+        connect(rescan, &QPushButton::clicked, d, [=] { rescanAll(); refill(); });
+        connect(close, &QPushButton::clicked, d, &QDialog::close);
+        connect(load, &QPushButton::clicked, d, [=] {
+            const QString p = selected();
+            if (p.isEmpty()) return;
+            if (HostWidget *held = hostHolding(p)) { tabs_->setCurrentWidget(held); return; }
+            HostWidget *h = addSynthTab();
+            if (!h->loadPlugin(p)) {
+                closeTabNow(tabs_->indexOf(h));
+                statusBar()->showMessage("that plug-in could not be loaded", 5000);
+            }
+            refill();
+        });
+        connect(unload, &QPushButton::clicked, d, [=] {
+            if (HostWidget *held = hostHolding(selected())) closeTabNow(tabs_->indexOf(held));
+            refill();
+        });
+        connect(remove, &QPushButton::clicked, d, [=] {
+            const QByteArray p = selected().toLocal8Bit();
+            if (p.isEmpty()) return;
+            if (showRemoved->isChecked()) vstdirs_unhide(p.constData());
+            else vstdirs_hide(p.constData());
+            rescanAll();
+            refill();
+        });
+        pluginMgr_ = d;
+        refill();
+        d->show();
+    }
+
+    void pluginFolders()
+    {
+        HostWidget *h = qobject_cast<HostWidget *>(tabs_->currentWidget());
+        for (int i = 0; !h && i < tabs_->count(); i++) h = qobject_cast<HostWidget *>(tabs_->widget(i));
+        if (!h) h = addSynthTab();
+        if (h) h->showPluginFolders();
+    }
     void newTracker() { addTrackerTab(); }
     void openSong()
     {
         const QString p = QFileDialog::getOpenFileName(this, "Open song", QString(),
                                                        "Tracker songs (*.trk);;All files (*)");
         if (!p.isEmpty()) openSongPath(p);
+    }
+
+    /* Open song, part two: the synths the song's tracks play.
+     *
+     * A track routed to a synth tab saves the tab's sink name ("track N sink
+     * <name>"), and loading the song brings the name back -- but not the tab,
+     * so the name said where the track used to play, not where it plays now.
+     * This puts the tabs back: every distinct sink name that is not an open
+     * tab already is resolved to a plug-in and loaded in a tab of its own,
+     * and every track that named a sink is routed to it. A name nothing
+     * answers to leaves its tracks on their ALSA windows, exactly where a
+     * song load always left them. */
+    void reopenSongSynths()
+    {
+        if (!trkEngine_) return;
+        pluginScan_.clear();             /* the folders may have moved since */
+
+        /* The tracks naming a sink, and the names, once each in first-seen
+         * order. trk_route_sink takes the engine's lock itself, so everything
+         * the song has to say is collected under the lock here and the
+         * routing happens below, outside it. */
+        QString trackSink[TRK_TRACKS];
+        QStringList names;
+        trk_lock(trkEngine_);
+        const trk_song *song = trk_song_of(trkEngine_);
+        for (int t = 0; t < TRK_TRACKS; t++) {
+            trackSink[t] = QString::fromUtf8(song->track[t].sink);
+            if (!trackSink[t].isEmpty() && !names.contains(trackSink[t]))
+                names << trackSink[t];
+        }
+        trk_unlock(trkEngine_);
+        if (names.isEmpty()) return;
+
+        /* Each name to the sink it means: one already open wins by name,
+         * otherwise a new tab is made for it. */
+        QHash<QString, int> sinkFor;
+        QStringList missing;
+        int opened = 0;
+        for (const QString &full : names) {
+            int id = -1;
+            for (const SinkEntry &e : sinks_)
+                if (e.name == full) { id = e.id; break; }
+            if (id < 0) {
+                /* A second tab of one plug-in is uniquified as "name 2", so
+                 * the plug-in is the name with a trailing " N" off. */
+                QString base = full;
+                const int sp = base.lastIndexOf(' ');
+                if (sp > 0) {
+                    bool digits = true;
+                    for (int i = sp + 1; i < base.size(); i++)
+                        if (!base[i].isDigit()) { digits = false; break; }
+                    if (digits) base.truncate(sp);
+                }
+                const QString path = resolvePlugin(base);
+                if (path.isEmpty()) { missing << full; continue; }
+                HostWidget *h = addSynthTab();
+                if (!h->loadPlugin(path)) {
+                    /* No empty tab left standing for it -- the session
+                     * restore reasons the same way. */
+                    closeTabNow(tabs_->indexOf(h));
+                    statusMessage("could not load " + path, 0);
+                    fprintf(stderr, "song: %s's plug-in %s would not load\n",
+                            qPrintable(full), qPrintable(path));
+                    fflush(stderr);
+                    missing << full;
+                    continue;
+                }
+                /* The tab registered its sink under the plug-in's own name,
+                 * uniquified had the name been taken: this tab's entry whose
+                 * name is the full name, the base, or a spelling of it. */
+                for (const SinkEntry &e : sinks_) {
+                    if (e.tab != h) continue;
+                    if (e.name == full || e.name == base ||
+                        e.name.startsWith(base)) { id = e.id; break; }
+                }
+                if (id >= 0) opened++;
+            }
+            if (id < 0) { missing << full; continue; }
+            sinkFor.insert(full, id);
+        }
+
+        /* Now that the tabs exist: route. trk_route_sink also refreshes the
+         * track's saved name mirror, so the name the song carries is the live
+         * sink's from here on. */
+        for (int t = 0; t < TRK_TRACKS; t++) {
+            if (trackSink[t].isEmpty()) continue;
+            const auto it = sinkFor.constFind(trackSink[t]);
+            if (it != sinkFor.constEnd()) trk_route_sink(trkEngine_, t, it.value());
+        }
+
+        statusMessage(QString("reopened %1 synth(s) from the song (default programs -- "
+                              "saved sounds live in the session file)%2")
+                          .arg(opened)
+                          .arg(missing.isEmpty() ? QString()
+                                                 : " -- not found: " + missing.join(", ")),
+                      0);
     }
 
     /* -- the session file ------------------------------------------------- */
@@ -669,10 +1089,14 @@ private:
         QWidget *w = tabs_->widget(ix);
         if (!w) return;
 
-        /* Menus first, while the widget still exists to be asked nothing. */
-        for (QMenu *m : menusOf_.take(w)) {
-            menuBar()->removeAction(m->menuAction());
-            delete m;
+        /* Actions first, while the widget still exists: they are parented to
+         * the menus, not the widget, so nothing else takes them off the bar
+         * -- and after the widget is gone a menu would be holding actions
+         * whose slots were the dead widget's. */
+        for (const auto &p : actionsOf_.take(w)) {
+            p.first->removeAction(p.second);
+            if (QMenu *sub = p.second->menu()) delete sub;   /* its Inputs submenus */
+            delete p.second;
         }
         tabs_->removeTab(ix);
         if (w == tracker_) {
@@ -694,6 +1118,15 @@ private:
              * stopped and the editors detached in its body, then the Engine's
              * own teardown stops the PipeWire loop before pehost_close. */
             delete w;
+        }
+        /* A merged menu the close emptied leaves the bar with its tab. */
+        const QList<QAction *> bar = menuBar()->actions();
+        for (QAction *a : bar) {
+            QMenu *m = a->menu();
+            if (m && !shellMenus_.contains(m) && m->actions().isEmpty()) {
+                menuBar()->removeAction(a);
+                delete m;
+            }
         }
         updateCanvas();
         arbitrateKeys();
@@ -747,16 +1180,167 @@ private:
             }
     }
 
+    /* A sink name back to the plug-in it came from, as an absolute path, or
+     * empty when nothing on this machine answers to it. The name is the
+     * plug-in's own -- it was the tab's window title when the song was saved
+     * -- and the scan the HostWidgets made of the plug-in folders keeps its
+     * result private to them, so this walks the same folders itself (once per
+     * song open; reopenSongSynths clears pluginScan_ on the way in) and
+     * matches the name against what it finds. An open tab under exactly that
+     * title answers first: its loaded path IS that plug-in, no guessing. On
+     * disk the file's name and the plug-in's name usually agree ("Surge
+     * XT.vst3", "TAL-NoiseMaker.so"); where they differ it is by decoration
+     * or a vendor's tag, so the later stages compare stripped of punctuation
+     * ("FB-7999" is fb799964.dll), then allow a tag of trailing digits
+     * ("blooo" is blooo64.dll), then one up front ("FM8" is NI FM8.dll) --
+     * the shortest spelling wins, as the least decorated. */
+    QString resolvePlugin(const QString &baseName)
+    {
+        for (int i = 0; i < tabs_->count(); i++) {
+            auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
+            if (h && !h->loadedPath().isEmpty() && h->windowTitle() == baseName)
+                return h->loadedPath();
+        }
+        for (int i = 0; i < tabs_->count(); i++) {
+            auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
+            if (h && !h->loadedPath().isEmpty() &&
+                !h->windowTitle().compare(baseName, Qt::CaseInsensitive))
+                return h->loadedPath();
+        }
+        if (pluginScan_.isEmpty()) scanPlugins();
+        for (const auto &p : pluginScan_)
+            if (p.first == baseName) return p.second;
+        for (const auto &p : pluginScan_)
+            if (!p.first.compare(baseName, Qt::CaseInsensitive)) return p.second;
+        const QString want = bareName(baseName);
+        for (const auto &p : pluginScan_)
+            if (bareName(p.first) == want) return p.second;
+        /* Trailing digits, then a prefix of any kind; the shortest match, in
+         * each stage, is the plug-in rather than its sibling editions. */
+        QString best;
+        int bestLen = 0;
+        for (const auto &p : pluginScan_) {
+            const QString have = bareName(p.first);
+            if (have.size() <= want.size() || !have.startsWith(want)) continue;
+            bool tag = true;
+            for (int i = want.size(); i < have.size() && tag; i++)
+                if (!have[i].isDigit()) tag = false;
+            if (tag && (best.isEmpty() || have.size() < bestLen)) {
+                best = p.second;
+                bestLen = have.size();
+            }
+        }
+        if (!best.isEmpty() || want.size() < 3) return best;
+        for (const auto &p : pluginScan_) {
+            const QString have = bareName(p.first);
+            if (have.size() > want.size() && have.endsWith(want) &&
+                (best.isEmpty() || have.size() < bestLen)) {
+                best = p.second;
+                bestLen = have.size();
+            }
+        }
+        return best;
+    }
+
+    /* The name with its punctuation and case off, for the looser stages:
+     * "FB-7999" and "fb799964" have to meet. */
+    static QString bareName(const QString &s)
+    {
+        QString out;
+        for (QChar c : s)
+            if (c.isLetterOrNumber()) out += c.toLower();
+        return out;
+    }
+
+    /* Fill pluginScan_ with (stem, absolute path) for everything that names
+     * like a plug-in under the folders the HostWidgets scan: the corpora
+     * found walking up from the binary, the system VST locations, and the
+     * user's own list from vstdirs. The same roots HostWidget::scanRoots
+     * finds, duplicated here because that scan's result is private -- and
+     * walked without the sniffing scanRoot does: opening every file to prove
+     * it a plug-in is the cost of a startup scan, not of answering one name,
+     * and a stem only ever reaches loadPlugin by matching a sink name, which
+     * is the certain test. */
+    void scanPlugins()
+    {
+        QStringList roots;
+        auto addRoot = [&roots](const QString &p) {
+            if (p.isEmpty()) return;
+            const QString abs = QDir(p).absolutePath();
+            if (QDir(abs).exists() && !roots.contains(abs)) roots << abs;
+        };
+        static const char *corpus[] = {
+            "windows/VST2-64", "windows/VST3", "linux/extracted", "windows/VST2-32",
+#if PESTUDIO_MAC
+            "macos/VST2", "macos/VST3", "macos/AU",
+#endif
+#if PESTUDIO_CLASSIC
+            "macos/classic",
+#endif
+        };
+        QDir up(QCoreApplication::applicationDirPath());
+        for (int i = 0; i < 6; i++) {
+            for (const char *rel : corpus) addRoot(up.absoluteFilePath(rel));
+            if (!up.cdUp()) break;
+        }
+        const QString home = QDir::homePath();
+        for (const QString &d : { home + "/.vst", home + "/.vst3",
+                                  QString("/usr/lib/vst"), QString("/usr/lib/vst3"),
+                                  QString("/usr/local/lib/vst"), QString("/usr/local/lib/vst3"),
+                                  QString("/usr/lib/x86_64-linux-gnu/vst"),
+                                  QString("/usr/lib/x86_64-linux-gnu/vst3") })
+            addRoot(d);
+        for (const char *var : { "VST_PATH", "VST3_PATH" }) {
+            const QString e = qEnvironmentVariable(var);
+            if (e.isEmpty()) continue;
+            const QStringList parts = e.split(':', Qt::SkipEmptyParts);
+            for (const QString &part : parts) addRoot(part);
+        }
+        vstdir userDirs[VSTDIRS_MAX];
+        const int nUser = vstdirs_load(userDirs, VSTDIRS_MAX);
+        for (int i = 0; i < nUser; i++)
+            addRoot(QString::fromLocal8Bit(userDirs[i].path));
+
+        QStringList queue = roots;
+        int guard = 0;
+        while (!queue.isEmpty() && guard++ < 4000) {
+            QDir d(queue.takeFirst());
+            const QFileInfoList es = d.entryInfoList(
+                QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot,
+                QDir::Name | QDir::IgnoreCase);
+            for (const QFileInfo &fi : es) {
+                const QString nm = fi.fileName();
+                /* A .vst3 or macOS .vst bundle is a directory and a leaf, as
+                 * in scanRoot; .lv2 innards are walked but never offered. */
+                const bool leafDir = fi.isDir() &&
+                    (nm.endsWith(".vst3", Qt::CaseInsensitive) ||
+                     nm.endsWith(".vst", Qt::CaseInsensitive));
+                const bool leafFile = fi.isFile() &&
+                    (nm.endsWith(".dll", Qt::CaseInsensitive) ||
+                     nm.endsWith(".vst3", Qt::CaseInsensitive) ||
+                     (nm.endsWith(".so", Qt::CaseInsensitive) &&
+                      !fi.absoluteFilePath().contains(".lv2/")));
+                if (leafDir || leafFile)
+                    pluginScan_ << qMakePair(fi.completeBaseName(),
+                                             fi.absoluteFilePath());
+                else if (fi.isDir())
+                    queue << fi.absoluteFilePath();
+            }
+        }
+    }
+
     /* Only the tab in front answers the computer keyboard. Every HostWidget
      * filters keys application-wide, and in one window they would otherwise
      * all answer at once -- see HostWidget::setKeysLive. Switching away from a
-     * tab releases its held notes on the way out. */
+     * tab releases its held notes on the way out. The menus follow the same
+     * tab, so both move from this one place. */
     void arbitrateKeys()
     {
         QWidget *cur = tabs_->currentWidget();
         for (int i = 0; i < tabs_->count(); i++)
             if (auto *h = qobject_cast<HostWidget *>(tabs_->widget(i)))
                 h->setKeysLive(h->isVisible() && tabs_->widget(i) == cur);
+        syncMenus();
     }
 
     void updateCanvas()
@@ -804,19 +1388,30 @@ private:
     QAction        *newTracker_ = nullptr;
     QAction        *reloadAct_ = nullptr;
     TrackerWidget  *tracker_ = nullptr;
+    QMenu          *helpMenu_ = nullptr;   /* the window's own, kept last in the bar */
+    QPointer<QDialog> pluginMgr_;          /* File > Plug-ins, while it is open */
+    QMenu          *fileMenu_ = nullptr;
+    QAction        *fileAnchor_ = nullptr, *helpAnchor_ = nullptr, *openSongAct_ = nullptr;
     trk_engine     *trkEngine_ = nullptr;
     QList<SinkEntry> sinks_;             /* every synth tab the tracker can play directly */
+    /* The plug-in folders as (file stem, absolute path) pairs, for
+     * resolvePlugin -- filled lazily by scanPlugins, cleared by
+     * reopenSongSynths so a song opened later in the run sees the folders as
+     * they are then. */
+    QList<QPair<QString, QString>> pluginScan_;
     QString        sessionPath_;         /* the file Save session writes without asking */
     QString        saveOnExit_;          /* --save-session: written on the clean exit */
     QSet<HostWidget *>           deadTabs_;    /* tabs already marked (stopped) */
     QHash<HostWidget *, unsigned long> lastCalls_;  /* callback counts, for the tooltips */
     bool           routed_ = false;      /* --route: the tracker drives the proof, not smoke's notes */
     /* Set around each tab's construction, which is when both widgets build
-     * their menus through addMenu; the menus collected are filed under the
-     * new tab once it exists -- see menusOf_. */
+     * their menus through addMenu; each menu handed out is remembered with
+     * the action count it had then, and what it gained past that count is
+     * attributed to the tab once it exists -- see attributeMenus. */
     bool           building_ = false;
-    QList<QMenu *> pendingMenus_;
-    QHash<QWidget *, QList<QMenu *>> menusOf_;
+    QList<QPair<QMenu *, int>> pendingStarts_;
+    QHash<QWidget *, QList<QPair<QMenu *, QAction *>>> actionsOf_;
+    QList<QMenu *> shellMenus_;      /* File and Help: always on the bar */
     int            smokeStep_ = 0, smokeNote_ = 60;
     bool           sawHost_ = false;   /* the crash marker is the first tab's */
 };

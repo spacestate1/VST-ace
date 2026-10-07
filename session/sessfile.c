@@ -485,7 +485,13 @@ sess_file *sess_read(const char *path, char *err, int errn)
                 sy = &s->synths[s->nsynths];
                 sy->plugin = NULL;
                 sy->patch = NULL;
-                if (!parse_synth(&sc, sy, err, errn)) goto fail;
+                if (!parse_synth(&sc, sy, err, errn)) {
+                    /* Not counted yet, so sess_free would not see what it
+                     * had already taken. */
+                    free(sy->plugin);
+                    free(sy->patch);
+                    goto fail;
+                }
                 s->nsynths++;
             }
         } else if (!strcmp(key, "routes")) {
@@ -510,7 +516,10 @@ sess_file *sess_read(const char *path, char *err, int errn)
                 r->track = -1;
                 r->synth = -1;
                 r->sink = NULL;
-                if (!parse_route(&sc, r, err, errn)) goto fail;
+                if (!parse_route(&sc, r, err, errn)) {
+                    free(r->sink);
+                    goto fail;
+                }
                 s->nroutes++;
             }
         } else if (!strcmp(key, "song")) {
