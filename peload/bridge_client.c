@@ -7,6 +7,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sys/syscall.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -14,6 +16,7 @@
 #include <string.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/stat.h>
@@ -23,6 +26,16 @@
 
 #include "bridge.h"
 #include "bridge_client.h"
+
+#ifndef SYS_close_range
+#define SYS_close_range 436
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_send_signal
+#define SYS_pidfd_send_signal 424
+#endif
 
 struct bridge {
     pid_t       pid;
@@ -41,15 +54,18 @@ struct bridge {
     size_t        ed_cap;
     int           ed_bw, ed_bh, ed_have;
     unsigned      ed_torn, ed_reads;   /* how often a read caught a write */
-    int         dead;
+    _Atomic int dead;                  /* read on the audio thread, written anywhere */
     double      sr;
     int         bs;
     /* Requests posted whose completion we gave up waiting for. Must reach zero
      * before another is posted -- see bridge_render_io. */
     int         pending;
     int         behind;            /* consecutive blocks with no reply */
+    float       last[2];           /* the last frame handed out, for fading a gap */
+    int         last_valid;        /* a block went out since the last gap */
+    int         regain;            /* the first block after a gap comes in over a ramp */
     int         reported_dead;
-    unsigned    midi_dropped;      /* events lost to a full MIDI ring */
+    _Atomic unsigned midi_dropped;     /* events lost to a full MIDI ring */
     /* What it takes to build the same helper again after one has died, and to
      * put the plug-in back the way the user had it. See bridge_recover. */
     char        path[1024];
@@ -66,10 +82,25 @@ struct bridge {
      * replaced underneath it. Read by the audio thread, written by the thread
      * doing the restart; a torn read is not possible for an int, and the worst
      * a stale one costs is one block of silence either side. */
-    int         silent;
+    _Atomic int silent;
+    /* How many threads are inside an entry point that touches `sh`: the audio
+     * thread in render/MIDI, any thread in set_param / editor input / pixels.
+     * A restart sets `silent` and then waits for this to reach zero before it
+     * unmaps the region, so nothing is ever left reading freed memory. */
+    _Atomic int users;
+    /* The helper, by handle rather than by number: only the thread that owns the
+     * bridge (the one restarting or closing it) ever reaps, and that thread can
+     * kill through this without any chance of hitting a reused pid. -1 where the
+     * kernel has no pidfds. Closed only once `users` is zero, since the audio
+     * thread uses it to cut off a wedged helper. */
+    int         pidfd;
+    /* Serialises request/reply round trips on the socket: two threads sharing it
+     * would otherwise read each other's replies. Recursive so that a restart can
+     * hold it across its whole sequence. Never taken on the audio thread. */
+    pthread_mutex_t callmu;
 };
 
-static char g_err[256];
+static __thread char g_err[256];
 const char *bridge_last_error(void) { return g_err; }
 
 /* ------------------------------------------------------------------ helper */
@@ -77,6 +108,22 @@ const char *bridge_last_error(void) { return g_err; }
 /* peload32 sits next to whichever binary is running, so derive its path from
  * /proc/self/exe rather than trusting the working directory. PELOAD32 overrides,
  * which is what a test harness or an installed layout wants. */
+/* A helper found by walking up from the binary: owned by whoever is running
+ * this or by root, and neither it nor its directory writable by everyone. */
+static int helper_trusted(const char *path)
+{
+    struct stat st;
+    char dir[1024], *slash;
+    if (stat(path, &st) != 0 || (st.st_uid != geteuid() && st.st_uid != 0) || (st.st_mode & S_IWOTH))
+        return 0;
+    snprintf(dir, sizeof dir, "%s", path);
+    if (!(slash = strrchr(dir, '/'))) return 0;
+    *slash = 0;
+    if (stat(dir, &st) != 0 || (st.st_uid != geteuid() && st.st_uid != 0) || (st.st_mode & S_IWOTH))
+        return 0;
+    return 1;
+}
+
 static int bridge_helper_named(const char *helper, char *out, size_t n)
 {
     const char *env = getenv(!strcmp(helper, "peload32") ? "PELOAD32" : "PESERVE");
@@ -107,7 +154,10 @@ static int bridge_helper_named(const char *helper, char *out, size_t n)
         *slash = 0;
         if (!exe[0]) break;
         snprintf(out, n, "%s/peload/build/%s", exe, helper);
-        if (access(out, X_OK) == 0) return 0;
+        /* A helper that somebody else left on the way up is not ours to run:
+         * it has to be owned by this user or by root, in a directory nobody
+         * else can write to. */
+        if (access(out, X_OK) == 0 && helper_trusted(out)) return 0;
     }
     return -1;
 }
@@ -226,8 +276,15 @@ static int bridge_call(bridge *b, const bridge_req *q, bridge_rep *r)
      * itself as whatever was on the stack. */
     if (r) memset(r, 0, sizeof *r);
     memset(&tmp, 0, sizeof tmp);
-    if (b->dead) return -1;
-    if (send(b->sock, q, sizeof *q, MSG_NOSIGNAL) != (ssize_t)sizeof *q) { b->dead = 1; return -1; }
+    /* One round trip at a time. Never called from the audio thread: it can wait
+     * up to the socket deadline. */
+    pthread_mutex_lock(&b->callmu);
+    if (b->dead || b->sock < 0) { pthread_mutex_unlock(&b->callmu); return -1; }
+    if (send(b->sock, q, sizeof *q, MSG_NOSIGNAL) != (ssize_t)sizeof *q) {
+        b->dead = 1;
+        pthread_mutex_unlock(&b->callmu);
+        return -1;
+    }
     if (recv(b->sock, r ? r : &tmp, sizeof tmp, MSG_WAITALL) != (ssize_t)sizeof tmp) {
         /* Distinguish a stall from a death: both end the session for this
          * plugin, but only one of them is worth reporting as a hang. */
@@ -235,8 +292,10 @@ static int bridge_call(bridge *b, const bridge_req *q, bridge_rep *r)
             fprintf(stderr, "bridge: helper stopped answering (op %d) -- "
                             "dropping it rather than hanging the host\n", q->op);
         b->dead = 1;
+        pthread_mutex_unlock(&b->callmu);
         return -1;
     }
+    pthread_mutex_unlock(&b->callmu);
     return 0;
 }
 
@@ -248,40 +307,87 @@ static int bridge_op(bridge *b, int op, int a, int bb, int c, int d, int e, brid
     return bridge_call(b, &q, r);
 }
 
+/* Entry to anything that touches the shared region from a thread that does not
+ * own the bridge. Pairs with the wait in bridge_teardown: this announces
+ * itself first and only then looks at `silent`/`dead` (both seq_cst), so a
+ * teardown that has set `silent` either sees this thread in `users` and waits,
+ * or this thread sees `silent` and leaves. Neither side blocks or locks. */
+static int bridge_enter(bridge *b)
+{
+    if (!b) return 0;
+    atomic_fetch_add(&b->users, 1);
+    if (b->dead || b->silent || !b->sh) {
+        atomic_fetch_sub(&b->users, 1);
+        return 0;
+    }
+    return 1;
+}
+
+static void bridge_leave(bridge *b) { atomic_fetch_sub(&b->users, 1); }
+
 /* Everything bridge_close does except free the struct.
  *
  * A restart needs exactly this: the child gone, the socket and the shared
  * region released, and the bridge object still standing so the pointer the host
- * is holding stays good. */
+ * is holding stays good.
+ *
+ * Leaves `silent` set. Whoever restarts clears it once the new helper is up. */
 static void bridge_teardown(bridge *b)
 {
+    int i;
     if (!b) return;
+    /* Before anything is released: from here the audio thread leaves the region
+     * alone. It may be inside it right now, so wait for it -- a bounded wait,
+     * because an in-flight render is itself bounded by its own deadline. */
+    b->silent = 1;
+    for (i = 0; i < 500 && atomic_load(&b->users) > 0; i++) {
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
     if (!b->dead) {
         bridge_rep r;
         bridge_op(b, BR_QUIT, 0, 0, 0, 0, 0, &r);
     }
+    pthread_mutex_lock(&b->callmu);
     if (b->sock >= 0) close(b->sock);
+    b->sock = -1;
+    pthread_mutex_unlock(&b->callmu);
     if (b->pid > 0) {
-        int st;
+        int st = 0;
+        siginfo_t si;
         /* It should be leaving on its own after BR_QUIT and the closed socket;
-         * give it a moment, then insist. */
-        int i;
+         * give it a moment, then insist. Looked at with WNOWAIT so it is still
+         * ours -- not yet reaped, its pid not yet reusable -- when the group is
+         * killed below. The audio thread never reaps or kills by number; this
+         * is the only place a pid is waited on. */
         for (i = 0; i < 50; i++) {
-            if (waitpid(b->pid, &st, WNOHANG) == b->pid) { b->pid = 0; break; }
+            memset(&si, 0, sizeof si);
+            if (waitid(P_PID, (id_t)b->pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid)
+                break;
             { struct timespec ts = { 0, 10000000 }; nanosleep(&ts, NULL); }
         }
-        if (b->pid > 0) {
-            /* The group, not just the helper: a plug-in that forked a child of
-             * its own leaves it behind otherwise. */
-            kill(-b->pid, SIGKILL);
-            kill(b->pid, SIGKILL);
-            waitpid(b->pid, &st, 0);
-        }
+        /* The group, not just the helper: a plug-in that forked a child of its
+         * own leaves it behind otherwise. */
+        kill(-b->pid, SIGKILL);
+        kill(b->pid, SIGKILL);
+        waitpid(b->pid, &st, 0);
+        if (WIFSIGNALED(st) && WTERMSIG(st) != SIGKILL)
+            fprintf(stderr, "bridge: the helper died on signal %d (%s)\n",
+                    WTERMSIG(st), strsignal(WTERMSIG(st)));
     }
-    if (b->sh) munmap(b->sh, BRIDGE_SHM_SIZE);
-    b->sh = NULL;
-    b->sock = -1;
     b->pid = 0;
+    /* Only now is the region unmapped, and only if nobody is still inside it: a
+     * straggler that outlasted the wait keeps a mapping that is leaked rather
+     * than pulled out from under it. */
+    if (atomic_load(&b->users) == 0) {
+        if (b->sh) munmap(b->sh, BRIDGE_SHM_SIZE);
+        if (b->pidfd >= 0) close(b->pidfd);
+        b->pidfd = -1;
+    } else {
+        fprintf(stderr, "bridge: audio thread still in the shared region; "
+                        "leaving it mapped\n");
+    }
+    b->sh = NULL;
     if (b->shm_name[0]) shm_unlink(b->shm_name);
     b->shm_name[0] = 0;
     b->pending = b->behind = 0;
@@ -296,6 +402,8 @@ void bridge_close(bridge *b)
         fprintf(stderr, "  [bridge] editor: %u read(s), %u caught the helper "
                         "mid-frame and were retried\n", b->ed_reads, b->ed_torn);
     bridge_teardown(b);
+    if (b->pidfd >= 0) close(b->pidfd);
+    pthread_mutex_destroy(&b->callmu);
     free(b->ed_buf);
     free(b->shadow);
     free(b);
@@ -338,7 +446,7 @@ static int reap_briefly(bridge *b, int *st)
 static int bridge_spawn(bridge *b, const char *dll, const char *helper_name)
 {
     char helper[4096], fdarg[16];
-    int sv[2], fd;
+    int sv[2], fd, shmfd = -1;
     bridge_rep rep;
     double samplerate = b->sr;
     int blocksize = b->bs;
@@ -349,20 +457,40 @@ static int bridge_spawn(bridge *b, const char *dll, const char *helper_name)
         return -1;
     }
 
-    snprintf(b->shm_name, sizeof b->shm_name, "/peload32-%d-%p", (int)getpid(), (void *)b);
-    shm_unlink(b->shm_name);
-    if ((fd = shm_open(b->shm_name, O_CREAT | O_EXCL | O_RDWR, 0600)) < 0) {
-        snprintf(g_err, sizeof g_err, "shm_open: %s", strerror(errno));
-        b->shm_name[0] = 0; bridge_teardown(b); return -1;
-    }
-    if (ftruncate(fd, (off_t)BRIDGE_SHM_SIZE)) {
-        snprintf(g_err, sizeof g_err, "ftruncate: %s", strerror(errno));
-        close(fd); bridge_teardown(b); return -1;
+    /* The region the helper shares with the host is an anonymous file handed
+     * down to it, sealed against shrinking and growing -- not a name in
+     * /dev/shm. A name can be opened by any process of this user, and a helper
+     * (or another plug-in's helper) that opens it and truncates it takes the
+     * host's next read of it down with SIGBUS, the audio thread's included.
+     * The seals make the size final; no name means no other helper's way in.
+     * Where memfd_create is not there the named region is used as before, and
+     * unlinked as soon as the helper has attached. */
+    shmfd = memfd_create("peload-bridge", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (shmfd >= 0) {
+        if (ftruncate(shmfd, (off_t)BRIDGE_SHM_SIZE) ||
+            fcntl(shmfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL)) {
+            snprintf(g_err, sizeof g_err, "sealing the shared region: %s", strerror(errno));
+            close(shmfd); bridge_teardown(b); return -1;
+        }
+        b->shm_name[0] = 0;
+        fd = shmfd;
+    } else {
+        snprintf(b->shm_name, sizeof b->shm_name, "/peload32-%d-%p", (int)getpid(), (void *)b);
+        shm_unlink(b->shm_name);
+        if ((fd = shm_open(b->shm_name, O_CREAT | O_EXCL | O_RDWR, 0600)) < 0) {
+            snprintf(g_err, sizeof g_err, "shm_open: %s", strerror(errno));
+            b->shm_name[0] = 0; bridge_teardown(b); return -1;
+        }
+        if (ftruncate(fd, (off_t)BRIDGE_SHM_SIZE)) {
+            snprintf(g_err, sizeof g_err, "ftruncate: %s", strerror(errno));
+            close(fd); bridge_teardown(b); return -1;
+        }
     }
     b->sh = mmap(NULL, BRIDGE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
+    if (shmfd < 0) close(fd);               /* a memfd stays open: the helper is handed it below */
     if (b->sh == MAP_FAILED) {
         snprintf(g_err, sizeof g_err, "mmap: %s", strerror(errno));
+        if (shmfd >= 0) close(shmfd);
         b->sh = NULL; bridge_teardown(b); return -1;
     }
     memset(b->sh, 0, sizeof *b->sh);
@@ -372,12 +500,14 @@ static int bridge_spawn(bridge *b, const char *dll, const char *helper_name)
 
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv)) {
         snprintf(g_err, sizeof g_err, "socketpair: %s", strerror(errno));
+        if (shmfd >= 0) close(shmfd);
         bridge_teardown(b); return -1;
     }
 
     if ((b->pid = fork()) < 0) {
         snprintf(g_err, sizeof g_err, "fork: %s", strerror(errno));
         close(sv[0]); close(sv[1]);
+        if (shmfd >= 0) close(shmfd);
         bridge_teardown(b); return -1;
     }
     if (b->pid == 0) {
@@ -389,9 +519,23 @@ static int bridge_spawn(bridge *b, const char *dll, const char *helper_name)
          * orphaned and spinning on a core. */
         setpgid(0, 0);
         close(sv[0]);
+        /* The region may have come out as fd 3 or 4 -- the numbers the helper
+         * is about to be given for the socket and for it -- so it is moved
+         * clear of them before either is placed. */
+        if (shmfd >= 0 && shmfd <= 4) {
+            int moved = fcntl(shmfd, F_DUPFD, 10);
+            if (moved < 0) _exit(127);
+            close(shmfd);
+            shmfd = moved;
+        }
         if (dup2(sv[1], 3) < 0) _exit(127);
         if (sv[1] != 3) close(sv[1]);
         fcntl(3, F_SETFD, 0);                       /* keep it across exec */
+        if (shmfd >= 0) {
+            if (shmfd != 4 && dup2(shmfd, 4) < 0) _exit(127);
+            if (shmfd != 4) close(shmfd);
+            fcntl(4, F_SETFD, 0);                   /* the sealed region, as fd 4 */
+        }
         /* The helper's normal chatter would interleave with the host's; keep
          * stderr for diagnostics but drop stdout unless asked. */
         if (!getenv("PELOAD_VERBOSE")) {
@@ -402,7 +546,18 @@ static int bridge_spawn(bridge *b, const char *dll, const char *helper_name)
         snprintf(bsz, sizeof bsz, "%d", blocksize > 0 ? blocksize : 512);
         /* So the helper does not try to isolate its own plugin in turn. */
         setenv("PELOAD_IS_SERVER", "1", 1);
-        execl(helper, helper_name, dll, "--serve", "3", "--shm", b->shm_name,
+        /* Nothing else the host holds open belongs in the helper: other plug-ins'
+         * sockets and sealed regions, config files, a MIDI device. A leaked
+         * socket end keeps a dead sibling's peer from ever seeing EOF. Only
+         * 0-4 are meant to cross: stdio, the control socket, the region. */
+        if (syscall(SYS_close_range, 5u, ~0u, 0u) != 0) {
+            struct rlimit rl;
+            int fdn, top = 4096;
+            if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+                rl.rlim_cur < 65536) top = (int)rl.rlim_cur;
+            for (fdn = 5; fdn < top; fdn++) close(fdn);
+        }
+        execl(helper, helper_name, dll, "--serve", "3", "--shm", shmfd >= 0 ? "fd:4" : b->shm_name,
               "--rate", sr, "--block", bsz, (char *)NULL);
         /* Only reached when exec itself failed, and saying so is worth the two
          * lines: from the parent this is indistinguishable from a helper that
@@ -417,7 +572,14 @@ static int bridge_spawn(bridge *b, const char *dll, const char *helper_name)
         _exit(127);
     }
     close(sv[1]);
+    if (shmfd >= 0) close(shmfd);               /* the helper has its own */
+    pthread_mutex_lock(&b->callmu);
     b->sock = sv[0];
+    pthread_mutex_unlock(&b->callmu);
+    /* A handle that stays good however long the zombie waits to be reaped; the
+     * audio thread uses it to cut off a wedged helper without ever naming a pid
+     * that something else may have been given since. */
+    b->pidfd = (int)syscall(SYS_pidfd_open, b->pid, 0);
 
     /* A deadline on the request socket.
      *
@@ -460,6 +622,11 @@ static int bridge_spawn(bridge *b, const char *dll, const char *helper_name)
         }
         bridge_teardown(b); return -1;
     }
+    /* The helper has attached: a named region has served its purpose. */
+    if (b->shm_name[0]) { shm_unlink(b->shm_name); b->shm_name[0] = 0; }
+    /* A reply's text is the helper's to fill: end it, whatever it put there. */
+    rep.text[sizeof rep.text - 1] = 0;
+    rep.text2[sizeof rep.text2 - 1] = 0;
     snprintf(b->name, sizeof b->name, "%s", rep.text);
     snprintf(b->vendor, sizeof b->vendor, "%s", rep.text2);
     b->nprograms = rep.a; b->nparams = rep.b;
@@ -476,6 +643,14 @@ bridge *bridge_open_helper(const char *dll, double samplerate, int blocksize,
     if (!helper_name) helper_name = "peload32";
     if (!(b = calloc(1, sizeof *b))) return NULL;
     b->sock = -1;
+    b->pidfd = -1;
+    {
+        pthread_mutexattr_t ma;
+        pthread_mutexattr_init(&ma);
+        pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&b->callmu, &ma);
+        pthread_mutexattr_destroy(&ma);
+    }
     b->sr = samplerate;
     b->bs = blocksize > 0 ? blocksize : 512;
     b->program = -1;
@@ -505,34 +680,53 @@ bridge *bridge_open_helper(const char *dll, double samplerate, int blocksize,
  *
  * Called from the thread that owns the plug-in, never from the audio callback:
  * this forks, execs and waits for a plug-in to initialise, which is hundreds of
- * milliseconds. The audio thread meanwhile sees `dead` and returns silence
- * without touching the shared region, which is what makes tearing it down
- * underneath safe -- and why `dead` is the last thing cleared.
+ * milliseconds. The audio thread meanwhile sees `silent` and returns silence
+ * without touching the shared region; teardown waits for any block already in
+ * flight before it unmaps, which is what makes that safe.
  *
  * Returns 1 when the plug-in is running again. A plug-in that faults on
  * something it will meet again faults again here, so the restart count is what
  * a caller should use to decide to stop trying. */
 int bridge_recover(bridge *b)
 {
-    int i, was_open;
+    int i, was_open, prog;
+    float *saved = NULL;
+    int nsaved = 0;
 
     if (!b) return 0;
     if (!b->dead) return 1;
     if (!b->path[0]) return 0;
 
+    /* Held throughout, so no other thread's op lands on the socket while the new
+     * helper is being handshaken. (Recursive; the audio thread never takes it.) */
+    pthread_mutex_lock(&b->callmu);
+
     was_open = b->ed_open;
-    b->silent = 1;                    /* the audio thread lets go of the shm */
+    prog = b->program;
+    /* What the user had set, taken before anything can change it: the program
+     * change below reads the new helper's defaults back into shadow[], which
+     * would otherwise be what got replayed. */
+    if (b->shadow && b->nshadow > 0 &&
+        (saved = malloc((size_t)b->nshadow * sizeof *saved))) {
+        nsaved = b->nshadow;
+        memcpy(saved, b->shadow, (size_t)nsaved * sizeof *saved);
+    }
+    /* Teardown sets `silent` and waits for the audio thread to leave the region,
+     * so the unmap cannot pull it out from under a render in flight. */
     bridge_teardown(b);
     b->restarts++;
     fprintf(stderr, "bridge: restarting the helper for %s (attempt %d)\n",
             b->path, b->restarts);
     /* Cleared before the spawn, not after: bridge_spawn's own handshake is an
-     * ordinary op, and an op against a bridge still marked dead is refused. */
+     * ordinary op, and an op against a bridge still marked dead is refused. The
+     * audio thread stays out through `silent`, not `dead`. */
     b->dead = 0;
     if (bridge_spawn(b, b->path, b->helper[0] ? b->helper : "peload32")) {
         fprintf(stderr, "bridge: it did not come back: %s\n", g_err);
         b->dead = 1;
         b->silent = 0;
+        free(saved);
+        pthread_mutex_unlock(&b->callmu);
         return 0;
     }
 
@@ -541,10 +735,20 @@ int bridge_recover(bridge *b)
 
     /* >= 0, not > 0: program 0 is a program, and -1 is the "never selected"
      * this starts at. */
-    if (b->program >= 0 && b->program < b->nprograms)
-        bridge_set_program(b, b->program);
-    for (i = 0; i < b->nshadow && i < b->nparams; i++)
-        bridge_set_param(b, i, b->shadow[i]);
+    if (prog >= 0 && prog < b->nprograms)
+        bridge_set_program(b, prog);
+    /* Replayed through the socket: the rings belong to the audio thread, which is
+     * still held off, and bridge_set_param refuses while `silent`. Done after the
+     * program so the user's values win over the program's. */
+    for (i = 0; i < nsaved && i < b->nparams; i++) {
+        bridge_req q;
+        bridge_rep r;
+        memset(&q, 0, sizeof q);
+        q.op = BR_SET_PARAM; q.a = i; q.f = saved[i];
+        if (bridge_call(b, &q, &r)) break;
+        b->shadow[i] = saved[i];
+    }
+    free(saved);
     /* bridge_editor_open returns 0 for success, like the other ops here -- not
      * a truth value. Testing it as one reported every successful reopen as a
      * failure. */
@@ -552,6 +756,7 @@ int bridge_recover(bridge *b)
         fprintf(stderr, "bridge: the plug-in is back, but its editor did not "
                         "reopen\n");
     b->silent = 0;                    /* audio again */
+    pthread_mutex_unlock(&b->callmu);
     fprintf(stderr, "bridge: %s is running again\n", b->name);
     return 1;
 }
@@ -608,47 +813,50 @@ float bridge_get_param(bridge *b, int i)
 
 /* Queued through shared memory, not the socket: a slider drag would otherwise
  * make one round trip per pixel, and the value has to land on the audio side
- * anyway. */
+ * anyway. Any thread may call this. */
 void bridge_set_param(bridge *b, int i, float v)
 {
     bridge_shm *s;
-    uint32_t h, t;
-    if (!b || b->dead || b->silent || i < 0 || i >= b->nparams) return;
-    s = b->sh;
-    h = atomic_load_explicit(&s->p_head, memory_order_relaxed);
-    t = atomic_load_explicit(&s->p_tail, memory_order_acquire);
-    if (h - t >= BRIDGE_PARAMQ) return;                  /* full: drop */
-    s->pq[h % BRIDGE_PARAMQ].index = i;
-    s->pq[h % BRIDGE_PARAMQ].value = v;
-    atomic_store_explicit(&s->p_head, h + 1, memory_order_release);
-    /* Kept so a restarted helper can be given it back. After the queue write,
-     * so the audio side is not made to wait for it. */
+    uint32_t pos;
+    if (!b || i < 0 || i >= b->nparams) return;
+    /* Remembered even when the helper is down or being restarted, so a restart
+     * replays what the user last set rather than losing a change made during the
+     * gap. */
     if (i < b->nshadow) b->shadow[i] = v;
+    if (!bridge_enter(b)) return;
+    s = b->sh;
+    if (bridge_ring_claim(&s->p_head, &s->p_tail, BRIDGE_PARAMQ, &pos)) {
+        s->pq[pos % BRIDGE_PARAMQ].index = i;
+        s->pq[pos % BRIDGE_PARAMQ].value = v;
+        bridge_ring_publish(&s->pq[pos % BRIDGE_PARAMQ].seq, pos);
+    }                                                    /* full: drop */
+    bridge_leave(b);
 }
 
+/* Any thread, including the audio thread: claims a slot and never waits. */
 void bridge_midi_at(bridge *b, int status, int d1, int d2, int at)
 {
     bridge_shm *s;
-    uint32_t h, t;
-    if (!b || b->dead || b->silent) return;
+    uint32_t pos;
+    if (!bridge_enter(b)) return;
     s = b->sh;
-    h = atomic_load_explicit(&s->m_head, memory_order_relaxed);
-    t = atomic_load_explicit(&s->m_tail, memory_order_acquire);
-    if (h - t >= BRIDGE_MIDIQ) {
+    if (!bridge_ring_claim(&s->m_head, &s->m_tail, BRIDGE_MIDIQ, &pos)) {
         /* Lost, and it may have been a note-off. The helper releases
          * everything once it has drained what got through. */
-        if (!b->midi_dropped++)
+        if (!atomic_fetch_add(&b->midi_dropped, 1))
             fprintf(stderr, "bridge: the MIDI ring overflowed -- some MIDI was "
                             "lost; releasing every sounding note\n");
         atomic_store_explicit(&s->m_release, 1, memory_order_release);
+        bridge_leave(b);
         return;
     }
-    s->mq[h % BRIDGE_MIDIQ].at     = at;
-    s->mq[h % BRIDGE_MIDIQ].status = (uint8_t)status;
-    s->mq[h % BRIDGE_MIDIQ].d1     = (uint8_t)d1;
-    s->mq[h % BRIDGE_MIDIQ].d2     = (uint8_t)d2;
-    s->mq[h % BRIDGE_MIDIQ].pad    = 0;
-    atomic_store_explicit(&s->m_head, h + 1, memory_order_release);
+    s->mq[pos % BRIDGE_MIDIQ].at     = at;
+    s->mq[pos % BRIDGE_MIDIQ].status = (uint8_t)status;
+    s->mq[pos % BRIDGE_MIDIQ].d1     = (uint8_t)d1;
+    s->mq[pos % BRIDGE_MIDIQ].d2     = (uint8_t)d2;
+    s->mq[pos % BRIDGE_MIDIQ].pad    = 0;
+    bridge_ring_publish(&s->mq[pos % BRIDGE_MIDIQ].seq, pos);
+    bridge_leave(b);
 }
 
 void bridge_midi(bridge *b, int status, int d1, int d2)
@@ -678,8 +886,16 @@ int bridge_get_program(bridge *b)
     return r.a;
 }
 
+/* A flag in shared memory rather than BR_ALL_NOTES_OFF: this is reachable from
+ * the audio thread (pehost_release_all), which must never make a socket round
+ * trip. The helper's audio thread answers the flag once the MIDI ring has
+ * drained, which is what the op did anyway. */
 void bridge_all_notes_off(bridge *b)
-{ bridge_rep r; if (b) bridge_op(b, BR_ALL_NOTES_OFF, 0, 0, 0, 0, 0, &r); }
+{
+    if (!bridge_enter(b)) return;
+    atomic_store_explicit(&b->sh->m_release, 1, memory_order_release);
+    bridge_leave(b);
+}
 
 void bridge_import_stats(bridge *b, int *impl, int *stub, int *hit)
 {
@@ -698,47 +914,84 @@ void bridge_import_stats(bridge *b, int *impl, int *stub, int *hit)
 /* Called from the host's realtime thread. Posts the request and waits, with a
  * deadline: if the helper has died or stalled we return silence rather than
  * stalling the whole graph. */
+/* A block the helper did not deliver -- a missed deadline, a dead helper --
+ * goes out as silence, and silence that begins on a nonzero sample is a click.
+ * The first such block carries the last frame it had, faded to zero over a
+ * couple of ms; the block that follows the gap comes in over a ramp for the
+ * same reason. */
+#define BRIDGE_GAP_RAMP 96
+
+static void bridge_gap(bridge *b, float *out, int frames)
+{
+    int i, n = frames < BRIDGE_GAP_RAMP ? frames : BRIDGE_GAP_RAMP;
+    memset(out, 0, (size_t)frames * 2 * sizeof *out);
+    if (!b) return;
+    if (b->last_valid) {
+        for (i = 0; i < n; i++) {
+            float g = 1.0f - (float)(i + 1) / (float)n;
+            out[2 * i]     = b->last[0] * g;
+            out[2 * i + 1] = b->last[1] * g;
+        }
+        b->last_valid = 0;
+    }
+    b->regain = 1;
+}
+
+static void bridge_delivered(bridge *b, float *out, int frames)
+{
+    if (b->regain) {
+        int i, n = frames < BRIDGE_GAP_RAMP ? frames : BRIDGE_GAP_RAMP;
+        for (i = 0; i < n; i++) {
+            float g = (float)(i + 1) / (float)n;
+            out[2 * i] *= g;
+            out[2 * i + 1] *= g;
+        }
+        b->regain = 0;
+    }
+    if (frames > 0) {
+        b->last[0] = out[2 * (frames - 1)];
+        b->last[1] = out[2 * (frames - 1) + 1];
+        b->last_valid = 1;
+    }
+}
+
+static void bridge_render_inner(bridge *b, const float *in, float *out, int frames);
+
 void bridge_render_io(bridge *b, const float *in, float *out, int frames)
 {
-    bridge_shm *s;
-    struct timespec ts;
-    int i;
-
     if (frames <= 0) return;
     /* Being restarted: silence, and none of the bookkeeping below -- the shared
      * region it would read is in the middle of being replaced. */
     if (b && b->silent && !b->dead) {
-        memset(out, 0, (size_t)frames * 2 * sizeof *out);
+        bridge_gap(b, out, frames);
         return;
     }
     if (!b || b->dead || frames > BRIDGE_MAX_FRAMES) {
         /* Say so once. Silence with no explanation is the worst possible failure
          * mode: it looks like a plugin that stopped working rather than a helper
-         * that is gone. */
+         * that is gone. How it died is reported by whoever reaps it (see
+         * bridge_teardown): the audio thread does not wait on children. */
         if (b && b->dead && !b->reported_dead) {
-            /* How it went is the whole question. A signal means the plugin
-             * faulted and the address is worth chasing; a clean exit status means
-             * it decided to leave. Saying only "gone" leaves both looking the
-             * same, and neither reproducible without the reporter's audio
-             * device. */
-            int st = 0;
             b->reported_dead = 1;
-            if (b->pid > 0 && waitpid(b->pid, &st, WNOHANG) == b->pid) {
-                if (WIFSIGNALED(st))
-                    fprintf(stderr, "bridge: the helper died on signal %d (%s)"
-                                    " -- restarting it\n",
-                            WTERMSIG(st), strsignal(WTERMSIG(st)));
-                else
-                    fprintf(stderr, "bridge: the helper exited with status %d"
-                                    " -- restarting it\n", WEXITSTATUS(st));
-            } else {
-                fprintf(stderr, "bridge: the helper is gone (still reaping)"
-                                " -- restarting it\n");
-            }
+            fprintf(stderr, "bridge: the helper is gone -- restarting it\n");
         }
-        memset(out, 0, (size_t)frames * 2 * sizeof *out);
+        bridge_gap(b, out, frames);
         return;
     }
+    /* In flight is counted for the whole block, so a restart waits for it. */
+    if (!bridge_enter(b)) {
+        bridge_gap(b, out, frames);
+        return;
+    }
+    bridge_render_inner(b, in, out, frames);
+    bridge_leave(b);
+}
+
+static void bridge_render_inner(bridge *b, const float *in, float *out, int frames)
+{
+    bridge_shm *s;
+    struct timespec ts;
+
     s = b->sh;
 
     /* Collect anything still in flight before posting again.
@@ -762,23 +1015,25 @@ void bridge_render_io(bridge *b, const float *in, float *out, int frames)
          * thread died, which leaves the process alive and the socket open, so
          * nothing else notices. */
         if (++b->behind >= 200) {
-            int st = 0;
-            int exited = (b->pid > 0 && waitpid(b->pid, &st, WNOHANG) == b->pid);
             fprintf(stderr, "bridge: the helper has stopped rendering (%d blocks "
-                            "with no reply)%s\n", b->behind,
-                    exited ? " -- it exited"
-                           : " -- its audio thread is stuck; giving up on it");
+                            "with no reply) -- its audio thread is stuck; giving "
+                            "up on it\n", b->behind);
             /* Not coming back: a render that has produced nothing for a second
              * is wedged inside the plug-in, not merely slow. Mark the helper
              * dead so the host stops waiting on it and the window can say so --
              * pehost_alive turns false and the editor and audio are reported
-             * gone rather than silently frozen. Kill its whole group first, so
-             * a plug-in that wedged itself by forking does not leave the fork
-             * spinning on a core for the rest of the session. */
-            if (!exited && b->pid > 0) { kill(-b->pid, SIGKILL); kill(b->pid, SIGKILL); }
+             * gone rather than silently frozen.
+             *
+             * Killed through the pidfd, never by pid: this thread does not reap,
+             * and the thread that does may already have, in which case a pid
+             * could belong to something else by now. The pidfd stays valid
+             * (teardown waits for this thread to leave before closing it), and
+             * the helper's process group is swept by teardown. */
+            if (b->pidfd >= 0)
+                syscall(SYS_pidfd_send_signal, b->pidfd, SIGKILL, NULL, 0);
             b->dead = 1;
         }
-        memset(out, 0, (size_t)frames * 2 * sizeof *out);
+        bridge_gap(b, out, frames);
         return;
     }
     b->behind = 0;
@@ -801,14 +1056,19 @@ void bridge_render_io(bridge *b, const float *in, float *out, int frames)
                             "emitting silence\n", frames);
         s->xruns++;
         b->pending++;                                /* collected on the next call */
-        memset(out, 0, (size_t)frames * 2 * sizeof *out);
+        bridge_gap(b, out, frames);
         return;
     }
     memcpy(out, s->out, (size_t)frames * 2 * sizeof *out);
-    (void)i;
+    bridge_delivered(b, out, frames);
 }
 
-unsigned bridge_xruns(const bridge *b) { return b && b->sh ? b->sh->xruns : 0; }
+unsigned bridge_xruns(const bridge *b)
+{
+    unsigned x = 0;
+    if (bridge_enter((bridge *)b)) { x = b->sh->xruns; bridge_leave((bridge *)b); }
+    return x;
+}
 
 /* ------------------------------------------------------------------ editor */
 
@@ -863,7 +1123,7 @@ int bridge_editor_pixels(bridge *b, const unsigned int **px, int *w, int *h)
     bridge_shm *sh;
     int tries;
 
-    if (!b || b->dead || !b->ed_open) return 0;
+    if (!b || !b->ed_open || !bridge_enter(b)) return 0;
     sh = b->sh;
     b->ed_reads++;
 
@@ -910,6 +1170,7 @@ int bridge_editor_pixels(bridge *b, const unsigned int **px, int *w, int *h)
         break;
     }
 
+    bridge_leave(b);
     /* If every attempt raced, show the last whole frame rather than a torn one or
      * nothing: a repeated frame reads as a pause, a torn one as a glitch. */
     if (!b->ed_have) return 0;
@@ -930,19 +1191,21 @@ int bridge_editor_pixels(bridge *b, const unsigned int **px, int *w, int *h)
 static void push_input(bridge *b, int kind, int a, int bb, int cc, int d, int e)
 {
     bridge_shm *s;
-    uint32_t h, t;
-    if (!b || b->dead) return;
+    uint32_t pos;
+    bridge_input *q;
+    if (!bridge_enter(b)) return;
     s = b->sh;
-    h = atomic_load_explicit(&s->in_head, memory_order_relaxed);
-    t = atomic_load_explicit(&s->in_tail, memory_order_acquire);
-    if (h - t >= BRIDGE_INQ) return;                    /* full: drop a move */
-    s->inq[h % BRIDGE_INQ].kind = kind;
-    s->inq[h % BRIDGE_INQ].a = a;
-    s->inq[h % BRIDGE_INQ].b = bb;
-    s->inq[h % BRIDGE_INQ].c = cc;
-    s->inq[h % BRIDGE_INQ].d = d;
-    s->inq[h % BRIDGE_INQ].e = e;
-    atomic_store_explicit(&s->in_head, h + 1, memory_order_release);
+    if (bridge_ring_claim(&s->in_head, &s->in_tail, BRIDGE_INQ, &pos)) {   /* full: drop a move */
+        q = &s->inq[pos % BRIDGE_INQ];
+        q->kind = kind;
+        q->a = a;
+        q->b = bb;
+        q->c = cc;
+        q->d = d;
+        q->e = e;
+        bridge_ring_publish(&q->seq, pos);
+    }
+    bridge_leave(b);
 }
 
 void bridge_editor_mouse(bridge *b, int x, int y, int msg, int buttons, int wheel)

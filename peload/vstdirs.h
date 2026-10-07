@@ -90,6 +90,23 @@ int vstdirs_save(const vstdir *dirs, int n);
 int vstdirs_add(const char *os, const char *dir);
 int vstdirs_remove(const char *dir);
 
+/* Plug-ins taken off the list. Removing a plug-in from the library does not
+ * delete its file: it puts the path in a second file beside the folder list,
+ * and the scans skip it. Kept between sessions, shared by every window, and
+ * undone with vstdirs_unhide. hide and unhide return 1 when the list changed,
+ * 0 when it already said so, -1 on error. */
+const char *vstdirs_hidden_file(void);
+int vstdirs_is_hidden(const char *path);
+int vstdirs_hide(const char *path);
+int vstdirs_unhide(const char *path);
+int vstdirs_hidden_list(char (*out)[VSTDIRS_PATHLEN], int max);
+
+/* Whether `path` is inside one of the folders in the list, once both are
+ * resolved. For a file that names a plug-in -- a saved session, a patch --
+ * to be taken at its word only when the plug-in is one the user has already
+ * pointed this program at. */
+int vstdirs_contains(const char *path);
+
 /* Which plug-in a path is, for spotting the same one found twice while
  * scanning. The folders a browser walks overlap in ways a path comparison
  * cannot see: a VST_PATH folder of symlinks into a corpus, ~/.vst3 holding a

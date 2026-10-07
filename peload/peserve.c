@@ -60,21 +60,22 @@ static void audio_rt_priority(void)
 static void drain(server *s)
 {
     bridge_shm *sh = s->sh;
-    uint32_t t, hd;
+    uint32_t t;
+    int k;
 
-    t  = atomic_load_explicit(&sh->p_tail, memory_order_relaxed);
-    hd = atomic_load_explicit(&sh->p_head, memory_order_acquire);
-    for (; t != hd; t++) {
-        bridge_param p = sh->pq[t % BRIDGE_PARAMQ];
-        pehost_set_param(s->h, p.index, p.value);
+    /* Bounded by the ring size and driven by each slot's sequence number, not by
+     * head - tail: see bridge_ring_start. */
+    t = bridge_ring_start(&sh->p_head, &sh->p_tail, BRIDGE_PARAMQ);
+    for (k = 0; k < BRIDGE_PARAMQ && bridge_ring_ready(&sh->pq[t % BRIDGE_PARAMQ].seq, t); k++, t++) {
+        bridge_param *p = &sh->pq[t % BRIDGE_PARAMQ];
+        pehost_set_param(s->h, p->index, p->value);
     }
     atomic_store_explicit(&sh->p_tail, t, memory_order_release);
 
-    t  = atomic_load_explicit(&sh->m_tail, memory_order_relaxed);
-    hd = atomic_load_explicit(&sh->m_head, memory_order_acquire);
-    for (; t != hd; t++) {
-        bridge_ev e = sh->mq[t % BRIDGE_MIDIQ];
-        pehost_midi_at(s->h, e.status, e.d1, e.d2, e.at);
+    t = bridge_ring_start(&sh->m_head, &sh->m_tail, BRIDGE_MIDIQ);
+    for (k = 0; k < BRIDGE_MIDIQ && bridge_ring_ready(&sh->mq[t % BRIDGE_MIDIQ].seq, t); k++, t++) {
+        bridge_ev *e = &sh->mq[t % BRIDGE_MIDIQ];
+        pehost_midi_at(s->h, e->status, e->d1, e->d2, e->at);
     }
     atomic_store_explicit(&sh->m_tail, t, memory_order_release);
     /* After the ring, so the release lands behind everything that got
@@ -117,14 +118,22 @@ static void drain_input(server *s)
 {
     static int depth;
     bridge_shm *sh = s->sh;
-    uint32_t t, hd;
+    uint32_t t;
+    int k;
 
     if (depth > 4) return;
     depth++;
-    t  = atomic_load_explicit(&sh->in_tail, memory_order_relaxed);
-    hd = atomic_load_explicit(&sh->in_head, memory_order_acquire);
-    for (; t != hd; t++) {
-        bridge_input e = sh->inq[t % BRIDGE_INQ];
+    /* The tail moves before delivery, not after: delivering runs the plugin's
+     * wndproc, which can re-enter this function through the input pump. Bounded
+     * by the ring size, and by the slot's sequence number rather than head. */
+    (void)bridge_ring_start(&sh->in_head, &sh->in_tail, BRIDGE_INQ);
+    for (k = 0; k < BRIDGE_INQ; k++) {
+        bridge_input e;
+        t = atomic_load_explicit(&sh->in_tail, memory_order_relaxed);
+        if (!bridge_ring_ready(&sh->inq[t % BRIDGE_INQ].seq, t)) break;
+        e.kind = sh->inq[t % BRIDGE_INQ].kind; e.a = sh->inq[t % BRIDGE_INQ].a;
+        e.b = sh->inq[t % BRIDGE_INQ].b; e.c = sh->inq[t % BRIDGE_INQ].c;
+        e.d = sh->inq[t % BRIDGE_INQ].d; e.e = sh->inq[t % BRIDGE_INQ].e;
         atomic_store_explicit(&sh->in_tail, t + 1, memory_order_release);
         if (e.kind == BRIDGE_IN_KEY) pehost_editor_key(s->h, e.a, e.b, e.c);
         else                         pehost_editor_mouse(s->h, e.a, e.b, e.c, e.d, e.e);
@@ -134,6 +143,25 @@ static void drain_input(server *s)
 
 static server S;
 static server *g_server;
+static pid_t g_ppid;
+static int sock_for_watchdog;
+
+/* Exit when the host process is gone. getppid() names the process, not the
+ * forking thread, so it only changes when the host really dies (to init or a
+ * subreaper). The socket is polled for hang-up as well: events=0 asks for
+ * nothing but POLLHUP/POLLERR, so no request is consumed. */
+static void *host_watchdog(void *ud)
+{
+    struct pollfd pfd;
+    (void)ud;
+    pfd.fd = sock_for_watchdog; pfd.events = 0;
+    for (;;) {
+        pfd.revents = 0;
+        poll(&pfd, 1, 250);
+        if (getppid() != g_ppid || (pfd.revents & (POLLHUP | POLLERR))) _exit(0);
+    }
+    return NULL;
+}
 int w32_paint_in_progress(void);
 
 static void publish_pixels(server *s);
@@ -178,6 +206,9 @@ static int handle_request(server *s, const bridge_req *qp, bridge_rep *rp)
             if (r.a > BRIDGE_MAX_ED_W || r.b > BRIDGE_MAX_ED_H) {
                 fprintf(stderr, "peserve: editor %dx%d exceeds the shared buffer\n",
                         r.a, r.b);
+                /* Opened above, so it has to be closed again, or the plugin's
+                 * window outlives the refusal with nothing left to close it. */
+                pehost_editor_detach(s->h);
                 s->editor_open = 0;
                 r.ok = 0;
                 break;
@@ -194,6 +225,7 @@ static int handle_request(server *s, const bridge_req *qp, bridge_rep *rp)
         case BR_ALL_NOTES_OFF: pehost_release_all(s->h); break;
         case BR_INPUT_MASK:    pehost_set_input_mask(s->h, (unsigned)q.a); break;
         case BR_IMPORT_STATS:  pehost_import_stats(&r.a, &r.b, &r.c); break;
+        case BR_SET_PARAM:     pehost_set_param(s->h, q.a, q.f); break;
         case BR_QUIT:
             return 1;                            /* the caller leaves the loop */
         default:
@@ -422,7 +454,10 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    if ((fd = shm_open(shm_name, O_RDWR, 0600)) < 0) { perror("shm_open"); return 1; }
+    /* "fd:N": the host's sealed region, handed down as an open file. Otherwise
+     * a name in /dev/shm. */
+    if (!strncmp(shm_name, "fd:", 3)) fd = atoi(shm_name + 3);
+    else if ((fd = shm_open(shm_name, O_RDWR, 0600)) < 0) { perror("shm_open"); return 1; }
     sh = mmap(NULL, BRIDGE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (sh == MAP_FAILED) { perror("mmap"); return 1; }
@@ -433,9 +468,21 @@ int main(int argc, char **argv)
 
     /* Do not outlive the host. A helper whose parent dies would otherwise sit
      * there holding a plugin -- which is exactly what the hung ones did before
-     * the input pump existed, and they are invisible once detached. */
-    prctl(PR_SET_PDEATHSIG, SIGTERM);
-    if (getppid() == 1) return 0;              /* already orphaned */
+     * the input pump existed, and they are invisible once detached.
+     *
+     * Not prctl(PR_SET_PDEATHSIG): that fires when the *thread* that forked us
+     * exits, not the process, so a host that spawns from a short-lived thread
+     * (a GUI worker, a recover thread) killed a perfectly healthy helper. The
+     * watchdog below notices the real thing -- reparenting, or the control
+     * socket hanging up -- and works even while the main thread is stuck
+     * inside the plugin. */
+    g_ppid = getppid();
+    if (g_ppid == 1) return 0;                 /* already orphaned */
+    {
+        pthread_t wd;
+        sock_for_watchdog = sock;
+        if (pthread_create(&wd, NULL, host_watchdog, NULL) == 0) pthread_detach(wd);
+    }
 
     pehost_thread_init();
     if (!(S.h = pehost_open(path, sr, bs))) {

@@ -1978,6 +1978,7 @@ void *pe_module_export(const pe_module *m, const char *name)
 
 #include "vst2.h"
 #include "vst3.h"
+#include "bridge.h"      /* the multi-producer ring helpers, shared with the bridge */
 
 /* Deep enough that no realistic burst can reach the bottom. A dropped event is
  * not a glitch that passes -- if it was a note-off, the note never stops -- so
@@ -1993,6 +1994,7 @@ typedef struct {
     float    v;
     uint64_t t;
     int32_t  at;          /* >= 0: use directly; < 0: derive from t */
+    bridge_seq seq;       /* published marker: see bridge_ring_claim */
 } ev_t;
 
 static uint64_t mono_ns(void)
@@ -2046,7 +2048,9 @@ struct pehost {
     float   **in, **out;
     int       nin, nout, cap;
 
-    /* lock-free SPSC queue: GUI thread produces, audio thread consumes */
+    /* lock-free MPSC queue: any thread produces (MIDI reader, GUI, and the audio
+     * thread's own injected events), the audio thread consumes. `head` counts
+     * claims; a slot is readable once its `seq` says so. */
     ev_t              evq[EVQ];
     _Atomic unsigned  head, tail;
 
@@ -2060,7 +2064,7 @@ struct pehost {
      * arrived during it is placed proportionally into this one, which preserves
      * the spacing between events even though the batch is a block late. */
     uint64_t blk_t0;
-    unsigned ev_dropped;
+    _Atomic unsigned ev_dropped;
     unsigned ev_spilled;
 
     /* What the plugin has been told is sounding: a note-on delivered and no
@@ -2215,23 +2219,28 @@ static MS intptr_t host_callback(AEffect *fx, int32_t op, int32_t idx,
 static void ev_push_at(pehost *h, unsigned char t, unsigned char a, unsigned char b,
                        unsigned char c, float v, int32_t at)
 {
-    unsigned hd = atomic_load_explicit(&h->head, memory_order_relaxed);
-    unsigned tl = atomic_load_explicit(&h->tail, memory_order_acquire);
-    if (((hd + 1) & (EVQ - 1)) == (tl & (EVQ - 1))) {
+    uint32_t pos;
+    ev_t *e;
+    /* Several threads produce here, so a slot is claimed with a compare-exchange
+     * and published only once filled; see bridge_ring_claim. Never blocks, so it
+     * is safe from the audio thread too. */
+    if (!bridge_ring_claim(&h->head, &h->tail, EVQ, &pos)) {
         /* Dropping silently is how a sequencer ends up with a held note nobody
          * asked for: the note-on got through and its note-off did not. Which
          * events were lost cannot be known, so everything sounding is released
          * once the queue has drained -- a cut note is a glitch, a hung one has
          * to be found and stopped by hand. Said once on stderr as well, so it
          * is a reported fault rather than a mystery. */
-        if (!h->ev_dropped++)
+        if (!atomic_fetch_add_explicit(&h->ev_dropped, 1, memory_order_relaxed))
             fprintf(stderr, "pehost: the event queue overflowed -- some MIDI was "
                             "lost; releasing every sounding note\n");
         atomic_store_explicit(&h->release_req, 1, memory_order_release);
         return;
     }
-    h->evq[hd & (EVQ - 1)] = (ev_t){ t, a, b, c, v, mono_ns(), at };
-    atomic_store_explicit(&h->head, hd + 1, memory_order_release);
+    e = &h->evq[pos & (EVQ - 1)];
+    e->type = t; e->a = a; e->b = b; e->c = c; e->v = v;
+    e->t = mono_ns(); e->at = at;
+    bridge_ring_publish(&e->seq, pos);
 }
 static void ev_push(pehost *h, unsigned char t, unsigned char a, unsigned char b,
                     unsigned char c, float v)
@@ -3557,9 +3566,9 @@ void pehost_flush_params(pehost *h)
      * block instead, which is what peload does. */
     if (!h || !h->fx || h->is_v3 || h->br || h->mv || h->au || h->cl) return;
 
-    hd = atomic_load_explicit(&h->head, memory_order_acquire);
+    /* Only published slots: a claimed one may still be being filled. */
     tl = atomic_load_explicit(&h->tail, memory_order_relaxed);
-    for (; tl != hd; tl++) {
+    for (hd = 0; hd < EVQ && bridge_ring_ready(&h->evq[tl & (EVQ - 1)].seq, tl); hd++, tl++) {
         ev_t *e = &h->evq[tl & (EVQ - 1)];
         if (e->type == EV_PARAM) {
             if (h->fx->setParameter)
@@ -3776,8 +3785,8 @@ static void render_io_block(pehost *h, const float *src, float *inter,
     /* Large enough that an ordinary bar of dense sequencing fits in one
      * block; anything beyond spills to the next rather than vanishing. */
     struct { VstEvents ev; VstMidiEvent m[256]; } pkt;
-    unsigned hd, tl;
-    int nev = 0, i, k;
+    unsigned tl;
+    int nev = 0, i, k, evk;
 
     if (h && h->cl) {
         /* The interpreter works in separate channels, so de-interleave in and
@@ -3840,8 +3849,8 @@ static void render_io_block(pehost *h, const float *src, float *inter,
     /* Drain the queue: MIDI is batched into one effProcessEvents call, while
      * parameter writes go straight through (setParameter is realtime-safe). */
     memset(&pkt, 0, sizeof pkt);
-    hd = atomic_load_explicit(&h->head, memory_order_acquire);
-    tl = atomic_load_explicit(&h->tail, memory_order_relaxed);
+    /* Sequence-driven and bounded by the queue size, not by head - tail. */
+    tl = bridge_ring_start(&h->head, &h->tail, EVQ);
     {
         /* Where in this block each event belongs.
          *
@@ -3865,8 +3874,12 @@ static void render_io_block(pehost *h, const float *src, float *inter,
         double   ns_per_frame = 1e9 / (g_cb_rate > 0.0 ? g_cb_rate : 48000.0);
         h->blk_t0 = now;
 
-        for (; tl != hd; tl++) {
-            ev_t e = h->evq[tl & (EVQ - 1)];
+        for (evk = 0; evk < EVQ && bridge_ring_ready(&h->evq[tl & (EVQ - 1)].seq, tl); evk++, tl++) {
+            ev_t e;
+            e.type = h->evq[tl & (EVQ - 1)].type; e.a = h->evq[tl & (EVQ - 1)].a;
+            e.b = h->evq[tl & (EVQ - 1)].b; e.c = h->evq[tl & (EVQ - 1)].c;
+            e.v = h->evq[tl & (EVQ - 1)].v; e.t = h->evq[tl & (EVQ - 1)].t;
+            e.at = h->evq[tl & (EVQ - 1)].at;
             if (e.type == EV_PARAM) {
                 if (h->fx->setParameter)
                     h->fx->setParameter(h->fx, e.a | (e.b << 8), e.v);
@@ -3921,7 +3934,7 @@ static void render_io_block(pehost *h, const float *src, float *inter,
      * channel for whatever the plugin latched on its own -- a sustain pedal, a
      * hold, an arpeggiator. More than one packet's worth carries over: each
      * note-off clears its bit, so the next block picks up where this stopped. */
-    if (tl == hd &&
+    if (tl == atomic_load_explicit(&h->head, memory_order_acquire) &&
         atomic_exchange_explicit(&h->release_req, 0, memory_order_acq_rel)) {
         const int cap = (int)(sizeof pkt.m / sizeof pkt.m[0]);
         int ch, n, done = 1;

@@ -653,8 +653,19 @@ private:
             float pk = 0.0f;
             for (int i = 0; i < n * 2; i++) {
                 float v = buf_[i] * gain_;
-                if (v >  1.0f) v =  1.0f;
-                if (v < -1.0f) v = -1.0f;
+                /* A NaN from a plug-in is neither above nor below the rails and
+                 * would pass the clip straight to the speakers as a burst. */
+                if (v != v) v = 0.0f;
+                /* Past 0.95 the level rolls into the rail instead of hitting it:
+                 * continuous in value and slope, so the peaks that used to be
+                 * squared off lose their edge and never pass 1. */
+                {
+                    const float av = v < 0 ? -v : v;
+                    if (av > 0.95f) {
+                        const float o = 0.95f + 0.05f * tanhf((av - 0.95f) * 20.0f);
+                        v = v < 0 ? -o : o;
+                    }
+                }
                 float a = v < 0 ? -v : v;
                 if (a > pk) pk = a;
                 dst[i] = v;
@@ -2303,6 +2314,19 @@ public:
      * loadPluginPath; this exposes it to a shell embedding one HostWidget per
      * plug-in, and to tests. */
     bool loadPlugin(const QString &path) { return loadPluginPath(path); }
+    /* The plug-in folders dialog, for a shell's menu: a setting is not to be
+     * out of reach until a synth tab is in front. */
+    void showPluginFolders() { editPluginFolders(); }
+    /* What the browser lists, for a shell's plug-in manager. */
+    struct PluginRef { QString path, label, kind; bool loadable; };
+    QVector<PluginRef> availablePlugins() const
+    {
+        QVector<PluginRef> out;
+        for (const Entry &e : all_) out.append({ e.path, e.label, e.fmt, e.loadable });
+        return out;
+    }
+    void rescanPlugins() { rescan(); }
+    QString loadedPluginPath() const { return loadedPath_; }
 
     /* What is open ("" when nothing is), and whether its helper died for
      * good -- the recoverable deaths pollUi already restarted and reported do
@@ -3190,6 +3214,10 @@ private slots:
         all_.clear();
         const QStringList roots = scanRoots();
         for (const QString &r : roots) scanRoot(r, all_);
+        /* Plug-ins taken off the list (File > Plug-ins) stay off it. */
+        all_.erase(std::remove_if(all_.begin(), all_.end(), [](const Entry &e) {
+                       return vstdirs_is_hidden(e.path.toLocal8Bit().constData()) != 0;
+                   }), all_.end());
 
         std::sort(all_.begin(), all_.end(), [](const Entry &a, const Entry &b) {
             const int ra = osRank(a.os.toLatin1().constData());
@@ -4396,6 +4424,7 @@ private:
                 patch_bank_patch_plugin_path(b, ix))).canonicalFilePath();
             if (!want.isEmpty() &&
                 want != QFileInfo(loadedPath_).canonicalFilePath()) {
+                if (!approvePatchPlugin(want)) return;
                 switching_ = true;
                 bool ok = loadPluginPath(want);
                 switching_ = false;
@@ -4561,7 +4590,7 @@ private:
         if (!eng_.host() && patch_bank_count(b) > 0) {
             const QString want = QString::fromLocal8Bit(
                 patch_bank_patch_plugin_path(b, 0));
-            if (!want.isEmpty()) loadPluginPath(want);
+            if (!want.isEmpty() && approvePatchPlugin(want)) loadPluginPath(want);
         }
         rebuildPatchList();
         if (patchRows_.size() > 1) {
@@ -4888,23 +4917,62 @@ private:
      * places, and both are searched the same way the plug-in corpora are:
      * upwards from the binary, then the packaged location. Empty when it
      * cannot be found, which the caller reports rather than working around. */
+    /* Whether something found by walking up from the binary is a place to
+     * run things from: owned by whoever is running this, or by root, and not
+     * writable by everyone. The walk reaches /tmp from an AppImage's mount
+     * point, and what is under /tmp is anybody's -- a planted "tools/" there
+     * would otherwise be taken for ours. */
+    static bool trustedPath(const QFileInfo &fi)
+    {
+        if (!fi.exists()) return false;
+        const uint owner = fi.ownerId();
+        if (owner != uint(geteuid()) && owner != 0) return false;
+        return !(fi.permissions() & QFileDevice::WriteOther);
+    }
+
     static QString installerTool()
     {
-        static const char *rel[] = {
+        /* An installed copy, beside the binary, is taken as it is. */
+        static const char *installed[] = {
+            "../lib/vst-ace/vst_install.py",
+            "../share/vst-ace/vst_install.py",
+        };
+        /* The development tree is found by walking up, and only what the
+         * user or root owns is taken from there. */
+        static const char *tree[] = {
             "tools/vst_install.py",
             "../tools/vst_install.py",
             "../lib/vst-ace/vst_install.py",
             "../share/vst-ace/vst_install.py",
         };
         QDir d(QCoreApplication::applicationDirPath());
+        for (size_t i = 0; i < sizeof installed / sizeof installed[0]; i++) {
+            QString p = d.absoluteFilePath(installed[i]);
+            if (QFileInfo(p).isFile()) return QFileInfo(p).absoluteFilePath();
+        }
         for (int up = 0; up < 6; up++) {
-            for (size_t i = 0; i < sizeof rel / sizeof rel[0]; i++) {
-                QString p = d.absoluteFilePath(rel[i]);
-                if (QFileInfo(p).isFile()) return QFileInfo(p).absoluteFilePath();
+            for (size_t i = 0; i < sizeof tree / sizeof tree[0]; i++) {
+                QFileInfo fi(d.absoluteFilePath(tree[i]));
+                if (fi.isFile() && trustedPath(fi) && trustedPath(QFileInfo(fi.absolutePath())))
+                    return fi.absoluteFilePath();
             }
             if (!d.cdUp()) break;
         }
         return QString();
+    }
+
+    /* A patch can name the plug-in it belongs to, and loading one runs it: a
+     * file somebody sent is not to choose what runs. A plug-in in a folder set
+     * up for this program goes ahead; any other is asked about. */
+    bool approvePatchPlugin(const QString &plugin)
+    {
+        if (qEnvironmentVariableIsSet("STUDIO_TRUST_SESSIONS") ||
+            vstdirs_contains(plugin.toLocal8Bit().constData()))
+            return true;
+        return QMessageBox::question(this, "Open patch",
+                   QString("This patch loads a plug-in from outside the folders set up for "
+                           "this program. Loading a plug-in runs it.\n\n%1\n\nLoad it?").arg(plugin),
+                   QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) == QMessageBox::Yes;
     }
 
     static bool looksLikeInstaller(const QString &abs)
@@ -5345,6 +5413,14 @@ private:
         QAction *folders = settings->addAction("Plug-in &Folders...");
         folders->setShortcut(QKeySequence("Ctrl+D"));
         connect(folders, &QAction::triggered, this, &HostWidget::editPluginFolders);
+        /* Keep the loaded plug-in's folder: made one of the folders searched,
+         * and kept between sessions. What Open VST offers, asked for. */
+        QAction *keep = settings->addAction("&Keep This Plug-in's Folder");
+        connect(keep, &QAction::triggered, this, [this] {
+            if (loadedPath_.isEmpty()) { status("load a plug-in first", 4000); return; }
+            addUserRoot(VSTDIRS_ANY, QFileInfo(loadedPath_).absolutePath(), /*select=*/true);
+            status(QFileInfo(loadedPath_).absolutePath() + " is one of your plug-in folders", 5000);
+        });
 
         /* Some plug-ins will not do anything until something has been typed
          * into them. daHornet puts a registration panel over its own interface

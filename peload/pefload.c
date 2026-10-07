@@ -37,7 +37,7 @@
 #define GUEST_DATA   PEF_DATA
 #define GUEST_HEAP   PEF_HEAP
 
-static char g_err[256];
+static __thread char g_err[256];   /* per thread: loads may overlap */
 const char *pef_last_error(void) { return g_err; }
 
 static int fail(const char *fmt, ...)
@@ -93,15 +93,18 @@ static int unpack_pattern(const uint8_t *src, uint32_t srclen,
 
         if (cnt == 0) VARINT(cnt);
 
+        /* Every length below is a 32-bit count out of the file, so none is
+         * added to a position and compared: that sum wraps. si <= srclen and
+         * di <= dstlen always hold, so the room left is the subtraction. */
         switch (op) {
         case 0:                                     /* zero `cnt` bytes       */
-            if (di + cnt > dstlen) return fail("pattern zero overruns section");
+            if (cnt > dstlen - di) return fail("pattern zero overruns section");
             memset(dst + di, 0, cnt);
             di += cnt;
             break;
 
         case 1:                                     /* copy `cnt` bytes       */
-            if (si + cnt > srclen || di + cnt > dstlen)
+            if (cnt > srclen - si || cnt > dstlen - di)
                 return fail("pattern copy overruns");
             memcpy(dst + di, src + si, cnt);
             si += cnt; di += cnt;
@@ -113,9 +116,11 @@ static int unpack_pattern(const uint8_t *src, uint32_t srclen,
              * block is written repeatCount + 1 times. */
             uint32_t rep;
             VARINT(rep);
-            if (si + cnt > srclen) return fail("pattern repeat overruns source");
-            for (i = 0; i <= rep; i++) {
-                if (di + cnt > dstlen) return fail("pattern repeat overruns section");
+            if (cnt > srclen - si) return fail("pattern repeat overruns source");
+            /* An empty block repeated 2^32 times writes nothing, and would
+             * take as long as that to say so. */
+            for (i = 0; cnt && i <= rep; i++) {
+                if (cnt > dstlen - di) return fail("pattern repeat overruns section");
                 memcpy(dst + di, src + si, cnt);
                 di += cnt;
             }
@@ -143,16 +148,17 @@ static int unpack_pattern(const uint8_t *src, uint32_t srclen,
             VARINT(custom);
             VARINT(rep);
             common_at = si;
+            if (op == 3 && cnt > srclen - si) return fail("pattern %u overruns source", op);
             cust_at = si + (op == 3 ? cnt : 0);
-            if (cust_at > srclen) return fail("pattern %u overruns source", op);
+            if (cnt == 0 && custom == 0) { si = cust_at; break; }   /* nothing to write, 2^32 times */
             for (k = 0; k <= rep; k++) {
-                if (di + cnt > dstlen)
+                if (cnt > dstlen - di)
                     return fail("pattern %u overruns section", op);
                 if (op == 3) memcpy(dst + di, src + common_at, cnt);
                 else         memset(dst + di, 0, cnt);
                 di += cnt;
                 if (k == rep) break;
-                if (cust_at + custom > srclen || di + custom > dstlen)
+                if (custom > srclen - cust_at || custom > dstlen - di)
                     return fail("pattern %u custom part overruns", op);
                 memcpy(dst + di, src + cust_at, custom);
                 di += custom;
@@ -390,6 +396,9 @@ pef *pef_load(const uint8_t *file, uint32_t len, ppc *cpu,
     p->cpu = cpu;
     nsec = rd16(file + 32);
     if (nsec > PEF_MAX_SECTIONS) { fail("%u sections", nsec); free(p); return NULL; }
+    /* The section headers are read below as the file's own bytes. */
+    if (40 + (uint64_t)nsec * 28 > len)
+        { fail("the section headers run past the file"); free(p); return NULL; }
     p->nsections = nsec;
 
     /* First pass: place the instantiated sections and copy them in. */
@@ -406,8 +415,14 @@ pef *pef_load(const uint8_t *file, uint32_t len, ppc *cpu,
         switch (kind) {
         case 0: base = p->code_base ? p->code_base : GUEST_CODE; break; /* code */
         case 1: case 2: case 3:                                    /* data etc */
-            base = p->data_base ? p->data_base
-                                : GUEST_DATA + ((p->data_used + 0xFFFFu) & ~0xFFFFu);
+            /* Each instantiated data section gets memory of its own, after
+             * the last one. (This used to reuse data_base once it was set, so
+             * a second data-class section -- say a constant section beside the
+             * pattern-initialised one -- was copied over the first.) data_base
+             * stays the first one's: it is the TOC base the entry vectors and
+             * the default relocation section refer to. data_used is where the
+             * previous one ended. */
+            base = GUEST_DATA + ((p->data_used + 0xFFFFu) & ~0xFFFFu);
             break;
         case 4: loader_off = coff; loader_len = packed; continue;  /* loader   */
         default: continue;                                         /* debug    */
@@ -445,7 +460,7 @@ pef *pef_load(const uint8_t *file, uint32_t len, ppc *cpu,
             memcpy(cpu->mem + base, file + coff, n);
             if (total > n) memset(cpu->mem + base + n, 0, total - n);
         }
-        if (kind != 0) p->data_used += total;
+        if (kind != 0) p->data_used = (base - GUEST_DATA) + total;
     }
 
     if (!loader_len) { fail("no loader section"); free(p); return NULL; }
@@ -453,12 +468,24 @@ pef *pef_load(const uint8_t *file, uint32_t len, ppc *cpu,
     /* Second pass: the loader section -- imports, then relocations. */
     {
         const uint8_t *L = file + loader_off;
-        int32_t mainSection = (int32_t)rd32(L + 0);
-        uint32_t mainOffset = rd32(L + 4);
-        uint32_t nlibs = rd32(L + 24), nsyms = rd32(L + 28);
-        uint32_t nrelsec = rd32(L + 32), relOff = rd32(L + 36);
-        uint32_t strOff = rd32(L + 40);
-        uint32_t symtab = 56 + nlibs * 24;
+        int32_t mainSection;
+        uint32_t mainOffset, nlibs, nsyms, nrelsec, relOff, strOff;
+        uint32_t symtab;
+
+        /* Every offset in the loader section is the file's word, taken as an
+         * offset from the section's start: each one is checked against the
+         * section's length, in 64 bits, before it is followed. */
+        if (loader_len < 56)
+            { fail("the loader section is %u bytes, under its 56-byte header", loader_len); free(p); return NULL; }
+        mainSection = (int32_t)rd32(L + 0);
+        mainOffset = rd32(L + 4);
+        nlibs = rd32(L + 24); nsyms = rd32(L + 28);
+        nrelsec = rd32(L + 32); relOff = rd32(L + 36);
+        strOff = rd32(L + 40);
+        if (56 + (uint64_t)nlibs * 24 + (uint64_t)nsyms * 4 + (uint64_t)nrelsec * 12 > loader_len ||
+            strOff > loader_len)
+            { fail("the loader section's tables run past it"); free(p); return NULL; }
+        symtab = 56 + nlibs * 24;
 
         if (nsyms > max_imports)
             { fail("%u imports, room for %u", nsyms, max_imports); free(p); return NULL; }
@@ -478,6 +505,10 @@ pef *pef_load(const uint8_t *file, uint32_t len, ppc *cpu,
              * some way from the actual mistake. */
             uint32_t cls = (v >> 24) & 0x0F;
             const char *nm = (const char *)(L + strOff + nameoff);
+            /* The name has to end inside the loader section. */
+            if ((uint64_t)strOff + nameoff >= loader_len ||
+                !memchr(nm, 0, loader_len - (strOff + nameoff)))
+                { fail("import %u: its name runs past the loader section", i); free(p); return NULL; }
             snprintf(p->imports[i].name, sizeof p->imports[i].name, "%s", nm);
             p->imports[i].cls = cls;
             p->imports[i].weak = ((v >> 24) & 0x80) != 0;
@@ -501,6 +532,8 @@ pef *pef_load(const uint8_t *file, uint32_t len, ppc *cpu,
             uint16_t sect = rd16(rh);
             uint32_t cnt = rd32(rh + 4), off = rd32(rh + 8);
             if (sect >= nsec) continue;
+            if ((uint64_t)relOff + off + (uint64_t)cnt * 2 > loader_len)
+                { fail("relocations for section %u run past the loader section", sect); free(p); return NULL; }
             if (run_relocs(p, L + relOff + off, cnt * 2,
                            p->sect_addr[sect], p->sect_len[sect])) {
                 free(p); return NULL;

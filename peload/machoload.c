@@ -151,7 +151,7 @@ typedef struct {
 #define MAX_IMP   4096
 #define MAX_EXP   4096
 
-typedef struct { char name[192]; unsigned long calls; } imprec;
+typedef struct { char name[192]; unsigned long calls; void *stub; } imprec;
 typedef struct { char name[192]; void *addr; } exprec;
 
 struct macho {
@@ -178,6 +178,10 @@ struct macho {
 
     imprec    imp[MAX_IMP];
     int       nimp, nresolved;
+    /* This image's import stubs. Per image, so closing it gives them back: one
+     * process-wide arena filled up after a few dozen loads and never emptied. */
+    uint8_t  *tramp;
+    size_t    tramp_used;
     exprec    exp[MAX_EXP];
     int       nexp;
 
@@ -208,7 +212,7 @@ struct macho {
  * hangs in its own initialisation needs describing. */
 static macho *g_last_image;
 
-static char g_err[512];
+static __thread char g_err[512];   /* per thread: loads may overlap */
 const char *macho_last_error(void) { return g_err; }
 static int fail(const char *fmt, ...)
 {
@@ -246,11 +250,14 @@ static int64_t sleb(const uint8_t **p, const uint8_t *end)
     uint8_t b = 0;
     while (*p < end) {
         b = *(*p)++;
-        r |= (int64_t)(b & 0x7f) << shift;
-        shift += 7;
+        /* The shift is capped, not the loop: a run of continuation bytes must
+         * still be consumed, but shifting a 64-bit value by 64 or more is
+         * undefined, and the stream is file data. Bits past 63 mean nothing. */
+        if (shift < 64) r |= (int64_t)((uint64_t)(b & 0x7f) << shift);
+        if (shift < 64) shift += 7;
         if (!(b & 0x80)) break;
     }
-    if (shift < 64 && (b & 0x40)) r |= -((int64_t)1 << shift);
+    if (shift < 64 && (b & 0x40)) r |= (int64_t)(~(uint64_t)0 << shift);
     return r;
 }
 
@@ -356,34 +363,37 @@ static void *host_lookup(const char *sym)
 /* An unresolved import gets a stub that names itself when called. Same idea as
  * the PE loader's: a plugin importing a symbol is not evidence it calls it, and
  * the difference decides whether it needs implementing. */
-static uint8_t *g_tramp;
-static size_t   g_tramp_used;
-static macho   *g_stub_owner;
+#define STUB_SZ    48
+#define TRAMP_SIZE ((size_t)MAX_IMP * STUB_SZ)       /* a multiple of the page size */
 
-static void stub_report(unsigned long idx)
+static void stub_report(unsigned long idx, macho *m)
 {
-    macho *m = g_stub_owner;
     if (!m || idx >= (unsigned long)m->nimp) return;
     if (m->imp[idx].calls++ == 0)
         fprintf(stderr, "  [macho] unimplemented: %s\n", m->imp[idx].name);
 }
 
-static void *make_stub(unsigned long idx)
+static void *make_stub(macho *m, unsigned long idx)
 {
-    uint8_t *p;
+    uint8_t *p, *start;
 
-    if (!g_tramp) {
-        g_tramp = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (g_tramp == MAP_FAILED) { g_tramp = NULL; return NULL; }
+    /* One stub per import, however many slots bind it. */
+    if (m->imp[idx].stub) return m->imp[idx].stub;
+    if (!m->tramp) {
+        m->tramp = mmap(NULL, TRAMP_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m->tramp == MAP_FAILED) { m->tramp = NULL; return NULL; }
     }
-    if (g_tramp_used + 32 > (1u << 20)) return NULL;
-    p = g_tramp + g_tramp_used;
-    g_tramp_used += 32;
+    if (m->tramp_used + STUB_SZ > TRAMP_SIZE) return NULL;
+    start = p = m->tramp + m->tramp_used;
+    m->tramp_used += STUB_SZ;
 
     /* System V AMD64: first argument in %rdi, and the caller cleans up -- so
-     * unlike i386 stdcall there is no argument count to get right. */
+     * unlike i386 stdcall there is no argument count to get right. The image is
+     * passed as the second, so a stub reports against its own image rather than
+     * whichever was opened last. */
     *p++ = 0x48; *p++ = 0xBF; memcpy(p, &idx, 8); p += 8;      /* mov rdi, imm64 */
+    *p++ = 0x48; *p++ = 0xBE; memcpy(p, &m, 8); p += 8;        /* mov rsi, imm64 */
     *p++ = 0x48; *p++ = 0xB8;
     { void *f = (void *)stub_report; memcpy(p, &f, 8); p += 8; } /* mov rax, fn   */
     *p++ = 0x50;                                                /* push rax (align) */
@@ -391,7 +401,8 @@ static void *make_stub(unsigned long idx)
     *p++ = 0xFF; *p++ = 0xD0;                                   /* call rax        */
     *p++ = 0x48; *p++ = 0x31; *p++ = 0xC0;                      /* xor rax, rax    */
     *p++ = 0xC3;                                                /* ret             */
-    return g_tramp + g_tramp_used - 32;
+    m->imp[idx].stub = start;
+    return start;
 }
 
 static void *resolve(macho *m, const char *sym, int weak)
@@ -420,11 +431,11 @@ static void *resolve(macho *m, const char *sym, int weak)
     if (weak) return NULL;
 
     for (i = 0; i < m->nimp; i++)
-        if (!strcmp(m->imp[i].name, sym)) return make_stub((unsigned long)i);
+        if (!strcmp(m->imp[i].name, sym)) return make_stub(m, (unsigned long)i);
     if (m->nimp < MAX_IMP) {
         snprintf(m->imp[m->nimp].name, sizeof m->imp[m->nimp].name, "%s", sym);
         m->nimp++;
-        return make_stub((unsigned long)(m->nimp - 1));
+        return make_stub(m, (unsigned long)(m->nimp - 1));
     }
     return NULL;
 }
@@ -433,24 +444,28 @@ static void *resolve(macho *m, const char *sym, int weak)
 
 static uint8_t *seg_addr(macho *m, int idx, uint64_t off)
 {
-    uint64_t at;
+    const segment_command_64 *sg;
 
     if (idx < 0 || idx >= m->nseg) return NULL;
-    at = m->seg[idx]->vmaddr + off;
-    /* The offset as well as the segment. `off` is a running total accumulated
-     * from ULEB128 values in the rebase and bind opcode streams -- file data,
-     * stepped forward by every DO_REBASE and DO_BIND -- so it is checked here
-     * on each use rather than once where the stream starts.
+    sg = m->seg[idx];
+    /* The offset as well as the segment, and against the segment's own extent
+     * rather than the whole image. `off` is a running total accumulated from
+     * ULEB128 values in the rebase and bind opcode streams -- file data, stepped
+     * forward by every DO_REBASE and DO_BIND -- so it is checked here on each
+     * use rather than once where the stream starts.
      *
      * Everything that writes through this stores an eight-byte pointer. An
      * offset that walked off the end used to write outside the image, and what
      * sits next to an anonymous mapping in this process includes the dynamic
      * linker's own structures: the fault that caused surfaced much later and
      * somewhere else entirely, inside dlsym, resolving an unrelated symbol
-     * through a link map that no longer parsed. */
-    if (at < off || at > m->span || m->span - at < sizeof(uint64_t))
+     * through a link map that no longer parses. Checking against m->span alone
+     * was not enough either: the gaps between segments inside the span are
+     * still PROT_NONE, and a write there faults on the spot. */
+    if (off > sg->vmsize || sg->vmsize - off < sizeof(uint64_t))
         return NULL;
-    return m->base + at;
+    /* Placed by vmaddr - lowest vmaddr, as map_image places the segment. */
+    return (uint8_t *)(uintptr_t)(sg->vmaddr + off + m->slide);
 }
 
 static int map_image(macho *m)
@@ -518,13 +533,18 @@ static int protect_segments(macho *m)
         if (!prot) prot = PROT_READ;
         /* __TEXT is r-x on macOS, but the bind pass writes into it for
          * TEXT_ABSOLUTE32 fixups, so protections go on afterwards. */
-        if (mprotect(m->base + (s->vmaddr), len, prot))
+        if (mprotect((void *)(uintptr_t)(s->vmaddr + m->slide), len, prot))
             MLOG("  [macho] mprotect %.16s failed: %s\n", s->segname, strerror(errno));
     }
     return 0;
 }
 
 /* --------------------------------------------------------- rebase / bind */
+
+/* Do these dyld-info streams lie inside the slice? Their offsets and sizes are
+ * file data, and the interpreters below read straight from them. */
+static int stream_ok(const macho *m, uint32_t off, uint32_t size)
+{ return (uint64_t)off + size <= m->slicelen; }
 
 static int do_rebase(macho *m)
 {
@@ -534,6 +554,8 @@ static int do_rebase(macho *m)
     uint64_t count, skip, i;
 
     if (!m->dyld || !m->dyld->rebase_size) return 0;
+    if (!stream_ok(m, m->dyld->rebase_off, m->dyld->rebase_size))
+        return fail("rebase stream lies outside the file");
     p = m->slice + m->dyld->rebase_off;
     end = p + m->dyld->rebase_size;
 
@@ -660,6 +682,10 @@ static int do_bind(macho *m)
 {
     dyld_info_command *d = m->dyld;
     if (!d) return 0;
+    if (!stream_ok(m, d->bind_off, d->bind_size) ||
+        !stream_ok(m, d->weak_bind_off, d->weak_bind_size) ||
+        !stream_ok(m, d->lazy_bind_off, d->lazy_bind_size))
+        return fail("a bind stream lies outside the file");
     if (d->bind_size &&
         run_bind_stream(m, m->slice + d->bind_off,
                         m->slice + d->bind_off + d->bind_size, 0, "regular"))
@@ -690,8 +716,16 @@ static int do_bind(macho *m)
  * looking up an unrelated symbol through a link map that no longer parses. */
 static void *img_slot(macho *m, uint64_t off, uint64_t len)
 {
-    if (off > m->span || len > (uint64_t)m->span - off) return NULL;
-    return m->base + off;
+    int i;
+    /* Inside one segment, not merely inside the span: the gaps between segments
+     * are PROT_NONE, and a write into one faults rather than being refused. */
+    for (i = 0; i < m->nseg; i++) {
+        const segment_command_64 *sg = m->seg[i];
+        if (off >= sg->vmaddr && off - sg->vmaddr <= sg->vmsize &&
+            len <= sg->vmsize - (off - sg->vmaddr))
+            return (void *)(uintptr_t)(off + m->slide);
+    }
+    return NULL;
 }
 
 /* Walk every symbol-pointer section and fill each slot from the indirect symbol
@@ -820,14 +854,23 @@ static int apply_relocs(macho *m)
 /* The export table is a trie: each node carries an optional terminal payload
  * and a list of labelled edges, and a symbol name is the concatenation of edge
  * labels along the path. Walk it depth-first, accumulating the prefix. */
+#define EXPORT_MAX_DEPTH 192
+
+/* Child offsets are file data, so nothing stops a node pointing back at one of
+ * its own ancestors, or two siblings at the same subtree. A real trie has no
+ * more nodes than bytes and no path longer than the longest symbol name, so
+ * both are capped: `depth` against stack overflow, `budget` against a loop or a
+ * fan-out that would otherwise run for ever. */
 static void walk_exports(macho *m, const uint8_t *start, const uint8_t *end,
-                         const uint8_t *node, char *prefix, size_t plen)
+                         const uint8_t *node, char *prefix, size_t plen,
+                         int depth, long *budget)
 {
     uint64_t term, flags, addr;
     const uint8_t *p = node;
     uint8_t nchild;
     int i;
 
+    if (depth > EXPORT_MAX_DEPTH || --*budget < 0) return;
     if (node < start || node >= end) return;
     term = uleb(&p, end);
     if (term) {
@@ -854,16 +897,19 @@ static void walk_exports(macho *m, const uint8_t *start, const uint8_t *end,
         if (p < end) p++;                         /* the NUL */
         prefix[n] = 0;
         { uint64_t child = uleb(&p, end);
-          walk_exports(m, start, end, start + child, prefix, n); }
+          if (child >= (uint64_t)(end - start)) continue;
+          walk_exports(m, start, end, start + child, prefix, n, depth + 1, budget); }
     }
 }
 
 static void collect_exports(macho *m)
 {
     char prefix[192] = { 0 };
-    if (m->dyld && m->dyld->export_size) {
+    if (m->dyld && m->dyld->export_size &&
+        stream_ok(m, m->dyld->export_off, m->dyld->export_size)) {
         const uint8_t *s = m->slice + m->dyld->export_off;
-        walk_exports(m, s, s + m->dyld->export_size, s, prefix, 0);
+        long budget = (long)m->dyld->export_size + 1;
+        walk_exports(m, s, s + m->dyld->export_size, s, prefix, 0, 0, &budget);
     }
     /* A bundle with no export trie still has a symbol table. */
     if (!m->nexp && m->symtab) {
@@ -1102,7 +1148,6 @@ macho *macho_open(const char *path)
 
     if (map_image(m)) { macho_close(m); return NULL; }
 
-    g_stub_owner = m;
     g_last_image = m;
     macshim_set_bundle(m->bundle_path);
     /* And tell the dyld shims which image is loaded. A VSTGUI plugin finds its
@@ -1191,7 +1236,6 @@ void macho_close(macho *m)
      * plugin after another does not fill the table and start refusing to
      * register the next one's. */
     if (m->classlist) macobjc_forget_image_classes(m->classlist, m->nclass);
-    if (g_stub_owner == m) g_stub_owner = NULL;
     if (g_last_image == m) g_last_image = NULL;
     /* A block the plugin dispatched runs on a thread of its own, and the code it
      * runs is in this image. Unmapping under one jumps into nothing -- and not
@@ -1207,6 +1251,7 @@ void macho_close(macho *m)
     if (macshim_dyld_image_is(m->base)) macshim_set_dyld_image(NULL, NULL, 0);
     if (macshim_gcd_drain(500)) {
         if (m->base) munmap(m->base, m->span);
+        if (m->tramp) munmap(m->tramp, TRAMP_SIZE);
         if (m->file) munmap(m->file, m->filelen);
     } else {
         static int said;

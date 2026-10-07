@@ -40,8 +40,11 @@
  * survives the crossing. Both sides are built together, so the check exists to
  * catch a stale helper binary rather than to support old ones.
  * 3: m_release, so MIDI lost to a full ring releases what it may have left
- * hanging. */
-#define BRIDGE_VERSION  3
+ * hanging.
+ * 4: the three rings carry a per-slot sequence number so any number of host
+ * threads may produce into them (see bridge_ring_claim), and BR_SET_PARAM
+ * exists so a restart can replay parameters without going through a ring. */
+#define BRIDGE_VERSION  4
 
 /* Generous enough for any period a host will ask for; the helper clamps. */
 #define BRIDGE_MAX_FRAMES  8192
@@ -92,16 +95,72 @@ static inline int bridge_sem_wait(bridge_sem *s, const struct timespec *rel)
     }
 }
 
-typedef struct { int32_t index; float value; } bridge_param;
+/* ---- multi-producer, single-consumer rings ----
+ *
+ * The host writes into these from several threads (the MIDI reader, the GUI,
+ * and sometimes the audio thread itself), so a plain head/tail pair with a
+ * single producer is not enough: two producers read the same head and write the
+ * same slot. A producer instead claims a position with a compare-exchange on
+ * `head`, fills the slot, and publishes it by storing pos+1 into the slot's
+ * `seq`. `head` therefore counts claims, not published entries, and the
+ * consumer must go by `seq` -- a claimed slot whose producer has not finished is
+ * simply "not there yet", and nobody ever waits on anybody (the audio thread
+ * can produce without being held up by a preempted GUI thread).
+ *
+ * The consumer owns `tail`. It never loops on head - tail: a head that is
+ * behind the tail (a scribbled region) would otherwise mean ~2^32 iterations,
+ * so it is resynchronised and every drain is bounded by the ring size. */
+typedef _Atomic uint32_t bridge_seq;
+
+/* Claim a slot. Returns 1 and *pos, or 0 when the ring is full. */
+static inline int bridge_ring_claim(_Atomic uint32_t *head, _Atomic uint32_t *tail,
+                                    uint32_t n, uint32_t *pos)
+{
+    for (;;) {
+        /* tail first: head only ever moves ahead of it, so the difference cannot
+         * come out negative through a stale head. */
+        uint32_t t = atomic_load_explicit(tail, memory_order_acquire);
+        uint32_t h = atomic_load_explicit(head, memory_order_relaxed);
+        if (h - t >= n) return 0;
+        if (atomic_compare_exchange_weak_explicit(head, &h, h + 1,
+                memory_order_relaxed, memory_order_relaxed)) {
+            *pos = h;
+            return 1;
+        }
+    }
+}
+
+static inline void bridge_ring_publish(bridge_seq *seq, uint32_t pos)
+{ atomic_store_explicit(seq, pos + 1, memory_order_release); }
+
+/* Is the slot at consumer position `t` filled? */
+static inline int bridge_ring_ready(const bridge_seq *seq, uint32_t t)
+{ return atomic_load_explicit(seq, memory_order_acquire) == t + 1; }
+
+/* Consumer: where to start. A tail that is not within n of the head is not
+ * something a correct producer can cause; drop to the head and carry on. */
+static inline uint32_t bridge_ring_start(_Atomic uint32_t *head, _Atomic uint32_t *tail,
+                                         uint32_t n)
+{
+    uint32_t t = atomic_load_explicit(tail, memory_order_relaxed);
+    uint32_t h = atomic_load_explicit(head, memory_order_acquire);
+    if (h - t > n) {
+        t = h;
+        atomic_store_explicit(tail, t, memory_order_release);
+    }
+    return t;
+}
+
+typedef struct { int32_t index; float value; bridge_seq seq; } bridge_param;
 /* `at` is the offset within the next block, or -1 for "as soon as it is drained".
  * Without it every event arriving between two callbacks collapsed onto the same
  * sample, which is what a sequencer hears as quantisation to the block size. */
-typedef struct { uint8_t status, d1, d2, pad; int32_t at; } bridge_ev;
+typedef struct { uint8_t status, d1, d2, pad; int32_t at; bridge_seq seq; } bridge_ev;
 /* Editor input, of either kind. Mouse: a=x b=y c=msg d=buttons e=wheel.
  * Key: a=vk b=down c=ch. One ring for both, because both have to bypass the
  * request socket -- a plugin spinning in its own loop cannot answer either. */
 enum { BRIDGE_IN_MOUSE = 0, BRIDGE_IN_KEY = 1 };
-typedef struct { int32_t kind, a, b, c, d, e; } bridge_input;
+typedef struct { int32_t kind, a, b, c, d, e; bridge_seq seq; } bridge_input;
 
 typedef struct {
     uint32_t magic, version;
@@ -114,11 +173,11 @@ typedef struct {
     float    in [BRIDGE_MAX_CHAN * BRIDGE_MAX_FRAMES];
     float    out[BRIDGE_MAX_CHAN * BRIDGE_MAX_FRAMES];
 
-    /* ---- parameter writes, GUI thread -> audio ---- */
+    /* ---- parameter writes, any host thread -> audio ---- */
     _Atomic uint32_t p_head, p_tail;
     bridge_param     pq[BRIDGE_PARAMQ];
 
-    /* ---- MIDI, GUI thread -> audio ---- */
+    /* ---- MIDI, any host thread -> audio ---- */
     _Atomic uint32_t m_head, m_tail;
     bridge_ev      mq[BRIDGE_MIDIQ];
     /* Release every sounding note. Raised by the host when the ring above was
@@ -175,7 +234,8 @@ enum {
     BR_ALL_NOTES_OFF,
     BR_IMPORT_STATS,     /*                       <- implemented,stubbed,hit */
     BR_INPUT_MASK,       /* -> mask                                          */
-    BR_QUIT
+    BR_QUIT,
+    BR_SET_PARAM         /* -> index, f=value     (restart replay; not a ring) */
 };
 
 /* One fixed-size message each way keeps framing trivial: a short read means the

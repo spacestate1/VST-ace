@@ -9,6 +9,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* $XDG_CONFIG_HOME if the desktop set one, else ~/.config, which is what the
@@ -342,4 +343,132 @@ int vstdirs_remove(const char *dir)
     }
     if (!hit) return 0;
     return vstdirs_save(dirs, w) ? -1 : 1;
+}
+
+int vstdirs_contains(const char *path)
+{
+    vstdir dirs[VSTDIRS_MAX];
+    char want[PATH_MAX];
+    int n, i;
+    if (!path || !*path || !realpath(path, want)) return 0;
+    n = vstdirs_load(dirs, VSTDIRS_MAX);
+    for (i = 0; i < n; i++) {
+        char root[PATH_MAX];
+        size_t l;
+        if (!realpath(dirs[i].path, root)) continue;
+        l = strlen(root);
+        if (!strncmp(want, root, l) && (want[l] == '/' || l == 1)) return 1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------- hidden ---- */
+
+const char *vstdirs_hidden_file(void)
+{
+    static char path[VSTDIRS_PATHLEN + 16];
+    char *slash;
+    snprintf(path, sizeof path, "%s", vstdirs_file());
+    if ((slash = strrchr(path, '/'))) *slash = 0;
+    snprintf(path + strlen(path), sizeof path - strlen(path), "/hidden-plugins");
+    return path;
+}
+
+/* Read whole, a line a path. Scans ask once per candidate, so the list is
+ * kept and only read again when the file's time changes. */
+static int hidden_read(char (*out)[VSTDIRS_PATHLEN], int max)
+{
+    FILE *f = fopen(vstdirs_hidden_file(), "r");
+    char line[VSTDIRS_PATHLEN + 8];
+    int n = 0;
+    if (!f) return 0;
+    while (n < max && fgets(line, sizeof line, f)) {
+        size_t l = strlen(line);
+        while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
+        if (!l) continue;
+        snprintf(out[n++], VSTDIRS_PATHLEN, "%s", line);
+    }
+    fclose(f);
+    return n;
+}
+
+#define HIDDEN_MAX 4096
+int vstdirs_hidden_list(char (*out)[VSTDIRS_PATHLEN], int max) { return hidden_read(out, max); }
+
+int vstdirs_is_hidden(const char *path)
+{
+    static char (*cache)[VSTDIRS_PATHLEN];
+    static int n;
+    static time_t stamp;
+    static long size = -1;
+    struct stat st;
+    int i;
+    if (!path || !*path) return 0;
+    if (stat(vstdirs_hidden_file(), &st) != 0) { n = 0; size = -1; return 0; }
+    if (!cache && !(cache = malloc((size_t)HIDDEN_MAX * VSTDIRS_PATHLEN))) return 0;
+    if (st.st_mtime != stamp || (long)st.st_size != size) {
+        n = hidden_read(cache, HIDDEN_MAX);
+        stamp = st.st_mtime;
+        size = (long)st.st_size;
+    }
+    for (i = 0; i < n; i++) if (!strcmp(cache[i], path)) return 1;
+    return 0;
+}
+
+static int hidden_write(char (*list)[VSTDIRS_PATHLEN], int n)
+{
+    char tmp[VSTDIRS_PATHLEN + 32], dir[VSTDIRS_PATHLEN + 16], *slash;
+    FILE *f;
+    int i, ok;
+    snprintf(dir, sizeof dir, "%s", vstdirs_hidden_file());
+    if ((slash = strrchr(dir, '/'))) {
+        char *q;
+        *slash = 0;
+        /* The folder and its parents, as `mkdir -p`. */
+        for (q = dir + 1; *q; q++)
+            if (*q == '/') { *q = 0; mkdir(dir, 0700); *q = '/'; }
+        mkdir(dir, 0700);
+    }
+    snprintf(tmp, sizeof tmp, "%s.new", vstdirs_hidden_file());
+    if (!(f = fopen(tmp, "w"))) return -1;
+    for (i = 0; i < n; i++) fprintf(f, "%s\n", list[i]);
+    ok = fclose(f) == 0;
+    if (!ok || rename(tmp, vstdirs_hidden_file()) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
+int vstdirs_hide(const char *path)
+{
+    char (*list)[VSTDIRS_PATHLEN];
+    int n, i, r = 1;
+    if (!path || !*path || strchr(path, '\n')) return -1;
+    if (!(list = malloc((size_t)(HIDDEN_MAX + 1) * VSTDIRS_PATHLEN))) return -1;
+    n = hidden_read(list, HIDDEN_MAX);
+    for (i = 0; i < n; i++) if (!strcmp(list[i], path)) r = 0;
+    if (r) {
+        if (n >= HIDDEN_MAX) r = -1;
+        else {
+            snprintf(list[n++], VSTDIRS_PATHLEN, "%s", path);
+            if (hidden_write(list, n)) r = -1;
+        }
+    }
+    free(list);
+    return r;
+}
+
+int vstdirs_unhide(const char *path)
+{
+    char (*list)[VSTDIRS_PATHLEN];
+    int n, i, j, r = 0;
+    if (!path || !*path) return -1;
+    if (!(list = malloc((size_t)HIDDEN_MAX * VSTDIRS_PATHLEN))) return -1;
+    n = hidden_read(list, HIDDEN_MAX);
+    for (i = j = 0; i < n; i++) {
+        if (!strcmp(list[i], path)) { r = 1; continue; }
+        if (i != j) memcpy(list[j], list[i], VSTDIRS_PATHLEN);
+        j++;
+    }
+    if (r && hidden_write(list, j)) r = -1;
+    free(list);
+    return r;
 }

@@ -172,7 +172,9 @@ static uint32_t mask_mb_me(int mb, int me)
                             : (((1u << (me - mb + 1)) - 1) << (31 - me));
     } else {
         /* mb > me wraps: the run runs off the end and continues from bit 0. */
-        m = ~mask_mb_me(me + 1, mb - 1);
+        /* mb == me + 1 leaves nothing to complement -- the run is every bit.
+         * Without this the recursion asks for (me + 1, me) again, forever. */
+        m = (mb == me + 1) ? 0xFFFFFFFFu : ~mask_mb_me(me + 1, mb - 1);
     }
     return m;
 }

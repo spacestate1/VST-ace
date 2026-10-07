@@ -89,28 +89,29 @@ static void sv_add(serve_state *s, int n, int st, int d1, int d2)
 static void sv_drain(serve_state *s)
 {
     bridge_shm *sh = s->sh;
-    uint32_t t, h;
-    int n = 0;
+    uint32_t t;
+    int n = 0, k;
 
-    t = atomic_load_explicit(&sh->p_tail, memory_order_relaxed);
-    h = atomic_load_explicit(&sh->p_head, memory_order_acquire);
-    for (; t != h; t++) {
-        bridge_param p = sh->pq[t % BRIDGE_PARAMQ];
-        if (p.index >= 0 && p.index < s->fx->numParams)
-            s->fx->setParameter(s->fx, p.index, p.value);
+    /* Driven by each slot's sequence number and bounded by the ring size, never
+     * by head - tail: see bridge_ring_start. */
+    t = bridge_ring_start(&sh->p_head, &sh->p_tail, BRIDGE_PARAMQ);
+    for (k = 0; k < BRIDGE_PARAMQ && bridge_ring_ready(&sh->pq[t % BRIDGE_PARAMQ].seq, t); k++, t++) {
+        bridge_param *p = &sh->pq[t % BRIDGE_PARAMQ];
+        if (p->index >= 0 && p->index < s->fx->numParams)
+            s->fx->setParameter(s->fx, p->index, p->value);
     }
     atomic_store_explicit(&sh->p_tail, t, memory_order_release);
 
-    t = atomic_load_explicit(&sh->m_tail, memory_order_relaxed);
-    h = atomic_load_explicit(&sh->m_head, memory_order_acquire);
-    for (; t != h && n < BRIDGE_MIDIQ; t++, n++) {
-        bridge_ev m = sh->mq[t % BRIDGE_MIDIQ];
-        int ch = m.status & 0x0f, kind = m.status & 0xf0, k = m.d1 & 0x7f;
-        sv_add(s, n, m.status, m.d1, m.d2);
-        if (kind == 0x90 && m.d2) s->sounding[ch][k >> 3] |= (unsigned char)(1u << (k & 7));
+    t = bridge_ring_start(&sh->m_head, &sh->m_tail, BRIDGE_MIDIQ);
+    for (k = 0; k < BRIDGE_MIDIQ && n < BRIDGE_MIDIQ &&
+                bridge_ring_ready(&sh->mq[t % BRIDGE_MIDIQ].seq, t); k++, t++, n++) {
+        bridge_ev *m = &sh->mq[t % BRIDGE_MIDIQ];
+        int ch = m->status & 0x0f, kind = m->status & 0xf0, k2 = m->d1 & 0x7f;
+        sv_add(s, n, m->status, m->d1, m->d2);
+        if (kind == 0x90 && m->d2) s->sounding[ch][k2 >> 3] |= (unsigned char)(1u << (k2 & 7));
         else if (kind == 0x80 || kind == 0x90)
-            s->sounding[ch][k >> 3] &= (unsigned char)~(1u << (k & 7));
-        else if (kind == 0xb0 && (k == 123 || k == 120))
+            s->sounding[ch][k2 >> 3] &= (unsigned char)~(1u << (k2 & 7));
+        else if (kind == 0xb0 && (k2 == 123 || k2 == 120))
             memset(s->sounding[ch], 0, sizeof s->sounding[ch]);
     }
     atomic_store_explicit(&sh->m_tail, t, memory_order_release);
@@ -120,7 +121,8 @@ static void sv_drain(serve_state *s)
      * for everything sounding, then CC 123 / 120 on every channel for what the
      * plugin latched itself. Each note-off clears its bit, so one too big for
      * this block finishes in the next. */
-    if (t == h && atomic_exchange_explicit(&sh->m_release, 0, memory_order_acq_rel)) {
+    if (t == atomic_load_explicit(&sh->m_head, memory_order_acquire) &&
+        atomic_exchange_explicit(&sh->m_release, 0, memory_order_acq_rel)) {
         int ch, k, done = 1;
         for (ch = 0; ch < 16 && done; ch++)
             for (k = 0; k < 128; k++) {
@@ -216,14 +218,21 @@ static void sv_drain_input(serve_state *s)
 {
     static int depth;
     bridge_shm *sh = s->sh;
-    uint32_t t, hd;
+    uint32_t t;
+    int k;
 
     if (!sh || depth > 4) return;
     depth++;
-    t  = atomic_load_explicit(&sh->in_tail, memory_order_relaxed);
-    hd = atomic_load_explicit(&sh->in_head, memory_order_acquire);
-    for (; t != hd; t++) {
-        bridge_input e = sh->inq[t % BRIDGE_INQ];
+    /* Tail first, then delivery: delivering runs the plug-in's wndproc, which can
+     * re-enter here through the pump. Sequence-driven and bounded, as above. */
+    (void)bridge_ring_start(&sh->in_head, &sh->in_tail, BRIDGE_INQ);
+    for (k = 0; k < BRIDGE_INQ; k++) {
+        bridge_input e;
+        t = atomic_load_explicit(&sh->in_tail, memory_order_relaxed);
+        if (!bridge_ring_ready(&sh->inq[t % BRIDGE_INQ].seq, t)) break;
+        e.kind = sh->inq[t % BRIDGE_INQ].kind; e.a = sh->inq[t % BRIDGE_INQ].a;
+        e.b = sh->inq[t % BRIDGE_INQ].b; e.c = sh->inq[t % BRIDGE_INQ].c;
+        e.d = sh->inq[t % BRIDGE_INQ].d; e.e = sh->inq[t % BRIDGE_INQ].e;
         atomic_store_explicit(&sh->in_tail, t + 1, memory_order_release);
         if (e.kind == BRIDGE_IN_KEY) w32_key(e.a, e.b, e.c);
         else                         w32_mouse(e.a, e.b, e.c, e.d, e.e);
@@ -303,7 +312,10 @@ static int serve_run(AEffect32 *fx, int sock, const char *shm_path)
     S.fx = fx;
     S.sock = sock;
 
-    if ((fd = shm_open(shm_path, O_RDWR, 0600)) < 0) { perror("shm_open"); return 1; }
+    /* "fd:N": the host's sealed region, handed down as an open file. Otherwise
+     * a name in /dev/shm. */
+    if (!strncmp(shm_path, "fd:", 3)) fd = atoi(shm_path + 3);
+    else if ((fd = shm_open(shm_path, O_RDWR, 0600)) < 0) { perror("shm_open"); return 1; }
     sh = mmap(NULL, BRIDGE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (sh == MAP_FAILED) { perror("mmap shm"); return 1; }
@@ -438,9 +450,12 @@ static int serve_run(AEffect32 *fx, int sock, const char *shm_path)
             w32_key(q.a, q.b, q.c);
             break;
         case BR_INPUT_MASK:    S.in_mask = (unsigned)q.a; break;
+        case BR_SET_PARAM:
+            if (q.a >= 0 && q.a < fx->numParams) fx->setParameter(fx, q.a, q.f);
+            break;
         case BR_ALL_NOTES_OFF:
-            /* Raised rather than written into mq: the host is that ring's one
-             * producer, and a second one here, on another thread, could
+            /* Raised rather than written into mq: the host's producers
+             * are the only writers of that ring, and one more here, on another thread, could
              * overwrite its entries. The audio thread sends each sounding note
              * its note-off and the CC 123 / 120 pair on every channel. */
             atomic_store_explicit(&sh->m_release, 1, memory_order_release);
