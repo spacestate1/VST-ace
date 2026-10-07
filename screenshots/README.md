@@ -27,3 +27,5 @@ broadway backend), not mock-ups. All taken from the current code.
 | 25-gtk-help-columns.png, 26-gtk-help-keys.png | help |
 | 27-gtk-tracks-added.png | tracks added with **+ Track** |
 | 28-gtk-sample-keymap.png, 11-qt-sample-keymap.png | Samples > Edit Sample Set: the key map (drag a sample onto a key) |
+| 12-qt-keymap-empty-top.png, 29-gtk-keymap-empty-top.png | the keyboard scrolled to the empty high notes |
+| 13-qt-keymap-key-picked.png, 30-gtk-keymap-key-picked.png | a key picked (orange), its sample selected |

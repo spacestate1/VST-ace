@@ -3768,6 +3768,14 @@ static gboolean uitest(gpointer u)
     pump(500);
     if (E.win) {
         shot_of(E.win, "g05-editor.png");
+        kb_scroll_to(110);
+        pump(400);
+        shot_of(E.win, "g05c-keymap-top.png");
+        E.curnote = 64;
+        kb_refresh();
+        kb_scroll_to(64);
+        pump(400);
+        shot_of(E.win, "g05d-keymap-picked.png");
         if (E.m->n >= 2) {   /* Samples onto keys: a swap, then a free key. */
             int a = E.m->pad[0].note, b = E.m->pad[1].note;
             ed_assign(0, b);

@@ -99,6 +99,18 @@ int uitest(trk_engine *e, TrackerWindow &w, const QString &outdir)
         wait(400);
         se.grab().save(outdir + "/05-editor.png");
         std::printf("  picture: %s/05-editor.png\n", outdir.toLocal8Bit().constData());
+        {   // The keyboard scrolled to the empty top, and a key picked.
+            auto *kb0 = se.findChild<KeyList *>();
+            if (kb0) {
+                kb0->scrollNear(110);
+                wait(300);
+                se.grab().save(outdir + "/05c-keymap-top.png");
+                kb0->scrollNear(64);
+                kb0->setCurrent(64, false);
+                wait(300);
+                se.grab().save(outdir + "/05d-keymap-picked.png");
+            }
+        }
         {   // Samples onto keys: a drop, a swap, and the key a drop lands on.
             auto *kb = se.findChild<KeyList *>();
             auto *tb = se.findChild<QTableWidget *>();
