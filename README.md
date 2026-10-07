@@ -75,6 +75,12 @@ for plug-ins are in [`docs/INSTALL.md`](docs/INSTALL.md).
 Editors embed through an X11 window id, so both windows ask for the X11 backend
 under Wayland; XWayland is enough.
 
+Synth audio goes to PipeWire by default. **File > Audio output...** (Qt) or
+**File > Audio...** (GTK) switches every synth to JACK or to an ALSA device
+while running; the choice is kept in `~/.config/vst-ace/audio-backend`, and
+`--backend auto|pipewire|jack|alsa` or `DW_BACKEND` overrides it. A backend that
+will not open, or that dies (a JACK server stopping), falls back to PipeWire.
+
 ## Running
 
     dw                       open a window — whichever matches the desktop

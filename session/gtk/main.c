@@ -34,6 +34,7 @@
 #include "trackerview.h"
 #include "trk.h"
 #include "pehost.h"
+#include "audioout.h"
 #include "vstdirs.h"
 #include "sessfile.h"
 
@@ -122,15 +123,17 @@ static void status(const char *msg)
  * engines: the plug-ins do their own event handling through pehost's queues,
  * so the callback only renders and sums. */
 
-static snd_pcm_t *g_pcm;
-static pthread_t  g_thread;
-static _Atomic int g_running, g_parked, g_park_req;
+static ao *g_ao;               /* the JACK or ALSA backend, when that is what runs */
+static _Atomic int g_parked, g_park_req;
 static struct pw_thread_loop *g_pw_loop;
 static struct pw_stream      *g_pw_stream;
 static double    *g_pw_buf;
 static const char *g_backend = "none";
+static char        g_backend_buf[200];       /* g_backend, when it is a description */
 static const char *g_backend_want = "auto";
-static unsigned long g_xruns;
+static int         g_backend_cli;            /* --backend was given: it wins over the saved choice */
+static char        g_audio_note[300];        /* what the last start or switch said */
+static double      g_ao_buf[PERIOD_MAX * 2]; /* the realtime scratch for the ao backends */
 static __thread int g_teb_ready;
 
 /* Scratch for one tab's block, mixed into the output at once. Sized once so
@@ -153,43 +156,22 @@ static void render_block(double *buf, int frames)
         memset(buf + (size_t)n * 2, 0, (size_t)(frames - n) * 2 * sizeof *buf);
 }
 
-static void *audio_thread(void *ud)
+/* The ao backends' render function: the same block the PipeWire callback
+ * renders, parked the same way, into the float buffer they hand over. */
+static void ao_render_cb(void *ud, float *out, int frames)
 {
-    double *buf = malloc((size_t)PERIOD_MAX * 2 * sizeof *buf);
-    short  *pcm = malloc((size_t)PERIOD_MAX * 2 * sizeof *pcm);
     int i;
     (void)ud;
-
-    if (!buf || !pcm) return NULL;
+    if (frames > PERIOD_MAX) frames = PERIOD_MAX;
     if (!g_teb_ready) { pehost_thread_init(); g_teb_ready = 1; }
-
-    while (atomic_load_explicit(&g_running, memory_order_relaxed)) {
-        long n;
-
-        if (atomic_load_explicit(&g_park_req, memory_order_acquire)) {
-            struct timespec ts = { 0, 2000000 };
-            atomic_store_explicit(&g_parked, 1, memory_order_release);
-            nanosleep(&ts, NULL);
-            continue;
-        }
-        atomic_store_explicit(&g_parked, 0, memory_order_release);
-
-        render_block(buf, g_period);
-
-        for (i = 0; i < g_period * 2; i++) {
-            double v = buf[i] * 32767.0;
-            pcm[i] = (short)(v > 32767.0 ? 32767.0 : (v < -32768.0 ? -32768.0 : v));
-        }
-
-        n = snd_pcm_writei(g_pcm, pcm, g_period);
-        if (n < 0) {
-            g_xruns++;
-            if (snd_pcm_recover(g_pcm, (int)n, 1) < 0) snd_pcm_prepare(g_pcm);
-        }
+    if (atomic_load_explicit(&g_park_req, memory_order_acquire)) {
+        atomic_store_explicit(&g_parked, 1, memory_order_release);
+        memset(out, 0, (size_t)frames * 2 * sizeof *out);
+        return;
     }
-    free(buf);
-    free(pcm);
-    return NULL;
+    atomic_store_explicit(&g_parked, 0, memory_order_release);
+    render_block(g_ao_buf, frames);
+    for (i = 0; i < frames * 2; i++) out[i] = out_soft(g_ao_buf[i]);
 }
 
 static void pw_on_process(void *ud)
@@ -281,45 +263,89 @@ static int engine_start_pipewire(void)
     return 0;
 }
 
+/* One backend, started. 0, or -1 with the reason in err. */
+static int start_backend(int backend, const char *device, char *err, size_t errn)
+{
+    err[0] = 0;
+    if (backend == AO_PIPEWIRE) {
+        if (engine_start_pipewire()) { snprintf(err, errn, "PipeWire is not available"); return -1; }
+        snprintf(g_backend_buf, sizeof g_backend_buf, "PipeWire, %d-frame quantum (%.1f ms), realtime",
+                 g_period, 1000.0 * g_period / SR);
+        g_backend = g_backend_buf;
+        return 0;
+    }
+    if (backend == AO_JACK || backend == AO_ALSA) {
+        g_ao = ao_open(backend, device, "studiogtk", SR, g_period, ao_render_cb, NULL, err, errn);
+        if (!g_ao) return -1;
+        snprintf(g_backend_buf, sizeof g_backend_buf, "%s", ao_describe(g_ao));
+        g_backend = g_backend_buf;
+        return 0;
+    }
+    snprintf(err, errn, "not a backend");
+    return -1;
+}
+
+/* Let go of whichever backend runs. After this nothing calls render_block. */
+static void engine_stop_audio(void)
+{
+    ao_close(g_ao);
+    g_ao = NULL;
+    engine_stop_pipewire();
+    g_backend = "none";
+}
+
+/* Start what `c` asks for. A named backend that will not start falls back --
+ * PipeWire, then ALSA's default -- and says so in g_audio_note, so the sound
+ * never simply goes missing because a setting could not be honoured. Automatic
+ * is PipeWire first (its callback runs on an RTKit-granted realtime thread),
+ * then ALSA. Returns 0 when what runs is what was asked for. */
+static int engine_start_with(const ao_choice *c)
+{
+    char err[200];
+    int rc = 0;
+
+    g_audio_note[0] = 0;
+    if (c->backend == AO_AUTO) {
+        if (start_backend(AO_PIPEWIRE, "", err, sizeof err)) {
+            fprintf(stderr, "audio: pipewire unavailable, falling back to ALSA\n");
+            if (start_backend(AO_ALSA, c->device, err, sizeof err)) {
+                snprintf(g_audio_note, sizeof g_audio_note, "no audio output: %s", err);
+                return -1;
+            }
+        }
+    } else if (start_backend(c->backend, c->device, err, sizeof err)) {
+        char why[200];
+        snprintf(why, sizeof why, "%s", err);
+        rc = -1;
+        if (!start_backend(AO_PIPEWIRE, "", err, sizeof err) ||
+            !start_backend(AO_ALSA, "", err, sizeof err)) {
+            snprintf(g_audio_note, sizeof g_audio_note, "%s: %s -- using %s",
+                     ao_backend_name(c->backend), why, g_backend);
+        } else {
+            snprintf(g_audio_note, sizeof g_audio_note, "%s: %s -- and nothing else would start",
+                     ao_backend_name(c->backend), why);
+        }
+        fprintf(stderr, "audio: %s\n", g_audio_note);
+        return rc;
+    }
+    snprintf(g_audio_note, sizeof g_audio_note, "audio: %s", g_backend);
+    fprintf(stderr, "%s\n", g_audio_note);
+    return rc;
+}
+
 static int engine_start_audio(void)
 {
-    if (g_pcm || g_pw_stream) return 0;
+    ao_choice c;
+    int forced = ao_backend_from_name(g_backend_want);
 
-    if (strcmp(g_backend_want, "auto") && strcmp(g_backend_want, "pipewire") &&
-        strcmp(g_backend_want, "alsa")) {
-        fprintf(stderr, "audio: unknown backend '%s' (want auto, pipewire or alsa)"
-                        " -- using auto\n", g_backend_want);
-        g_backend_want = "auto";
+    if (g_ao || g_pw_stream) return 0;
+    ao_choice_load(&c);
+    if (g_backend_cli && forced >= 0) c.backend = forced;   /* --backend on the command line wins */
+    else if (g_backend_cli) {
+        fprintf(stderr, "audio: unknown backend '%s' (want auto, pipewire, jack or alsa) -- using the saved choice\n",
+                g_backend_want);
     }
-
-    /* PipeWire first: its callback runs on an RTKit-granted realtime thread,
-     * which is the whole point. Fall back to ALSA if that fails. */
-    if (strcmp(g_backend_want, "alsa")) {
-        if (!engine_start_pipewire()) {
-            g_backend = "pipewire (realtime)";
-            fprintf(stderr, "audio: pipewire, %d-frame quantum (%.1f ms), realtime\n",
-                    g_period, 1000.0 * g_period / SR);
-            return 0;
-        }
-        if (!strcmp(g_backend_want, "pipewire")) {
-            fprintf(stderr, "audio: pipewire requested but unavailable\n");
-            return -1;
-        }
-        fprintf(stderr, "audio: pipewire unavailable, falling back to ALSA\n");
-    }
-    g_backend = "alsa";
-    if (snd_pcm_open(&g_pcm, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
-        g_pcm = NULL;
-        return -1;
-    }
-    if (snd_pcm_set_params(g_pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                           2, SR, 1, (unsigned)g_latency_us) < 0)
-        return -1;
-    fprintf(stderr, "audio: alsa, %d-frame blocks (%.1f ms), %d ms buffer\n",
-            g_period, 1000.0 * g_period / SR, g_latency_us / 1000);
-    atomic_store_explicit(&g_running, 1, memory_order_release);
-    pthread_create(&g_thread, NULL, audio_thread, NULL);
-    return 0;
+    return engine_start_with(&c);
 }
 
 /* Stop the audio callback touching the tabs so the GTK thread can add, load
@@ -329,7 +355,7 @@ static void engine_park(void)
 {
     int spins;
 
-    if (!g_pcm && !g_pw_stream) return;      /* no audio running: nothing to park */
+    if (!g_ao && !g_pw_stream) return;       /* no audio running: nothing to park */
 
     /* Clear the acknowledgement before asking for it, or a stale `parked` left
      * over from the previous park is mistaken for this one. */
@@ -1475,10 +1501,25 @@ static int open_session_path(const char *path)
  * status line), and every tab's tooltip says what its audio is doing, from
  * the callback counter against the ~187.5 blocks a second a 256-frame
  * quantum at 48 kHz should be making. */
+static void engine_restart_note(const ao_choice *c);
+
 static gboolean watch_tabs(gpointer u)
 {
     int t;
+    static int gone;
     (void)u;
+    /* A JACK server that went away, or a device that cannot be recovered: three
+     * looks in a row (an underrun the thread recovers from is not this), then
+     * the audio is brought up somewhere else rather than left silent. */
+    if (g_ao && !ao_alive(g_ao)) {
+        if (++gone >= 3) {
+            ao_choice c = { AO_AUTO, "" };
+            gone = 0;
+            engine_restart_note(&c);
+        }
+    } else {
+        gone = 0;
+    }
     for (t = 0; t < MAXTABS; t++) {
         synctab *tab = &g_tabs[t];
         unsigned long calls, rate;
@@ -1989,6 +2030,130 @@ static void act_plugin_manager(GSimpleAction *a, GVariant *p, gpointer u)
     gtk_window_present(GTK_WINDOW(g_pm->win));
 }
 
+/* ---------------------------------------------------------- audio settings --
+ *
+ * File > Audio: PipeWire, JACK or ALSA for the synths, and which ALSA device.
+ * Applying stops the running backend and starts the chosen one -- with the tabs
+ * left as they are, silent for the moment between -- and a backend that will not
+ * start is said so about and replaced, not left as silence. */
+
+static void engine_restart_note(const ao_choice *c)
+{
+    engine_stop_audio();
+    engine_start_with(c);
+    status(g_audio_note);
+}
+
+typedef struct {
+    GtkWidget *win, *radio[4], *dev, *now, *note;
+    char names[24][128], labels[24][96];
+    int ndev;
+} audiodlg;
+
+static audiodlg *g_ad;
+
+static void ad_show_now(void)
+{
+    char t[400];
+    snprintf(t, sizeof t, "Now: %s", g_backend);
+    gtk_label_set_text(GTK_LABEL(g_ad->now), t);
+    gtk_label_set_text(GTK_LABEL(g_ad->note), g_audio_note);
+}
+
+static void ad_apply(GtkButton *b, gpointer u)
+{
+    ao_choice c;
+    int i, sel = AO_AUTO;
+    (void)b; (void)u;
+    for (i = 0; i < 4; i++)
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(g_ad->radio[i]))) sel = i;
+    c.backend = sel;
+    c.device[0] = 0;
+    if (g_ad->ndev) {
+        guint d = gtk_drop_down_get_selected(GTK_DROP_DOWN(g_ad->dev));
+        if (d < (guint)g_ad->ndev && strcmp(g_ad->names[d], "default"))
+            snprintf(c.device, sizeof c.device, "%s", g_ad->names[d]);
+    }
+    ao_choice_save(&c);
+    engine_restart_note(&c);
+    ad_show_now();
+}
+
+static void ad_gone(GtkWidget *w, gpointer u) { (void)w; (void)u; g_free(g_ad); g_ad = NULL; }
+
+static void act_audio(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    GtkWidget *box, *row, *apply, *close, *intro;
+    static const char *const labels[4] = { "Automatic (PipeWire, else ALSA)", "PipeWire", "JACK", "ALSA (direct)" };
+    ao_choice cur;
+    char why[160];
+    int i;
+    (void)a; (void)p; (void)u;
+    if (g_ad) { gtk_window_present(GTK_WINDOW(g_ad->win)); return; }
+    g_ad = g_new0(audiodlg, 1);
+    g_ad->win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(g_ad->win), "Audio");
+    gtk_window_set_transient_for(GTK_WINDOW(g_ad->win), GTK_WINDOW(g_win));
+    g_signal_connect(g_ad->win, "destroy", G_CALLBACK(ad_gone), NULL);
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(box, 14); gtk_widget_set_margin_end(box, 14);
+    gtk_widget_set_margin_top(box, 12);   gtk_widget_set_margin_bottom(box, 12);
+    intro = gtk_label_new("Where the synths play. The choice is kept, and applied now.");
+    gtk_label_set_xalign(GTK_LABEL(intro), 0.0f);
+    gtk_box_append(GTK_BOX(box), intro);
+
+    ao_choice_load(&cur);
+    for (i = 0; i < 4; i++) {
+        g_ad->radio[i] = gtk_check_button_new_with_label(labels[i]);
+        if (i) gtk_check_button_set_group(GTK_CHECK_BUTTON(g_ad->radio[i]), GTK_CHECK_BUTTON(g_ad->radio[0]));
+        if (i == cur.backend) gtk_check_button_set_active(GTK_CHECK_BUTTON(g_ad->radio[i]), TRUE);
+        gtk_box_append(GTK_BOX(box), g_ad->radio[i]);
+    }
+    if (!ao_jack_available(why, sizeof why)) {
+        char tip[200];
+        snprintf(tip, sizeof tip, "JACK is not available: %s", why);
+        gtk_widget_set_tooltip_text(g_ad->radio[AO_JACK], tip);
+        gtk_check_button_set_label(GTK_CHECK_BUTTON(g_ad->radio[AO_JACK]), "JACK (not available right now)");
+    }
+    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(row), gtk_label_new("ALSA device:"));
+    {
+        const char *items[26];
+        int sel = 0;
+        g_ad->ndev = ao_alsa_devices(g_ad->names, g_ad->labels, 24);
+        for (i = 0; i < g_ad->ndev; i++) {
+            items[i] = g_ad->labels[i];
+            if (cur.device[0] ? !strcmp(cur.device, g_ad->names[i]) : !strcmp(g_ad->names[i], "default")) sel = i;
+        }
+        items[g_ad->ndev] = NULL;
+        g_ad->dev = gtk_drop_down_new_from_strings(items);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(g_ad->dev), (guint)sel);
+    }
+    gtk_widget_set_hexpand(g_ad->dev, TRUE);
+    gtk_box_append(GTK_BOX(row), g_ad->dev);
+    gtk_box_append(GTK_BOX(box), row);
+    g_ad->now = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(g_ad->now), 0.0f);
+    gtk_box_append(GTK_BOX(box), g_ad->now);
+    g_ad->note = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(g_ad->note), 0.0f);
+    gtk_label_set_wrap(GTK_LABEL(g_ad->note), TRUE);
+    gtk_widget_add_css_class(g_ad->note, "dim-label");
+    gtk_box_append(GTK_BOX(box), g_ad->note);
+    row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    apply = gtk_button_new_with_label("Apply");
+    close = gtk_button_new_with_label("Close");
+    gtk_widget_set_halign(row, GTK_ALIGN_END);
+    g_signal_connect(apply, "clicked", G_CALLBACK(ad_apply), NULL);
+    g_signal_connect_swapped(close, "clicked", G_CALLBACK(gtk_window_destroy), g_ad->win);
+    gtk_box_append(GTK_BOX(row), apply);
+    gtk_box_append(GTK_BOX(row), close);
+    gtk_box_append(GTK_BOX(box), row);
+    gtk_window_set_child(GTK_WINDOW(g_ad->win), box);
+    ad_show_now();
+    gtk_window_present(GTK_WINDOW(g_ad->win));
+}
+
 static void act_keep_folder(GSimpleAction *a, GVariant *p, gpointer u)
 { synctab *t; (void)a; (void)p; (void)u;
   if ((t = synth_or_status())) plugview_keep_folder(t->pv); }
@@ -2089,6 +2254,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "plugin-folders-any", act_plugin_folders_any, NULL, NULL, NULL, {0} },
         { "keep-folder", act_keep_folder, NULL, NULL, NULL, {0} },
         { "plugin-manager", act_plugin_manager, NULL, NULL, NULL, {0} },
+        { "audio-settings", act_audio, NULL, NULL, NULL, {0} },
         { "enter-key",   act_enter_key,   NULL, NULL, NULL, {0} },
         { "toggle-editor", act_toggle_editor, NULL, NULL, NULL, {0} },
         { "panic",       act_panic,       NULL, NULL, NULL, {0} },
@@ -2158,6 +2324,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append(sess, "Save session as…", "win.save-session-as");
     g_menu_append_section(file, NULL, G_MENU_MODEL(sess));
     g_menu_append(sect, "Plug-ins…", "win.plugin-manager");
+    g_menu_append(sect, "Audio…", "win.audio-settings");
     g_menu_append(sect, "Plug-in folders…", "win.plugin-folders-any");
     g_menu_append(sect, "Close tab",   "win.close-tab");
     g_menu_append(sect, "Quit",        "win.quit");
@@ -2489,11 +2656,12 @@ int main(int argc, char **argv)
             g_quit_after = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--backend") && i + 1 < argc) {
             g_backend_want = argv[++i];
+            g_backend_cli = 1;
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("studiogtk [--synth <plug-in>]... [--tracker] [--song <file.trk>]\n"
                    "          [--session <file.vstace>] [--save-session <file.vstace>]\n"
                    "          [--route <track>] [--smoke <ms>] [--quit-after <ms>]\n"
-                   "          [--backend auto|pipewire|alsa]\n\n"
+                   "          [--backend auto|pipewire|jack|alsa]\n\n"
                    "The session window, in GTK: a tab per synth plug-in, one for "
                    "the tracker.\nWith no arguments it opens on a blank canvas.\n"
                    "--session restores a session saved with File > Save session; "
@@ -2532,14 +2700,11 @@ int main(int argc, char **argv)
     /* Silence both backends before anything else goes away: PipeWire's data
      * loop is still calling render_block() at this point, and letting it run
      * into process teardown renders out of freed tab state. */
-    atomic_store_explicit(&g_running, 0, memory_order_release);
-    if (g_pcm) { pthread_join(g_thread, NULL); snd_pcm_close(g_pcm); }
-    engine_stop_pipewire();
+    engine_stop_audio();
     pw_deinit();
     if (g_tracker) trk_view_free(g_tracker);  /* its widget died with the window */
     if (g_trk) trk_close(g_trk);
     for (i = 0; i < MAXTABS; i++)
         if (g_tabs[i].used) plugview_free(g_tabs[i].pv);
-    if (g_xruns) fprintf(stderr, "audio: %lu ALSA underrun(s)\n", g_xruns);
     return status_rc;
 }

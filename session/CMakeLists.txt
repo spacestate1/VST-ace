@@ -90,7 +90,7 @@ if(GTK4_FOUND AND X11_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND AND TARGET trkgtk)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../gui gui-build EXCLUDE_FROM_ALL)
   add_executable(studiogtk gtk/main.c sessfile.c)
   target_include_directories(studiogtk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(studiogtk PRIVATE gtkhost trkgtk
+  target_link_libraries(studiogtk PRIVATE gtkhost trkgtk audioout
       PkgConfig::PIPEWIRE PkgConfig::ALSA m pthread)
 else()
   message(STATUS "studiogtk skipped (needs gtk4, x11, libpipewire-0.3 and alsa)")

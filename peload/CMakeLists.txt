@@ -99,6 +99,19 @@ else()
   message(STATUS "pehost: no libx11 -- native plug-in editors may not appear")
 endif()
 
+# The studio's synth audio to JACK or to ALSA (PipeWire is the hosts' own).
+# Its own library because it needs libasound, which the rest of pehost does not.
+pkg_check_modules(ALSA IMPORTED_TARGET alsa)
+if(ALSA_FOUND)
+  add_library(audioout STATIC audioout.c)
+  target_include_directories(audioout PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(audioout PUBLIC PkgConfig::ALSA Threads::Threads ${CMAKE_DL_LIBS})
+  set_target_properties(audioout PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_compile_options(audioout PRIVATE -Wall -Wextra)
+  add_executable(audioout-test test/audioout_test.c)
+  target_link_libraries(audioout-test PRIVATE audioout m)
+endif()
+
 # The DAW bridge: this same host, as a Linux VST2 .so.
 #
 # Every DAW on Linux already loads a Linux VST2, and none of them will ever
@@ -145,7 +158,7 @@ if(Qt6_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND)
   # in a QMainWindow shell, and the multi-plug-in studio window links this and
   # embeds several.
   add_library(qthost STATIC qtgui/hostwindow.cpp qtgui/hostwindow.h qtgui/midiio.cpp)
-  target_link_libraries(qthost PUBLIC pehost Qt6::Widgets PkgConfig::PIPEWIRE PkgConfig::ALSA)
+  target_link_libraries(qthost PUBLIC pehost audioout Qt6::Widgets PkgConfig::PIPEWIRE PkgConfig::ALSA)
   target_include_directories(qthost PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   add_executable(pestudio qtgui/main.cpp)
   target_link_libraries(pestudio PRIVATE qthost)

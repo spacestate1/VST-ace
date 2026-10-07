@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "midiio.h"
+#include "audioout.h"
 
 extern "C" {
 #include "pehost.h"
@@ -350,8 +351,68 @@ class Engine {
 public:
     ~Engine() { stopAudio(); unload(); }
 
-    bool startAudio(QString *err)
+    /* The choice kept between runs (File > Audio), falling back to PipeWire
+     * when what was asked for will not open. `note` says what happened. */
+    bool startAudio(QString *err, QString *note = nullptr)
     {
+        ao_choice c;
+        ao_choice_load(&c);
+        return startAudioWith(c, err, note);
+    }
+
+    bool startAudioWith(const ao_choice &c, QString *err, QString *note = nullptr)
+    {
+        backend_ = c.backend == AO_AUTO ? AO_PIPEWIRE : c.backend;
+        if (backend_ != AO_PIPEWIRE) {
+            char why[256] = "";
+            if (openAo(backend_, c.device, why, sizeof why)) {
+                if (note) *note = QString::fromUtf8(ao_describe(ao_));
+                return true;
+            }
+            if (note) *note = QString("%1: %2 -- using PipeWire")
+                                  .arg(ao_backend_name(backend_), why);
+            backend_ = AO_PIPEWIRE;
+        }
+        return startPipewire(err, backend_ == AO_PIPEWIRE);
+    }
+
+    int backend() const { return backend_; }
+    /* A JACK server that went away or an ALSA device that was unplugged. */
+    bool backendDead() const { return ao_ && !ao_alive(ao_); }
+
+    /* Switch while running. The plug-in is parked across the swap so no
+     * callback is inside it while the old thread is torn down. */
+    bool restartAudio(const ao_choice &c, QString *err, QString *note)
+    {
+        if (!park()) { *err = "the audio callback is still busy"; return false; }
+        stopAudio();
+        const bool ok = startAudioWith(c, err, note);
+        unpark();
+        return ok;
+    }
+
+    bool openAo(int backend, const char *dev, char *why, size_t n)
+    {
+        buf_ = static_cast<float *>(calloc(size_t(kMaxFrames) * 2, sizeof(float)));
+        in_  = static_cast<float *>(calloc(size_t(kMaxFrames) * 2, sizeof(float)));
+        if (!buf_ || !in_) { snprintf(why, n, "out of memory"); return false; }
+        tebReady_ = false;
+        ao_ = ao_open(backend, dev, nodeName("pestudio").constData(), kSampleRate,
+                      kQuantum, &Engine::onAo, this, why, n);
+        if (!ao_) { free(buf_); buf_ = nullptr; free(in_); in_ = nullptr; return false; }
+        running_ = true;
+        ring_.reset(kMaxFrames);
+        /* Input capture is still PipeWire's; without it the effect input stays
+         * silent, which is the same as no source chosen. */
+        pw_init(nullptr, nullptr);
+        loop_ = pw_thread_loop_new(nodeName("pestudio").constData(), nullptr);
+        if (loop_ && pw_thread_loop_start(loop_) == 0) openCapture(QString());
+        return true;
+    }
+
+    bool startPipewire(QString *err, bool)
+    {
+        tebReady_ = false;
         pw_init(nullptr, nullptr);
         buf_ = static_cast<float *>(calloc(size_t(kMaxFrames) * 2, sizeof(float)));
         in_  = static_cast<float *>(calloc(size_t(kMaxFrames) * 2, sizeof(float)));
@@ -466,6 +527,7 @@ public:
 
     void stopAudio()
     {
+        if (ao_) { ao_close(ao_); ao_ = nullptr; }
         if (loop_)   pw_thread_loop_stop(loop_);
         if (capture_) { pw_stream_destroy(capture_); capture_ = nullptr; }
         if (stream_) { pw_stream_destroy(stream_); stream_ = nullptr; }
@@ -585,6 +647,8 @@ public:
     unsigned long midiPlaced() const { return injPlaced_.load(std::memory_order_relaxed); }
 
 private:
+    ao *ao_ = nullptr;
+    int backend_ = AO_PIPEWIRE;
     static const int kMaxFrames = 8192;
 
     /* Which Engine this is, for naming its streams -- see g_hostInstances. */
@@ -600,8 +664,6 @@ private:
 
     void process()
     {
-        if (!tebReady_) { pehost_thread_init(); tebReady_ = true; }
-
         pw_buffer *b = pw_stream_dequeue_buffer(stream_);
         if (!b) return;
         spa_buffer *sb = b->buffer;
@@ -611,6 +673,25 @@ private:
         int n = int(sb->datas[0].maxsize / (sizeof(float) * 2));
         if (b->requested && int(b->requested) < n) n = int(b->requested);
         if (n > kMaxFrames) n = kMaxFrames;
+
+        renderBlock(dst, n);
+
+        sb->datas[0].chunk->offset = 0;
+        sb->datas[0].chunk->stride = sizeof(float) * 2;
+        sb->datas[0].chunk->size   = uint32_t(n * 2 * sizeof(float));
+        pw_stream_queue_buffer(stream_, b);
+    }
+
+    /* JACK and ALSA arrive here from audioout's thread. */
+    static void onAo(void *ud, float *out, int frames)
+    {
+        static_cast<Engine *>(ud)->renderBlock(out, frames > kMaxFrames ? kMaxFrames : frames);
+    }
+
+    /* One block of the plug-in, whichever backend asked for it. */
+    void renderBlock(float *dst, int n)
+    {
+        if (!tebReady_) { pehost_thread_init(); tebReady_ = true; }
 
         /* When this block starts, on the clock the injected MIDI is stamped
          * with. Measured here rather than derived from PipeWire's time: what
@@ -677,11 +758,6 @@ private:
              * speakers rather than what the plugin produced before the fader. */
             rec_.feed(dst, n);
         }
-
-        sb->datas[0].chunk->offset = 0;
-        sb->datas[0].chunk->stride = sizeof(float) * 2;
-        sb->datas[0].chunk->size   = uint32_t(n * 2 * sizeof(float));
-        pw_stream_queue_buffer(stream_, b);
     }
 
     static void onCapture(void *ud) { static_cast<Engine *>(ud)->capture(); }
@@ -2982,14 +3058,11 @@ public:
         connect(tick, &QTimer::timeout, this, &HostWidget::pollUi);
         tick->start(80);
 
-        QString err;
-        if (!eng_.startAudio(&err))
+        QString err, note;
+        if (!eng_.startAudio(&err, &note))
             status("audio failed: " + err);
         else
-            status("pipewire, " + QString::number(kQuantum) +
-                                     "-frame quantum (" +
-                                     QString::number(1000.0 * kQuantum / kSampleRate, 'f', 1) +
-                                     " ms), realtime");
+            status(audioStatus(note));
         /* After the audio is up, so the capture stream exists to be pointed at
          * whatever is chosen. */
         refreshAudioInputs();
@@ -3987,9 +4060,50 @@ private slots:
         midiSources_->setText(t);
     }
 
+    QString audioStatus(const QString &note) const
+    {
+        const QString pw = "pipewire, " + QString::number(kQuantum) +
+                           "-frame quantum (" +
+                           QString::number(1000.0 * kQuantum / kSampleRate, 'f', 1) +
+                           " ms), realtime";
+        if (eng_.backend() == AO_PIPEWIRE)
+            return note.isEmpty() ? pw : note + " (" + pw + ")";
+        return note;
+    }
+
+public:
+    /* File > Audio: move this synth to another backend. */
+    bool switchAudio(const ao_choice &c, QString *msg)
+    {
+        QString err, note;
+        if (!eng_.restartAudio(c, &err, &note)) {
+            *msg = "audio failed: " + err;
+            status(*msg);
+            return false;
+        }
+        refreshAudioInputs();
+        *msg = audioStatus(note);
+        status(*msg);
+        return true;
+    }
+    int audioBackend() const { return eng_.backend(); }
+    /* Called from the poll timer: a backend that died falls back to PipeWire. */
+    void checkAudio()
+    {
+        if (!eng_.backendDead()) { deadChecks_ = 0; return; }
+        if (++deadChecks_ < 3) return;
+        deadChecks_ = 0;
+        ao_choice c{AO_PIPEWIRE, ""};
+        QString m;
+        switchAudio(c, &m);
+        status("audio backend stopped -- " + m);
+    }
+private:
+    int deadChecks_ = 0;
     void pollUi()
     {
         level_->setValue(int(eng_.peak() * 100.0f));
+        checkAudio();
         /* Self-heal a missing editor.
          *
          * If the editor tab is the one showing, the plug-in has an editor, and

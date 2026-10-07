@@ -89,6 +89,7 @@ public:
          * reach until a synth tab is in front. */
         file->addAction("&Plug-ins...", this, &SessionShell::pluginManager);
         file->addAction("Plug-in &folders...", this, &SessionShell::pluginFolders);
+        file->addAction("&Audio output...", this, &SessionShell::audioSettings);
         file->addSeparator();
         QAction *quit = file->addAction("&Quit", QKeySequence::Quit, this, &QWidget::close);
 
@@ -778,6 +779,64 @@ private:
         pluginMgr_ = d;
         refill();
         d->show();
+    }
+
+    /* File > Audio output: PipeWire, JACK or ALSA for every synth tab. The
+     * choice is kept for the next run; a tab whose backend will not open falls
+     * back to PipeWire and says so in its own status line. */
+    void audioSettings()
+    {
+        ao_choice cur;
+        ao_choice_load(&cur);
+        QDialog dlg(this);
+        dlg.setWindowTitle("Audio output");
+        auto *lay = new QVBoxLayout(&dlg);
+        lay->addWidget(new QLabel("Where the synths play. Changes apply at once."));
+        auto *autoB = new QRadioButton("Automatic (PipeWire)");
+        auto *pwB   = new QRadioButton("PipeWire");
+        auto *jackB = new QRadioButton("JACK");
+        auto *alsaB = new QRadioButton("ALSA");
+        char why[256] = "";
+        const bool jackOk = ao_jack_available(why, sizeof why) != 0;
+        if (!jackOk) { jackB->setToolTip(why); jackB->setText(QString("JACK (%1)").arg(why)); }
+        for (auto *b : {autoB, pwB, jackB, alsaB}) lay->addWidget(b);
+        auto *dev = new QComboBox;
+        dev->addItem("System default", "");
+        static char names[32][128], labels[32][96];
+        const int nd = ao_alsa_devices(names, labels, 32);
+        for (int i = 0; i < nd; i++) dev->addItem(labels[i], QString::fromUtf8(names[i]));
+        int di = dev->findData(QString::fromUtf8(cur.device));
+        if (di < 0 && cur.device[0]) { dev->addItem(cur.device, QString::fromUtf8(cur.device)); di = dev->count() - 1; }
+        dev->setCurrentIndex(di < 0 ? 0 : di);
+        lay->addWidget(dev);
+        auto sync = [=] { dev->setEnabled(alsaB->isChecked()); };
+        connect(alsaB, &QRadioButton::toggled, &dlg, sync);
+        (cur.backend == AO_PIPEWIRE ? pwB : cur.backend == AO_JACK ? jackB
+            : cur.backend == AO_ALSA ? alsaB : autoB)->setChecked(true);
+        sync();
+        auto *result = new QLabel;
+        result->setWordWrap(true);
+        lay->addWidget(result);
+        auto *bb = new QDialogButtonBox(QDialogButtonBox::Apply | QDialogButtonBox::Close);
+        lay->addWidget(bb);
+        connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::accept);
+        connect(bb->button(QDialogButtonBox::Apply), &QPushButton::clicked, &dlg, [&] {
+            ao_choice c{};
+            c.backend = pwB->isChecked() ? AO_PIPEWIRE : jackB->isChecked() ? AO_JACK
+                      : alsaB->isChecked() ? AO_ALSA : AO_AUTO;
+            snprintf(c.device, sizeof c.device, "%s",
+                     c.backend == AO_ALSA ? dev->currentData().toString().toUtf8().constData() : "");
+            ao_choice_save(&c);
+            QStringList out;
+            for (int i = 0; i < tabs_->count(); i++)
+                if (auto *h = qobject_cast<HostWidget *>(tabs_->widget(i))) {
+                    QString m;
+                    h->switchAudio(c, &m);
+                    out << QString("%1: %2").arg(tabs_->tabText(i), m);
+                }
+            result->setText(out.isEmpty() ? "Saved; the next synth will use it." : out.join("\n"));
+        });
+        dlg.exec();
     }
 
     void pluginFolders()
