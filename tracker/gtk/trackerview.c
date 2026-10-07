@@ -719,13 +719,15 @@ static void on_load_samples(GSimpleAction *a, GVariant *v, gpointer u)
 
 static struct {
     ui        *U;                     /* the window that opened it */
-    GtkWidget *win, *sets, *dir, *grid, *status;
+    GtkWidget *win, *sets, *dir, *grid, *status, *kb, *octave, *learn, *outside;
+    int        sel, hover, menu_note;   /* the picked row, the key a drag is over, the key a menu is on */
     dk_map    *m;
     char       name[TRK_PATH_LEN];
     char      *setval[MAXSAMP];
     int        nsets, cur, dirty, filling, pending;   /* pending: a set to switch to */
 } E;
 
+static void kb_refresh(void);
 static void ed_status(const char *msg) { gtk_label_set_text(GTK_LABEL(E.status), msg); }
 
 static int ed_dir(char *out, size_t n)
@@ -739,6 +741,7 @@ static void ed_note_changed(GtkEditable *ed, gpointer u)
     if (E.filling || i >= E.m->n) return;
     E.m->pad[i].note = drumkit_note_parse(gtk_editable_get_text(ed));
     E.dirty = 1;
+    kb_refresh();
 }
 
 static void ed_gain_changed(GtkSpinButton *s, gpointer u)
@@ -770,6 +773,330 @@ static void ed_play(GtkButton *b, gpointer u)
     }
 }
 
+
+static void ed_fill(void);
+
+/* ---- the keys: a piano of the typing keys, the sample on each --------- */
+
+#define KB_SPAN 29
+static const char kb_keys[] = "zsxdcvgbhnjmq2w3er5t6y7ui9o0p";
+
+static int kb_black(int i) { int m = i % 12; return m == 1 || m == 3 || m == 6 || m == 8 || m == 10; }
+static int kb_white_index(int i)
+{
+    static const int pre[12] = { 0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6 };
+    return (i / 12) * 7 + pre[i % 12];
+}
+static int kb_base(void)
+{
+    return (gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(E.octave)) + 1) * 12;
+}
+static void kb_rect(int i, double W, double H, double r[4])
+{
+    double ww = W / 17.0;
+    if (kb_black(i)) { r[0] = kb_white_index(i) * ww - ww * 0.3; r[1] = 0; r[2] = ww * 0.6; r[3] = H * 0.6; }
+    else             { r[0] = kb_white_index(i) * ww; r[1] = 0; r[2] = ww; r[3] = H; }
+}
+static int kb_key_at(double x, double y)
+{
+    double W = gtk_widget_get_width(E.kb), H = gtk_widget_get_height(E.kb), r[4];
+    int pass, i;
+    for (pass = 0; pass < 2; pass++)
+        for (i = 0; i < KB_SPAN; i++) {
+            int n = kb_base() + i;
+            if (kb_black(i) != (pass == 0) || n > 127) continue;
+            kb_rect(i, W, H, r);
+            if (x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]) return n;
+        }
+    return -1;
+}
+static int ed_pad_of(int note)
+{
+    int i;
+    for (i = 0; i < E.m->n; i++) if (E.m->pad[i].note == note) return i;
+    return -1;
+}
+static const char *ed_pad_name(int i)
+{
+    const char *b = strrchr(E.m->pad[i].file, '/');
+    return b ? b + 1 : E.m->pad[i].file;
+}
+
+static void kb_refresh(void)
+{
+    char msg[160];
+    int i, outside = 0, lo = kb_base();
+    if (!E.kb) return;
+    for (i = 0; i < E.m->n; i++)
+        if (E.m->pad[i].note < lo || E.m->pad[i].note >= lo + KB_SPAN) outside++;
+    if (outside) snprintf(msg, sizeof msg, "%d sample%s on keys outside these octaves -- change \"Keys from octave\" to see them",
+                          outside, outside == 1 ? "" : "s");
+    else msg[0] = 0;
+    gtk_label_set_text(GTK_LABEL(E.outside), msg);
+    gtk_widget_queue_draw(E.kb);
+}
+
+static void kb_draw(GtkDrawingArea *a, cairo_t *cr, int W, int H, gpointer u)
+{
+    int pass, i;
+    (void)a; (void)u;
+    cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 10);
+    for (pass = 0; pass < 2; pass++)
+        for (i = 0; i < KB_SPAN; i++) {
+            int n = kb_base() + i, pad, black = kb_black(i);
+            double r[4], cr_, cg, cb, ink;
+            char nn[5], key[2] = { 0, 0 };
+            if (black != (pass == 1) || n > 127) continue;
+            kb_rect(i, W, H, r);
+            pad = ed_pad_of(n);
+            if (black) { cr_ = .2; cg = .2; cb = .22; ink = .86; } else { cr_ = .96; cg = .96; cb = .96; ink = .08; }
+            if (pad >= 0) { if (black) { cr_ = .14; cg = .43; cb = .67; ink = 1; } else { cr_ = .59; cg = .8; cb = .96; } }
+            if (n == E.hover || (pad >= 0 && pad == E.sel)) {
+                if (black) { cr_ = .82; cg = .51; cb = .08; ink = 1; } else { cr_ = 1; cg = .8; cb = .43; }
+            }
+            cairo_rectangle(cr, r[0] + .5, r[1] + .5, r[2] - 1, r[3] - 1);
+            cairo_set_source_rgb(cr, cr_, cg, cb);
+            cairo_fill_preserve(cr);
+            cairo_set_source_rgb(cr, .35, .35, .35);
+            cairo_set_line_width(cr, 1);
+            cairo_stroke(cr);
+            cairo_set_source_rgb(cr, ink, ink, ink);
+            drumkit_note_name(n, nn);
+            key[0] = (char)(kb_keys[i] >= 'a' && kb_keys[i] <= 'z' ? kb_keys[i] - 32 : kb_keys[i]);
+            {
+                cairo_text_extents_t te;
+                cairo_text_extents(cr, key, &te);
+                cairo_move_to(cr, r[0] + (r[2] - te.width) / 2 - te.x_bearing, r[1] + r[3] - 18);
+                cairo_show_text(cr, key);
+                cairo_text_extents(cr, nn, &te);
+                cairo_move_to(cr, r[0] + (r[2] - te.width) / 2 - te.x_bearing, r[1] + r[3] - 5);
+                cairo_show_text(cr, nn);
+            }
+            if (pad >= 0) {
+                char nm[96];
+                double room = r[3] - 50;
+                cairo_text_extents_t te;
+                snprintf(nm, sizeof nm, "%s", ed_pad_name(pad));
+                for (;;) {                      /* shorten it to the key's height */
+                    size_t l = strlen(nm);
+                    cairo_text_extents(cr, nm, &te);
+                    if (te.x_advance <= room || l < 2) break;
+                    nm[l - 1] = 0;
+                }
+                cairo_save(cr);
+                cairo_move_to(cr, r[0] + r[2] / 2 + 3.5, r[1] + r[3] - 36);
+                cairo_rotate(cr, -1.5707963);
+                cairo_show_text(cr, nm);
+                cairo_restore(cr);
+            }
+        }
+}
+
+static void ed_play_pad(int i)
+{
+    char dir[TRK_PATH_LEN] = "", msg[256];
+    ed_dir(dir, sizeof dir);
+    if (trk_audition(E.U->e, dir, E.m->pad[i].file, E.m->pad[i].gain_db, 100)) {
+        snprintf(msg, sizeof msg, "that WAV would not play. %s", trk_audio_status(E.U->e));
+        ed_status(msg);
+    }
+}
+
+/* Put a pad on a note. A pad already there swaps to this one's old note, so
+ * nothing is lost and no two pads share a key. */
+static void ed_assign(int row, int note)
+{
+    int other, old;
+    char nn[5], msg[200];
+    if (row < 0 || row >= E.m->n || note < 0 || note > 127) return;
+    old = E.m->pad[row].note;
+    other = ed_pad_of(note);
+    if (other >= 0 && other != row && old >= 0) E.m->pad[other].note = old;
+    E.m->pad[row].note = note;
+    E.sel = row;
+    E.dirty = 1;
+    ed_fill();
+    drumkit_note_name(note, nn);
+    snprintf(msg, sizeof msg, "%s is on %s -- Save to keep it", ed_pad_name(row), nn);
+    ed_status(msg);
+    ed_play_pad(row);
+}
+
+static void kb_played(int note)
+{
+    int pad;
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(E.learn))) {
+        if (E.sel >= 0) ed_assign(E.sel, note); else ed_status("pick a sample in the list first");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(E.learn), FALSE);
+        return;
+    }
+    pad = ed_pad_of(note);
+    E.sel = pad;
+    ed_fill();
+    if (pad >= 0) ed_play_pad(pad);
+}
+
+static void kb_pressed(GtkGestureClick *g, int n, double x, double y, gpointer u);
+
+static void kb_menu_put(GtkButton *b, gpointer u)
+{
+    (void)u;
+    gtk_popover_popdown(GTK_POPOVER(gtk_widget_get_ancestor(GTK_WIDGET(b), GTK_TYPE_POPOVER)));
+    if (E.sel >= 0) ed_assign(E.sel, E.menu_note);
+}
+
+static void kb_menu_clear(GtkButton *b, gpointer u)
+{
+    int i = ed_pad_of(E.menu_note);
+    (void)u;
+    gtk_popover_popdown(GTK_POPOVER(gtk_widget_get_ancestor(GTK_WIDGET(b), GTK_TYPE_POPOVER)));
+    if (i < 0) return;
+    memmove(&E.m->pad[i], &E.m->pad[i + 1], sizeof E.m->pad[0] * (size_t)(E.m->n - i - 1));
+    E.m->n--;
+    E.sel = -1;
+    E.dirty = 1;
+    ed_fill();
+}
+
+static void kb_chosen(GObject *src, GAsyncResult *res, gpointer u)
+{
+    GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *path, dir[TRK_PATH_LEN] = "";
+    size_t dl;
+    int i;
+    (void)u;
+    if (!f) return;
+    path = g_file_get_path(f);
+    g_object_unref(f);
+    if (!path) return;
+    ed_dir(dir, sizeof dir);
+    dl = strlen(dir);
+    if ((i = ed_pad_of(E.menu_note)) < 0) {
+        if (E.m->n >= DK_MAX_SAMPLES) { g_free(path); return; }
+        i = E.m->n++;
+    }
+    memset(&E.m->pad[i], 0, sizeof E.m->pad[i]);
+    E.m->pad[i].note = E.menu_note;
+    if (dl && !strncmp(path, dir, dl) && path[dl] == '/') snprintf(E.m->pad[i].file, sizeof E.m->pad[i].file, "%s", path + dl + 1);
+    else snprintf(E.m->pad[i].file, sizeof E.m->pad[i].file, "%s", path);
+    g_free(path);
+    E.sel = i;
+    E.dirty = 1;
+    ed_fill();
+    ed_play_pad(i);
+}
+
+static void kb_menu_choose(GtkButton *b, gpointer u)
+{
+    GtkFileDialog *d = gtk_file_dialog_new();
+    GtkFileFilter *wav = gtk_file_filter_new();
+    GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    char dir[TRK_PATH_LEN] = "";
+    (void)u;
+    gtk_popover_popdown(GTK_POPOVER(gtk_widget_get_ancestor(GTK_WIDGET(b), GTK_TYPE_POPOVER)));
+    if (ed_dir(dir, sizeof dir)) { g_object_unref(d); g_object_unref(wav); g_object_unref(filters); return; }
+    gtk_file_filter_set_name(wav, "WAV files");
+    gtk_file_filter_add_suffix(wav, "wav");
+    gtk_file_filter_add_suffix(wav, "WAV");
+    g_list_store_append(filters, wav);
+    gtk_file_dialog_set_filters(d, G_LIST_MODEL(filters));
+    {
+        GFile *start = g_file_new_for_path(dir);
+        gtk_file_dialog_set_initial_folder(d, start);
+        g_object_unref(start);
+    }
+    gtk_file_dialog_open(d, GTK_WINDOW(E.win), NULL, kb_chosen, NULL);
+    g_object_unref(wav); g_object_unref(filters); g_object_unref(d);
+}
+
+static void kb_pressed(GtkGestureClick *g, int n, double x, double y, gpointer u)
+{
+    int note = kb_key_at(x, y);
+    (void)n; (void)u;
+    gtk_widget_grab_focus(E.kb);
+    if (note < 0) return;
+    if (gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(g)) == 3) {
+        GtkWidget *pop = gtk_popover_new(), *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2), *b;
+        GdkRectangle at = { (int)x, (int)y, 1, 1 };
+        char nn[5], label[160];
+        drumkit_note_name(note, nn);
+        E.menu_note = note;
+        if (E.sel >= 0) snprintf(label, sizeof label, "Put \"%s\" on %s", ed_pad_name(E.sel), nn);
+        else snprintf(label, sizeof label, "Put the selected sample on %s", nn);
+        b = gtk_button_new_with_label(label);
+        gtk_widget_set_sensitive(b, E.sel >= 0);
+        g_signal_connect(b, "clicked", G_CALLBACK(kb_menu_put), NULL);
+        gtk_box_append(GTK_BOX(box), b);
+        snprintf(label, sizeof label, "Choose a WAV for %s…", nn);
+        b = gtk_button_new_with_label(label);
+        g_signal_connect(b, "clicked", G_CALLBACK(kb_menu_choose), NULL);
+        gtk_box_append(GTK_BOX(box), b);
+        snprintf(label, sizeof label, "Take the sample off %s", nn);
+        b = gtk_button_new_with_label(label);
+        gtk_widget_set_sensitive(b, ed_pad_of(note) >= 0);
+        g_signal_connect(b, "clicked", G_CALLBACK(kb_menu_clear), NULL);
+        gtk_box_append(GTK_BOX(box), b);
+        gtk_popover_set_child(GTK_POPOVER(pop), box);
+        gtk_widget_set_parent(pop, E.kb);
+        gtk_popover_set_pointing_to(GTK_POPOVER(pop), &at);
+        g_signal_connect(pop, "closed", G_CALLBACK(gtk_widget_unparent), NULL);
+        gtk_popover_popup(GTK_POPOVER(pop));
+        return;
+    }
+    kb_played(note);
+}
+
+static gboolean kb_key(GtkEventControllerKey *c, guint keyval, guint code, GdkModifierType m, gpointer u)
+{
+    int note;
+    (void)c; (void)code; (void)u;
+    if (m & (GDK_CONTROL_MASK | GDK_ALT_MASK) || keyval > 0x7e) return FALSE;
+    note = trk_key_note((int)keyval, gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(E.octave)));
+    if (note < 0) return FALSE;
+    kb_played(note);
+    return TRUE;
+}
+
+static gboolean kb_drop(GtkDropTarget *t, const GValue *v, double x, double y, gpointer u)
+{
+    int note = kb_key_at(x, y);
+    (void)t; (void)u;
+    E.hover = -1;
+    if (note >= 0) ed_assign(g_value_get_int(v), note);
+    return note >= 0;
+}
+
+static GdkDragAction kb_motion(GtkDropTarget *t, double x, double y, gpointer u)
+{
+    int note = kb_key_at(x, y);
+    (void)t; (void)u;
+    if (note != E.hover) { E.hover = note; gtk_widget_queue_draw(E.kb); }
+    return note >= 0 ? GDK_ACTION_COPY : 0;
+}
+
+static void kb_leave(GtkDropTarget *t, gpointer u)
+{
+    (void)t; (void)u;
+    E.hover = -1;
+    gtk_widget_queue_draw(E.kb);
+}
+
+static GdkContentProvider *row_drag_prepare(GtkDragSource *s, double x, double y, gpointer u)
+{
+    (void)s; (void)x; (void)y;
+    return gdk_content_provider_new_typed(G_TYPE_INT, GPOINTER_TO_INT(u));
+}
+
+static void row_picked(GtkGestureClick *g, int n, double x, double y, gpointer u)
+{
+    (void)g; (void)n; (void)x; (void)y;
+    E.sel = GPOINTER_TO_INT(u);
+    ed_fill();
+}
+
+static void octave_changed(GtkSpinButton *s, gpointer u) { (void)s; (void)u; kb_refresh(); }
+
 static void ed_fill(void);
 
 static void ed_remove(GtkButton *b, gpointer u)
@@ -779,6 +1106,7 @@ static void ed_remove(GtkButton *b, gpointer u)
     if (i >= E.m->n) return;
     memmove(&E.m->pad[i], &E.m->pad[i + 1], sizeof E.m->pad[0] * (size_t)(E.m->n - i - 1));
     E.m->n--;
+    E.sel = -1;
     E.dirty = 1;
     ed_fill();
 }
@@ -808,6 +1136,16 @@ static void ed_fill(void)
         gtk_editable_set_width_chars(GTK_EDITABLE(note), 4);
         file = gtk_label_new(base ? base + 1 : p->file);
         gtk_label_set_xalign(GTK_LABEL(file), 0);
+        if (i == E.sel) gtk_widget_add_css_class(file, "heading");
+        {   /* click it to pick it; drag it onto a key to put it there */
+            GtkGesture *click = gtk_gesture_click_new();
+            GtkDragSource *drag = gtk_drag_source_new();
+            g_signal_connect(click, "pressed", G_CALLBACK(row_picked), GINT_TO_POINTER(i));
+            gtk_widget_add_controller(file, GTK_EVENT_CONTROLLER(click));
+            gtk_drag_source_set_actions(drag, GDK_ACTION_COPY);
+            g_signal_connect(drag, "prepare", G_CALLBACK(row_drag_prepare), GINT_TO_POINTER(i));
+            gtk_widget_add_controller(file, GTK_EVENT_CONTROLLER(drag));
+        }
         gtk_label_set_ellipsize(GTK_LABEL(file), PANGO_ELLIPSIZE_END);
         gtk_widget_set_hexpand(file, TRUE);
         gtk_widget_set_tooltip_text(file, p->file);
@@ -834,6 +1172,7 @@ static void ed_fill(void)
         gtk_grid_attach(GTK_GRID(E.grid), del,   5, i + 1, 1, 1);
     }
     E.filling = 0;
+    kb_refresh();
 }
 
 static void ed_load(int k)
@@ -851,6 +1190,12 @@ static void ed_load(int k)
         snprintf(line, sizeof line, "%s   %s", dir,
                  E.m->mapped ? "(kit.txt)" : "(no kit.txt yet: every WAV from C-4 up)");
         gtk_label_set_text(GTK_LABEL(E.dir), line);
+    }
+    E.sel = -1;
+    if (E.m->n) {
+        int lowest = 127, j;
+        for (j = 0; j < E.m->n; j++) if (E.m->pad[j].note < lowest) lowest = E.m->pad[j].note;
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(E.octave), lowest / 12 - 1 < 0 ? 0 : lowest / 12 - 1);
     }
     ed_fill();
     ed_status("");
@@ -1049,7 +1394,7 @@ static void on_edit_samples(GSimpleAction *a, GVariant *v, gpointer u)
     gtk_window_set_title(GTK_WINDOW(E.win), "Edit Sample Set");
     gtk_window_set_transient_for(GTK_WINDOW(E.win), parent_window(U));
     gtk_window_set_modal(GTK_WINDOW(E.win), TRUE);
-    gtk_window_set_default_size(GTK_WINDOW(E.win), 760, 520);
+    gtk_window_set_default_size(GTK_WINDOW(E.win), 860, 700);
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_widget_set_margin_start(box, 8); gtk_widget_set_margin_end(box, 8);
     gtk_widget_set_margin_top(box, 8);   gtk_widget_set_margin_bottom(box, 8);
@@ -1066,6 +1411,48 @@ static void on_edit_samples(GSimpleAction *a, GVariant *v, gpointer u)
     gtk_label_set_selectable(GTK_LABEL(E.dir), TRUE);
     gtk_widget_add_css_class(E.dir, "dim-label");
     gtk_box_append(GTK_BOX(box), E.dir);
+
+    E.sel = -1;
+    E.hover = -1;
+    {
+        GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6), *hint;
+        GtkGesture *click = gtk_gesture_click_new();
+        GtkEventController *keyc = gtk_event_controller_key_new();
+        GtkDropTarget *drop = gtk_drop_target_new(G_TYPE_INT, GDK_ACTION_COPY);
+        gtk_box_append(GTK_BOX(bar), gtk_label_new("Keys from octave"));
+        E.octave = gtk_spin_button_new_with_range(0, 8, 1);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(E.octave), 4);
+        g_signal_connect(E.octave, "value-changed", G_CALLBACK(octave_changed), NULL);
+        gtk_box_append(GTK_BOX(bar), E.octave);
+        E.learn = gtk_toggle_button_new_with_label("Learn");
+        gtk_widget_set_tooltip_text(E.learn, "Pick a sample in the list, press Learn, then click a key or press its typing key: the sample moves onto it");
+        gtk_box_append(GTK_BOX(bar), E.learn);
+        hint = gtk_label_new("Click a key to hear it. Drag a sample from the list onto a key, or use Learn. Right-click a key for more.");
+        gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
+        gtk_label_set_xalign(GTK_LABEL(hint), 0);
+        gtk_widget_set_hexpand(hint, TRUE);
+        gtk_widget_add_css_class(hint, "dim-label");
+        gtk_box_append(GTK_BOX(bar), hint);
+        gtk_box_append(GTK_BOX(box), bar);
+        E.kb = gtk_drawing_area_new();
+        gtk_widget_set_size_request(E.kb, -1, 150);
+        gtk_widget_set_focusable(E.kb, TRUE);
+        gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(E.kb), kb_draw, NULL, NULL);
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 0);
+        g_signal_connect(click, "pressed", G_CALLBACK(kb_pressed), NULL);
+        gtk_widget_add_controller(E.kb, GTK_EVENT_CONTROLLER(click));
+        g_signal_connect(keyc, "key-pressed", G_CALLBACK(kb_key), NULL);
+        gtk_widget_add_controller(E.kb, keyc);
+        g_signal_connect(drop, "drop", G_CALLBACK(kb_drop), NULL);
+        g_signal_connect(drop, "motion", G_CALLBACK(kb_motion), NULL);
+        g_signal_connect(drop, "leave", G_CALLBACK(kb_leave), NULL);
+        gtk_widget_add_controller(E.kb, GTK_EVENT_CONTROLLER(drop));
+        gtk_box_append(GTK_BOX(box), E.kb);
+        E.outside = gtk_label_new("");
+        gtk_label_set_xalign(GTK_LABEL(E.outside), 0);
+        gtk_widget_add_css_class(E.outside, "dim-label");
+        gtk_box_append(GTK_BOX(box), E.outside);
+    }
 
     E.grid = gtk_grid_new();
     gtk_grid_set_column_spacing(GTK_GRID(E.grid), 6);
@@ -3172,6 +3559,16 @@ static gboolean uitest(gpointer u)
     pump(500);
     if (E.win) {
         shot_of(E.win, "g05-editor.png");
+        if (E.m->n >= 2) {   /* Samples onto keys: a swap, then a free key. */
+            int a = E.m->pad[0].note, b = E.m->pad[1].note;
+            ed_assign(0, b);
+            check(E.m->pad[0].note == b && E.m->pad[1].note == a,
+                  "dropping a sample on a taken key swaps the two");
+            ed_assign(1, 100);
+            check(E.m->pad[1].note == 100, "dropping on a free key moves the sample there");
+            pump(300);
+            shot_of(E.win, "g05b-keymap.png");
+        } else check(0, "the editor has samples to put on keys");
         E.dirty = 0;
         gtk_window_destroy(GTK_WINDOW(E.win));
         pump(100);

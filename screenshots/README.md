@@ -26,3 +26,4 @@ broadway backend), not mock-ups. All taken from the current code.
 | 23-gtk-record-options.png, 24-gtk-audio-output.png | the same windows in GTK |
 | 25-gtk-help-columns.png, 26-gtk-help-keys.png | help |
 | 27-gtk-tracks-added.png | tracks added with **+ Track** |
+| 28-gtk-sample-keymap.png, 11-qt-sample-keymap.png | Samples > Edit Sample Set: the key map (drag a sample onto a key) |

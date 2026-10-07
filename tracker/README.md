@@ -74,6 +74,20 @@ on it with it, clamped at C-0 and G-9, so a part keeps sounding as it did.
   ▶ to listen to one. **Save** writes the folder's `kit.txt`, and every
   track playing the set plays the new one at once.
 
+**Edit Sample Set** opens on a piano of the typing keys, each key showing
+the sample on it (Z, S, X ... P, from the octave in the box above it).
+
+- Click a key to hear its sample and pick its row in the list.
+- Drag a sample from the list onto a key to put it there. A sample already
+  on that key swaps to the dragged one's old key, so nothing is lost and no
+  two share a key.
+- Or pick a sample, press **Learn**, and click a key or press its typing key.
+- Right-click a key: put the picked sample on it, choose a WAV for it from
+  anywhere, or take its sample off.
+- Samples on keys outside the octaves shown are counted under the piano.
+
+Nothing changes for the tracks until **Save**.
+
 Pads in one choke group cut each other off, as a closed hat stops an open
 one -- across tracks too. A hit plays out: a drum has no note-off. Stop fades
 what is sounding; Panic cuts it dead. A track plays one note at a time, so

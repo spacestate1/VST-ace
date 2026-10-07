@@ -32,6 +32,7 @@
 #include <QPainter>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QMimeData>
 #include <QScrollBar>
 #include <QSpinBox>
 #include <QSlider>
@@ -563,6 +564,150 @@ private:
     int dragR_ = 0, dragT_ = 0;                 // where it began
 };
 
+// A piano of the typing keys, for the set editor: every key shows the sample
+// on it, a click plays it, and a sample dragged from the list (or picked up
+// with Learn and a key press) lands on the key it is dropped on.
+class KeyMapWidget : public QWidget {
+    Q_OBJECT
+public:
+    explicit KeyMapWidget(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setMinimumHeight(150);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        setAcceptDrops(true);
+        setFocusPolicy(Qt::StrongFocus);
+        setMouseTracking(true);
+    }
+    static constexpr int kSpan = 29;           // the keys z..p reach
+    static const char *typingKeys() { return "zsxdcvgbhnjmq2w3er5t6y7ui9o0p"; }
+
+    void setOctave(int o) { octave_ = std::clamp(o, 0, 8); update(); }
+    int octave() const { return octave_; }
+    void setNames(const QHash<int, QString> &n) { names_ = n; update(); }
+    void setCurrent(int note) { cur_ = note; update(); }
+    int baseNote() const { return (octave_ + 1) * 12; }
+
+signals:
+    void played(int note);                     // clicked, or its typing key pressed
+    void dropped(int row, int note);           // a list row dropped on a key
+    void menuAt(int note, QPoint global);
+
+protected:
+    bool isBlack(int idx) const { int m = idx % 12; return m == 1 || m == 3 || m == 6 || m == 8 || m == 10; }
+    int whiteIndex(int idx) const   // white keys before this semitone
+    {
+        static const int pre[12] = { 0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6 };
+        return (idx / 12) * 7 + pre[idx % 12];
+    }
+    QRectF keyRect(int idx) const
+    {
+        const double ww = double(width()) / 17.0, h = height();
+        if (isBlack(idx)) {
+            const double x = whiteIndex(idx) * ww;      // the boundary after its white
+            return QRectF(x - ww * 0.3, 0, ww * 0.6, h * 0.6);
+        }
+        return QRectF(whiteIndex(idx) * ww, 0, ww, h);
+    }
+    int keyAt(const QPointF &pt) const
+    {
+        for (int pass = 0; pass < 2; pass++)            // black keys sit on top
+            for (int i = 0; i < kSpan; i++)
+                if (isBlack(i) == (pass == 0) && keyRect(i).contains(pt)) {
+                    const int n = baseNote() + i;
+                    return n >= 0 && n <= 127 ? n : -1;
+                }
+        return -1;
+    }
+
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.setRenderHint(QPainter::TextAntialiasing);
+        const QPalette &pal = palette();
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < kSpan; i++) {
+                if (isBlack(i) != (pass == 1)) continue;
+                const int n = baseNote() + i;
+                if (n > 127) continue;
+                const QRectF r = keyRect(i).adjusted(0.5, 0.5, -0.5, -0.5);
+                const bool has = names_.contains(n);
+                QColor fill = isBlack(i) ? QColor(50, 50, 55) : QColor(245, 245, 245);
+                if (has) fill = isBlack(i) ? QColor(35, 110, 170) : QColor(150, 205, 245);
+                if (n == cur_) fill = isBlack(i) ? QColor(210, 130, 20) : QColor(255, 205, 110);
+                p.setPen(QColor(90, 90, 90));
+                p.setBrush(fill);
+                p.drawRect(r);
+                const QColor ink = isBlack(i) && !has && n != cur_ ? QColor(220, 220, 220)
+                                   : (isBlack(i) ? QColor(255, 255, 255) : QColor(20, 20, 20));
+                p.setPen(ink);
+                QFont f = font();
+                f.setPointSizeF(std::max(7.0, f.pointSizeF() * 0.85));
+                p.setFont(f);
+                const QFontMetrics fm(f);
+                char nn[5];
+                drumkit_note_name(n, nn);
+                const QString key = QString(QChar(typingKeys()[i])).toUpper();
+                p.drawText(QRectF(r.left(), r.bottom() - fm.height() * 2 - 2, r.width(), fm.height()),
+                           Qt::AlignHCenter, key);
+                p.drawText(QRectF(r.left(), r.bottom() - fm.height() - 1, r.width(), fm.height()),
+                           Qt::AlignHCenter, QString::fromLatin1(nn));
+                if (has) {                              // the sample's name, up the key
+                    p.save();
+                    p.translate(r.center().x() + fm.ascent() / 2.0 - 1,
+                                r.bottom() - fm.height() * 2 - 6);
+                    p.rotate(-90);
+                    const double room = r.height() - fm.height() * 2 - 12;
+                    p.drawText(QPointF(0, 0), fm.elidedText(names_.value(n), Qt::ElideRight, int(room)));
+                    p.restore();
+                }
+            }
+        if (hasFocus()) { p.setPen(pal.color(QPalette::Highlight)); p.setBrush(Qt::NoBrush);
+                          p.drawRect(rect().adjusted(0, 0, -1, -1)); }
+    }
+
+    void mousePressEvent(QMouseEvent *ev) override
+    {
+        setFocus();
+        const int n = keyAt(ev->position());
+        if (n < 0) return;
+        if (ev->button() == Qt::RightButton) emit menuAt(n, ev->globalPosition().toPoint());
+        else emit played(n);
+    }
+    void keyPressEvent(QKeyEvent *ev) override
+    {
+        if (ev->isAutoRepeat() || ev->modifiers() & (Qt::ControlModifier | Qt::AltModifier)) {
+            QWidget::keyPressEvent(ev); return;
+        }
+        const QString t = ev->text().toLower();
+        const int n = t.size() == 1 ? trk_key_note(t[0].toLatin1(), octave_) : -1;
+        if (n >= 0) emit played(n);
+        else QWidget::keyPressEvent(ev);
+    }
+    void dragEnterEvent(QDragEnterEvent *ev) override
+    {
+        if (ev->mimeData()->hasFormat("application/x-qabstractitemmodeldatalist")) ev->acceptProposedAction();
+    }
+    void dragMoveEvent(QDragMoveEvent *ev) override
+    {
+        const int n = keyAt(ev->position());
+        cur_ = n; update();
+        if (n >= 0) ev->acceptProposedAction(); else ev->ignore();
+    }
+    void dropEvent(QDropEvent *ev) override
+    {
+        const int n = keyAt(ev->position());
+        QByteArray d = ev->mimeData()->data("application/x-qabstractitemmodeldatalist");
+        QDataStream ds(&d, QIODevice::ReadOnly);
+        int row = -1, col = 0;
+        if (!ds.atEnd()) ds >> row >> col;
+        if (n >= 0 && row >= 0) { ev->acceptProposedAction(); emit dropped(row, n); }
+    }
+
+private:
+    int octave_ = 4, cur_ = -1;
+    QHash<int, QString> names_;
+};
+
 // ------------------------------------------------------ the set editor --
 //
 // Samples > Edit Sample Set: which note plays which WAV in a set, its gain
@@ -577,7 +722,7 @@ public:
         : QDialog(parent), e_(e), map_(new dk_map)
     {
         setWindowTitle("Edit Sample Set");
-        resize(760, 520);
+        resize(860, 700);
         auto *v = new QVBoxLayout(this);
         auto *top = new QHBoxLayout;
         sets_ = new QComboBox;
@@ -596,7 +741,32 @@ public:
         dir_->setTextInteractionFlags(Qt::TextSelectableByMouse);
         v->addWidget(dir_);
 
+        keys_ = new KeyMapWidget;
+        auto *kbar = new QHBoxLayout;
+        kbar->addWidget(new QLabel("Keys from octave"));
+        octave_ = new QSpinBox;
+        octave_->setRange(0, 8);
+        octave_->setValue(4);
+        kbar->addWidget(octave_);
+        learn_ = new QPushButton("Learn");
+        learn_->setCheckable(true);
+        learn_->setToolTip("Pick a sample in the list, press Learn, then click a key "
+                           "or press its typing key: the sample moves onto it");
+        kbar->addWidget(learn_);
+        auto *hint = new QLabel("Click a key to hear it. Drag a sample from the list onto a key, "
+                                "or use Learn. Right-click a key for more.");
+        hint->setStyleSheet("color: #777;");
+        hint->setWordWrap(true);
+        kbar->addWidget(hint, 1);
+        v->addLayout(kbar);
+        v->addWidget(keys_);
+        outside_ = new QLabel;
+        outside_->setStyleSheet("color: #777;");
+        v->addWidget(outside_);
+
         table_ = new QTableWidget(0, 5);
+        table_->setDragEnabled(true);
+        table_->setDragDropMode(QAbstractItemView::DragOnly);
         table_->setHorizontalHeaderLabels({ "Note", "Sample", "Gain dB", "Choke", "" });
         table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
         table_->verticalHeader()->setVisible(false);
@@ -627,7 +797,15 @@ public:
         connect(del, &QPushButton::clicked, this, &SetEditor::removeRows);
         connect(save, &QPushButton::clicked, this, &SetEditor::save);
         connect(close, &QPushButton::clicked, this, &QDialog::close);
-        connect(table_, &QTableWidget::itemChanged, this, [this] { if (!filling_) dirty_ = true; });
+        connect(table_, &QTableWidget::itemChanged, this, [this] { if (!filling_) dirty_ = true; refreshKeys(); });
+        connect(octave_, &QSpinBox::valueChanged, this, [this](int o) { keys_->setOctave(o); refreshKeys(); });
+        connect(table_, &QTableWidget::itemSelectionChanged, this, [this] {
+            const int r = selectedRow();
+            keys_->setCurrent(r >= 0 ? noteOfRow(r) : -1);
+        });
+        connect(keys_, &KeyMapWidget::played, this, &SetEditor::keyPlayed);
+        connect(keys_, &KeyMapWidget::dropped, this, [this](int row, int note) { assignRow(row, note); });
+        connect(keys_, &KeyMapWidget::menuAt, this, &SetEditor::keyMenu);
 
         if (at >= 0) sets_->setCurrentIndex(at);
         if (sets_->count()) load(sets_->currentData().toString());
@@ -712,6 +890,125 @@ private:
         });
     }
 
+    int selectedRow() const
+    {
+        const auto rows = table_->selectionModel()->selectedRows();
+        return rows.isEmpty() ? -1 : rows.first().row();
+    }
+    int noteOfRow(int r) const
+    {
+        if (!table_->item(r, 0)) return -1;     // a row still being built
+        return drumkit_note_parse(table_->item(r, 0)->text().trimmed().toUtf8().constData());
+    }
+    int rowOfNote(int note) const
+    {
+        for (int r = 0; r < table_->rowCount(); r++) if (noteOfRow(r) == note) return r;
+        return -1;
+    }
+    void audition(int r)
+    {
+        auto *g = static_cast<QDoubleSpinBox *>(table_->cellWidget(r, 2));
+        if (trk_audition(e_, setDir().toUtf8().constData(),
+                         table_->item(r, 1)->data(Qt::UserRole).toString().toUtf8().constData(),
+                         g->value(), 100))
+            status_->setText("that WAV would not play. " + QString::fromUtf8(trk_audio_status(e_)));
+    }
+
+    // The keyboard shows what the list says, so it is rebuilt from the list.
+    void refreshKeys()
+    {
+        QHash<int, QString> names;
+        int outside = 0;
+        const int lo = keys_->baseNote(), hi = lo + KeyMapWidget::kSpan;
+        for (int r = 0; r < table_->rowCount(); r++) {
+            const int n = noteOfRow(r);
+            if (n < 0 || !table_->item(r, 1)) continue;
+            names.insert(n, table_->item(r, 1)->text());
+            if (n < lo || n >= hi) outside++;
+        }
+        keys_->setNames(names);
+        outside_->setText(outside ? QString("%1 sample%2 on keys outside these octaves -- change "
+                                            "\"Keys from octave\" to see them")
+                                        .arg(outside).arg(outside == 1 ? "" : "s")
+                                  : QString());
+    }
+
+    // Put a sample on a note. A sample already there swaps to the one's old
+    // note, so nothing is lost and no two pads share a key.
+    void assignRow(int row, int note)
+    {
+        if (row < 0 || row >= table_->rowCount() || note < 0 || note > 127) return;
+        const int old = noteOfRow(row), other = rowOfNote(note);
+        char nn[5];
+        filling_ = true;
+        if (other >= 0 && other != row && old >= 0) {
+            drumkit_note_name(old, nn);
+            table_->item(other, 0)->setText(QString::fromLatin1(nn));
+        }
+        drumkit_note_name(note, nn);
+        table_->item(row, 0)->setText(QString::fromLatin1(nn));
+        filling_ = false;
+        dirty_ = true;
+        table_->selectRow(row);
+        refreshKeys();
+        keys_->setCurrent(note);
+        status_->setText(QString("%1 is on %2 -- Save to keep it")
+                             .arg(table_->item(row, 1)->text(), QString::fromLatin1(nn)));
+        audition(row);
+    }
+
+    void keyPlayed(int note)
+    {
+        if (learn_->isChecked()) {
+            const int r = selectedRow();
+            if (r >= 0) assignRow(r, note);
+            else status_->setText("pick a sample in the list first");
+            learn_->setChecked(false);
+            return;
+        }
+        const int r = rowOfNote(note);
+        keys_->setCurrent(note);
+        if (r < 0) { table_->clearSelection(); return; }
+        table_->selectRow(r);
+        keys_->setCurrent(note);
+        audition(r);
+    }
+
+    void keyMenu(int note, QPoint at)
+    {
+        const int r = rowOfNote(note), sel = selectedRow();
+        char nn[5];
+        drumkit_note_name(note, nn);
+        QMenu m;
+        QAction *put = m.addAction(sel >= 0 ? QString("Put \"%1\" on %2").arg(table_->item(sel, 1)->text(), nn)
+                                            : QString("Put the selected sample on %1").arg(nn));
+        put->setEnabled(sel >= 0);
+        QAction *pick = m.addAction(QString("Choose a WAV for %1…").arg(nn));
+        QAction *clear = m.addAction(QString("Take the sample off %1").arg(nn));
+        clear->setEnabled(r >= 0);
+        QAction *got = m.exec(at);
+        if (got == put) assignRow(sel, note);
+        else if (got == pick) {
+            const QString dir = setDir();
+            if (dir.isEmpty()) return;
+            const QString f = QFileDialog::getOpenFileName(this, QString("A WAV for %1").arg(nn), dir,
+                                                           "WAV files (*.wav *.WAV)");
+            if (f.isEmpty()) return;
+            if (r >= 0) table_->removeRow(r);
+            const QString base = dir + '/';
+            filling_ = true;
+            addRow(note, f.startsWith(base) ? f.mid(base.size()) : f, 0.0, 0);
+            filling_ = false;
+            dirty_ = true;
+            refreshKeys();
+            audition(table_->rowCount() - 1);
+        } else if (got == clear && r >= 0) {
+            table_->removeRow(r);
+            dirty_ = true;
+            refreshKeys();
+        }
+    }
+
     void fill()
     {
         filling_ = true;
@@ -721,6 +1018,11 @@ private:
                    map_->pad[i].gain_db, map_->pad[i].choke);
         table_->resizeColumnToContents(0);
         filling_ = false;
+        int lowest = 127;
+        for (int i = 0; i < map_->n; i++) lowest = std::min(lowest, map_->pad[i].note);
+        if (map_->n) octave_->setValue(std::clamp(lowest / 12 - 1, 0, 8));
+        keys_->setOctave(octave_->value());
+        refreshKeys();
     }
 
     void addWavs()
@@ -740,6 +1042,7 @@ private:
             // From the set's own folder, by name; from anywhere else, by path.
             addRow(note + 1, f.startsWith(base) ? f.mid(base.size()) : f, 0.0, 0);
             dirty_ = true;
+            refreshKeys();
         }
     }
 
@@ -750,6 +1053,7 @@ private:
         std::sort(rows.begin(), rows.end(), std::greater<int>());
         for (int r : rows) table_->removeRow(r);
         if (!rows.isEmpty()) dirty_ = true;
+        refreshKeys();
     }
 
     void save()
@@ -791,6 +1095,10 @@ private:
     QComboBox *sets_;
     QLabel *dir_, *status_;
     QTableWidget *table_;
+    KeyMapWidget *keys_;
+    QSpinBox *octave_;
+    QPushButton *learn_;
+    QLabel *outside_;
     QString name_;
     bool dirty_ = false, filling_ = false;
 };

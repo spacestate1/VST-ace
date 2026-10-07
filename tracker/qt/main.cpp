@@ -99,6 +99,22 @@ int uitest(trk_engine *e, TrackerWindow &w, const QString &outdir)
         wait(400);
         se.grab().save(outdir + "/05-editor.png");
         std::printf("  picture: %s/05-editor.png\n", outdir.toLocal8Bit().constData());
+        {   // Samples onto keys: a drop, a swap, and the key a drop lands on.
+            auto *kb = se.findChild<KeyMapWidget *>();
+            auto *tb = se.findChild<QTableWidget *>();
+            check(kb && tb && tb->rowCount() >= 2, "the editor has a keyboard over its list");
+            if (kb && tb && tb->rowCount() >= 2) {
+                const QString a = tb->item(0, 0)->text(), b = tb->item(1, 0)->text();
+                const QString n0 = tb->item(0, 1)->text();
+                emit kb->dropped(0, drumkit_note_parse(b.toUtf8().constData()));
+                check(tb->item(0, 0)->text() == b && tb->item(1, 0)->text() == a,
+                      "dropping a sample on a taken key swaps the two");
+                emit kb->dropped(1, 100);
+                check(tb->item(1, 0)->text() == "E-7", "dropping on a free key moves the sample there");
+                se.grab().save(outdir + "/05b-keymap.png");
+                (void)n0;
+            }
+        }
         se.hide();
     }
     {   // A block selected -- and the cursor put back, for the steps after.
