@@ -1084,6 +1084,12 @@ public:
     trk_editor *editor() { return &ed_; }
     QComboBox *dest(int t) const { return dest_[t]; }
     bool writeSong(const QString &p) { return writeTo(p); }
+    // A shell saving a session asks these: where the song lives ("" when it
+    // was never saved), whether it has unsaved changes, and a way to put that
+    // right through the ordinary save flow before the session file is written.
+    QString songPath() const { return path_; }
+    bool isDirty() { return dirty(); }
+    bool saveSong() { return save(); }
     // A scripted drive that changed the song for its own purposes: closing
     // should not ask about those changes.
     void markClean()

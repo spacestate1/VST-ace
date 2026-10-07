@@ -550,18 +550,22 @@ static void resolve_path(patch_bank *b, const char *bank_path)
         resolve_one(b->p[i].path, (int)sizeof b->p[i].path, bank_path);
 }
 
-patch_bank *patch_bank_read(const char *path, char *err, int errn)
+/* The parse, divorced from where the text came from: patch_bank_read hands it
+ * a file's contents, patch_bank_read_text a buffer already in memory -- a
+ * patch embedded in a session file, which was never a file of its own. `path`
+ * is used only for error messages, the single-patch name fallback and
+ * resolving relative pluginPaths against, so a text that has no home passes a
+ * descriptive name instead. */
+static patch_bank *bank_parse(const char *text, const char *path,
+                              char *err, int errn)
 {
     patch_bank *b;
-    char       *text;
     scan        s;
     patch       single;
 
     if (errn > 0) err[0] = 0;
-    if (!(text = read_file(path, err, errn))) return NULL;
     if (!(b = calloc(1, sizeof *b))) {
         snprintf(err, (size_t)errn, "out of memory");
-        free(text);
         return NULL;
     }
 
@@ -571,10 +575,8 @@ patch_bank *patch_bank_read(const char *path, char *err, int errn)
     if (!parse_obj(&s, &single, b, path, err, errn)) {
         free(single.v);
         patch_bank_free(b);
-        free(text);
         return NULL;
     }
-    free(text);
 
     if (b->n == 0) {
         /* No "patches" array, so the top level was itself one patch. */
@@ -606,6 +608,26 @@ patch_bank *patch_bank_read(const char *path, char *err, int errn)
     }
     resolve_path(b, path);
     return b;
+}
+
+patch_bank *patch_bank_read(const char *path, char *err, int errn)
+{
+    char *text;
+    patch_bank *b;
+
+    if (errn > 0) err[0] = 0;
+    if (!(text = read_file(path, err, errn))) return NULL;
+    b = bank_parse(text, path, err, errn);
+    free(text);
+    return b;
+}
+
+patch_bank *patch_bank_read_text(const char *text, const char *origin,
+                                 char *err, int errn)
+{
+    if (errn > 0) err[0] = 0;
+    if (!text) { snprintf(err, (size_t)errn, "no patch text"); return NULL; }
+    return bank_parse(text, origin && *origin ? origin : "patch", err, errn);
 }
 
 void patch_bank_free(patch_bank *b)
@@ -858,6 +880,18 @@ int patch_load(pehost *h, const char *path, char *err, int errn,
     return rc;
 }
 
+int patch_apply_text(pehost *h, const char *text, char *err, int errn,
+                     int *applied, int *missed)
+{
+    patch_bank *b;
+    int         rc;
+
+    if (!(b = patch_bank_read_text(text, "session", err, errn))) return -1;
+    rc = patch_bank_apply(b, 0, h, err, errn, applied, missed);
+    patch_bank_free(b);
+    return rc;
+}
+
 /* ------------------------------------------------------------------- save */
 
 static void json_puts(FILE *f, const char *s)
@@ -875,10 +909,12 @@ static void json_puts(FILE *f, const char *s)
     fputc('"', f);
 }
 
-int patch_save(pehost *h, const char *path, const char *plugin_path,
-               char *err, int errn)
+/* The write, to any stream: patch_save's stream is the file it opened,
+ * patch_capture's is a memory buffer. `what` names the destination in error
+ * messages. */
+static int patch_write(pehost *h, FILE *f, const char *plugin_path,
+                       const char *what, char *err, int errn)
 {
-    FILE  *f;
     char **names;
     int    nparams, i, j;
 
@@ -888,11 +924,6 @@ int patch_save(pehost *h, const char *path, const char *plugin_path,
     nparams = pehost_num_params(h);
     if (!(names = read_names(h, nparams))) {
         snprintf(err, (size_t)errn, "out of memory");
-        return -1;
-    }
-    if (!(f = fopen(path, "wb"))) {
-        snprintf(err, (size_t)errn, "%s: cannot write", path);
-        free_names(names, nparams);
         return -1;
     }
 
@@ -930,12 +961,50 @@ int patch_save(pehost *h, const char *path, const char *plugin_path,
     fputs("  }\n}\n", f);
 
     if (ferror(f)) {
-        snprintf(err, (size_t)errn, "%s: write failed", path);
-        fclose(f);
+        snprintf(err, (size_t)errn, "%s: write failed", what);
         free_names(names, nparams);
         return -1;
     }
-    fclose(f);
     free_names(names, nparams);
     return 0;
+}
+
+int patch_save(pehost *h, const char *path, const char *plugin_path,
+               char *err, int errn)
+{
+    FILE *f;
+    int   rc;
+
+    if (errn > 0) err[0] = 0;
+    if (!(f = fopen(path, "wb"))) {
+        snprintf(err, (size_t)errn, "%s: cannot write", path);
+        return -1;
+    }
+    rc = patch_write(h, f, plugin_path, path, err, errn);
+    fclose(f);
+    return rc;
+}
+
+char *patch_capture(pehost *h, const char *plugin_path, char *err, int errn)
+{
+    char  *buf = NULL;
+    size_t len = 0;
+    FILE  *f;
+    int    rc;
+
+    if (errn > 0) err[0] = 0;
+    if (!(f = open_memstream(&buf, &len))) {
+        snprintf(err, (size_t)errn, "out of memory");
+        return NULL;
+    }
+    /* The stream is closed whatever the write did: buf belongs to it until
+     * fclose, so freeing it before then would free the stream's buffer. */
+    rc = patch_write(h, f, plugin_path, "patch capture", err, errn);
+    if (fclose(f) != 0) rc = -1;
+    if (rc) {
+        if (errn > 0 && !err[0]) snprintf(err, (size_t)errn, "patch capture failed");
+        free(buf);
+        return NULL;
+    }
+    return buf;
 }

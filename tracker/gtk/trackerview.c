@@ -103,6 +103,10 @@ struct trk_view {
     void       *sinks_ud;
     void      (*embed_close)(void *ud);
     void       *embed_close_ud;
+    /* trk_view_ensure_saved's continuation: the same flow as a close, but
+     * what runs at the end is the shell's next step, and nothing closes. */
+    void      (*embed_ensure)(void *ud);
+    void       *embed_ensure_ud;
 
     guint       t_follow, t_reroute; /* the view's timers, removed on destroy */
 };
@@ -1726,6 +1730,17 @@ static GtkWidget *labelled(const char *text, GtkWidget *w)
 /* ------------------------------------------------------------- the files */
 
 static void close_confirmed(ui *U);
+static void ensure_confirmed(ui *U);
+
+/* What a save that was asked for on the way to something else goes on to:
+ * the close it was asked for, a shell's ensure_saved step, or nothing. */
+enum { SAVED_THEN_NOTHING, SAVED_THEN_CLOSE, SAVED_THEN_ENSURE };
+
+static void saved_then(ui *U, int then)
+{
+    if (then == SAVED_THEN_CLOSE) close_confirmed(U);
+    else if (then == SAVED_THEN_ENSURE) ensure_confirmed(U);
+}
 
 static void open_done(GObject *src, GAsyncResult *res, gpointer u)
 {
@@ -1754,7 +1769,7 @@ static void save_done(GObject *src, GAsyncResult *res, gpointer u)
         char path[4096];
         const char *base = strrchr(p, '/');
         snprintf(path, sizeof path, "%s%s", p, base && !strchr(base, '.') ? ".trk" : "");
-        if (!write_to(U, path) && close_after) close_confirmed(U);
+        if (!write_to(U, path)) saved_then(U, close_after);
     }
     g_free(p);
     g_object_unref(f);
@@ -1790,10 +1805,10 @@ static void save_as(ui *U, int close_after)
 static void do_save(ui *U, int close_after)
 {
     if (!U->path[0]) { save_as(U, close_after); return; }
-    if (!write_to(U, U->path) && close_after) close_confirmed(U);
+    if (!write_to(U, U->path)) saved_then(U, close_after);
 }
 
-typedef enum { AFTER_NEW, AFTER_OPEN, AFTER_CLOSE } after_t;
+typedef enum { AFTER_NEW, AFTER_OPEN, AFTER_CLOSE, AFTER_ENSURE } after_t;
 
 /* The close the flow has been building to: the standalone's window closes;
  * an embedded view answers the shell that asked through
@@ -1806,9 +1821,18 @@ static void close_confirmed(ui *U)
     else gtk_window_close(GTK_WINDOW(U->win));
 }
 
+/* trk_view_ensure_saved's end: the way is clear, the shell goes on. Unlike a
+ * close, the view stays exactly as it was -- `closing` is not touched. */
+static void ensure_confirmed(ui *U)
+{
+    void (*cb)(void *) = U->embed_ensure;
+    if (cb) { U->embed_ensure = NULL; cb(U->embed_ensure_ud); }
+}
+
 static void after_confirm(ui *U, after_t what)
 {
     if (what == AFTER_CLOSE) { close_confirmed(U); return; }
+    if (what == AFTER_ENSURE) { ensure_confirmed(U); return; }
     if (what == AFTER_NEW) {
         trk_stop(U->e);
         trk_lock(U->e);
@@ -1837,7 +1861,8 @@ static void confirm_done(GObject *src, GAsyncResult *res, gpointer u)
     g_free(r);
     if (b == 1) after_confirm(U, what);                 /* discard */
     else if (b == 2) {                               /* save first */
-        if (what == AFTER_CLOSE) do_save(U, 1);
+        if (what == AFTER_CLOSE) do_save(U, SAVED_THEN_CLOSE);
+        else if (what == AFTER_ENSURE) do_save(U, SAVED_THEN_ENSURE);
         else if (!U->path[0]) save_as(U, 0);
         else if (!write_to(U, U->path)) after_confirm(U, what);
     }
@@ -2638,6 +2663,7 @@ GtkWidget *trk_view_widget(trk_view *v)
 int  trk_view_open(trk_view *v, const char *path) { return open_path(v, path); }
 void trk_view_reset(trk_view *v) { reset_view(v); }
 int  trk_view_dirty(trk_view *v) { return dirty(v); }
+const char *trk_view_path(trk_view *v) { return ((ui *)v)->path; }
 
 void trk_view_mark_clean(trk_view *v)
 {
@@ -2663,6 +2689,19 @@ void trk_view_confirm_close(trk_view *v, void (*cb)(void *ud), void *ud)
     U->embed_close = cb;
     U->embed_close_ud = ud;
     confirm_then(U, AFTER_CLOSE);
+}
+
+/* The same flow as confirm_close, with "the close proceeds" read as "the way
+ * is clear": Save saves and calls cb, Discard calls cb, Cancel is silence.
+ * Nothing closes -- cb is the shell's own next step -- so it runs through
+ * AFTER_ENSURE rather than AFTER_CLOSE, which would mark the view closing. */
+void trk_view_ensure_saved(trk_view *v, void (*cb)(void *ud), void *ud)
+{
+    ui *U = v;
+    if (!dirty(U)) { cb(ud); return; }
+    U->embed_ensure = cb;
+    U->embed_ensure_ud = ud;
+    confirm_then(U, AFTER_ENSURE);
 }
 
 void trk_view_free(trk_view *v)

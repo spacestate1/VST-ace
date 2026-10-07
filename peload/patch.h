@@ -47,6 +47,11 @@ typedef struct patch_bank patch_bank;
 /* Read a patch file, in either shape. Returns NULL on failure with a one-line
  * reason in `err`. */
 patch_bank *patch_bank_read(const char *path, char *err, int errn);
+/* The same parse over text already in memory -- a patch embedded in a session
+ * file. `origin` stands in for the file name in error messages and for
+ * resolving relative pluginPaths against. */
+patch_bank *patch_bank_read_text(const char *text, const char *origin,
+                                 char *err, int errn);
 void        patch_bank_free(patch_bank *b);
 
 int         patch_bank_count(const patch_bank *b);
@@ -97,6 +102,11 @@ int patch_bank_apply_params(const patch_bank *b, int i, pehost *h,
 int patch_load(pehost *h, const char *path, char *err, int errn,
                int *applied, int *missed);
 
+/* Apply a patch held in memory -- one embedded in a session file -- to an
+ * open plugin. Same semantics as patch_load. */
+int patch_apply_text(pehost *h, const char *text, char *err, int errn,
+                     int *applied, int *missed);
+
 /* Where a patch someone made goes, and therefore where one is looked for.
  *
  * $XDG_DATA_HOME/vst-ace/patches, else ~/.local/share/vst-ace/patches -- the
@@ -136,6 +146,11 @@ int patch_find_for(const pehost *h, const char *plugin_path,
  * the patch can later be opened without naming the plugin again. */
 int patch_save(pehost *h, const char *path, const char *plugin_path,
                char *err, int errn);
+
+/* The same patch, as a malloc'd JSON string rather than a file -- for
+ * embedding in a session file, where a patch per tab has no path of its own.
+ * patch_apply_text reads back what this wrote. Free with free(). */
+char *patch_capture(pehost *h, const char *plugin_path, char *err, int errn);
 
 #ifdef __cplusplus
 }

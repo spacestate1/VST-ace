@@ -18,12 +18,23 @@
  * tracker never calls into a dead pane.
  *
  * Threading, as dwstudio: the audio thread never takes a lock; the tabs it
- * mixes are changed only while it is parked. */
+ * mixes are changed only while it is parked.
+ *
+ * Two more things a frame owes several tabs rather than one, as in the Qt
+ * shell. A plug-in whose helper died for good -- its pane restarted it three
+ * times and gave up -- is marked on its tab by a once-a-second watch, and
+ * Synth > Reload Plug-in is the way back; the recoverable deaths never reach
+ * here, the pane restarts those itself and says so on its status line. And
+ * the whole session -- the open tabs with their plug-ins and sounds, the
+ * song, which tracks play which tab -- is one JSON file
+ * (session/sessfile.h), written from File > Save Session and read back by
+ * File > Open Session or --session. */
 
 #include "plugview.h"
 #include "trackerview.h"
 #include "trk.h"
 #include "pehost.h"
+#include "sessfile.h"
 
 #include <alsa/asoundlib.h>
 #include <pipewire/pipewire.h>
@@ -58,6 +69,8 @@ typedef struct {
     char          sink_name[TRK_DEST_LEN];
     unsigned char held[128];   /* computer keys down, released on switch away */
     _Atomic unsigned long callbacks;   /* blocks rendered, for the smoke drive */
+    int           dead_marked; /* the tab already says (stopped) */
+    unsigned long last_calls;  /* callback count a second ago, for the tooltip */
 } synctab;
 
 static synctab      g_tabs[MAXTABS];
@@ -70,6 +83,8 @@ static GtkWidget   *g_win, *g_notebook, *g_stack, *g_hint, *g_status;
 static GSimpleAction *g_new_tracker_act;
 static int          g_routed;          /* --route: the tracker drives the proof */
 static int          g_smoke_ms;
+static char         g_session_path[4096];   /* the file Save Session writes */
+static char         g_save_on_exit[4096];   /* --save-session */
 
 static void status(const char *msg)
 {
@@ -721,6 +736,280 @@ static int route_track(int track)
     return 1;
 }
 
+/* ------------------------------------------------------------- the session
+ *
+ * The whole session as one JSON file: which synth tabs with which plug-ins
+ * and their sounds, the song, which tracks play which tab. Shared with the
+ * Qt shell through sessfile.c, so a session saved in one opens in the other. */
+
+static int write_session(const char *path)
+{
+    sess_file s;
+    char err[512], msg[4200];
+    int synth_sink[MAXTABS];   /* each recorded synth's tracker destination */
+    int t, i;
+
+    memset(&s, 0, sizeof s);
+    for (t = 0; t < MAXTABS; t++) {
+        sess_synth *sy;
+        if (!g_tabs[t].used || !plugview_loaded_path(g_tabs[t].pv)[0]) continue;
+        if (!(sy = realloc(s.synths, (size_t)(s.nsynths + 1) * sizeof *sy))) break;
+        s.synths = sy;
+        synth_sink[s.nsynths] = g_tabs[t].sink_id;
+        sy = &s.synths[s.nsynths++];
+        /* Absolute, whatever --synth was given as: the file has to mean the
+         * same thing from any working directory. */
+        sy->plugin = g_canonicalize_filename(plugview_loaded_path(g_tabs[t].pv), NULL);
+        sy->patch = plugview_capture_patch(g_tabs[t].pv);
+    }
+    s.song = g_tracker && trk_view_path(g_tracker)[0]
+           ? g_canonicalize_filename(trk_view_path(g_tracker), NULL) : g_strdup("");
+    if (g_trk) {
+        for (i = 0; i < TRK_TRACKS; i++) {
+            char nm[TRK_DEST_LEN] = "";
+            sess_route *r;
+            int id = trk_sink_of(g_trk, i);
+            if (id < 0) continue;
+            trk_sink_name(g_trk, id, nm, sizeof nm);
+            if (!(r = realloc(s.routes, (size_t)(s.nroutes + 1) * sizeof *r))) break;
+            s.routes = r;
+            r = &s.routes[s.nroutes++];
+            r->track = i;
+            r->synth = -1;
+            for (t = 0; t < s.nsynths; t++)
+                if (synth_sink[t] == id) { r->synth = t; break; }
+            r->sink = g_strdup(nm);
+        }
+    }
+
+    i = sess_write(path, &s, err, sizeof err);
+    for (t = 0; t < s.nsynths; t++) { g_free(s.synths[t].plugin); free(s.synths[t].patch); }
+    for (t = 0; t < s.nroutes; t++) g_free(s.routes[t].sink);
+    free(s.synths);
+    free(s.routes);
+    g_free(s.song);
+    if (i) {
+        snprintf(msg, sizeof msg, "could not save the session: %s", err);
+        status(msg);
+        return 0;
+    }
+    snprintf(g_session_path, sizeof g_session_path, "%s", path);
+    snprintf(msg, sizeof msg, "session saved to %s", path);
+    status(msg);
+    fprintf(stderr, "session: saved %s\n", path);
+    fflush(stderr);
+    return 1;
+}
+
+/* The song question settled -- saved or discarded, never cancelled -- so the
+ * write can go ahead. trk_view_ensure_saved's callback. */
+static char g_pending_session[4096];   /* the write waiting on that answer */
+
+static void session_write_confirmed(void *ud)
+{
+    (void)ud;
+    write_session(g_pending_session);
+}
+
+/* The write, after the unsaved-song question if there is one. The song is
+ * recorded by its path, which a dirty song may not have yet -- Save and
+ * Discard both let the write go ahead, Cancel stops it. */
+static void save_session_checked(const char *path)
+{
+    if (g_tracker && trk_view_dirty(g_tracker)) {
+        /* Held here rather than handed over as ud: a Cancel never calls
+         * back, and there would be nothing to free it. */
+        snprintf(g_pending_session, sizeof g_pending_session, "%s", path);
+        trk_view_ensure_saved(g_tracker, session_write_confirmed, NULL);
+        return;
+    }
+    write_session(path);
+}
+
+/* Every tab, any song question already answered: the synths, then the
+ * tracker -- whose close takes the engine and every destination with it. */
+static void close_all_tabs_now(void)
+{
+    int t;
+    for (t = 0; t < MAXTABS; t++)
+        if (g_tabs[t].used) close_synth_tab(&g_tabs[t]);
+    if (g_tracker) tracker_close_ok(NULL);
+}
+
+/* Restore, in place of whatever was open: the tabs with their plug-ins and
+ * sounds, then the song, then -- last, because they name the tabs -- the
+ * routings. Anything that will not come back is said about and skipped, not
+ * fatal. Takes `s` and frees it. */
+static void restore_session(sess_file *s, const char *path)
+{
+    char msg[4200], trouble[2048] = "";
+    synctab *made[MAXTABS];      /* the tab each saved synth came back as */
+    int i, routed = 0;
+
+    close_all_tabs_now();
+    g_session_path[0] = 0;
+    for (i = 0; i < MAXTABS; i++) made[i] = NULL;
+    for (i = 0; i < s->nsynths && i < MAXTABS; i++) {
+        synctab *tab;
+        if (!s->synths[i].plugin || !*s->synths[i].plugin) continue;
+        if (!(tab = add_synth_tab())) break;
+        if (!plugview_load_path(tab->pv, s->synths[i].plugin)) {
+            const char *base = strrchr(s->synths[i].plugin, '/');
+            /* No empty tab left standing for it: the message says what did
+             * not come back, and an empty tab would be saved over the session
+             * as one that never had anything in it. */
+            close_synth_tab(tab);
+            snprintf(trouble + strlen(trouble), sizeof trouble - strlen(trouble),
+                     "%s%s", trouble[0] ? ", " : "", base ? base + 1 : s->synths[i].plugin);
+            continue;
+        }
+        made[i] = tab;
+        if (s->synths[i].patch && plugview_apply_patch(tab->pv, s->synths[i].patch)) {
+            const char *base = strrchr(s->synths[i].plugin, '/');
+            snprintf(trouble + strlen(trouble), sizeof trouble - strlen(trouble),
+                     "%s%s (its sound)", trouble[0] ? ", " : "",
+                     base ? base + 1 : s->synths[i].plugin);
+        }
+    }
+    if (s->song && *s->song) {
+        if (!open_song_path(s->song)) {
+            snprintf(trouble + strlen(trouble), sizeof trouble - strlen(trouble),
+                     "%s%s", trouble[0] ? ", " : "", s->song);
+        }
+    } else if (s->nroutes) {
+        open_tracker_tab();              /* the routes need somewhere to point */
+    }
+    /* Last, now that the tabs exist to be found: by the saved synth's index,
+     * mapped to the tab this restore made for it, so a tab that was already
+     * open -- or a second instance of the same plug-in -- cannot capture the
+     * route. A file without indices falls back to the name, among this
+     * restore's tabs only. A route whose tab failed to load is dropped. */
+    for (i = 0; i < s->nroutes; i++) {
+        const sess_route *r = &s->routes[i];
+        synctab *to = NULL;
+        int j;
+        if (g_trk && r->track >= 0 && r->track < TRK_TRACKS) {
+            if (r->synth >= 0 && r->synth < s->nsynths && r->synth < MAXTABS)
+                to = made[r->synth];
+            else if (r->synth < 0 && r->sink)
+                for (j = 0; j < s->nsynths && j < MAXTABS; j++)
+                    if (made[j] && !strcmp(made[j]->sink_name, r->sink)) {
+                        to = made[j];
+                        break;
+                    }
+        }
+        if (!to || to->sink_id < 0) {
+            snprintf(trouble + strlen(trouble), sizeof trouble - strlen(trouble),
+                     "%strack %d's route to %s", trouble[0] ? ", " : "", r->track + 1,
+                     r->sink && *r->sink ? r->sink : "a synth");
+            continue;
+        }
+        trk_route_sink(g_trk, r->track, to->sink_id);
+        routed++;
+    }
+    snprintf(g_session_path, sizeof g_session_path, "%s", path);
+    snprintf(msg, sizeof msg, "session restored from %s%s%s", path,
+             trouble[0] ? "; could not bring back: " : "", trouble);
+    status(msg);
+    fprintf(stderr, "session: restored %s -- %d tab(s), %d route(s)%s\n",
+            path, s->nsynths, routed, trouble[0] ? " (with losses)" : "");
+    fflush(stderr);
+    sess_free(s);
+}
+
+/* A restore waiting on the unsaved-song question. Held here rather than
+ * handed over as ud: a Cancel never calls back, and there would be nothing to
+ * free it -- the next restore frees it instead. */
+static sess_file *g_pending_restore;
+static char       g_pending_restore_path[4096];
+
+static gboolean restore_pending(gpointer u)
+{
+    sess_file *s = g_pending_restore;
+    (void)u;
+    g_pending_restore = NULL;
+    if (s) restore_session(s, g_pending_restore_path);
+    return G_SOURCE_REMOVE;
+}
+
+/* trk_view_ensure_saved's callback. The restore frees the tracker view, and
+ * this runs inside that view's own dialog handling -- so it goes on from the
+ * main loop, once the view is out of its call stack. */
+static void restore_confirmed(void *ud)
+{
+    (void)ud;
+    g_idle_add(restore_pending, NULL);
+}
+
+/* Open a session: read first, so a file that will not parse costs nothing;
+ * then, when the song has unsaved changes, the tracker's Save/Discard/Cancel
+ * -- Cancel leaves everything as it was -- and only then the restore. */
+static int open_session_path(const char *path)
+{
+    sess_file *s;
+    char err[512], msg[700];
+
+    if (!(s = sess_read(path, err, sizeof err))) {
+        snprintf(msg, sizeof msg, "could not open the session: %s", err);
+        status(msg);
+        fprintf(stderr, "session: %s\n", msg);
+        fflush(stderr);
+        return 0;
+    }
+    if (g_tracker && trk_view_dirty(g_tracker)) {
+        sess_free(g_pending_restore);
+        g_pending_restore = s;
+        snprintf(g_pending_restore_path, sizeof g_pending_restore_path, "%s", path);
+        trk_view_ensure_saved(g_tracker, restore_confirmed, NULL);
+        return 1;
+    }
+    restore_session(s, path);
+    return 1;
+}
+
+/* Once a second: the tab-face bookkeeping nothing else owns. A tab whose
+ * plug-in's helper died for good is marked on its tab (the recoverable
+ * deaths are the pane's own business -- it restarts them and says so on its
+ * status line), and every tab's tooltip says what its audio is doing, from
+ * the callback counter against the ~187.5 blocks a second a 256-frame
+ * quantum at 48 kHz should be making. */
+static gboolean watch_tabs(gpointer u)
+{
+    int t;
+    (void)u;
+    for (t = 0; t < MAXTABS; t++) {
+        synctab *tab = &g_tabs[t];
+        unsigned long calls, rate;
+        char tip[160];
+        int dead;
+        if (!tab->used) continue;
+        dead = plugview_dead(tab->pv);
+        if (dead && !tab->dead_marked) {
+            char lbl[TRK_DEST_LEN + 16], msg[TRK_DEST_LEN + 128];
+            tab->dead_marked = 1;
+            snprintf(lbl, sizeof lbl, "%s (stopped)", plugview_loaded_name(tab->pv));
+            gtk_label_set_text(GTK_LABEL(tab->tablabel), lbl);
+            snprintf(msg, sizeof msg,
+                     "the plug-in in tab \"%s\" stopped responding and would "
+                     "not restart -- Synth > Reload Plug-in tries again",
+                     plugview_loaded_name(tab->pv));
+            status(msg);
+        } else if (!dead && tab->dead_marked) {
+            const char *loaded = plugview_loaded_name(tab->pv);
+            tab->dead_marked = 0;
+            gtk_label_set_text(GTK_LABEL(tab->tablabel), *loaded ? loaded : "synth");
+        }
+        calls = atomic_load_explicit(&tab->callbacks, memory_order_relaxed);
+        rate = calls - tab->last_calls;
+        tab->last_calls = calls;
+        snprintf(tip, sizeof tip, "audio: %lu blocks/s (%d%%)%s", rate,
+                 (int)(rate * 100.0 / 187.5 + 0.5),
+                 dead ? " -- plug-in stopped" : "");
+        gtk_widget_set_tooltip_text(tab->tablabel, tip);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
 /* ------------------------------------------------------------- the menus */
 
 static void act_new_synth(GSimpleAction *a, GVariant *p, gpointer u)
@@ -771,6 +1060,73 @@ static void act_open_song(GSimpleAction *a, GVariant *p, gpointer u)
 static void act_quit(GSimpleAction *a, GVariant *p, gpointer u)
 { (void)a; (void)p; (void)u; gtk_window_close(GTK_WINDOW(g_win)); }
 
+static void on_session_opened(GObject *src, GAsyncResult *res, gpointer u)
+{
+    GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *path;
+    (void)u;
+    if (!f) return;
+    if ((path = g_file_get_path(f))) {
+        open_session_path(path);
+        g_free(path);
+    }
+    g_object_unref(f);
+}
+
+static void act_open_session(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    GtkFileDialog *d = gtk_file_dialog_new();
+    GtkFileFilter *ft = gtk_file_filter_new();
+    GListStore *fs = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    (void)a; (void)p; (void)u;
+    gtk_file_dialog_set_title(d, "Open session");
+    gtk_file_filter_set_name(ft, "vst-ace sessions");
+    gtk_file_filter_add_pattern(ft, "*.vstace");
+    g_list_store_append(fs, ft);
+    gtk_file_dialog_set_filters(d, G_LIST_MODEL(fs));
+    g_object_unref(ft);
+    g_object_unref(fs);
+    gtk_file_dialog_open(d, GTK_WINDOW(g_win), NULL, on_session_opened, NULL);
+    g_object_unref(d);
+}
+
+static void on_session_save_chosen(GObject *src, GAsyncResult *res, gpointer u)
+{
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *path;
+    (void)u;
+    if (!f) return;
+    if ((path = g_file_get_path(f))) {
+        char with_ext[4096];
+        snprintf(with_ext, sizeof with_ext, "%s%s", path,
+                 strstr(path, ".vstace") ? "" : ".vstace");
+        save_session_checked(with_ext);
+        g_free(path);
+    }
+    g_object_unref(f);
+}
+
+static void act_save_session_as(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    GtkFileDialog *d = gtk_file_dialog_new();
+    const char *base;
+    (void)a; (void)p; (void)u;
+    gtk_file_dialog_set_title(d, "Save session");
+    gtk_file_dialog_set_initial_name(d,
+        g_session_path[0] ? ((base = strrchr(g_session_path, '/')) ? base + 1
+                                                                     : g_session_path)
+                          : "session.vstace");
+    gtk_file_dialog_save(d, GTK_WINDOW(g_win), NULL, on_session_save_chosen, NULL);
+    g_object_unref(d);
+}
+
+static void act_save_session(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    (void)a; (void)p; (void)u;
+    if (g_session_path[0]) save_session_checked(g_session_path);
+    else act_save_session_as(a, p, u);
+}
+
 /* The Synth menu: the pane's own commands, acting on the tab in front. One
  * shared menu set rather than a set per tab -- GTK's popover menus rebuild
  * per window, not per tab, and what they act on is always the tab you are
@@ -809,6 +1165,34 @@ static void act_enter_key(GSimpleAction *a, GVariant *p, gpointer u)
 static void act_toggle_editor(GSimpleAction *a, GVariant *p, gpointer u)
 { synctab *t; (void)a; (void)p; (void)u;
   if ((t = synth_or_status())) plugview_toggle_editor(t->pv); }
+
+/* Synth > Reload Plug-in: the way back for a tab whose plug-in stopped and
+ * would not restart. It is the ordinary load path, so a live plug-in is just
+ * loaded again. */
+static void act_reload_plugin(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    synctab *t;
+    char path[1024], msg[1100], *sound;
+    (void)a; (void)p; (void)u;
+    if (!(t = synth_or_status())) return;
+    /* Copied out: the load rewrites the pane's own loaded_path. */
+    snprintf(path, sizeof path, "%s", plugview_loaded_path(t->pv));
+    if (!path[0]) { status("nothing is loaded in this tab to reload"); return; }
+    /* The sound comes along: captured first -- from a dead helper that is the
+     * bridge's record of what was last set, which is what a restart would
+     * have put back -- and applied to the fresh instance. */
+    sound = plugview_capture_patch(t->pv);
+    snprintf(msg, sizeof msg, "reloading %s ...", path);
+    status(msg);
+    if (!plugview_load_path(t->pv, path)) {
+        snprintf(msg, sizeof msg, "could not reload %s", path);
+        status(msg);
+    } else if (sound && plugview_apply_patch(t->pv, sound)) {
+        snprintf(msg, sizeof msg, "reloaded %s, but not its sound", path);
+        status(msg);
+    }
+    free(sound);
+}
 
 static void act_panic(GSimpleAction *a, GVariant *p, gpointer u)
 {
@@ -851,6 +1235,10 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "new-synth",   act_new_synth,   NULL, NULL, NULL, {0} },
         { "new-tracker", act_new_tracker, NULL, NULL, NULL, {0} },
         { "open-song",   act_open_song,   NULL, NULL, NULL, {0} },
+        { "open-session",    act_open_session,    NULL, NULL, NULL, {0} },
+        { "save-session",    act_save_session,    NULL, NULL, NULL, {0} },
+        { "save-session-as", act_save_session_as, NULL, NULL, NULL, {0} },
+        { "reload-plugin",   act_reload_plugin,   NULL, NULL, NULL, {0} },
         { "close-tab",   act_close_tab,   NULL, NULL, NULL, {0} },
         { "quit",        act_quit,        NULL, NULL, NULL, {0} },
         { "open-vst",    act_open_vst,    NULL, NULL, NULL, {0} },
@@ -866,6 +1254,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
     GMenu *bar   = g_menu_new();
     GMenu *file  = g_menu_new();
     GMenu *sect  = g_menu_new();
+    GMenu *sess  = g_menu_new();
     GMenu *synth = g_menu_new();
     GMenu *s2    = g_menu_new();
     GMenu *help  = g_menu_new();
@@ -906,12 +1295,17 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append(file, "New synth…",  "win.new-synth");
     g_menu_append(file, "New tracker", "win.new-tracker");
     g_menu_append(file, "Open song…",  "win.open-song");
+    g_menu_append(sess, "Open session…",    "win.open-session");
+    g_menu_append(sess, "Save session",     "win.save-session");
+    g_menu_append(sess, "Save session as…", "win.save-session-as");
+    g_menu_append_section(file, NULL, G_MENU_MODEL(sess));
     g_menu_append(sect, "Close tab",   "win.close-tab");
     g_menu_append(sect, "Quit",        "win.quit");
     g_menu_append_section(file, NULL, G_MENU_MODEL(sect));
     g_menu_append_submenu(bar, "File", G_MENU_MODEL(file));
 
     g_menu_append(synth, "Open VST…",   "win.open-vst");
+    g_menu_append(synth, "Reload Plug-in", "win.reload-plugin");
     g_menu_append(synth, "Load Folder…", "win.load-folder");
     g_menu_append(synth, "Save Patch…", "win.save-patch");
     g_menu_append(synth, "Open Patch…", "win.open-patch");
@@ -928,7 +1322,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
     w = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(bar));
     gtk_widget_set_halign(w, GTK_ALIGN_START);
     g_object_unref(help); g_object_unref(s2); g_object_unref(synth);
-    g_object_unref(sect); g_object_unref(file); g_object_unref(bar);
+    g_object_unref(sect); g_object_unref(sess); g_object_unref(file); g_object_unref(bar);
     return w;
 }
 
@@ -1016,15 +1410,37 @@ static void start_smoke_drive(int ms)
 
 /* ------------------------------------------------------------- the window */
 
+/* Set once the song question has been answered for this close, so the
+ * close it leads to is not asked again: after Discard the song is still
+ * dirty, and close-request would otherwise put the same question for ever. */
+static int g_win_close_ok;
+
+/* The close goes ahead: --save-session writes now, with the song question
+ * (if there was one) already answered, so it is not asked a second time. */
+static void win_close_proceed(void)
+{
+    g_win_close_ok = 1;
+    if (g_save_on_exit[0]) write_session(g_save_on_exit);
+}
+
+static void win_close_confirmed(void *ud)
+{
+    (void)ud;
+    win_close_proceed();
+    gtk_window_close(GTK_WINDOW(g_win));
+}
+
 static gboolean on_win_close(GtkWindow *w, gpointer u)
 {
     (void)w; (void)u;
+    if (g_win_close_ok) return FALSE;
     /* The tracker's song may have unsaved changes; closing the window asks
      * exactly as closing its tab does, and the answer closes the window. */
     if (g_tracker && !g_smoke_ms && trk_view_dirty(g_tracker)) {
-        trk_view_confirm_close(g_tracker, (void (*)(void *))gtk_window_close, g_win);
+        trk_view_confirm_close(g_tracker, win_close_confirmed, NULL);
         return TRUE;
     }
+    win_close_proceed();
     return FALSE;
 }
 
@@ -1055,6 +1471,7 @@ static char   g_want_synths[MAXTABS][1024];
 static int    g_nwant_synths;
 static int    g_want_tracker;
 static char   g_want_song[4096];
+static char   g_want_session[4096];
 static int    g_want_route = -1;
 static int    g_quit_after;
 
@@ -1110,6 +1527,9 @@ static void activate(GtkApplication *app, gpointer ud)
 
     engine_start_audio();
     update_canvas();
+    g_timeout_add(1000, watch_tabs, NULL);
+
+    if (g_want_session[0]) open_session_path(g_want_session);
 
     for (i = 0; i < g_nwant_synths; i++) {
         synctab *tab = add_synth_tab();
@@ -1171,6 +1591,8 @@ int main(int argc, char **argv)
      *
      *   studiogtk --synth blooo64.dll --synth "Surge XT.vst3" --tracker
      *   studiogtk --song song.trk
+     *   studiogtk --session take-five.vstace   a saved session, whole
+     *   studiogtk --save-session out.vstace ...   write the session on the clean exit
      *   studiogtk --route 2 --synth ... --tracker   track 2 plays the first synth tab
      *   studiogtk --smoke 15000 --synth ...   scripted exercise, then quit
      *   studiogtk --quit-after 15000 ...      just quit then
@@ -1185,6 +1607,10 @@ int main(int argc, char **argv)
             g_want_tracker = 1;
         } else if (!strcmp(argv[i], "--song") && i + 1 < argc) {
             snprintf(g_want_song, sizeof g_want_song, "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--session") && i + 1 < argc) {
+            snprintf(g_want_session, sizeof g_want_session, "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--save-session") && i + 1 < argc) {
+            snprintf(g_save_on_exit, sizeof g_save_on_exit, "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--route") && i + 1 < argc) {
             g_want_route = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--smoke") && i + 1 < argc) {
@@ -1195,10 +1621,13 @@ int main(int argc, char **argv)
             g_backend_want = argv[++i];
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("studiogtk [--synth <plug-in>]... [--tracker] [--song <file.trk>]\n"
+                   "          [--session <file.vstace>] [--save-session <file.vstace>]\n"
                    "          [--route <track>] [--smoke <ms>] [--quit-after <ms>]\n"
                    "          [--backend auto|pipewire|alsa]\n\n"
                    "The session window, in GTK: a tab per synth plug-in, one for "
                    "the tracker.\nWith no arguments it opens on a blank canvas.\n"
+                   "--session restores a session saved with File > Save session; "
+                   "--save-session\nwrites one on the clean exit.\n"
                    "--route plays the numbered track into the first synth tab, "
                    "in-process,\nand starts the song -- the scripted proof of the "
                    "direct routing.\n");

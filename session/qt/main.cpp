@@ -19,9 +19,21 @@
  * block on the sample (Engine::injectMidi). A tab closing unregisters its
  * sink first -- trk_remove_sink waits out any delivery in flight -- so the
  * tracker never calls into a dead engine, and tracks routed there fall back
- * to the ALSA windows their songs name. */
+ * to the ALSA windows their songs name.
+ *
+ * Two more things a frame owes several tabs rather than one. A plug-in whose
+ * helper died for good -- its HostWidget restarted it three times and gave up
+ * -- is marked on its tab by the shell's watchdog, and File > Reload plug-in
+ * is the way back; the recoverable deaths never reach here, HostWidget
+ * restarts those itself and says so on the status line. And the whole session
+ * -- the open tabs with their plug-ins and sounds, the song, which tracks
+ * play which tab -- is one JSON file (session/sessfile.h), written from
+ * File > Save session and read back by File > Open session or --session. */
 
 #include <QtWidgets>
+
+#include <cstring>
+#include <vector>
 
 #include "hostwindow.h"
 #include "trackerwidget.h"
@@ -29,6 +41,8 @@
 extern "C" {
 #include "trk.h"
 #include "version.h"
+#include "patch.h"
+#include "sessfile.h"
 }
 
 /* The tracker's delivery into a synth tab: the engine's delivery thread calls
@@ -62,6 +76,13 @@ public:
         newTracker_ = file->addAction("New &tracker", this, &SessionShell::newTracker);
         file->addAction("&Open song...", this, &SessionShell::openSong);
         file->addSeparator();
+        file->addAction("Op&en session...", this, &SessionShell::openSession);
+        file->addAction("&Save session", this, &SessionShell::saveSession);
+        file->addAction("Save session &as...", this, &SessionShell::saveSessionAs);
+        file->addSeparator();
+        reloadAct_ = file->addAction("&Reload plug-in", this, &SessionShell::reloadPlugin);
+        reloadAct_->setEnabled(false);
+        file->addSeparator();
         QAction *quit = file->addAction("&Quit", QKeySequence::Quit, this, &QWidget::close);
 
         QMenu *help = menuBar()->addMenu("&Help");
@@ -90,6 +111,15 @@ public:
         connect(tabs_, &QTabWidget::tabCloseRequested, this,
                 &SessionShell::closeTab);
 
+        /* Once a second: the tab-face bookkeeping nothing else owns. A tab
+         * whose plug-in's helper died for good is marked on its tab (the
+         * recoverable deaths are HostWidget's own business -- it restarts
+         * them and says so on the status line), and every tab's tooltip says
+         * what its audio is doing, from the engine's callback counter. */
+        auto *watch = new QTimer(this);
+        connect(watch, &QTimer::timeout, this, &SessionShell::watchTabs);
+        watch->start(1000);
+
         statusBar()->showMessage("open a synth or the tracker from the File menu", 0);
     }
 
@@ -108,6 +138,104 @@ public:
         return t && t->openPath(path);
     }
     int tabCount() const { return tabs_->count(); }
+
+    /* Restore a saved session in place of whatever is open: the tabs with
+     * their plug-ins and sounds, then the song, then -- last, because they
+     * name the tabs -- the routings. The file is read before anything is
+     * closed, so a session that will not parse costs nothing, and an unsaved
+     * song is asked about before it goes (Cancel leaves everything as it
+     * was). Anything in the file that will not come back is said about and
+     * skipped, not fatal: half a session back is worth more than none. */
+    bool openSessionPath(const QString &path)
+    {
+        char err[512];
+        sess_file *s = sess_read(path.toLocal8Bit().constData(), err, sizeof err);
+        if (!s) {
+            statusBar()->showMessage(QString("could not open the session: %1")
+                                         .arg(QString::fromLocal8Bit(err)), 0);
+            fprintf(stderr, "session: could not open %s -- %s\n", qPrintable(path), err);
+            fflush(stderr);
+            return false;
+        }
+        if (!closeAllTabs()) {
+            sess_free(s);
+            statusBar()->showMessage("session not opened -- the song was kept", 5000);
+            fprintf(stderr, "session: %s not opened -- cancelled at the song\n",
+                    qPrintable(path));
+            fflush(stderr);
+            return false;
+        }
+        sessionPath_.clear();
+        QStringList trouble;
+        QList<HostWidget *> made;            /* the tab each saved synth came back as */
+        for (int i = 0; i < s->nsynths; i++) {
+            made << nullptr;
+            if (!s->synths[i].plugin || !*s->synths[i].plugin) continue;
+            const QString plugin = QString::fromLocal8Bit(s->synths[i].plugin);
+            HostWidget *h = addSynthTab();
+            if (!h->loadPlugin(plugin)) {
+                /* No empty tab left standing for it: the message says what
+                 * did not come back, and an empty tab would be saved over the
+                 * session as one that never had anything in it. */
+                closeTabNow(tabs_->indexOf(h));
+                trouble << QFileInfo(plugin).fileName();
+                continue;
+            }
+            made[i] = h;
+            QString why;
+            if (s->synths[i].patch && !h->applyPatchText(s->synths[i].patch, &why))
+                trouble << QString("%1 (its sound: %2)").arg(QFileInfo(plugin).fileName(), why);
+        }
+        if (s->song && *s->song) {
+            if (!openSongPath(QString::fromLocal8Bit(s->song)))
+                trouble << QString::fromLocal8Bit(s->song);
+        } else if (s->nroutes) {
+            addTrackerTab();             /* the routes need somewhere to point */
+        }
+        /* Last, now that the tabs exist to be found: by the saved synth's
+         * index, mapped to the tab this restore made for it, so a tab that was
+         * already open -- or a second instance of the same plug-in -- cannot
+         * capture the route. A file without indices falls back to the name,
+         * among this restore's tabs only. A route whose tab failed to load is
+         * dropped. */
+        int routed = 0;
+        for (int i = 0; i < s->nroutes; i++) {
+            const sess_route &r = s->routes[i];
+            bool done = false;
+            if (trkEngine_ && r.track >= 0 && r.track < TRK_TRACKS) {
+                const QString sink = QString::fromUtf8(r.sink ? r.sink : "");
+                for (const SinkEntry &e : sinks_) {
+                    const qsizetype at = made.indexOf(e.tab);
+                    if (at < 0) continue;
+                    if (r.synth >= 0 ? at == r.synth : e.name == sink) {
+                        trk_route_sink(trkEngine_, r.track, e.id);
+                        routed++;
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            if (!done)
+                trouble << QString("track %1's route to %2").arg(r.track + 1)
+                               .arg(QString::fromUtf8(r.sink && *r.sink ? r.sink : "a synth"));
+        }
+        sessionPath_ = path;
+        statusBar()->showMessage(
+            trouble.isEmpty()
+                ? QString("session restored from %1").arg(path)
+                : QString("session restored; could not bring back: %1")
+                      .arg(trouble.join(", ")), 0);
+        fprintf(stderr, "session: restored %s -- %d tab(s), %d route(s)%s\n",
+                qPrintable(path), s->nsynths, routed,
+                trouble.isEmpty() ? "" : " (with losses)");
+        fflush(stderr);
+        sess_free(s);
+        return true;
+    }
+
+    /* Save on a clean exit, for --save-session: the unsaved-song question has
+     * already been answered by closeEvent's confirmClose before this runs. */
+    void saveSessionOnExit(const QString &path) { saveOnExit_ = path; }
 
     /* --route <track>: play the track into the first synth tab, in-process,
      * and start the song. A four-note figure goes into the pattern first so
@@ -171,11 +299,13 @@ public:
                 unsigned dropped = 0, spilled = 0;
                 if (ph) pehost_midi_stats(ph, &dropped, &spilled);
                 fprintf(stderr, "smoke: tab %d \"%s\" callbacks=%lu peak=%.3f "
-                                "keysLive=%d dropped=%u spilled=%u injected=%lu placed=%lu%s\n",
+                                "keysLive=%d dropped=%u spilled=%u injected=%lu placed=%lu "
+                                "dead=%d restarts=%d%s\n",
                         i, qPrintable(tabs_->tabText(i)),
                         h->engine()->callbacks(), h->engine()->peak(),
                         int(h->keysLive()), dropped, spilled,
                         h->engine()->midiInjected(), h->engine()->midiPlaced(),
+                        int(h->pluginDead()), ph ? pehost_restarts(ph) : 0,
                         ph ? "" : " (no plug-in)");
             }
             smokeStep_++;
@@ -238,6 +368,10 @@ protected:
         /* The tracker's song may have unsaved changes; closing the window asks
          * exactly as closing its tab does. */
         if (tracker_ && !tracker_->confirmClose()) { e->ignore(); return; }
+        /* --save-session writes here, on the clean exit: the song question
+         * above has been answered by now, so what gets written is what the
+         * answer left behind. */
+        if (!saveOnExit_.isEmpty()) writeSession(saveOnExit_, false);
         /* The tabs are deleted with the window, not through closeTab, so
          * their tracker destinations are unregistered here: after the last
          * trk_remove_sink returns the delivery thread is provably out of
@@ -337,11 +471,203 @@ private:
         if (!p.isEmpty()) openSongPath(p);
     }
 
+    /* -- the session file ------------------------------------------------- */
+
+    void openSession()
+    {
+        const QString p = QFileDialog::getOpenFileName(
+            this, "Open session", QString(),
+            "vst-ace sessions (*.vstace);;All files (*)");
+        if (!p.isEmpty()) openSessionPath(p);
+    }
+    void saveSession()
+    {
+        if (sessionPath_.isEmpty()) { saveSessionAs(); return; }
+        writeSession(sessionPath_);
+    }
+    void saveSessionAs()
+    {
+        QString p = QFileDialog::getSaveFileName(
+            this, "Save session", sessionPath_.isEmpty() ? "session.vstace" : sessionPath_,
+            "vst-ace sessions (*.vstace);;All files (*)");
+        if (p.isEmpty()) return;
+        if (QFileInfo(p).suffix().isEmpty()) p += ".vstace";
+        writeSession(p);
+    }
+
+    /* The whole session as one JSON file: which synth tabs with which
+     * plug-ins and their sounds, the song, which tracks play which tab. A
+     * dirty song is the song's own question and is asked through the
+     * tracker's ordinary save flow first -- Save and Discard both let the
+     * write go ahead (the file records the song's path either way), Cancel
+     * stops it. */
+    bool writeSession(const QString &path, bool askSong = true)
+    {
+        /* askSong false: the caller has already put the song question --
+         * closeEvent, through confirmClose -- and a Discard there must not be
+         * asked again here. */
+        if (askSong && tracker_ && tracker_->isDirty()) {
+            const auto b = QMessageBox::question(
+                this, "studio", "Save changes to the song first?",
+                QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
+            if (b == QMessageBox::Cancel) return false;
+            if (b == QMessageBox::Save && !tracker_->saveSong()) return false;
+        }
+
+        sess_file s;
+        memset(&s, 0, sizeof s);
+        std::vector<char *> pool;            /* everything strdup'd, freed below */
+        auto keep = [&pool](char *p) { pool.push_back(p); return p; };
+        QList<HostWidget *> recorded;        /* s.synths[i] came from recorded[i] */
+        for (int i = 0; i < tabs_->count(); i++) {
+            auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
+            if (!h || h->loadedPath().isEmpty()) continue;
+            auto *sy = static_cast<sess_synth *>(
+                realloc(s.synths, sizeof(sess_synth) * size_t(s.nsynths + 1)));
+            if (!sy) continue;
+            s.synths = sy;
+            sy = &s.synths[s.nsynths++];
+            recorded << h;
+            /* Absolute, whatever --synth was given as: the file has to mean
+             * the same thing from any working directory. */
+            sy->plugin = keep(strdup(QFileInfo(h->loadedPath()).absoluteFilePath()
+                                         .toLocal8Bit().constData()));
+            sy->patch = nullptr;
+            if (h->engine()->host()) {
+                char perr[128];
+                sy->patch = patch_capture(h->engine()->host(), sy->plugin,
+                                          perr, sizeof perr);
+            }
+        }
+        const QString song = tracker_ && !tracker_->songPath().isEmpty()
+                           ? QFileInfo(tracker_->songPath()).absoluteFilePath() : QString();
+        s.song = keep(strdup(song.toLocal8Bit().constData()));
+        if (trkEngine_) {
+            for (int t = 0; t < TRK_TRACKS; t++) {
+                char nm[TRK_DEST_LEN] = "";
+                const int id = trk_sink_of(trkEngine_, t);
+                if (id < 0) continue;
+                trk_sink_name(trkEngine_, id, nm, sizeof nm);
+                auto *r = static_cast<sess_route *>(
+                    realloc(s.routes, sizeof(sess_route) * size_t(s.nroutes + 1)));
+                if (!r) continue;
+                s.routes = r;
+                r = &s.routes[s.nroutes++];
+                r->track = t;
+                r->synth = -1;
+                for (const SinkEntry &e : sinks_)
+                    if (e.id == id) { r->synth = int(recorded.indexOf(e.tab)); break; }
+                r->sink = keep(strdup(nm));
+            }
+        }
+
+        char err[512];
+        const int rc = sess_write(path.toLocal8Bit().constData(), &s, err, sizeof err);
+        for (char *p : pool) free(p);
+        for (int i = 0; i < s.nsynths; i++) free(s.synths[i].patch);
+        free(s.synths);
+        free(s.routes);
+        if (rc) {
+            statusBar()->showMessage(QString("could not save the session: %1")
+                                         .arg(QString::fromLocal8Bit(err)), 0);
+            return false;
+        }
+        sessionPath_ = path;
+        statusBar()->showMessage("session saved to " + path, 5000);
+        fprintf(stderr, "session: saved %s\n", qPrintable(path));
+        fflush(stderr);
+        return true;
+    }
+
+    /* File > Reload plug-in: the way back for a tab whose plug-in stopped
+     * and would not restart, which is also what the action's tooltip says.
+     * Reloading is the ordinary load path, so a tab that was never dead is
+     * only reloaded. */
+    void reloadPlugin()
+    {
+        auto *h = qobject_cast<HostWidget *>(tabs_->currentWidget());
+        if (!h || h->loadedPath().isEmpty()) return;
+        const QString path = h->loadedPath();     /* the load rewrites it */
+        /* The sound comes along: captured first -- from a dead helper that is
+         * the bridge's record of what was last set, which is what a restart
+         * would have put back -- and applied to the fresh instance. */
+        char perr[128];
+        char *sound = h->engine()->host()
+                    ? patch_capture(h->engine()->host(), path.toLocal8Bit().constData(),
+                                    perr, sizeof perr)
+                    : nullptr;
+        statusBar()->showMessage("reloading " + path + " ...", 3000);
+        if (!h->loadPlugin(path)) {
+            statusBar()->showMessage("could not reload " + path, 0);
+        } else if (sound) {
+            QString why;
+            if (!h->applyPatchText(sound, &why))
+                statusBar()->showMessage("reloaded " + path + ", but not its sound: " + why, 0);
+        }
+        free(sound);
+    }
+
+    /* The once-a-second tab bookkeeping. A tab whose plug-in died for good
+     * says so on its face until it is reloaded; every tab's tooltip says what
+     * its audio is doing, from the engine's callback counter against the
+     * ~187.5 blocks a second a 256-frame quantum at 48 kHz should be making. */
+    void watchTabs()
+    {
+        for (int i = 0; i < tabs_->count(); i++) {
+            auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
+            if (!h) continue;
+            const bool dead = h->pluginDead();
+            const bool marked = deadTabs_.contains(h);
+            if (dead && !marked) {
+                deadTabs_.insert(h);
+                tabs_->setTabText(i, h->windowTitle() + " (stopped)");
+                statusBar()->showMessage(
+                    QString("the plug-in in tab \"%1\" stopped responding and "
+                            "would not restart -- File > Reload plug-in tries again")
+                        .arg(h->windowTitle()), 0);
+            } else if (!dead && marked) {
+                deadTabs_.remove(h);
+                tabs_->setTabText(i, h->windowTitle().isEmpty()
+                                         ? QString("synth") : h->windowTitle());
+            }
+            const unsigned long calls = h->engine()->callbacks();
+            const unsigned long rate = calls - lastCalls_.value(h, calls);
+            lastCalls_[h] = calls;
+            tabs_->setTabToolTip(i, QString("audio: %1 blocks/s (%2%)%3")
+                                        .arg(rate)
+                                        .arg(int(rate * 100.0 / 187.5 + 0.5))
+                                        .arg(dead ? QString(" -- plug-in stopped")
+                                                  : QString()));
+        }
+        reloadAct_->setEnabled(qobject_cast<HostWidget *>(tabs_->currentWidget()) &&
+                               !static_cast<HostWidget *>(tabs_->currentWidget())
+                                    ->loadedPath().isEmpty());
+    }
+
     void closeTab(int ix)
     {
         QWidget *w = tabs_->widget(ix);
         if (!w) return;
         if (w == tracker_ && !tracker_->confirmClose()) return;
+        closeTabNow(ix);
+    }
+
+    /* Every tab, for a session opened in place of this one. The song is
+     * asked about once, up front -- false on Cancel, with nothing closed --
+     * and the tabs then go without asking again, since after a Discard the
+     * song is still dirty and would be asked about a second time. */
+    bool closeAllTabs()
+    {
+        if (tracker_ && !tracker_->confirmClose()) return false;
+        while (tabs_->count()) closeTabNow(tabs_->count() - 1);
+        return true;
+    }
+
+    /* The close itself, any question already answered. */
+    void closeTabNow(int ix)
+    {
+        QWidget *w = tabs_->widget(ix);
+        if (!w) return;
 
         /* Menus first, while the widget still exists to be asked nothing. */
         for (QMenu *m : menusOf_.take(w)) {
@@ -362,6 +688,8 @@ private:
              * out -- after it returns, nothing touches the engine again, and
              * tracks routed here fall back to their ALSA windows. */
             removeSink(static_cast<HostWidget *>(w));
+            deadTabs_.remove(static_cast<HostWidget *>(w));
+            lastCalls_.remove(static_cast<HostWidget *>(w));
             /* ~HostWidget lets go of the plug-in cleanly: the MIDI reader is
              * stopped and the editors detached in its body, then the Engine's
              * own teardown stops the PipeWire loop before pehost_close. */
@@ -474,9 +802,14 @@ private:
     QTabWidget     *tabs_;
     QLabel         *hint_ = nullptr;
     QAction        *newTracker_ = nullptr;
+    QAction        *reloadAct_ = nullptr;
     TrackerWidget  *tracker_ = nullptr;
     trk_engine     *trkEngine_ = nullptr;
     QList<SinkEntry> sinks_;             /* every synth tab the tracker can play directly */
+    QString        sessionPath_;         /* the file Save session writes without asking */
+    QString        saveOnExit_;          /* --save-session: written on the clean exit */
+    QSet<HostWidget *>           deadTabs_;    /* tabs already marked (stopped) */
+    QHash<HostWidget *, unsigned long> lastCalls_;  /* callback counts, for the tooltips */
     bool           routed_ = false;      /* --route: the tracker drives the proof, not smoke's notes */
     /* Set around each tab's construction, which is when both widgets build
      * their menus through addMenu; the menus collected are filed under the
@@ -526,24 +859,25 @@ int main(int argc, char **argv)
                         "(PEHOST_ISOLATE=0 to disable)\n");
     }
 
-    QApplication app(argc, argv);
-    app.setApplicationName("studio");
-    /* Before any plugin is opened: the Classic backend is handed this when its
-     * shim is built. */
-    pehost_set_input_pump(pump_input, nullptr);
-
     /* A session can be named rather than clicked together:
      *
      *   studio --synth blooo64.dll --synth "Surge XT.vst3" --tracker
      *   studio --song song.trk
+     *   studio --session take-five.vstace   a saved session, whole
      *   studio --route 2 --synth ... --tracker   track 2 plays the first synth tab
      *   studio --smoke 15000 --synth ...   scripted exercise, then quit
      *   studio --quit-after 15000 ...      just quit then
+     *   studio --save-session out.vstace ...   write the session on the clean exit
      */
     QStringList synths;
-    QString song;
+    QString song, session, saveSession;
     bool wantTracker = false;
     int quitAfter = 0, smoke = 0, route = -1;
+    /* Read before QApplication sees argv, which it edits: Qt takes
+     * -session/--session as its own X11 session-management option and removes
+     * it, so --session never got here. What is not ours is passed on to Qt,
+     * and whatever Qt does not take either is the unknown argument. */
+    std::vector<char *> qtArgv{argv[0]};
     for (int i = 1; i < argc; i++) {
         const QString a = QString::fromLocal8Bit(argv[i]);
         if (a == "--synth" && i + 1 < argc)
@@ -552,6 +886,10 @@ int main(int argc, char **argv)
             wantTracker = true;
         else if (a == "--song" && i + 1 < argc)
             song = QString::fromLocal8Bit(argv[++i]);
+        else if (a == "--session" && i + 1 < argc)
+            session = QString::fromLocal8Bit(argv[++i]);
+        else if (a == "--save-session" && i + 1 < argc)
+            saveSession = QString::fromLocal8Bit(argv[++i]);
         else if (a == "--route" && i + 1 < argc)
             route = atoi(argv[++i]);
         else if (a == "--quit-after" && i + 1 < argc)
@@ -560,25 +898,41 @@ int main(int argc, char **argv)
             smoke = atoi(argv[++i]);
         else if (a == "--help" || a == "-h") {
             printf("studio [--synth <plug-in>]... [--tracker] [--song <file.trk>]\n"
+                   "       [--session <file.vstace>] [--save-session <file.vstace>]\n"
                    "       [--route <track>] [--smoke <ms>] [--quit-after <ms>]\n\n"
                    "The session window: a tab per synth plug-in, one for the "
                    "tracker.\nWith no arguments it opens on a blank canvas.\n"
+                   "--session restores a session saved with File > Save session; "
+                   "--save-session\nwrites one on the clean exit.\n"
                    "--route plays the numbered track into the first synth tab, "
                    "in-process,\nand starts the song -- the scripted proof of the "
                    "direct routing.\n");
             return 0;
         } else {
-            fprintf(stderr, "studio: unknown argument %s -- try --help\n",
-                    qPrintable(a));
-            return 2;
+            qtArgv.push_back(argv[i]);
         }
+    }
+    int qtArgc = int(qtArgv.size());
+    qtArgv.push_back(nullptr);
+
+    QApplication app(qtArgc, qtArgv.data());
+    app.setApplicationName("studio");
+    /* Before any plugin is opened: the Classic backend is handed this when its
+     * shim is built. */
+    pehost_set_input_pump(pump_input, nullptr);
+
+    if (qtArgc > 1) {
+        fprintf(stderr, "studio: unknown argument %s -- try --help\n", qtArgv[1]);
+        return 2;
     }
 
     SessionShell w;
     w.show();
+    if (!session.isEmpty()) w.openSessionPath(session);
     for (const QString &s : synths) w.openSynth(s);
     if (wantTracker) w.openTracker();
     if (!song.isEmpty()) w.openSongPath(song);
+    if (!saveSession.isEmpty()) w.saveSessionOnExit(saveSession);
     if (route > 0 && !w.routeTrack(route - 1))
         fprintf(stderr, "studio: --route %d failed (no synth tab, or no tracker?)\n", route);
     if (smoke > 0)

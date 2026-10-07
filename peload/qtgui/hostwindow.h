@@ -2304,6 +2304,39 @@ public:
      * plug-in, and to tests. */
     bool loadPlugin(const QString &path) { return loadPluginPath(path); }
 
+    /* What is open ("" when nothing is), and whether its helper died for
+     * good -- the recoverable deaths pollUi already restarted and reported do
+     * not set this, only the one that would not come back. A shell with one
+     * of these per tab needs both: the path is what a session file records,
+     * and the flag is what the tab's face has to say. */
+    QString loadedPath() const { return loadedPath_; }
+    bool    pluginDead() const { return deadReported_; }
+
+    /* Apply a patch held as text -- a session file's, or one captured before
+     * a reload -- and bring the face up to date with it: the Programs list
+     * follows without re-dispatching the program (which would overwrite every
+     * parameter just set), and the parameter list is rebuilt, or the sound
+     * would be audible and invisible. False with the reason in `why`. */
+    bool applyPatchText(const char *text, QString *why = nullptr)
+    {
+        char err[256];
+        if (!eng_.host() || !text) {
+            if (why) *why = "no plug-in loaded";
+            return false;
+        }
+        if (patch_apply_text(eng_.host(), text, err, sizeof err, nullptr, nullptr)) {
+            if (why) *why = QString::fromLocal8Bit(err);
+            return false;
+        }
+        if (int prog = pehost_get_program(eng_.host());
+            prog >= 0 && prog < programList_->count()) {
+            QSignalBlocker block(programList_);
+            programList_->setCurrentRow(prog);
+        }
+        refreshParams();
+        return true;
+    }
+
     /* The audio engine. A shell embedding several of these wants the meters;
      * tests want callbacks() and peak(). */
     Engine *engine() { return &eng_; }

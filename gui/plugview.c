@@ -199,6 +199,7 @@ struct plugview {
      * whether the fit is still in charge. See zoom_fit_idle. */
     int        ed_fit_pending;
     int        ed_fit_auto;
+    guint      ed_fit_idle;     /* the queued zoom_fit_idle, removed on shutdown */
     int        ed_fit_vw, ed_fit_vh;   /* pane size the last fit measured */
     GtkWidget *zoom_out, *zoom_in, *zoom_fit, *zoom_one, *zoom_lbl, *zoom_note;
     int        dead_reported;   /* said once, not once per tick */
@@ -1232,7 +1233,7 @@ static int native_editor_open(plugview *pv, pehost *h, const char *title)
      * is nothing to ask to resize. Fit on the next turn of the main loop, once
      * the pane has been laid out at this editor's size. */
     zoom_update_ui(pv);
-    g_idle_add(zoom_fit_idle, pv);
+    if (!pv->ed_fit_idle) pv->ed_fit_idle = g_idle_add(zoom_fit_idle, pv);
     /* Said out loud, the way pestudio says it. Both rectangles, because which
      * one is bigger is the whole question when an editor does not fit: the
      * plug-in gets the first, and the second is how much of it you can see. */
@@ -1544,7 +1545,7 @@ static void zoom_fit_poll(plugview *pv)
  * flag keeps the request alive and editor_tick retries it until the pane can
  * actually be measured. */
 static gboolean zoom_fit_idle(gpointer u)
-{ plugview *pv = u; pv->ed_fit_pending = 1; pv->ed_fit_auto = 1;
+{ plugview *pv = u; pv->ed_fit_idle = 0; pv->ed_fit_pending = 1; pv->ed_fit_auto = 1;
   pv->ed_fit_vw = pv->ed_fit_vh = -1; zoom_fit(pv, 1); return G_SOURCE_REMOVE; }
 
 static void on_zoom_out(GtkButton *b, gpointer u) { plugview *pv = u; (void)b; zoom_step(pv, -1); }
@@ -1879,7 +1880,7 @@ static void load(plugview *pv, const entry *e)
                 zoom_update_ui(pv);
                 /* Fit it if it does not already fit, one turn later -- the pane
                  * has not been laid out at this editor's size yet. */
-                g_idle_add(zoom_fit_idle, pv);
+                if (!pv->ed_fit_idle) pv->ed_fit_idle = g_idle_add(zoom_fit_idle, pv);
             }
             snprintf(msg, sizeof msg, "%s loaded — editor %dx%d", e->name, w, h);
         } else if (kind == PEHOST_EDITOR_X11) {
@@ -2063,8 +2064,14 @@ static void open_path(plugview *pv, const char *path)
     }
     for (i = 0; i < pv->nvis; i++)
         if (!strcmp(pv->plug[pv->vis[i]].path, path)) {
-            gtk_list_box_select_row(GTK_LIST_BOX(pv->list),
-                gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->list), i));
+            GtkListBoxRow *row = gtk_list_box_get_row_at_index(GTK_LIST_BOX(pv->list), i);
+            /* Selecting the row that is already selected emits nothing, so
+             * opening the plug-in already open -- a shell's Reload, after its
+             * helper died for good -- loads it directly. */
+            if (gtk_list_box_get_selected_row(GTK_LIST_BOX(pv->list)) == row)
+                load(pv, &pv->plug[pv->vis[i]]);
+            else
+                gtk_list_box_select_row(GTK_LIST_BOX(pv->list), row);
             return;
         }
     if (pv->nplug >= MAX_PLUGINS) return;
@@ -2853,11 +2860,38 @@ int plugview_render(plugview *pv, float *out, int frames)
 int plugview_load_path(plugview *pv, const char *path)
 {
     open_path(pv, path);
-    return pv->host != NULL;
+    /* Loaded means *this* plug-in is: a pane that already had one keeps it
+     * when the path will not load, and "there is a host" would read that as
+     * success -- a session naming a missing plug-in came back as whichever
+     * one the new tab had opened on. */
+    return pv->host != NULL && !strcmp(pv->loaded_path, path);
 }
 
 const char *plugview_loaded_name(plugview *pv)
 { return pv->host ? pehost_name(pv->host) : ""; }
+
+const char *plugview_loaded_path(plugview *pv) { return pv->loaded_path; }
+
+int plugview_dead(plugview *pv) { return pv->dead_reported; }
+
+char *plugview_capture_patch(plugview *pv)
+{
+    char err[128];
+    if (!pv->host) return NULL;
+    return patch_capture(pv->host, pv->loaded_path[0] ? pv->loaded_path : NULL,
+                         err, sizeof err);
+}
+
+int plugview_apply_patch(plugview *pv, const char *text)
+{
+    char err[256];
+    if (!pv->host || !text) return -1;
+    if (patch_apply_text(pv->host, text, err, sizeof err, NULL, NULL)) return -1;
+    /* As the pane's own Open Patch: the values changed under the list, so it
+     * is rebuilt -- otherwise the sound is audible and invisible. */
+    fill_params(pv);
+    return 0;
+}
 
 double plugview_peak(plugview *pv)
 { return atomic_load_explicit(&pv->peak_milli, memory_order_relaxed) / 1000.0; }
@@ -2991,6 +3025,10 @@ void plugview_shutdown(plugview *pv)
      * outlives this call is inert rather than merely unlikely to run. */
     if (pv->tick)  { g_source_remove(pv->tick);  pv->tick  = 0; }
     if (pv->meter) { g_source_remove(pv->meter); pv->meter = 0; }
+    /* And the editor fit a load queued for the next turn of the loop: a pane
+     * closed straight after a load -- a session's tab whose plug-in did not
+     * come back -- was freed before it ran, and it ran anyway. */
+    if (pv->ed_fit_idle) { g_source_remove(pv->ed_fit_idle); pv->ed_fit_idle = 0; }
     /* Every widget pointer, and before the unload rather than after it.
      *
      * Clearing `status` and `editor` fixed the meter and left the zoom bar,

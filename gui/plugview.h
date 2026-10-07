@@ -114,6 +114,23 @@ int  plugview_load_path(plugview *pv, const char *path);
  * shell puts on the pane's tab and in the tracker's destination list. */
 const char *plugview_loaded_name(plugview *pv);
 
+/* The path it was loaded from, or "" -- what a shell records in a session
+ * file, and what "reload" loads again. */
+const char *plugview_loaded_path(plugview *pv);
+
+/* True when the plug-in's helper died and would not be restarted (the
+ * recoverable deaths are restarted by the pane itself and never set this).
+ * A shell marks the tab from it; plugview_load_path clears it. */
+int plugview_dead(plugview *pv);
+
+/* The loaded plug-in's sound, as patch.h JSON text (malloc'd; NULL when
+ * nothing is loaded), and the same applied back. A session file carries one
+ * per tab; patch_capture / patch_apply_text do the work. Applying rebuilds
+ * the pane's parameter list; it returns 0, or -1 when nothing took. A dead
+ * plug-in's capture is its last-known values, so a reload can put them back. */
+char *plugview_capture_patch(plugview *pv);
+int   plugview_apply_patch(plugview *pv, const char *text);
+
 /* The highest output level seen since the last plugview_peak_reset, as a
  * fraction of full scale -- for a shell's instrumentation, where the pane's
  * own meter is the display version of the same number. */

@@ -58,6 +58,18 @@ void       trk_view_mark_clean(trk_view *v);
 
 int        trk_view_dirty(trk_view *v);
 
+/* Where the song lives, "" when it was never saved -- what a shell records
+ * in a session file. */
+const char *trk_view_path(trk_view *v);
+
+/* Make sure the song is saved before whatever cb does -- a shell writing a
+ * session file, which records the song by its path. Runs the same
+ * Save/Discard/Cancel flow as trk_view_confirm_close when there are unsaved
+ * changes; cb is called when the way is clear (saved, discarded, or nothing
+ * to lose), never on cancel -- so ud must not be something only cb frees.
+ * Unlike confirm_close, the view is left as it was, not marked closing. */
+void       trk_view_ensure_saved(trk_view *v, void (*cb)(void *ud), void *ud);
+
 /* Ask whether the view may be destroyed, asking the user first when the song
  * has unsaved changes (the same Save/Discard/Cancel flow the standalone's
  * window close runs). cb is called -- synchronously when the song is clean,

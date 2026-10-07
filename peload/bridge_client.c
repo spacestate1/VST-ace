@@ -597,6 +597,11 @@ void bridge_program_name(bridge *b, int i, char *buf, int n)
 float bridge_get_param(bridge *b, int i)
 {
     bridge_rep r;
+    /* A dead helper answers from the shadow: the last value written to each
+     * parameter, which is what a recovery replays anyway -- and what a shell
+     * captures before reloading a plug-in that would not come back, so the
+     * reload keeps its sound instead of zeroing it. */
+    if (b && b->dead && i >= 0 && i < b->nshadow) return b->shadow[i];
     if (!b || bridge_op(b, BR_PARAM_GET, i, 0, 0, 0, 0, &r) || !r.ok) return 0.0f;
     return r.f;
 }
@@ -667,6 +672,8 @@ void bridge_set_program(bridge *b, int i)
 int bridge_get_program(bridge *b)
 {
     bridge_rep r;
+    /* Dead: the program last selected, as recovery would reselect it. */
+    if (b && b->dead) return b->program >= 0 ? b->program : 0;
     if (!b || bridge_op(b, BR_GET_PROGRAM, 0, 0, 0, 0, 0, &r) || !r.ok) return 0;
     return r.a;
 }
