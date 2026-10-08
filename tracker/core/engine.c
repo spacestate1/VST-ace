@@ -153,6 +153,11 @@ struct trk_engine {
     pos_mark        pos[POS_RING];
     unsigned        npos;
 
+    /* The level meters: a note's velocity as it sounds, falling away. */
+    float           meter[TRK_TRACKS];
+    unsigned        meter_seen;           /* pos marks already counted */
+    double          meter_time;           /* when trk_levels last ran */
+
     int             prev_note[TRK_TRACKS], prev_ch[TRK_TRACKS];
 
     /* Every note started and not yet released directly: [track][channel]
@@ -188,6 +193,7 @@ struct trk_engine {
     _Atomic double  bpm_now;              /* the queue's tempo, for the audio thread */
     _Atomic int     vol_live;             /* song.volume as of the last unlock: the audio thread's copy */
     char            audio_msg[160];
+    _Atomic unsigned xruns;               /* periods the device ran dry on: each is a click */
     char            pcm_name[TRK_DEST_LEN];   /* the chosen output, "" for the default */
 
     /* In-process sinks. Changed under both locks, lock then dmx; the delivery
@@ -727,6 +733,7 @@ static void *audio_main(void *ud)
             out[i] = (short)(v > 32767.0 ? 32767 : v < -32768.0 ? -32768 : v);
         }
         w = snd_pcm_writei(e->pcm, out, (snd_pcm_uframes_t)P);
+        if (w < 0) atomic_fetch_add_explicit(&e->xruns, 1, memory_order_relaxed);
         if (w < 0 && snd_pcm_recover(e->pcm, (int)w, 1) < 0) {
             struct timespec ts = { 0, 5000000 };
             nanosleep(&ts, NULL);                /* broken device: do not spin */
@@ -1543,6 +1550,43 @@ void trk_position(trk_engine *e, int *order, int *pattern, int *row)
     if (row) *row = r;
 }
 
+void trk_levels(trk_engine *e, float out[TRK_TRACKS])
+{
+    struct timespec ts;
+    double now, dt;
+    int t;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    pthread_mutex_lock(&e->lock);
+    dt = e->meter_time > 0 ? now - e->meter_time : 0;
+    if (dt < 0 || dt > 1) dt = 0.033;
+    e->meter_time = now;
+    for (t = 0; t < TRK_TRACKS; t++) e->meter[t] *= (float)exp(-dt / 0.55);
+    if (e->playing && e->npos) {
+        unsigned cur = queue_tick(e), i;
+        if (e->meter_seen > e->npos || e->npos - e->meter_seen > POS_RING) e->meter_seen = e->npos;
+        for (i = e->meter_seen; i < e->npos; i++) {
+            const pos_mark *m = &e->pos[i % POS_RING];
+            if (m->tick > cur) break;                /* not sounding yet */
+            for (t = 0; t < e->song.ntracks; t++) {
+                const trk_track *k = &e->song.track[t];
+                const trk_cell *c = &e->song.pattern[m->pattern].cell[m->row][t];
+                if (k->mute || c->note > 127) continue;
+                {
+                    int vel = c->vel != TRK_EMPTY ? c->vel : k->velocity;
+                    float v = (vel < 1 ? 1 : vel > 127 ? 127 : vel) / 127.0f;
+                    if (v > e->meter[t]) e->meter[t] = v;
+                }
+            }
+            e->meter_seen = i + 1;
+        }
+    } else {
+        e->meter_seen = e->npos;
+    }
+    for (t = 0; t < TRK_TRACKS; t++) out[t] = e->meter[t];
+    pthread_mutex_unlock(&e->lock);
+}
+
 void trk_set_bpm(trk_engine *e, double bpm)
 {
     if (bpm != bpm) return;                 /* NaN is no tempo: the one there stays */
@@ -1579,6 +1623,7 @@ void trk_preview(trk_engine *e, int t, int note, int vel)
     int ch;
     if (t < 0 || t >= TRK_TRACKS || note < 0 || note > 127) return;
     pthread_mutex_lock(&e->lock);
+    e->meter[t] = (vel >= 1 && vel <= 127 ? vel : e->song.track[t].velocity) / 127.0f;
     if (is_sampled(&e->song.track[t])) {
         /* Played out rather than held: a preview of a drum should be the
          * whole hit, however quickly the key comes back up. */
@@ -2703,6 +2748,7 @@ void trk_undo_clear(trk_engine *e)
 }
 const char *trk_client_name(trk_engine *e) { return e->name; }
 const char *trk_audio_status(trk_engine *e) { return e->audio_msg; }
+unsigned trk_audio_xruns(trk_engine *e) { return atomic_load_explicit(&e->xruns, memory_order_relaxed); }
 
 /* Instrumentation for trktest, which has no other window onto the sample
  * queue: how much of it is pending, and the audio thread's running totals.

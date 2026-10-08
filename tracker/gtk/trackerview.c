@@ -98,6 +98,11 @@ struct trk_view {
     int         drag_rows, drag_r, drag_t;   /* a drag selecting rows, or a block, and where it began */
     GtkWidget  *name[TRK_TRACKS], *dest[TRK_TRACKS], *chan[TRK_TRACKS];
     GtkWidget  *mute[TRK_TRACKS], *state[TRK_TRACKS], *oct[TRK_TRACKS];
+    GtkWidget  *meter[TRK_TRACKS];   /* a track's level bar */
+    float       level[TRK_TRACKS];
+    unsigned    xruns;
+    int         meters_off;    /* View > Level meters unticked */
+    int         pitch_off;     /* View > Color notes by pitch unticked */
     GtkWidget  *headbox[TRK_TRACKS];
     char       *destval[TRK_TRACKS][MAXDEST];   /* "client\tport" per dropdown item */
     int         ndest[TRK_TRACKS];
@@ -137,6 +142,8 @@ struct trk_view {
      * synths its sink lines name. Unset standalone. */
     void      (*song_opened)(void *ud);
     void       *song_opened_ud;
+    void      (*song_saved)(const char *path, void *ud);
+    void       *song_saved_ud;
 
     guint       t_follow, t_reroute; /* the view's timers, removed on destroy */
     guint       t_refit;             /* a pending refit_columns, 0 when none is */
@@ -225,7 +232,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
     PangoLayout *l;
     const trk_song *s;
     const trk_pattern *pt;
-    int r, r0, r1, t, lpb, mutes = 0, nt;
+    int r, r0, r1, t, lpb, mutes = 0, nt, t0 = 0, t1 = TRK_TRACKS - 1;
     ui *U = u; (void)h;
 
     gtk_widget_get_color(GTK_WIDGET(a), &fgc);
@@ -251,7 +258,27 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
 
     /* Which notes each sample-set track has a sample on -- asked before the
      * song's lock is taken, which this call takes itself. */
-    for (t = 0; t < TRK_TRACKS; t++) sampled[t] = trk_sample_mask(U->e, t, masks[t]);
+    {   /* Only what is on screen is drawn. The drawing area is as big as the
+         * pattern, and GTK hands the whole of it over, so without this a 64-row
+         * song paid for 64 rows at every cursor step and every playback row. */
+        GtkAdjustment *va = U->scroll ? gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(U->scroll)) : NULL;
+        GtkAdjustment *ha = U->scroll ? gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(U->scroll)) : NULL;
+        if (va && gtk_adjustment_get_page_size(va) > 0) {
+            const double top = gtk_adjustment_get_value(va), page = gtk_adjustment_get_page_size(va);
+            double ny1 = top - U->ch, ny2 = top + page + U->ch;    /* a row of slack either side */
+            if (ny1 > y1) y1 = ny1;
+            if (ny2 < y2) y2 = ny2;
+        }
+        if (ha && gtk_adjustment_get_page_size(ha) > 0) {
+            const double left = gtk_adjustment_get_value(ha), page = gtk_adjustment_get_page_size(ha);
+            t0 = (int)((left - gutter(U)) / colwidth(U)) - 1;
+            t1 = (int)((left + page - gutter(U)) / colwidth(U)) + 1;
+        }
+    }
+    if (t0 < 0) t0 = 0;
+    nt = ntr(U);
+    if (t1 > nt - 1) t1 = nt - 1;
+    for (t = 0; t < TRK_TRACKS; t++) sampled[t] = t >= t0 && t <= t1 ? trk_sample_mask(U->e, t, masks[t]) : 0;
 
     /* What is drawn is copied out under the lock and drawn after it: the
      * lock is the scheduling thread's and the note path's too, and a redraw
@@ -282,7 +309,7 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
         set(cr, r % lpb == 0 ? fg : dim);
         text_at(cr, l, U->cw / 2.0, y + 1, num, -1);
 
-        for (t = 0; t < nt; t++) {
+        for (t = t0; t <= t1 && t < nt; t++) {
             static const int start[TRK_FIELDS] = { TRK_COL_NOTE, TRK_COL_VEL, TRK_COL_CC, TRK_COL_VAL };
             static const int len[TRK_FIELDS]   = { 3, 2, 2, 2 };
             const int x = gutter(U) + t * colwidth(U);
@@ -303,6 +330,17 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
                                 len[U->ed.field] * U->cw + 2, U->ch);
                 cairo_fill(cr);
             }
+            /* An empty cell -- most of them -- is one string in the faint colour
+             * rather than four: the same picture for a quarter of the layout work. */
+            if (cells[r][t].note == TRK_EMPTY && cells[r][t].vel == TRK_EMPTY &&
+                cells[r][t].cc == TRK_EMPTY && cells[r][t].val == TRK_EMPTY &&
+                !(on_cursor)) {
+                rgba c = faint;
+                if (mutes & (1 << t)) c.a /= 3;
+                set(cr, c);
+                text_at(cr, l, x, y + 1, txt, -1);
+                continue;
+            }
             /* Field by field, so empty dots can be fainter than what is there
              * and the parameters quieter than the note. */
             for (f = 0; f < TRK_FIELDS; f++) {
@@ -313,6 +351,11 @@ static void draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
                  * nothing: red, so it is seen before it is not heard. */
                 if (f == TRK_F_NOTE && sampled[t] && nt <= 127 && !(masks[t][nt >> 3] & (1u << (nt & 7))))
                     c = (rgba){ 0.86, 0.2, 0.18, 1 };
+                else if (f == TRK_F_NOTE && !U->pitch_off && nt <= 127) {
+                    unsigned char rgb[3];
+                    trk_note_rgb(nt, fg.r + fg.g + fg.b > 1.5, rgb);   /* a dark page when the text is light */
+                    c = (rgba){ rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, 1 };
+                }
                 if (mutes & (1 << t)) c.a /= 3;
                 if (on_cursor && f == U->ed.field) c = white;
                 set(cr, c);
@@ -487,6 +530,49 @@ static void help_menu(GtkMenuButton *mb, gpointer u)
     g_menu_append(m, "Cheat Sheet", "win.cheat");
     gtk_menu_button_set_menu_model(mb, G_MENU_MODEL(m));
     g_object_unref(m);
+}
+
+/* View > Level meters: shown unless turned off. */
+void trk_view_set_meters(trk_view *v, int on)
+{
+    ui *U = (ui *)v;
+    int t;
+    U->meters_off = !on;
+    for (t = 0; t < TRK_TRACKS; t++) if (U->meter[t]) gtk_widget_set_visible(U->meter[t], on != 0);
+}
+
+/* View > Color notes by pitch: on by default. */
+void trk_view_set_pitch_colors(trk_view *v, int on)
+{
+    ui *U = (ui *)v;
+    U->pitch_off = !on;
+    redraw(U);
+}
+
+int trk_view_pitch_colors(trk_view *v) { return !((ui *)v)->pitch_off; }
+
+int trk_view_meters(trk_view *v) { return !((ui *)v)->meters_off; }
+
+/* A track's level meter: fills left to right, #4008b5 to #02cf30. */
+static void meter_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
+{
+    ui *U = u;
+    int t;
+    float v;
+    cairo_pattern_t *g;
+    for (t = 0; t < TRK_TRACKS && U->meter[t] != GTK_WIDGET(a); t++) ;
+    if (t == TRK_TRACKS) return;
+    v = U->level[t];
+    cairo_set_source_rgb(cr, 0.08, 0.11, 0.08);
+    cairo_paint(cr);
+    if (v <= 0.f) return;
+    g = cairo_pattern_create_linear(0, 0, w, 0);
+    cairo_pattern_add_color_stop_rgb(g, 0.0, 0x40 / 255.0, 0x08 / 255.0, 0xb5 / 255.0);   /* #4008b5 */
+    cairo_pattern_add_color_stop_rgb(g, 1.0, 0x02 / 255.0, 0xcf / 255.0, 0x30 / 255.0);   /* #02cf30 */
+    cairo_set_source(cr, g);
+    cairo_rectangle(cr, 0, 0, w * (v > 1.f ? 1.f : v), h);
+    cairo_fill(cr);
+    cairo_pattern_destroy(g);
 }
 
 static void update_states(ui *U)
@@ -678,6 +764,15 @@ static void on_sample(GtkDropDown *d, GParamSpec *ps, gpointer u)
     snprintf(trk_song_of(U->e)->track[t].samples, TRK_PATH_LEN, "%s", U->sampleval[t][i]);
     trk_unlock(U->e);
     trk_route(U->e);
+    {   /* the note keys land on the set's pads */
+        int fit = trk_track_fit_octave(U->e, t);
+        if (fit >= 0) {
+            U->loading = 1;
+            gtk_drop_down_set_selected(GTK_DROP_DOWN(U->oct[t]), (guint)fit);
+            U->loading = 0;
+            if (t == U->ed.track) U->ed.octave = fit;
+        }
+    }
     gtk_widget_set_sensitive(U->dest[t], U->sampleval[t][i][0] == 0);
     update_states(U);
 }
@@ -1765,6 +1860,7 @@ static int write_to(ui *U, const char *path)
         snprintf(msg, sizeof msg, "Saved %s", path);
         status(U, msg);
     }
+    if (U->song_saved) U->song_saved(path, U->song_saved_ud);
     return 0;
 }
 
@@ -2113,6 +2209,15 @@ static void clip_status(ui *U, int key)
     char msg[96];
     int rows = 0, tracks = 0;
     trk_clipboard(&rows, &tracks);
+    if (key == TRK_K_COPY || key == TRK_K_CUT) {   /* also as text, for an editor */
+        size_t cap = (size_t)TRK_ROWS_MAX * TRK_TRACKS * 20 + 16;
+        char *txt = malloc(cap);
+        if (txt) {
+            trk_clipboard_text(txt, cap);
+            gdk_clipboard_set_text(gtk_widget_get_clipboard(U->view), txt);
+            free(txt);
+        }
+    }
     if (!U->ed.edit && key != TRK_K_COPY) { status(U, "edit is off -- Space to edit, then cut or paste"); return; }
     snprintf(msg, sizeof msg, "%s %d row%s x %d track%s",
              key == TRK_K_COPY ? "copied" : key == TRK_K_CUT ? "cut" : "pasted",
@@ -2221,6 +2326,26 @@ static gboolean follow_playback(gpointer u)
     ui *U = u;
     int o, p, r;
     show_rec(U);
+    {   /* the sample output ran dry: a click */
+        unsigned x = trk_audio_xruns(U->e);
+        if (x != U->xruns) {
+            char m[96];
+            U->xruns = x;
+            snprintf(m, sizeof m, "sample output dropped out (%u so far) -- that is the click", x);
+            status(U, m);
+        }
+    }
+    {
+        float lv[TRK_TRACKS];
+        int t;
+        trk_levels(U->e, lv);
+        for (t = 0; t < TRK_TRACKS; t++) {
+            if (U->meter[t] && (lv[t] - U->level[t] > 0.004f || U->level[t] - lv[t] > 0.004f)) {
+                U->level[t] = lv[t];
+                gtk_widget_queue_draw(U->meter[t]);
+            }
+        }
+    }
     trk_position(U->e, &o, &p, &r);
     /* The part playing, marked; and, following, the one being edited. */
     if (o != U->part_playing || (o >= 0 && U->ed.follow && o != U->part_at)) {
@@ -3558,6 +3683,11 @@ static GtkWidget *tracker_view_new(ui *U)
         gtk_box_append(GTK_BOX(box), U->dest[t]);
         gtk_box_append(GTK_BOX(box), U->sample[t]);
         gtk_box_append(GTK_BOX(box), row);
+        U->meter[t] = gtk_drawing_area_new();
+        gtk_widget_set_size_request(U->meter[t], -1, 14);
+        gtk_widget_set_tooltip_text(U->meter[t], "This track's level: the velocity of the notes as they sound");
+        gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(U->meter[t]), meter_draw, U, NULL);
+        gtk_box_append(GTK_BOX(box), U->meter[t]);
         gtk_box_append(GTK_BOX(head), box);
         g_signal_connect(U->name[t], "changed", G_CALLBACK(on_name),
                          ui_ref_new(U, t, G_OBJECT(U->name[t])));
@@ -3616,7 +3746,15 @@ static GtkWidget *tracker_view_new(ui *U)
     U->scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(U->scroll), U->area);
     gtk_widget_set_vexpand(U->scroll, TRUE);
-    gtk_scrolled_window_set_has_frame(GTK_SCROLLED_WINDOW(U->scroll), TRUE);
+    gtk_scrolled_window_set_has_frame(GTK_SCROLLED_WINDOW(U->scroll), FALSE);   /* a frame would shift the grid a pixel off its headers */
+
+    /* The grid draws only what is in view, so scrolling has to redraw it. */
+    g_signal_connect_swapped(gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(U->scroll)),
+                             "value-changed", G_CALLBACK(redraw), U);
+    g_signal_connect_swapped(gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(U->scroll)),
+                             "value-changed", G_CALLBACK(redraw), U);
+    g_signal_connect_swapped(gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(U->scroll)),
+                             "changed", G_CALLBACK(redraw), U);
 
     U->headscroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(U->headscroll), head);
@@ -3996,6 +4134,13 @@ void trk_view_set_sinks(trk_view *v, const trk_view_sinks *api, void *ud)
     if (api) U->sinks = *api;
     U->sinks_ud = ud;
     if (U->view) refresh_dests(U, 1);
+}
+
+void trk_view_set_song_saved(trk_view *v, void (*cb)(const char *path, void *ud), void *ud)
+{
+    ui *U = (ui *)v;
+    U->song_saved = cb;
+    U->song_saved_ud = ud;
 }
 
 void trk_view_set_song_opened(trk_view *v, void (*cb)(void *ud), void *ud)

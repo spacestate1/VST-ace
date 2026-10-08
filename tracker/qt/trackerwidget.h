@@ -14,6 +14,8 @@
 #include "trk.h"
 #include "drumkit.h"
 
+#include <QClipboard>
+#include <QGuiApplication>
 #include <QAbstractItemView>
 #include <QCheckBox>
 #include <QCloseEvent>
@@ -51,6 +53,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cmath>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -175,7 +178,31 @@ signals:
     void trackRemoveRequested();     // Ctrl+Delete
     void clipped(int key);           // copied, cut or pasted: for the status line
 
+public:
+    // View > Dark grid: the pattern columns on a dark page whatever the
+    // system theme is. Only this widget's palette changes.
+    void setDarkGrid(bool on)
+    {
+        if (on) {
+            QPalette d = palette();
+            d.setColor(QPalette::Base, QColor(22, 22, 26));
+            d.setColor(QPalette::Window, QColor(22, 22, 26));     // the area round a short pattern
+            d.setColor(QPalette::AlternateBase, QColor(31, 31, 37));
+            d.setColor(QPalette::Text, QColor(225, 225, 230));
+            d.setColor(QPalette::Mid, QColor(110, 110, 125));
+            d.setColor(QPalette::HighlightedText, QColor(255, 255, 255));
+            setPalette(d);
+        } else {
+            setPalette(QPalette());           // back to the application's
+        }
+        update();
+    }
+    // View > Color notes by pitch: the note column drawn low to high across
+    // the rainbow. On unless turned off.
+    void setPitchColors(bool on) { pitchColors_ = on; update(); }
+    bool pitchColors() const { return pitchColors_; }
 protected:
+    bool pitchColors_ = true;
     void paintEvent(QPaintEvent *ev) override
     {
         QPainter p(this);
@@ -264,6 +291,11 @@ protected:
                     const int nt = cells[r][t].note;
                     if (c < 3 && sampled[t] && nt <= 127 && !(masks[t][nt >> 3] & (1u << (nt & 7))))
                         col = missing;
+                    else if (pitchColors_ && c < 3 && nt <= 127) {
+                        unsigned char rgb[3];
+                        trk_note_rgb(nt, pal.color(QPalette::Base).lightness() < 128, rgb);
+                        col = QColor(rgb[0], rgb[1], rgb[2]);
+                    }
                     if (mutes & (1 << t)) col.setAlpha(col.alpha() / 3);
                     if (cur) col = pal.color(QPalette::HighlightedText);
                     p.setPen(col);
@@ -1280,9 +1312,45 @@ public:
     // with synth tabs reopens the ones the song's sink lines name; the
     // default is nothing, the standalone's whole answer.
     virtual void songOpened() {}
+    // A song was just written to `path`. A shell with synth tabs saves the
+    // sounds the tracks' synths are on beside it.
+    virtual void songSaved(const QString &path) { (void)path; }
 };
 
 // ------------------------------------------------------------- the widget --
+
+// A track's level meter: a bar that fills left to right in a gradient from
+// #4008b5 at the quiet end to #02cf30 at the loud one.
+class LevelMeter : public QWidget {
+public:
+    explicit LevelMeter(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setFixedHeight(14);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        setToolTip("This track's level: the velocity of the notes as they sound");
+    }
+    void setLevel(float v)
+    {
+        v = std::clamp(v, 0.0f, 1.0f);
+        if (std::fabs(v - level_) < 0.004f) return;
+        level_ = v;
+        update();
+    }
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(20, 28, 20));
+        const int w = int(width() * level_);
+        if (w <= 0) return;
+        QLinearGradient g(0, 0, width(), 0);
+        g.setColorAt(0.0, QColor(0x40, 0x08, 0xb5));
+        g.setColorAt(1.0, QColor(0x02, 0xcf, 0x30));
+        p.fillRect(QRect(0, 0, w, height()), g);
+    }
+private:
+    float level_ = 0;
+};
 
 class TrackerWidget : public QWidget {
     Q_OBJECT
@@ -1425,6 +1493,8 @@ public:
             bl->addWidget(dest_[t]);
             bl->addWidget(sample_[t]);
             bl->addLayout(row);
+            meter_[t] = new LevelMeter;
+            bl->addWidget(meter_[t]);
             hl->addWidget(box);
         }
         hl->addStretch(1);
@@ -1481,6 +1551,37 @@ public:
         // menus attributes to this tab what exists when construction ends.
         samplesMenu_ = host_->addMenu("&Samples");
         rebuildSamplesMenu();
+        // View: the level meters under each track's header, on unless turned off.
+        QMenu *view = host_->addMenu("&View");
+        QAction *meters = view->addAction("&Level meters");
+        meters->setCheckable(true);
+        meters->setChecked(true);
+        meters->setToolTip("Show a level meter under each track's header");
+        connect(meters, &QAction::toggled, this, [this, head](bool on) {
+            for (int t = 0; t < TRK_TRACKS; t++) if (meter_[t]) meter_[t]->setVisible(on);
+            head->layout()->activate();                      // the header strip shrinks or grows
+            headScroll_->setFixedHeight(head->sizeHint().height());
+        });
+        QAction *pitch = view->addAction("&Color notes by pitch");
+        pitch->setCheckable(true);
+        pitch->setChecked(true);
+        pitch->setToolTip("Draw each note in a rainbow colour by how high or low it is");
+        connect(pitch, &QAction::toggled, this, [this](bool on) { view_->setPitchColors(on); });
+        QAction *dark = view->addAction("&Dark grid");
+        dark->setCheckable(true);
+        dark->setToolTip("Draw the pattern columns on a dark background (with the pitch colours); "
+                         "the light grid is plain");
+        // The dark grid is the default and wears the pitch colours; the light
+        // grid is plain. Either colour setting can still be changed by hand
+        // afterwards from this menu.
+        connect(dark, &QAction::toggled, this, [this, pitch](bool on) {
+            view_->setDarkGrid(on);
+            pitch->setChecked(on);
+            // The area round the grid, when the pattern is smaller than the window.
+            scroll_->viewport()->setAutoFillBackground(true);
+            scroll_->viewport()->setPalette(view_->palette());
+        });
+        dark->setChecked(true);
         QMenu *help = host_->addMenu("&Help");
         help->addAction("&Keys", this, [this] { showText("tracker keys", QString::fromUtf8(kKeysHelp)); });
         help->addAction("&Columns", this, [this] { showText("tracker columns", QString::fromUtf8(trk_columns_help())); });
@@ -1566,6 +1667,12 @@ public:
                               sample_[t]->currentData().toString().toUtf8().constData());
                 trk_unlock(e_);
                 trk_route(e_);
+                const int fit = trk_track_fit_octave(e_, t);    // the keys land on its pads
+                if (fit >= 0) {
+                    oct_[t]->setCurrentIndex(fit);
+                    if (t == ed_.track) ed_.octave = fit;
+                    QTimer::singleShot(0, this, &TrackerWidget::refreshCheat);
+                }
                 refreshDests(true);
                 view_->setFocus();
             });
@@ -1595,6 +1702,11 @@ public:
         connect(view_, &PatternView::cursorMoved, this, &TrackerWidget::cursorMoved);
         connect(view_, &PatternView::clipped, this, [this](int k) {
             int rows = 0, tracks = 0;
+            if (k == TRK_K_COPY || k == TRK_K_CUT) {   // also as text, for an editor
+                std::vector<char> txt(TRK_ROWS_MAX * TRK_TRACKS * 20 + 16);
+                trk_clipboard_text(txt.data(), txt.size());
+                QGuiApplication::clipboard()->setText(QString::fromLatin1(txt.data()));
+            }
             trk_clipboard(&rows, &tracks);
             const QString size = QString("%1 row%2 x %3 track%4").arg(rows).arg(rows > 1 ? "s" : "")
                                      .arg(tracks).arg(tracks > 1 ? "s" : "");
@@ -2398,6 +2510,15 @@ private:
     {
         int o, p, r;
         showRec();
+        if (const unsigned x = trk_audio_xruns(e_); x != xruns_) {   // the sample output ran dry: a click
+            xruns_ = x;
+            host_->showStatus(QString("sample output dropped out (%1 so far) -- that is the click").arg(x), 4000);
+        }
+        {
+            float lv[TRK_TRACKS];
+            trk_levels(e_, lv);
+            for (int t = 0; t < TRK_TRACKS; t++) if (meter_[t]) meter_[t]->setLevel(lv[t]);
+        }
         trk_position(e_, &o, &p, &r);
         view_->setPlayRow(p, r);
         // The part playing, marked; and, following, the one being edited.
@@ -2555,6 +2676,7 @@ private:
         path_ = p;
         updateTitle();
         host_->showStatus("Saved " + p, 3000);
+        host_->songSaved(p);
         return true;
     }
 
@@ -2589,6 +2711,8 @@ private:
     int partPlaying_ = -1;                // the one playing, as last shown
     bool fillingParts_ = false;
     QWidget   *headStrip_ = nullptr;          // the header row, scrolled with the grid
+    LevelMeter *meter_[TRK_TRACKS] = {};
+    unsigned   xruns_ = 0;
     QWidget   *headBox_[TRK_TRACKS] = {};      // a track's header: shown while the song has the track
     QLineEdit *name_[TRK_TRACKS];
     QComboBox *dest_[TRK_TRACKS];

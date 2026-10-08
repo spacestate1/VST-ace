@@ -534,7 +534,105 @@ public:
     }
     /* A song was loaded -- the shell's Open, the tracker tab's own, or the
      * command line -- so the synths its sink lines name come back too. */
-    void songOpened() override { reopenSongSynths(); }
+    void songOpened() override { reopenSongSynths(); restoreSongSounds(); }
+    void songSaved(const QString &path) override { saveSongSounds(path); }
+
+    /* The sounds a song's synths were on. The song file is plain text for the
+     * tracks and cells; what each synth was playing is a patch, and a patch is
+     * a whole plug-in's parameters. So it goes beside the song, in
+     * <song>.sounds, in the session file's own format: one synth entry (plug-in
+     * and patch) for each synth tab a track plays, and a route naming the
+     * track and the synth's sink name. Opening the song puts them back. */
+    static QString soundsPath(const QString &song) { return song + ".sounds"; }
+
+    void saveSongSounds(const QString &song)
+    {
+        if (!trkEngine_) return;
+        sess_file s;
+        memset(&s, 0, sizeof s);
+        std::vector<char *> pool;
+        auto keep = [&pool](char *p) { pool.push_back(p); return p; };
+        QList<HostWidget *> recorded;
+        for (int t = 0; t < TRK_TRACKS; t++) {
+            const int id = trk_sink_of(trkEngine_, t);
+            if (id < 0) continue;
+            HostWidget *tab = nullptr;
+            QString sinkName;
+            for (const SinkEntry &e : sinks_)
+                if (e.id == id) { tab = e.tab; sinkName = e.name; break; }
+            if (!tab || tab->loadedPath().isEmpty()) continue;
+            int at = int(recorded.indexOf(tab));
+            if (at < 0) {
+                auto *sy = static_cast<sess_synth *>(
+                    realloc(s.synths, sizeof(sess_synth) * size_t(s.nsynths + 1)));
+                if (!sy) continue;
+                s.synths = sy;
+                sy = &s.synths[s.nsynths];
+                sy->plugin = keep(strdup(QFileInfo(tab->loadedPath()).absoluteFilePath()
+                                             .toLocal8Bit().constData()));
+                sy->patch = nullptr;
+                if (tab->engine()->host()) {
+                    char perr[128];
+                    sy->patch = patch_capture(tab->engine()->host(), sy->plugin, perr, sizeof perr);
+                }
+                recorded << tab;
+                at = s.nsynths++;
+            }
+            auto *r = static_cast<sess_route *>(
+                realloc(s.routes, sizeof(sess_route) * size_t(s.nroutes + 1)));
+            if (!r) continue;
+            s.routes = r;
+            r = &s.routes[s.nroutes++];
+            r->track = t;
+            r->synth = at;
+            r->sink = keep(strdup(sinkName.toLocal8Bit().constData()));
+        }
+        s.song = keep(strdup(QFileInfo(song).absoluteFilePath().toLocal8Bit().constData()));
+        char err[512];
+        const QByteArray out = soundsPath(song).toLocal8Bit();
+        if (!s.nsynths) {
+            QFile::remove(soundsPath(song));          /* nothing to remember: no stale file */
+        } else if (sess_write(out.constData(), &s, err, sizeof err)) {
+            statusBar()->showMessage(QString("song saved, but not the synths' sounds: %1")
+                                         .arg(QString::fromLocal8Bit(err)), 0);
+        }
+        for (char *p : pool) free(p);
+        for (int i = 0; i < s.nsynths; i++) free(s.synths[i].patch);
+        free(s.synths);
+        free(s.routes);
+    }
+
+    /* The other half: each synth the song's routes name gets its saved
+     * patch. Matched by sink name among the tabs that exist now, which
+     * reopenSongSynths has just made. */
+    void restoreSongSounds()
+    {
+        if (!tracker_ || tracker_->songPath().isEmpty()) return;
+        char err[512];
+        sess_file *s = sess_read(soundsPath(tracker_->songPath()).toLocal8Bit().constData(),
+                                 err, sizeof err);
+        if (!s) return;                      /* no sounds saved with it */
+        QStringList trouble;
+        QSet<int> done;
+        for (int i = 0; i < s->nroutes; i++) {
+            const sess_route &r = s->routes[i];
+            if (r.synth < 0 || r.synth >= s->nsynths || done.contains(r.synth)) continue;
+            const char *patch = s->synths[r.synth].patch;
+            if (!patch) continue;
+            const QString sink = QString::fromUtf8(r.sink ? r.sink : "");
+            for (const SinkEntry &e : sinks_) {
+                if (e.name != sink) continue;
+                QString why;
+                if (!e.tab->applyPatchText(patch, &why))
+                    trouble << QString("%1 (%2)").arg(sink, why);
+                done.insert(r.synth);
+                break;
+            }
+        }
+        sess_free(s);
+        if (!trouble.isEmpty())
+            statusMessage("song's sounds not restored: " + trouble.join(", "), 0);
+    }
 
 protected:
     void closeEvent(QCloseEvent *e) override
@@ -684,9 +782,14 @@ private:
         remove->setToolTip("Takes it off the list. The file stays where it is; "
                            "Show removed lets you put it back");
         auto *showRemoved = new QCheckBox("Show removed");
+        auto *add = new QPushButton("Add plug-in...");
+        auto *addBundle = new QPushButton("Add bundle...");
+        add->setToolTip("Pick a plug-in file: use it for this session only, or install it "
+                        "into the folder for its kind (Windows, Linux, macOS...)");
+        addBundle->setToolTip("The same for a .vst3 / .vst / .component bundle folder");
         auto *rescan = new QPushButton("Rescan");
         auto *close = new QPushButton("Close");
-        for (QWidget *w : std::initializer_list<QWidget *>{ load, unload, remove, showRemoved })
+        for (QWidget *w : std::initializer_list<QWidget *>{ load, unload, remove, showRemoved, add, addBundle })
             row->addWidget(w);
         row->addStretch(1);
         row->addWidget(rescan);
@@ -752,6 +855,14 @@ private:
         connect(showRemoved, &QCheckBox::toggled, d, refill);
         connect(list, &QListWidget::currentRowChanged, d, sync);
         connect(rescan, &QPushButton::clicked, d, [=] { rescanAll(); refill(); });
+        auto addOne = [=](bool bundle) {
+            HostWidget *h = anyHost(false);
+            if (!h || !h->addPluginInteractive(d, bundle)) return;
+            rescanAll();                      // every tab's list shows it
+            refill();
+        };
+        connect(add, &QPushButton::clicked, d, [=] { addOne(false); });
+        connect(addBundle, &QPushButton::clicked, d, [=] { addOne(true); });
         connect(close, &QPushButton::clicked, d, &QDialog::close);
         connect(load, &QPushButton::clicked, d, [=] {
             const QString p = selected();
@@ -942,8 +1053,7 @@ private:
             if (it != sinkFor.constEnd()) trk_route_sink(trkEngine_, t, it.value());
         }
 
-        statusMessage(QString("reopened %1 synth(s) from the song (default programs -- "
-                              "saved sounds live in the session file)%2")
+        statusMessage(QString("reopened %1 synth(s) from the song%2")
                           .arg(opened)
                           .arg(missing.isEmpty() ? QString()
                                                  : " -- not found: " + missing.join(", ")),

@@ -60,6 +60,13 @@ void plugview_scan(plugview *pv, const char *dir);
 void plugview_open_vst(plugview *pv, GtkWindow *parent);
 void plugview_load_folder(plugview *pv, GtkWindow *parent);
 
+/* Add one plug-in file (or, with `bundle`, a bundle folder): for this session
+ * only, or installed into the folder for its kind. */
+void plugview_add_plugin(plugview *pv, GtkWindow *parent, int bundle);
+/* Called after an Add plug-in finished (added, installed or cancelled), so a
+ * shell can rescan its other tabs and refresh a list. */
+void plugview_set_list_changed(void (*cb)(void));
+
 /* File > Save Patch / Open Patch: the plug-in's current parameters written as
  * JSON, and read back. The plug-in's own programs are its factory presets and
  * cannot be written to; this is where a sound somebody made goes. Same format

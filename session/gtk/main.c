@@ -43,6 +43,7 @@
 #include <spa/param/audio/format-utils.h>
 
 #include <gtk/gtk.h>
+#include <glib/gstdio.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -94,6 +95,10 @@ typedef struct {
     _Atomic unsigned long callbacks;   /* blocks rendered, for the smoke drive */
     int           dead_marked; /* the tab already says (stopped) */
     unsigned long last_calls;  /* callback count a second ago, for the tooltip */
+    GtkWidget    *kbd;         /* the on-screen keyboard under the pane */
+    GtkWidget    *wheel;       /* the pitch wheel left of it */
+    GtkWidget    *kbrow;       /* wheel and keys: what View > On-screen keyboard shows */
+    int           bend, bend_drag, bend_grab_v;   /* 14-bit, 8192 at rest */
 } synctab;
 
 static synctab      g_tabs[MAXTABS];
@@ -101,7 +106,7 @@ static trk_engine  *g_trk;
 static trk_view    *g_tracker;
 static GtkWidget   *g_tracker_page;
 /* The menu bar follows the tab in front -- see sync_menus. */
-static GMenu       *g_bar, *g_file_m, *g_synth_m, *g_samples_m, *g_help_m, *g_help_trk;
+static GMenu       *g_bar, *g_file_m, *g_synth_m, *g_samples_m, *g_view_m, *g_help_m, *g_help_trk;
 static void sync_menus(GtkWidget *front);
 static synctab     *g_front;           /* the synth tab the keys play, if one is */
 
@@ -393,6 +398,339 @@ static int key_note(guint kv)
     return -1;
 }
 
+
+/* ----------------------------------------------------- on-screen keyboard */
+
+/* A row of keys under each synth tab, the way dwstudio has one: keys keep
+ * their size and a wider window shows more of them. Clicking plays the tab's
+ * plug-in; keys held from the computer keyboard light up too. View >
+ * On-screen keyboard hides or shows it in every tab. */
+#define KB_W   24.0
+#define KB_LO  36
+#define KB_TOP 127
+#define KB_H   108                    /* 4.5 white keys, as pestudio's */
+#define BEND_CENTRE 8192
+#define BEND_MAX    16383
+
+static int g_kbd_on = 1;               /* View > On-screen keyboard */
+
+static int kb_white(int n)
+{
+    static const int w[12] = { 1,0,1,0,1,1,0,1,0,1,0,1 };
+    return w[n % 12];
+}
+
+static int kb_hi_for_width(int w)
+{
+    int whites = (int)((double)w / KB_W), n, seen = 0, hi = KB_LO;
+    if (whites < 1) whites = 1;
+    for (n = KB_LO; n <= KB_TOP; n++) {
+        if (!kb_white(n)) continue;
+        seen++;
+        hi = n;
+        if (seen >= whites) break;
+    }
+    return hi;
+}
+
+/* The keys are centred in the room there is: whatever is left over past the
+ * last whole key is shared between the two sides, as pestudio's piano does. */
+static double kb_x0(int w, int hi)
+{
+    int n, whites = 0;
+    double used;
+    for (n = KB_LO; n <= hi; n++) if (kb_white(n)) whites++;
+    used = whites * KB_W;
+    return used < w ? (w - used) / 2.0 : 0.0;
+}
+
+static int kb_note_at(double x, double y, int w, int h)
+{
+    int n, i = 0, hi = kb_hi_for_width(w);
+    x -= kb_x0(w, hi);
+    if (x < 0) return -1;
+    for (n = KB_LO; n <= hi; n++) {                      /* black keys sit on top */
+        if (!kb_white(n)) continue;
+        if (n + 1 <= hi && !kb_white(n + 1) && y < h * 0.62) {
+            double bx = i * KB_W + KB_W * 0.68;
+            if (x >= bx && x < bx + KB_W * 0.62) return n + 1;
+        }
+        i++;
+    }
+    i = (int)(x / KB_W);
+    for (n = KB_LO; n <= hi; n++)
+        if (kb_white(n) && i-- == 0) return n;
+    return -1;
+}
+
+static synctab *tab_of_kbd(GtkWidget *w)
+{
+    int t;
+    for (t = 0; t < MAXTABS; t++)
+        if (g_tabs[t].used && g_tabs[t].kbd == w) return &g_tabs[t];
+    return NULL;
+}
+
+static const char *kb_name(int n, int with_octave, char *buf, size_t bufn)
+{
+    static const char *nm[12] = { "C", "C♯", "D", "D♯", "E", "F",
+                                  "F♯", "G", "G♯", "A", "A♯", "B" };
+    if (with_octave) snprintf(buf, bufn, "%s%d", nm[n % 12], n / 12 - 1);
+    else             snprintf(buf, bufn, "%s", nm[n % 12]);
+    return buf;
+}
+
+/* Centred on the key, sitting on `bottom`. */
+static void kb_label(cairo_t *cr, const char *text, double cx, double bottom, double size)
+{
+    PangoLayout *l = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string("sans");
+    int tw, th;
+    /* Pango rather than cairo's toy text API, which has no font fallback and
+     * draws the sharp sign as a missing-glyph box. */
+    pango_font_description_set_absolute_size(fd, size * PANGO_SCALE);
+    pango_layout_set_font_description(l, fd);
+    pango_layout_set_text(l, text, -1);
+    pango_layout_get_pixel_size(l, &tw, &th);
+    /* `bottom` is the text's baseline in the old code; the layout's own
+     * baseline is what it is aligned to now. */
+    cairo_move_to(cr, cx - tw / 2.0, bottom - pango_layout_get_baseline(l) / (double)PANGO_SCALE);
+    pango_cairo_show_layout(cr, l);
+    pango_font_description_free(fd);
+    g_object_unref(l);
+    (void)th;
+}
+
+/* Drawn as pestudio and dwstudio draw it: every white key named, the octave
+ * dropped when the key is too narrow to hold it, black keys with the
+ * accidental only. */
+static void kb_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
+{
+    synctab *tab = tab_of_kbd(GTK_WIDGET(a));
+    int n, i = 0, hi = kb_hi_for_width(w);
+    const double x0 = kb_x0(w, hi);
+    (void)u;
+    cairo_set_source_rgb(cr, 0.094, 0.094, 0.110);
+    cairo_paint(cr);
+    for (n = KB_LO; n <= hi; n++) {                      /* white keys */
+        char buf[16];
+        double fs = KB_W * 0.30;
+        cairo_text_extents_t te;
+        if (!kb_white(n)) continue;
+        if (tab && tab->held[n]) cairo_set_source_rgb(cr, 0.47, 0.67, 1.0);
+        else                     cairo_set_source_rgb(cr, 0.933, 0.933, 0.941);
+        cairo_rectangle(cr, x0 + i * KB_W, 0, KB_W - 1, h);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgb(cr, 0.235, 0.235, 0.259);
+        cairo_set_line_width(cr, 1);
+        cairo_stroke(cr);
+        if (fs < 6) fs = 6;
+        if (fs > 10) fs = 10;
+        cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, fs);
+        kb_name(n, 1, buf, sizeof buf);
+        cairo_text_extents(cr, buf, &te);
+        if (te.width > KB_W - 5) kb_name(n, 0, buf, sizeof buf);
+        if (n % 12 == 0) cairo_set_source_rgb(cr, 0.27, 0.27, 0.31);
+        else             cairo_set_source_rgb(cr, 0.51, 0.51, 0.55);
+        kb_label(cr, buf, x0 + i * KB_W + (KB_W - 1) / 2.0, h - 4.0, fs);
+        i++;
+    }
+    i = 0;
+    for (n = KB_LO; n <= hi; n++) {                      /* black keys on top */
+        if (!kb_white(n)) continue;
+        if (n + 1 <= hi && !kb_white(n + 1)) {
+            char buf[16];
+            double bw = KB_W * 0.62, fs = bw * 0.46;
+            if (tab && tab->held[n + 1]) cairo_set_source_rgb(cr, 0.275, 0.471, 0.824);
+            else                         cairo_set_source_rgb(cr, 0.078, 0.078, 0.094);
+            cairo_rectangle(cr, x0 + i * KB_W + KB_W * 0.68, 0, bw, h * 0.62);
+            cairo_fill(cr);
+            if (fs < 5.5) fs = 5.5;
+            if (fs > 9) fs = 9;
+            cairo_set_source_rgb(cr, 0.75, 0.75, 0.78);
+            kb_label(cr, kb_name(n + 1, 0, buf, sizeof buf),
+                     x0 + i * KB_W + KB_W * 0.68 + bw / 2.0, h * 0.62 - 4.0, fs);
+        }
+        i++;
+    }
+}
+
+static void kb_pressed(GtkGestureClick *g, int np, double x, double y, gpointer u)
+{
+    synctab *tab = u;
+    int n = kb_note_at(x, y, gtk_widget_get_width(tab->kbd), gtk_widget_get_height(tab->kbd));
+    (void)g; (void)np;
+    if (n < 0 || tab->held[n]) return;
+    tab->held[n] = 1;
+    plugview_note_on(tab->pv, n, 100);
+    gtk_widget_queue_draw(tab->kbd);
+}
+
+static void kb_released(GtkGestureClick *g, int np, double x, double y, gpointer u)
+{
+    synctab *tab = u;
+    int n;
+    (void)g; (void)np; (void)x; (void)y;
+    /* The pointer leaves the key it pressed as often as not: every note this
+     * click could have started is released, computer keys included. */
+    for (n = 0; n < 128; n++)
+        if (tab->held[n]) { tab->held[n] = 0; plugview_note_off(tab->pv, n); }
+    gtk_widget_queue_draw(tab->kbd);
+}
+
+/* The sprung pitch wheel left of the keys, as pestudio and dwstudio have it.
+ * Sprung is the whole of it: a bend left off centre detunes everything played
+ * after, so it returns to centre when released and says so. The value stays in
+ * MIDI's 14-bit form because bend range is the plug-in's parameter. */
+static synctab *tab_of_wheel(GtkWidget *w)
+{
+    int t;
+    for (t = 0; t < MAXTABS; t++)
+        if (g_tabs[t].used && g_tabs[t].wheel == w) return &g_tabs[t];
+    return NULL;
+}
+
+static void wheel_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
+{
+    synctab *tab = tab_of_wheel(GTK_WIDGET(a));
+    const double label = 12.0;
+    double bx = 6.0, by = 4.0, bw = w - 12.0, bh = h - 4.0 - label;
+    double off, spacing = 7.0, roll, y, my, cy;
+    cairo_pattern_t *lg;
+    int bend = tab ? tab->bend : BEND_CENTRE;
+    (void)u;
+    cairo_set_source_rgb(cr, 0.094, 0.094, 0.110);
+    cairo_paint(cr);
+    if (bw < 6.0 || bh < 8.0) return;
+    off = (double)(bend - BEND_CENTRE) / BEND_CENTRE;          /* -1 .. +1 */
+
+    lg = cairo_pattern_create_linear(bx, 0, bx + bw, 0);       /* a cylinder seen edge on */
+    cairo_pattern_add_color_stop_rgb(lg, 0.00, 0.07, 0.07, 0.09);
+    cairo_pattern_add_color_stop_rgb(lg, 0.35, 0.29, 0.29, 0.33);
+    cairo_pattern_add_color_stop_rgb(lg, 0.50, 0.38, 0.38, 0.43);
+    cairo_pattern_add_color_stop_rgb(lg, 0.65, 0.29, 0.29, 0.33);
+    cairo_pattern_add_color_stop_rgb(lg, 1.00, 0.07, 0.07, 0.09);
+    cairo_set_source(cr, lg);
+    cairo_rectangle(cr, bx, by, bw, bh);
+    cairo_fill(cr);
+    cairo_pattern_destroy(lg);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, bx, by, bw, bh);
+    cairo_clip(cr);
+    /* Ridges roll with the value; two and a half of roll, not three, so full
+     * deflection is not back in phase with centre. */
+    roll = -off * spacing * 2.5;
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.35);
+    cairo_set_line_width(cr, 1.0);
+    for (y = fmod(roll, spacing) - spacing; y < bh + spacing; y += spacing) {
+        double yy = by + y;
+        if (yy < by || yy > by + bh) continue;
+        cairo_move_to(cr, bx, yy + 0.5);
+        cairo_line_to(cr, bx + bw, yy + 0.5);
+        cairo_stroke(cr);
+    }
+    my = by + bh / 2.0 - off * (bh / 2.0 - 4.0);               /* the grip */
+    if (bend == BEND_CENTRE) cairo_set_source_rgb(cr, 0.59, 0.59, 0.63);
+    else                     cairo_set_source_rgb(cr, 0.47, 0.67, 1.0);
+    cairo_set_line_width(cr, 2.0);
+    cairo_move_to(cr, bx + 1, my);
+    cairo_line_to(cr, bx + bw - 1, my);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+
+    cy = by + bh / 2.0;                                        /* detent marks: where centre is */
+    cairo_set_source_rgb(cr, 0.35, 0.35, 0.39);
+    cairo_set_line_width(cr, 1.0);
+    cairo_move_to(cr, 1, cy + 0.5);       cairo_line_to(cr, 5, cy + 0.5);
+    cairo_move_to(cr, w - 5, cy + 0.5);   cairo_line_to(cr, w - 1, cy + 0.5);
+    cairo_stroke(cr);
+
+    {
+        cairo_text_extents_t ext;
+        cairo_set_source_rgb(cr, 0.51, 0.51, 0.55);
+        cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr, 8.0);
+        cairo_text_extents(cr, "PITCH", &ext);
+        cairo_move_to(cr, (w - ext.width) / 2.0 - ext.x_bearing, h - 3.0);
+        cairo_show_text(cr, "PITCH");
+    }
+}
+
+static void bend_send(synctab *tab)
+{
+    plugview_bend(tab->pv, tab->bend);
+    gtk_widget_queue_draw(tab->wheel);
+}
+
+static void bend_recentre(synctab *tab)
+{
+    tab->bend_drag = 0;
+    tab->bend = BEND_CENTRE;
+    bend_send(tab);
+}
+
+static void wheel_drag_begin(GtkGestureDrag *g, double x, double y, gpointer u)
+{ synctab *tab = u; (void)g; (void)x; (void)y; tab->bend_drag = 1; tab->bend_grab_v = tab->bend; }
+
+static void wheel_drag_update(GtkGestureDrag *g, double ox, double oy, gpointer u)
+{
+    synctab *tab = u;
+    double travel = gtk_widget_get_height(tab->wheel) / 2.0 - 6.0;
+    int nv;
+    (void)g; (void)ox;
+    if (!tab->bend_drag) return;
+    if (travel < 8.0) travel = 8.0;
+    /* Relative to where the wheel was taken hold of, so the way to a small
+     * bend is not a large one. */
+    nv = tab->bend_grab_v + (int)(-oy / travel * BEND_CENTRE);   /* up is sharp */
+    if (nv < 0) nv = 0;
+    if (nv > BEND_MAX) nv = BEND_MAX;
+    if (nv == tab->bend) return;
+    tab->bend = nv;
+    bend_send(tab);
+}
+
+static void wheel_drag_end(GtkGestureDrag *g, double ox, double oy, gpointer u)
+{ (void)g; (void)ox; (void)oy; bend_recentre(u); }
+
+/* The pane with its keyboard under it: the notebook page for a synth tab. The
+ * wheel sits left of the keys, in the same row so the two are one height. */
+static GtkWidget *kb_wrap(synctab *tab, GtkWidget *pane)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkGesture *click = gtk_gesture_click_new(), *drag = gtk_gesture_drag_new();
+    gtk_widget_set_vexpand(pane, TRUE);
+    gtk_box_append(GTK_BOX(box), pane);
+
+    tab->bend = BEND_CENTRE;
+    tab->wheel = gtk_drawing_area_new();
+    gtk_widget_set_size_request(tab->wheel, 40, -1);
+    gtk_widget_set_tooltip_text(tab->wheel, "Pitch wheel — drag up or down; springs back to centre");
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(tab->wheel), wheel_draw, NULL, NULL);
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(drag), GDK_BUTTON_PRIMARY);
+    g_signal_connect(drag, "drag-begin",  G_CALLBACK(wheel_drag_begin),  tab);
+    g_signal_connect(drag, "drag-update", G_CALLBACK(wheel_drag_update), tab);
+    g_signal_connect(drag, "drag-end",    G_CALLBACK(wheel_drag_end),    tab);
+    gtk_widget_add_controller(tab->wheel, GTK_EVENT_CONTROLLER(drag));
+
+    tab->kbd = gtk_drawing_area_new();
+    gtk_widget_set_hexpand(tab->kbd, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(tab->kbd), kb_draw, NULL, NULL);
+    g_signal_connect(click, "pressed", G_CALLBACK(kb_pressed), tab);
+    g_signal_connect(click, "released", G_CALLBACK(kb_released), tab);
+    gtk_widget_add_controller(tab->kbd, GTK_EVENT_CONTROLLER(click));
+
+    tab->kbrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_append(GTK_BOX(tab->kbrow), tab->wheel);
+    gtk_box_append(GTK_BOX(tab->kbrow), tab->kbd);
+    gtk_widget_set_size_request(tab->kbrow, -1, KB_H);
+    gtk_widget_set_visible(tab->kbrow, g_kbd_on != 0);
+    gtk_box_append(GTK_BOX(box), tab->kbrow);
+    return box;
+}
+
 static synctab *tab_of_page(GtkWidget *page)
 {
     int t;
@@ -433,6 +771,7 @@ static gboolean on_key(GtkEventControllerKey *c, guint kv, guint kc,
     if (!tab->held[n]) {
         tab->held[n] = 1;
         plugview_note_on(tab->pv, n, 100);
+        if (tab->kbd) gtk_widget_queue_draw(tab->kbd);
     }
     return TRUE;
 }
@@ -448,6 +787,7 @@ static void on_key_up(GtkEventControllerKey *c, guint kv, guint kc,
     if (n >= 0 && tab->held[n]) {
         tab->held[n] = 0;
         plugview_note_off(tab->pv, n);
+        if (tab->kbd) gtk_widget_queue_draw(tab->kbd);
     }
 }
 
@@ -461,6 +801,7 @@ static void release_tab(synctab *tab)
     if (!tab) return;
     for (n = 0; n < 128; n++)
         if (tab->held[n]) { tab->held[n] = 0; plugview_note_off(tab->pv, n); }
+    if (tab->kbd) gtk_widget_queue_draw(tab->kbd);
 }
 
 static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num, gpointer u)
@@ -641,7 +982,7 @@ static synctab *add_synth_tab(void)
     tab->sink_id = -1;
     tab->pv = plugview_new(engine_park, engine_unpark, SR, g_period);
     plugview_scan(tab->pv, NULL);
-    tab->pane = plugview_pane(tab->pv);
+    tab->pane = kb_wrap(tab, plugview_pane(tab->pv));
     engine_unpark();
 
     plugview_set_note_key(tab->pv, key_note);
@@ -684,10 +1025,20 @@ static void reopen_song_synths(void);
 
 /* The view's song-opened hook: its Open button and the shell's open song
  * paths alike land here, and every one of them reopens the song's synths. */
+static void restore_song_sounds(const char *song);
+static void save_song_sounds(const char *song);
+
 static void song_opened_cb(void *ud)
 {
     (void)ud;
     reopen_song_synths();
+    if (g_tracker && trk_view_path(g_tracker)[0]) restore_song_sounds(trk_view_path(g_tracker));
+}
+
+static void song_saved_cb(const char *path, void *ud)
+{
+    (void)ud;
+    save_song_sounds(path);
 }
 
 static int open_tracker_tab(void)
@@ -713,6 +1064,7 @@ static int open_tracker_tab(void)
     g_tracker_page = trk_view_widget(g_tracker);
     trk_view_set_sinks(g_tracker, &g_sink_api, NULL);
     trk_view_set_song_opened(g_tracker, song_opened_cb, NULL);
+    trk_view_set_song_saved(g_tracker, song_saved_cb, NULL);
     trk_view_reset(g_tracker);
     gtk_notebook_append_page(GTK_NOTEBOOK(g_notebook), g_tracker_page,
                              tab_title_widget("tracker", g_tracker_page, NULL));
@@ -1157,8 +1509,7 @@ static void reopen_song_synths(void)
     for (i = 0; i < nnames; i++)
         if (ids[i] >= 0) reopened++;
     snprintf(msg, sizeof msg,
-             "reopened %d synth(s) from the song (default programs -- saved "
-             "sounds live in the session file)", reopened);
+             "reopened %d synth(s) from the song", reopened);
     if (missing[0])
         snprintf(msg + strlen(msg), sizeof msg - strlen(msg),
                  " -- not found: %s", missing);
@@ -1271,6 +1622,95 @@ static int write_session(const char *path)
     fprintf(stderr, "session: saved %s\n", path);
     fflush(stderr);
     return 1;
+}
+
+/* The sounds a song's synths were on, beside it as <song>.sounds in the
+ * session file's own format -- the Qt shell reads and writes the same file.
+ * One synth entry (plug-in and patch) for each tab a track plays, and a route
+ * naming the track and the tab's sink name. */
+static void save_song_sounds(const char *song)
+{
+    sess_file s;
+    char err[512], *out;
+    int synth_sink[MAXTABS], t, i;
+
+    if (!g_trk) return;
+    memset(&s, 0, sizeof s);
+    for (i = 0; i < TRK_TRACKS; i++) {
+        char nm[TRK_DEST_LEN] = "";
+        sess_route *r;
+        int id = trk_sink_of(g_trk, i), at = -1;
+        synctab *tab = NULL;
+        if (id < 0) continue;
+        for (t = 0; t < MAXTABS; t++)
+            if (g_tabs[t].used && g_tabs[t].sink_id == id) { tab = &g_tabs[t]; break; }
+        if (!tab || !plugview_loaded_path(tab->pv)[0]) continue;
+        for (t = 0; t < s.nsynths; t++) if (synth_sink[t] == id) { at = t; break; }
+        if (at < 0) {
+            sess_synth *sy = realloc(s.synths, (size_t)(s.nsynths + 1) * sizeof *sy);
+            if (!sy) break;
+            s.synths = sy;
+            synth_sink[s.nsynths] = id;
+            sy = &s.synths[at = s.nsynths++];
+            sy->plugin = g_canonicalize_filename(plugview_loaded_path(tab->pv), NULL);
+            sy->patch = plugview_capture_patch(tab->pv);
+        }
+        trk_sink_name(g_trk, id, nm, sizeof nm);
+        if (!(r = realloc(s.routes, (size_t)(s.nroutes + 1) * sizeof *r))) break;
+        s.routes = r;
+        r = &s.routes[s.nroutes++];
+        r->track = i;
+        r->synth = at;
+        r->sink = g_strdup(nm);
+    }
+    s.song = g_canonicalize_filename(song, NULL);
+    out = g_strconcat(song, ".sounds", NULL);
+    if (!s.nsynths) {
+        g_unlink(out);                       /* nothing to remember: no stale file */
+    } else if (sess_write(out, &s, err, sizeof err)) {
+        char msg[700];
+        snprintf(msg, sizeof msg, "song saved, but not the synths' sounds: %s", err);
+        status(msg);
+    }
+    g_free(out);
+    for (t = 0; t < s.nsynths; t++) { g_free(s.synths[t].plugin); free(s.synths[t].patch); }
+    for (t = 0; t < s.nroutes; t++) g_free(s.routes[t].sink);
+    free(s.synths);
+    free(s.routes);
+    g_free(s.song);
+}
+
+/* The other half: each synth the song's routes name gets its saved patch,
+ * matched by sink name among the tabs there are now. */
+static void restore_song_sounds(const char *song)
+{
+    char err[512], msg[700], bad[512] = "";
+    char *in = g_strconcat(song, ".sounds", NULL);
+    sess_file *s = sess_read(in, err, sizeof err);
+    unsigned done = 0;
+    int i, t;
+
+    g_free(in);
+    if (!s) return;                          /* no sounds saved with it */
+    for (i = 0; i < s->nroutes; i++) {
+        const sess_route *r = &s->routes[i];
+        if (r->synth < 0 || r->synth >= s->nsynths || r->synth >= 32 ||
+            (done & (1u << r->synth)) || !s->synths[r->synth].patch) continue;
+        for (t = 0; t < MAXTABS; t++) {
+            if (!g_tabs[t].used || g_tabs[t].sink_id < 0 ||
+                strcmp(g_tabs[t].sink_name, r->sink ? r->sink : "")) continue;
+            if (plugview_apply_patch(g_tabs[t].pv, s->synths[r->synth].patch))
+                snprintf(bad + strlen(bad), sizeof bad - strlen(bad), "%s%s",
+                         bad[0] ? ", " : "", g_tabs[t].sink_name);
+            done |= 1u << r->synth;
+            break;
+        }
+    }
+    sess_free(s);
+    if (bad[0]) {
+        snprintf(msg, sizeof msg, "song's sounds not restored: %s", bad);
+        status(msg);
+    }
 }
 
 /* The song question settled -- saved or discarded, never cancelled -- so the
@@ -1651,6 +2091,32 @@ static void act_trk_audio(GSimpleAction *a, GVariant *p, gpointer u)
 { trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_audio_output(v); }
 static void act_trk_columns(GSimpleAction *a, GVariant *p, gpointer u)
 { trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_show_columns(v); }
+/* View > On-screen keyboard: every synth tab's keys, on by default. */
+static void act_view_keyboard(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    int t;
+    (void)u;
+    g_simple_action_set_state(a, v);
+    g_kbd_on = g_variant_get_boolean(v);
+    for (t = 0; t < MAXTABS; t++)
+        if (g_tabs[t].used && g_tabs[t].kbrow) gtk_widget_set_visible(g_tabs[t].kbrow, g_kbd_on != 0);
+}
+
+/* View > Level meters: a stateful toggle, on by default. */
+static void act_trk_meters(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    (void)u;
+    g_simple_action_set_state(a, v);
+    if (g_tracker) trk_view_set_meters(g_tracker, g_variant_get_boolean(v));
+}
+
+static void act_trk_pitch(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    (void)u;
+    g_simple_action_set_state(a, v);
+    if (g_tracker) trk_view_set_pitch_colors(g_tracker, g_variant_get_boolean(v));
+}
+
 static void act_trk_cheat(GSimpleAction *a, GVariant *p, gpointer u)
 { trk_view *v; (void)a; (void)p; (void)u; if ((v = tracker_or_status())) trk_view_show_cheat(v); }
 
@@ -1667,6 +2133,11 @@ static void sync_menus(GtkWidget *front)
     g_menu_append_submenu(g_bar, "File", G_MENU_MODEL(g_file_m));
     if (is_synth)   g_menu_append_submenu(g_bar, "Synth", G_MENU_MODEL(g_synth_m));
     if (is_tracker) g_menu_append_submenu(g_bar, "Samples", G_MENU_MODEL(g_samples_m));
+    g_menu_remove_all(g_view_m);
+    if (is_synth)   g_menu_append(g_view_m, "On-screen keyboard", "win.view-keyboard");
+    if (is_tracker) g_menu_append(g_view_m, "Level meters", "win.tracker-meters");
+    if (is_tracker) g_menu_append(g_view_m, "Color notes by pitch", "win.tracker-pitch");
+    if (is_synth || is_tracker) g_menu_append_submenu(g_bar, "View", G_MENU_MODEL(g_view_m));
     g_menu_remove_all(g_help_m);
     if (is_tracker) g_menu_append_section(g_help_m, NULL, G_MENU_MODEL(g_help_trk));
     g_menu_append(g_help_m, "About studiogtk", "win.about");
@@ -1951,6 +2422,19 @@ static void pm_on_remove(GtkButton *b, gpointer u)
     g_free(p);
 }
 
+static void pm_list_changed(void)
+{
+    pm_rescan_all();
+    if (g_pm) pm_refill();
+}
+
+static void pm_on_add(GtkButton *b, gpointer u)
+{
+    synctab *t = synth_or_status();
+    (void)b;
+    if (t) plugview_add_plugin(t->pv, GTK_WINDOW(g_pm->win), GPOINTER_TO_INT(u));
+}
+
 static void pm_on_rescan(GtkButton *b, gpointer u) { (void)b; (void)u; pm_rescan_all(); pm_refill(); }
 
 static void pm_on_toggle(GtkCheckButton *c, gpointer u)
@@ -2012,6 +2496,18 @@ static void act_plugin_manager(GSimpleAction *a, GVariant *p, gpointer u)
     g_pm->show_removed = gtk_check_button_new_with_label("Show removed");
     g_signal_connect(g_pm->show_removed, "toggled", G_CALLBACK(pm_on_toggle), NULL);
     gtk_box_append(GTK_BOX(row), g_pm->show_removed);
+    {
+        GtkWidget *add = gtk_button_new_with_label("Add plug-in…");
+        GtkWidget *addb = gtk_button_new_with_label("Add bundle…");
+        gtk_widget_set_tooltip_text(add, "Pick a plug-in file: use it for this session only, or "
+                                         "install it into the folder for its kind");
+        gtk_widget_set_tooltip_text(addb, "The same for a .vst3 / .vst / .component bundle folder");
+        g_signal_connect(add, "clicked", G_CALLBACK(pm_on_add), GINT_TO_POINTER(0));
+        g_signal_connect(addb, "clicked", G_CALLBACK(pm_on_add), GINT_TO_POINTER(1));
+        gtk_box_append(GTK_BOX(row), add);
+        gtk_box_append(GTK_BOX(row), addb);
+        plugview_set_list_changed(pm_list_changed);
+    }
     {
         GtkWidget *rescan = gtk_button_new_with_label("Rescan");
         GtkWidget *spacer = gtk_label_new("");
@@ -2265,6 +2761,9 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "tracker-columns",      act_trk_columns,      NULL, NULL, NULL, {0} },
         { "tracker-audio",        act_trk_audio,        NULL, NULL, NULL, {0} },
         { "tracker-cheat",        act_trk_cheat,        NULL, NULL, NULL, {0} },
+        { "tracker-meters",       NULL, NULL, "true", act_trk_meters, {0} },
+        { "tracker-pitch",        NULL, NULL, "true", act_trk_pitch,  {0} },
+        { "view-keyboard",        NULL, NULL, "true", act_view_keyboard, {0} },
     };
     GMenu *bar   = g_menu_new();
     GMenu *file  = g_menu_new();
@@ -2348,6 +2847,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append(g_samples_m, "Load Sample Set…", "win.tracker-load-samples");
     g_menu_append(g_samples_m, "Edit Sample Set…", "win.tracker-edit-samples");
     g_menu_append(g_samples_m, "Audio Output…", "win.tracker-audio");
+    g_view_m = g_menu_new();             /* filled by sync_menus: it depends on the tab */
     g_help_trk = g_menu_new();
     g_menu_append(g_help_trk, "Keys", "win.tracker-keys");
     g_menu_append(g_help_trk, "Columns", "win.tracker-columns");

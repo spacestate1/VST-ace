@@ -1043,7 +1043,7 @@ typedef struct {
 
     /* The pitch wheel, left of the keys as on a hardware synth. 14-bit MIDI,
      * 8192 at rest. */
-    GtkWidget    *wheel, *kbrow;
+    GtkWidget    *wheel, *kbrow, *kbframe;   /* kbframe: View > On-screen keyboard */
     int           kb_h;
     int           bend, bend_drag;
     double        bend_grab_y;
@@ -1169,12 +1169,22 @@ static const char *note_name(int n, int with_octave, char *buf, size_t bufn)
 static void piano_label(cairo_t *cr, const char *text, double cx, double bottom,
                         double size)
 {
-    cairo_text_extents_t te;
-    cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, size);
-    cairo_text_extents(cr, text, &te);
-    cairo_move_to(cr, cx - (te.width / 2 + te.x_bearing), bottom);
-    cairo_show_text(cr, text);
+    PangoLayout *l = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string("sans");
+    int tw, th;
+    /* Pango rather than cairo's toy text API, which has no font fallback and
+     * draws the sharp sign as a missing-glyph box. */
+    pango_font_description_set_absolute_size(fd, size * PANGO_SCALE);
+    pango_layout_set_font_description(l, fd);
+    pango_layout_set_text(l, text, -1);
+    pango_layout_get_pixel_size(l, &tw, &th);
+    /* `bottom` is the text's baseline in the old code; the layout's own
+     * baseline is what it is aligned to now. */
+    cairo_move_to(cr, cx - tw / 2.0, bottom - pango_layout_get_baseline(l) / (double)PANGO_SCALE);
+    pango_cairo_show_layout(cr, l);
+    pango_font_description_free(fd);
+    g_object_unref(l);
+    (void)th;
 }
 
 static void piano_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
@@ -2536,6 +2546,46 @@ static void on_mic_raw(GSimpleAction *a, GVariant *v, gpointer ud)
 /* Both halves of "what is this machine listening to", rescanned together --
  * plugging something in is exactly when both lists are wrong, and pestudio's
  * Rescan does the same two things. */
+/* Inputs > Tempo: the MIDI row's tempo box, asked for in a small window now
+ * that the row is not on screen. The box is still there, hidden, and still
+ * follows a sequencer's clock; setting it here goes through the same path. */
+static void tempo_ok(GtkButton *b, gpointer u)
+{
+    GtkWidget *win = u, *sb = g_object_get_data(G_OBJECT(win), "sb");
+    (void)b;
+    gtk_spin_button_update(GTK_SPIN_BUTTON(sb));
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(U.tempo_sb),
+                              gtk_spin_button_get_value(GTK_SPIN_BUTTON(sb)));
+    gtk_window_destroy(GTK_WINDOW(win));
+}
+
+static void act_tempo(GSimpleAction *a, GVariant *p, gpointer ud)
+{
+    GtkWidget *win, *box, *sb, *ok, *l;
+    (void)a; (void)p; (void)ud;
+    if (!GTK_IS_WIDGET(U.tempo_sb)) return;
+    win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(win), "Tempo");
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(U.win));
+    gtk_window_set_modal(GTK_WINDOW(win), TRUE);
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(box, 12); gtk_widget_set_margin_bottom(box, 12);
+    gtk_widget_set_margin_start(box, 12); gtk_widget_set_margin_end(box, 12);
+    l = gtk_label_new("Beats per minute. A sequencer's clock overrides it.");
+    sb = gtk_spin_button_new_with_range(20.0, 999.0, 0.25);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(sb), 2);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(sb), gtk_spin_button_get_value(GTK_SPIN_BUTTON(U.tempo_sb)));
+    ok = gtk_button_new_with_label("OK");
+    g_object_set_data(G_OBJECT(win), "sb", sb);
+    g_signal_connect(ok, "clicked", G_CALLBACK(tempo_ok), win);
+    g_signal_connect_swapped(sb, "activate", G_CALLBACK(gtk_widget_activate), ok);
+    gtk_box_append(GTK_BOX(box), l);
+    gtk_box_append(GTK_BOX(box), sb);
+    gtk_box_append(GTK_BOX(box), ok);
+    gtk_window_set_child(GTK_WINDOW(win), box);
+    gtk_window_present(GTK_WINDOW(win));
+}
+
 static void act_rescan(GSimpleAction *a, GVariant *p, gpointer ud)
 {
     int n, i, kept = 0;
@@ -2568,6 +2618,15 @@ static void act_rescan(GSimpleAction *a, GVariant *p, gpointer ud)
  * under the menu bar; pestudio carries both too, for the same reason -- one is
  * where you look while playing, the other is where you look when it is not
  * working. */
+/* View > On-screen keyboard. The computer keys are caught on the window, so
+ * hiding the keys does not stop them playing. */
+static void on_view_keyboard(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    (void)u;
+    g_simple_action_set_state(a, v);
+    if (GTK_IS_WIDGET(U.kbframe)) gtk_widget_set_visible(U.kbframe, g_variant_get_boolean(v));
+}
+
 static void on_midi_thru(GSimpleAction *a, GVariant *v, gpointer ud)
 {
     (void)ud;
@@ -2702,6 +2761,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "plugin-folders", act_plugin_folders, NULL, NULL, NULL, {0} },
         { "enter-key",   act_enter_key,   NULL, NULL, NULL, {0} },
         { "rescan",      act_rescan,      NULL, NULL, NULL, {0} },
+        { "tempo",       act_tempo,       NULL, NULL, NULL, {0} },
         { "panic",       act_panic,       NULL, NULL, NULL, {0} },
         { "focus-plugins",  act_focus_plugins,  NULL, NULL, NULL, {0} },
         { "focus-programs", act_focus_programs, NULL, NULL, NULL, {0} },
@@ -2712,6 +2772,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
         /* Stateful, so the menu draws the check itself and the state is the
          * one place the answer lives. A boolean entry with no activate handler
          * toggles on its own and reports through change_state. */
+        { "view-keyboard", NULL, NULL,  "true",  on_view_keyboard, {0} },
         { "midi-thru",     NULL, NULL,  "false", on_midi_thru,     {0} },
         { "midi-out-auto", NULL, NULL,  "false", on_midi_out_auto, {0} },
         { "midi-channel",  NULL, "i",   "-1",    on_midi_channel,  {0} },
@@ -2727,6 +2788,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
     GMenu *sect     = g_menu_new();
     GMenu *settings = g_menu_new();
     GMenu *view     = g_menu_new();
+    GMenu *viewm    = g_menu_new();
     GMenu *inputs   = g_menu_new();
     GMenu *midiin   = g_menu_new();
     GMenu *midisrcs = g_menu_new();
@@ -2805,6 +2867,8 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append(view, "Programs", "win.focus-programs");
     g_menu_append(view, "Parameters / Editor", "win.toggle-editor");
     g_menu_append(view, "Back to the Keys", "win.focus-keys");
+    g_menu_append(viewm, "On-screen keyboard", "win.view-keyboard");
+    g_menu_append_submenu(bar, "View", G_MENU_MODEL(viewm));
     g_menu_append_submenu(bar, "Go", G_MENU_MODEL(view));
 
     g_menu_append(settings, "Plug-in Folders…", "win.plugin-folders");
@@ -2837,6 +2901,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append_submenu(midisect, "Channel", G_MENU_MODEL(chan));
     g_menu_append(midisect, "Thru (in → out)", "win.midi-thru");
     g_menu_append(midisect, "Connect out to hardware", "win.midi-out-auto");
+    g_menu_append(midisect, "Tempo…", "win.tempo");
     g_menu_append_section(midiin, NULL, G_MENU_MODEL(midisect));
     g_menu_append_submenu(inputs, "MIDI input", G_MENU_MODEL(midiin));
     g_menu_append(inputs, "Rescan devices", "win.rescan");
@@ -2850,7 +2915,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
 
     w = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(bar));
     gtk_widget_set_halign(w, GTK_ALIGN_START);
-    g_object_unref(about); g_object_unref(settings); g_object_unref(view);
+    g_object_unref(about); g_object_unref(settings); g_object_unref(view); g_object_unref(viewm);
     /* midisrcs, audiodevs and audiostate are not unreffed with the rest: each
      * is refilled for as long as the window lives -- see U.midi_menu above. */
     g_object_unref(chan); g_object_unref(midisect);
@@ -3095,6 +3160,9 @@ static void activate(GtkApplication *app, gpointer ud)
         gtk_widget_set_hexpand(U.midi_conn, TRUE);
         gtk_widget_add_css_class(U.midi_conn, "dim-label");
         gtk_box_append(GTK_BOX(U.midibar), U.midi_conn);
+        /* All of it is under the Inputs menu; the row stays built, since the
+         * MIDI code drives these widgets, but is not shown. */
+        gtk_widget_set_visible(U.midibar, FALSE);
     }
 
     U.list = gtk_list_box_new();
@@ -3122,7 +3190,7 @@ static void activate(GtkApplication *app, gpointer ud)
         gtk_paned_set_start_child(GTK_PANED(paned), sw1);
         gtk_paned_set_end_child(GTK_PANED(paned), rightbox);
     }
-    gtk_paned_set_position(GTK_PANED(paned), 400);
+    gtk_paned_set_position(GTK_PANED(paned), 520);
     gtk_widget_set_vexpand(paned, TRUE);
     gtk_box_append(GTK_BOX(box), paned);
 
@@ -3181,6 +3249,7 @@ static void activate(GtkApplication *app, gpointer ud)
         frame = gtk_frame_new("Keyboard  —  click, or zsxdcvgbhnjm / q2w3er5t6y7u");
         gtk_frame_set_child(GTK_FRAME(frame), kb);
     }
+    U.kbframe = frame;
     gtk_box_append(GTK_BOX(U.outer), frame);
 
     U.status = gtk_label_new("");

@@ -82,7 +82,18 @@ void       trk_view_set_sinks(trk_view *v, const trk_view_sinks *api, void *ud);
 /* Called after a song is loaded -- the view's own Open button and a shell's
  * open alike -- so the shell can reopen the synths the song's sink lines
  * name. Unset: nothing, the standalone's answer. */
+/* View > Level meters: the bar under each track's header, on by default. */
+void       trk_view_set_meters(trk_view *v, int on);
+int        trk_view_meters(trk_view *v);
+/* View > Color notes by pitch: notes drawn low to high across the rainbow, on by default. */
+void       trk_view_set_pitch_colors(trk_view *v, int on);
+int        trk_view_pitch_colors(trk_view *v);
+
 void       trk_view_set_song_opened(trk_view *v, void (*cb)(void *ud), void *ud);
+
+/* Called after a song was written to `path`, so a shell can save the sounds
+ * of the synths its tracks play beside it. Unset: nothing. */
+void       trk_view_set_song_saved(trk_view *v, void (*cb)(const char *path, void *ud), void *ud);
 
 /* Mark the song as saved -- for a shell that wrote into it itself, as the Qt
  * shell does before routing a track for its scripted proof. */

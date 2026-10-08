@@ -104,6 +104,49 @@ int trk_track_set_octave(trk_engine *e, int track, int octave)
     return moved;
 }
 
+void trk_note_rgb(int note, int dark, unsigned char rgb[3])
+{
+    /* Low to high across the rainbow: C1 red, through yellow, green, cyan and
+     * blue, to violet at C7; notes beyond that keep the end colours. */
+    double h, sat = 0.80, val = dark ? 0.95 : 0.72, f, p, q, t, r, g, b;
+    int i;
+    if (note < 24) note = 24;
+    if (note > 96) note = 96;
+    h = (note - 24) / 72.0 * 270.0 / 60.0;          /* 0..4.5 of the six 60-degree sectors */
+    i = (int)h;
+    f = h - i;
+    p = val * (1.0 - sat);
+    q = val * (1.0 - sat * f);
+    t = val * (1.0 - sat * (1.0 - f));
+    switch (i) {
+    case 0:  r = val; g = t;   b = p;   break;
+    case 1:  r = q;   g = val; b = p;   break;
+    case 2:  r = p;   g = val; b = t;   break;
+    case 3:  r = p;   g = q;   b = val; break;
+    default: r = t;   g = p;   b = val; break;
+    }
+    rgb[0] = (unsigned char)(r * 255.0 + 0.5);
+    rgb[1] = (unsigned char)(g * 255.0 + 0.5);
+    rgb[2] = (unsigned char)(b * 255.0 + 0.5);
+}
+
+int trk_track_fit_octave(trk_engine *e, int track)
+{
+    unsigned char mask[16];
+    int n, oct;
+    if (track < 0 || track >= TRK_TRACKS) return -1;
+    if (!trk_sample_mask(e, track, mask)) return -1;      /* no loaded set */
+    for (n = 0; n < 128; n++) if (mask[n / 8] & (1 << (n % 8))) break;
+    if (n == 128) return -1;
+    oct = n / 12 - 1;
+    if (oct < 0) oct = 0;
+    if (oct > 9) oct = 9;
+    trk_lock(e);
+    trk_song_of(e)->track[track].octave = oct;
+    trk_unlock(e);
+    return oct;
+}
+
 const char *trk_columns_help(void)
 {
     return
@@ -124,7 +167,8 @@ const char *trk_columns_help(void)
         "            window.\n"
         "  ch        The MIDI channel the track sends on, 1 to 16.\n"
         "  oct       The octave the note keys type at. Changing it moves the\n"
-        "            track's notes too. Fixed for a sample set.\n"
+        "            track's notes too. A sample set sets it to where its\n"
+        "            first sample is.\n"
         "  mute      Silences the track. Its notes stay.\n"
         "  dot       Green: connected. Red: that window or sample set was not\n"
         "            found.\n"
@@ -410,6 +454,27 @@ int trk_clipboard(int *rows, int *tracks)
     if (rows) *rows = clip.rows;
     if (tracks) *tracks = clip.tracks;
     return clip.rows * clip.tracks;
+}
+
+size_t trk_clipboard_text(char *buf, size_t n)
+{
+    size_t used = 0;
+    int r, t;
+    if (n) buf[0] = 0;
+    for (r = 0; r < clip.rows; r++) {
+        for (t = 0; t < clip.tracks; t++) {
+            char name[4] = "-";
+            if (used + 8 >= n) return used;
+            if (t) { memcpy(buf + used, " | ", 3); used += 3; }
+            /* only the note, a dash when empty; no dots, vel or controller */
+            if (clip.cell[r][t].note != TRK_EMPTY) trk_note_name(clip.cell[r][t].note, name);
+            memcpy(buf + used, name, strlen(name));
+            used += strlen(name);
+        }
+        buf[used++] = '\n';
+        buf[used] = 0;
+    }
+    return used;
 }
 
 static int hexval(int key)

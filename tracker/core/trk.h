@@ -157,6 +157,9 @@ void        trk_unlock(trk_engine *e);
 const char *trk_client_name(trk_engine *e);      /* as other programs list it */
 /* What the samples play out of -- "samples: default, 38 ms" -- or why they
  * cannot; empty until a track has a sample set. */
+/* How many times the sample output ran dry since the program started -- each
+ * one is an audible click or pop. 0 means the device is not the cause. */
+unsigned trk_audio_xruns(trk_engine *e);
 const char *trk_audio_status(trk_engine *e);
 
 /* Subscribe each track's port to what its client/port names, and the clock
@@ -261,6 +264,10 @@ int  trk_playing(trk_engine *e);
 /* What is sounding now -- not what has been scheduled ahead. -1s when
  * stopped. */
 void trk_position(trk_engine *e, int *order, int *pattern, int *row);
+/* Each track's level, 0..1, for a meter: a note's velocity the moment it
+ * sounds (previews too), then falling away. Call it on a UI timer; it
+ * takes the lock itself. */
+void trk_levels(trk_engine *e, float out[TRK_TRACKS]);
 void trk_set_bpm(trk_engine *e, double bpm);     /* takes effect at once */
 
 /* Play one note now, as feedback while entering it. Released by
@@ -425,6 +432,12 @@ int  trk_paste(trk_engine *e, trk_editor *ed);
 int  trk_clear_block(trk_engine *e, trk_editor *ed);
 int  trk_clipboard(int *rows, int *tracks);
 
+/* The clipboard as plain text for a text editor: one line per row, only the
+ * notes ("C-4", "==="), tracks split by " | ", an empty cell a "-" --
+ * no dots, velocities or controllers. Returns the length; stops at whole
+ * cells when n is short. */
+size_t trk_clipboard_text(char *buf, size_t n);
+
 /* Undo the last edit: cell entry and clearing, insert and backspace, an
  * octave move, cut, paste and clear, the parts list, a pattern copy. Each
  * edit point snapshots the whole song just before it changes, the last
@@ -456,6 +469,16 @@ int  trk_key_note(int key, int octave);
  * a bad track. A track playing a sample set is left alone: its notes are
  * the pads, and an octave move would only put them on other samples. */
 int  trk_track_set_octave(trk_engine *e, int track, int octave);
+
+/* Put a sample track's octave where its set's lowest sample is, so the
+ * note keys land on the pads. Returns the octave, -1 when the track plays
+ * no loaded set. Call after trk_route; takes the lock itself. */
+int  trk_track_fit_octave(trk_engine *e, int track);
+
+/* The colour a note is drawn in when notes are coloured by pitch: low to high
+ * across the rainbow, red at C1 to violet at C7 (clamped beyond). `dark` is a
+ * dark page, which takes brighter colours than a light one. */
+void trk_note_rgb(int note, int dark, unsigned char rgb[3]);
 
 /* Help > Columns: what each part of the screen is and what it changes, as
  * plain text for a dialog in a fixed-width font. Both windows show it. */

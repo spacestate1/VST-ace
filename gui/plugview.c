@@ -122,6 +122,7 @@ struct plugview {
     int    nroot;
     GtkWidget *dirlabel;
     GtkWidget *list;          /* plug-ins */
+    GtkWidget *search;        /* keyword search over the plug-in list */
     GtkWidget *proglist;      /* the loaded plug-in's programs */
     GtkWidget *paramlist;
     /* What is open, so a saved patch can name the plug-in it came from and be
@@ -513,11 +514,11 @@ static const char *fmt_of(const entry *e)
 static int entry_cmp(const void *a, const void *b)
 {
     const entry *x = a, *y = b;
-    int rx = os_rank(x->os), ry = os_rank(y->os);
+    int c = g_ascii_strcasecmp(x->name, y->name);
 
-    if (rx != ry) return rx - ry;
-    if (x->kindv != y->kindv) return x->kindv - y->kindv;
-    return g_ascii_strcasecmp(x->name, y->name);
+    /* Alphabetical by name, whatever the platform or format: the two selectors
+     * narrow the list, and a plug-in added later lands where its name belongs. */
+    return c ? c : g_ascii_strcasecmp(x->path, y->path);
 }
 
 /* Is this entry a plug-in worth listing, and if so what shape?
@@ -571,6 +572,71 @@ static int is_candidate(const char *path, const char *name, int isdir)
  * one directory, and found nothing at all under linux/extracted, where each
  * one arrives as its own unpacked release with the plug-in several levels
  * down. */
+/* One plug-in found on disk: skipped when it is hidden or already listed,
+ * otherwise classified and appended to plug[]. Shared by the folder walk and
+ * by the plug-ins added by file for this session. */
+static void add_candidate(plugview *pv, const char *path, const char *nm)
+{
+    entry *e;
+    pehost_info info;
+
+    if (vstdirs_is_hidden(path)) return;       /* taken off the list: File > Plug-ins */
+    /* A candidate by shape still has to be one this host can run --
+     * a 32-bit build without the helper, a PowerPC Mach-O. Listed
+     * either way, with the reason when it cannot: a plug-in that is
+     * simply absent from the list looks like one the scan failed to
+     * find, and "why is it not there" is a worse question than "why
+     * will it not load". pestudio does the same. */
+    {   /* Folders overlap -- a system VST directory can sit inside a
+         * corpus, the user can add one that is already scanned, a
+         * VST_PATH folder can be symlinks into one, and ~/.vst can hold
+         * a copy of what a corpus has. The same plug-in is listed once,
+         * wherever it was found first. */
+        vstdirs_id id;
+        int k, seen = 0;
+        vstdirs_identify(path, &id);
+        for (k = 0; k < pv->nplug; k++)
+            if (!strcmp(pv->plug[k].path, path) ||
+                vstdirs_same_plugin(path, &id, pv->plug[k].path, &pv->plug[k].id))
+                { seen = 1; break; }
+        if (seen) return;
+        pv->plug[pv->nplug].id = id;
+    }
+    e = &pv->plug[pv->nplug++];
+    snprintf(e->path, sizeof e->path, "%s", path);
+    snprintf(e->name, sizeof e->name, "%s", nm);
+    /* One verdict, not two. pehost_classify already reports whether
+     * this build can run the file and why not, and it knows things
+     * pehost_can_load does not -- that a macOS VST3 bundle is a VST3
+     * that is simply not hosted yet, rather than "not a PE, ELF or
+     * Mach-O image". Asking both sniffed every candidate twice and then
+     * showed the less informed of the two answers. */
+    pehost_classify(path, &info);
+    e->loadable = info.loadable;
+    /* The platform and format the two selectors sort and sift on. From
+     * the binary, every time -- which is why a .vst3 can come out
+     * Windows here and Linux three rows down. */
+    snprintf(e->os,  sizeof e->os,  "%s", info.os);
+    snprintf(e->fmt, sizeof e->fmt, "%s", info.format);
+    e->kindv = (int)info.kind;
+    {   /* Directory reads only -- nothing is loaded to find this out. */
+        pehost_data_need dn;
+        if (pehost_data_check(path, &dn)) {
+            snprintf(e->warn, sizeof e->warn, "%s", dn.need);
+            e->repairable = dn.repairable;
+        }
+    }
+    snprintf(e->kind, sizeof e->kind, "%s",
+             info.loadable  ? pehost_kind_label(info.kind)
+             : info.why[0]  ? info.why
+                            : "unsupported");
+}
+
+/* Plug-ins added by file for this run only (Add plug-in, "this session only"):
+ * one list for every tab, so each tab's scan finds them. */
+static char g_session_files[64][1024];
+static int  g_nsession_files;
+
 /* Walk one folder, appending what it holds to plug[]. Split out of
  * plugview_scan because there are several folders now and each is walked the
  * same way -- and because the caller, not this, decides when the list starts
@@ -604,8 +670,6 @@ static void scan_tree(plugview *pv, const char *dir)
         while ((nm = g_dir_read_name(d)) && pv->nplug < MAX_PLUGINS) {
             char  path[1024];
             int   isdir;
-            entry *e;
-            pehost_info info;
 
             if (nm[0] == '.') continue;
             snprintf(path, sizeof path, "%s/%s", base, nm);
@@ -616,56 +680,7 @@ static void scan_tree(plugview *pv, const char *dir)
                     snprintf(queue[tail++], sizeof queue[0], "%s", path);
                 continue;
             }
-            if (vstdirs_is_hidden(path)) continue;       /* taken off the list: File > Plug-ins */
-            /* A candidate by shape still has to be one this host can run --
-             * a 32-bit build without the helper, a PowerPC Mach-O. Listed
-             * either way, with the reason when it cannot: a plug-in that is
-             * simply absent from the list looks like one the scan failed to
-             * find, and "why is it not there" is a worse question than "why
-             * will it not load". pestudio does the same. */
-            {   /* Folders overlap -- a system VST directory can sit inside a
-                 * corpus, the user can add one that is already scanned, a
-                 * VST_PATH folder can be symlinks into one, and ~/.vst can hold
-                 * a copy of what a corpus has. The same plug-in is listed once,
-                 * wherever it was found first. */
-                vstdirs_id id;
-                int k, seen = 0;
-                vstdirs_identify(path, &id);
-                for (k = 0; k < pv->nplug; k++)
-                    if (!strcmp(pv->plug[k].path, path) ||
-                        vstdirs_same_plugin(path, &id, pv->plug[k].path, &pv->plug[k].id))
-                        { seen = 1; break; }
-                if (seen) continue;
-                pv->plug[pv->nplug].id = id;
-            }
-            e = &pv->plug[pv->nplug++];
-            snprintf(e->path, sizeof e->path, "%s", path);
-            snprintf(e->name, sizeof e->name, "%s", nm);
-            /* One verdict, not two. pehost_classify already reports whether
-             * this build can run the file and why not, and it knows things
-             * pehost_can_load does not -- that a macOS VST3 bundle is a VST3
-             * that is simply not hosted yet, rather than "not a PE, ELF or
-             * Mach-O image". Asking both sniffed every candidate twice and then
-             * showed the less informed of the two answers. */
-            pehost_classify(path, &info);
-            e->loadable = info.loadable;
-            /* The platform and format the two selectors sort and sift on. From
-             * the binary, every time -- which is why a .vst3 can come out
-             * Windows here and Linux three rows down. */
-            snprintf(e->os,  sizeof e->os,  "%s", info.os);
-            snprintf(e->fmt, sizeof e->fmt, "%s", info.format);
-            e->kindv = (int)info.kind;
-            {   /* Directory reads only -- nothing is loaded to find this out. */
-                pehost_data_need dn;
-                if (pehost_data_check(path, &dn)) {
-                    snprintf(e->warn, sizeof e->warn, "%s", dn.need);
-                    e->repairable = dn.repairable;
-                }
-            }
-            snprintf(e->kind, sizeof e->kind, "%s",
-                     info.loadable  ? pehost_kind_label(info.kind)
-                     : info.why[0]  ? info.why
-                                    : "unsupported");
+            add_candidate(pv, path, nm);
         }
         g_dir_close(d);
     }
@@ -742,6 +757,11 @@ void plugview_scan(plugview *pv, const char *dir)
 
     pv->nplug = 0;
     for (i = 0; i < pv->nroot; i++) scan_tree(pv, pv->roots[i].path);
+    for (i = 0; i < g_nsession_files && pv->nplug < MAX_PLUGINS; i++) {
+        const char *sl = strrchr(g_session_files[i], '/');
+        if (g_file_test(g_session_files[i], G_FILE_TEST_EXISTS))
+            add_candidate(pv, g_session_files[i], sl ? sl + 1 : g_session_files[i]);
+    }
     qsort(pv->plug, (size_t)pv->nplug, sizeof pv->plug[0], entry_cmp);
     rebuild_filters(pv);
     /* Said out loud, the way pestudio says it, so the two windows can be
@@ -782,19 +802,33 @@ static const char *want_os(plugview *pv)
 static void fill_browser(plugview *pv)
 {
     const char *wt = want_type(pv), *wo = want_os(pv);
+    const char *needle = pv->search ? gtk_editable_get_text(GTK_EDITABLE(pv->search)) : "";
+    char *ln = g_utf8_strdown(needle, -1);
     int i;
 
-    if (!pv->list) return;
+    if (!pv->list) { g_free(ln); return; }
     clear_list(pv->list);
     pv->nvis = 0;
     for (i = 0; i < pv->nplug; i++) {
         const entry *e = &pv->plug[i];
         if (wt && strcmp(fmt_of(e), wt)) continue;
         if (wo && strcmp(e->os, wo)) continue;
+        if (*ln) {
+            char *n1 = g_utf8_strdown(e->name, -1), *n2 = g_utf8_strdown(e->path, -1);
+            int hit = strstr(n1, ln) || strstr(n2, ln);
+            g_free(n1); g_free(n2);
+            if (!hit) continue;
+        }
         pv->vis[pv->nvis++] = i;
         append_row(pv, e);
     }
 
+    if (*ln) {
+        plug_status(pv, "%d of %d plug-in(s) match \"%s\"", pv->nvis, pv->nplug, needle);
+        g_free(ln);
+        return;          /* searching is not choosing: nothing loads while typing */
+    }
+    g_free(ln);
     if (!wt && !wo) plug_status(pv, "%d plug-in(s) in %d folder(s)", pv->nplug, pv->nroot);
     else            plug_status(pv, "%d of %d plug-in(s) -- %s%s%s", pv->nvis, pv->nplug,
                                 wo ? os_label(wo) : "every platform",
@@ -811,6 +845,14 @@ static void fill_browser(plugview *pv)
 
 /* Both selectors sift the list already in hand -- no folder is walked again,
  * so switching format or platform is instant however long the scan took. */
+static void on_search_changed(GtkSearchEntry *e, gpointer ud)
+{
+    plugview *pv = ud;
+    (void)e;
+    if (pv->loading) return;
+    fill_browser(pv);
+}
+
 static void on_filter_changed(GObject *dd, GParamSpec *ps, gpointer ud)
 {
     plugview *pv = ud;
@@ -2428,6 +2470,189 @@ void plugview_open_vst(plugview *pv, GtkWindow *parent)
     gtk_file_dialog_open(d, parent, NULL, on_vst_chosen, pv);
 }
 
+
+/* -------------------------------------------------------- Add plug-in ---- */
+
+/* Plugins > Add plug-in: one file (or bundle) the user picks, either for this
+ * session only or copied where plug-ins of its kind belong. What kind it is
+ * comes from the binary, not the name, and the kind decides the folder: a
+ * folder the user already set up for that platform if there is one, else a
+ * place of this program's own under the data directory. Native Linux plug-ins
+ * go to the standard ~/.vst and ~/.vst3. */
+typedef struct {
+    plugview *pv;
+    char path[1024], os[16], fmt[8], arch[16], target[1024];
+} addctx;
+
+static void install_dir_for(const char *os, const char *fmt, const char *arch,
+                            char *out, size_t n)
+{
+    vstdir dirs[VSTDIRS_MAX];
+    char first[1024] = "", byfmt[1024] = "", lfmt[16];
+    int i, nd;
+    const char *data;
+    char *lc;
+
+    if (!strcmp(os, "linux")) {
+        snprintf(out, n, "%s/%s", g_get_home_dir(), !strcmp(fmt, "VST3") ? ".vst3" : ".vst");
+        return;
+    }
+    nd = vstdirs_load(dirs, VSTDIRS_MAX);
+    snprintf(lfmt, sizeof lfmt, "%s", fmt);
+    lc = g_ascii_strdown(lfmt, -1);
+    for (i = 0; i < nd; i++) {
+        char *lp;
+        if (strcmp(os, dirs[i].os) || !g_file_test(dirs[i].path, G_FILE_TEST_IS_DIR)) continue;
+        if (!first[0]) snprintf(first, sizeof first, "%s", dirs[i].path);
+        lp = g_ascii_strdown(dirs[i].path, -1);
+        if (!byfmt[0] && *lc && strstr(lp, lc)) snprintf(byfmt, sizeof byfmt, "%s", dirs[i].path);
+        g_free(lp);
+    }
+    g_free(lc);
+    if (byfmt[0]) { snprintf(out, n, "%s", byfmt); return; }
+    if (first[0]) { snprintf(out, n, "%s", first); return; }
+    data = g_get_user_data_dir();
+    snprintf(out, n, "%s/vst-ace/plugins/%s/%s%s%s", data, os, fmt, arch[0] ? "-" : "", arch);
+}
+
+/* Copy a file or a whole folder, recursively. 0 on success. */
+static int copy_tree(const char *src, const char *dst)
+{
+    if (g_file_test(src, G_FILE_TEST_IS_DIR)) {
+        GDir *d = g_dir_open(src, 0, NULL);
+        const char *nm;
+        int rc = 0;
+        if (!d || g_mkdir_with_parents(dst, 0755) != 0) { if (d) g_dir_close(d); return -1; }
+        while (!rc && (nm = g_dir_read_name(d))) {
+            char *s2 = g_build_filename(src, nm, NULL), *d2 = g_build_filename(dst, nm, NULL);
+            rc = copy_tree(s2, d2);
+            g_free(s2); g_free(d2);
+        }
+        g_dir_close(d);
+        return rc;
+    } else {
+        GFile *a = g_file_new_for_path(src), *b = g_file_new_for_path(dst);
+        int rc = g_file_copy(a, b, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, NULL) ? 0 : -1;
+        g_object_unref(a); g_object_unref(b);
+        return rc;
+    }
+}
+
+static void (*g_list_changed)(void);
+void plugview_set_list_changed(void (*cb)(void)) { g_list_changed = cb; }
+
+static void on_add_answer(GObject *src, GAsyncResult *res, gpointer ud)
+{
+    addctx *c = ud;
+    plugview *pv = c->pv;
+    int pick = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(src), res, NULL);
+    const char *nm = strrchr(c->path, '/') ? strrchr(c->path, '/') + 1 : c->path;
+
+    if (pick == 1) {                                   /* this session only */
+        int i;
+        for (i = 0; i < g_nsession_files; i++) if (!strcmp(g_session_files[i], c->path)) break;
+        if (i == g_nsession_files && g_nsession_files < 64)
+            snprintf(g_session_files[g_nsession_files++], sizeof g_session_files[0], "%s", c->path);
+        rescan_all(pv);
+        plug_status(pv, "%s added for this session", nm);
+    } else if (pick == 2) {                            /* install */
+        char *srcp = g_strdup(c->path), *dest;
+        if (!g_file_test(c->path, G_FILE_TEST_IS_DIR)) {
+            /* A lone plug-in sitting among other files loads its data from
+             * beside itself: the whole folder goes. */
+            char *par = g_path_get_dirname(c->path);
+            GDir *d = g_dir_open(par, 0, NULL);
+            const char *e;
+            int plugins = 0, others = 0;
+            while (d && (e = g_dir_read_name(d))) {
+                char *ep = g_build_filename(par, e, NULL);
+                if (is_candidate(ep, e, is_dir(ep))) plugins++; else others++;
+                g_free(ep);
+            }
+            if (d) g_dir_close(d);
+            if (plugins == 1 && others > 0) { g_free(srcp); srcp = par; par = NULL; }
+            g_free(par);
+        }
+        {
+            char *base = g_path_get_basename(srcp);
+            dest = g_build_filename(c->target, base, NULL);
+            g_free(base);
+        }
+        if (copy_tree(srcp, dest) != 0) {
+            plug_status(pv, "could not install %s into %s", nm, c->target);
+        } else {
+            vstdirs_add(c->os, c->target);
+            rescan_all(pv);
+            plug_status(pv, "%s installed into %s", nm, c->target);
+        }
+        g_free(srcp); g_free(dest);
+    }
+    if (g_list_changed) g_list_changed();
+    g_object_unref(src);
+    g_free(c);
+}
+
+static void on_add_chosen(GObject *src, GAsyncResult *res, gpointer ud)
+{
+    plugview *pv = ud;
+    GFile *f = g_object_get_data(G_OBJECT(src), "bundle")
+             ? gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(src), res, NULL)
+             : gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *path;
+    g_object_unref(src);
+    if (!f) return;
+    if ((path = g_file_get_path(f))) {
+        pehost_info info;
+        pehost_classify(path, &info);
+        if (info.kind == PEHOST_KIND_UNKNOWN) {
+            plug_status(pv, "%s is not a plug-in this host recognises",
+                        strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+        } else {
+            addctx *c = g_new0(addctx, 1);
+            GtkAlertDialog *d;
+            const char *buttons[] = { "Cancel", "This session only", "Install", NULL };
+            char *msg, *detail;
+            GtkRoot *rt = pv->root ? gtk_widget_get_root(pv->root) : NULL;
+            c->pv = pv;
+            snprintf(c->path, sizeof c->path, "%s", path);
+            snprintf(c->os, sizeof c->os, "%s", info.os);
+            snprintf(c->fmt, sizeof c->fmt, "%s", info.format);
+            snprintf(c->arch, sizeof c->arch, "%s", info.arch);
+            install_dir_for(c->os, c->fmt, c->arch, c->target, sizeof c->target);
+            msg = g_strdup_printf("Add %s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+            detail = g_strdup_printf("%s %s%s%s%s\n\nUse it for this session only, or install it "
+                                     "where plug-ins of this kind are kept:\n%s%s%s",
+                                     os_label(c->os), c->fmt, c->arch[0] ? " (" : "", c->arch,
+                                     c->arch[0] ? ")" : "", c->target,
+                                     info.loadable ? "" : "\n\nThis build may not be able to run it: ",
+                                     info.loadable ? "" : (info.why[0] ? info.why : "unsupported"));
+            d = gtk_alert_dialog_new("%s", msg);
+            gtk_alert_dialog_set_detail(d, detail);
+            gtk_alert_dialog_set_buttons(d, buttons);
+            gtk_alert_dialog_set_cancel_button(d, 0);
+            gtk_alert_dialog_set_default_button(d, 1);
+            gtk_alert_dialog_choose(d, rt && GTK_IS_WINDOW(rt) ? GTK_WINDOW(rt) : NULL,
+                                    NULL, on_add_answer, c);
+            g_free(msg); g_free(detail);
+        }
+        g_free(path);
+    }
+    g_object_unref(f);
+}
+
+void plugview_add_plugin(plugview *pv, GtkWindow *parent, int bundle)
+{
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(d, bundle ? "Add plug-in bundle (.vst3, .vst, .component)"
+                                        : "Add plug-in");
+    if (bundle) {
+        g_object_set_data(G_OBJECT(d), "bundle", GINT_TO_POINTER(1));
+        gtk_file_dialog_select_folder(d, parent, NULL, on_add_chosen, pv);
+    } else {
+        gtk_file_dialog_open(d, parent, NULL, on_add_chosen, pv);
+    }
+}
+
 /* ------------------------------------------------------------- patches ---- */
 
 /* A plug-in's own programs are its factory presets and are read-only; this is
@@ -3386,17 +3611,21 @@ GtkWidget *plugview_pane(plugview *pv)
     g_signal_connect(pv->proglist, "row-selected", G_CALLBACK(on_prog_selected), pv);
     progsw = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(progsw), pv->proglist);
-    gtk_widget_set_size_request(progsw, -1, 170);
+    gtk_widget_set_size_request(progsw, -1, 260);
 
     left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_box_append(GTK_BOX(left), pv->filterrows[0]);
     gtk_box_append(GTK_BOX(left), pv->filterrows[1]);
     gtk_box_append(GTK_BOX(left), top);
     gtk_box_append(GTK_BOX(left), gtk_label_new("Plug-ins"));
+    pv->search = gtk_search_entry_new();
+    gtk_search_entry_set_placeholder_text(GTK_SEARCH_ENTRY(pv->search), "Search plug-ins");
+    g_signal_connect(pv->search, "search-changed", G_CALLBACK(on_search_changed), pv);
+    gtk_box_append(GTK_BOX(left), pv->search);
     gtk_box_append(GTK_BOX(left), sw);
     gtk_box_append(GTK_BOX(left), gtk_label_new("Programs"));
     gtk_box_append(GTK_BOX(left), progsw);
-    gtk_widget_set_size_request(left, 300, -1);
+    gtk_widget_set_size_request(left, 420, -1);
 
     /* ---- right: header, then Parameters | Editor ---- */
     pv->header = gtk_label_new("no plug-in loaded");
@@ -3511,7 +3740,7 @@ GtkWidget *plugview_pane(plugview *pv)
     paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_paned_set_start_child(GTK_PANED(paned), left);
     gtk_paned_set_end_child(GTK_PANED(paned), right);
-    gtk_paned_set_position(GTK_PANED(paned), 320);
+    gtk_paned_set_position(GTK_PANED(paned), 520);
     gtk_paned_set_resize_start_child(GTK_PANED(paned), FALSE);
 
     pv->status = gtk_label_new("");
