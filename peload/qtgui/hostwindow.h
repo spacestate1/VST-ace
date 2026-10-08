@@ -672,6 +672,8 @@ public:
     }
 
     int backend() const { return backend_; }
+    /* This engine's stream in the PipeWire graph, for linking it to something else. */
+    QByteArray graphNodeName() const { return nodeName("pestudio"); }
     /* A JACK server that went away or an ALSA device that was unplugged. */
     bool backendDead() const { return ao_ && !ao_alive(ao_); }
 
@@ -2827,6 +2829,10 @@ public:
      * of these per tab needs both: the path is what a session file records,
      * and the flag is what the tab's face has to say. */
     QString loadedPath() const { return loadedPath_; }
+    /* The names this tab goes by in the PipeWire graph and on the ALSA
+     * sequencer, so the studio can link it to something else (Connect > REAPER). */
+    QByteArray graphNodeName() const { return eng_.graphNodeName(); }
+    QString midiClientName() const { return midi_ ? midi_->clientName() : QString(); }
     bool    pluginDead() const { return deadReported_; }
 
     /* Apply a patch held as text -- a session file's, or one captured before

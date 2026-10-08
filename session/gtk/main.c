@@ -39,6 +39,7 @@
 #include "sessfile.h"
 #include "recentfiles.h"
 #include "mixbus.h"
+#include "reaperlink.h"
 
 #include <alsa/asoundlib.h>
 #include <pipewire/pipewire.h>
@@ -106,6 +107,13 @@ typedef struct {
     GtkWidget    *wheel;       /* the pitch wheel left of it */
     GtkWidget    *kbrow;       /* wheel and keys: what View > On-screen keyboard shows */
     int           bend, bend_drag, bend_grab_v;   /* 14-bit, 8192 at rest */
+    /* Connect > REAPER: this synth's own MIDI port and, while REAPER is on, its
+     * own audio stream, so REAPER can take it on a track of its own. */
+    int           mport;       /* its ALSA sequencer port, or -1 */
+    struct pw_stream *dstream; /* its own output stream, or NULL: then it is in the shared mix */
+    int           dmix;        /* its place on the studio mix bus while it has a stream */
+    _Atomic int   direct;      /* the stream carries it: the shared mix leaves it out */
+    float         dbuf[PERIOD_MAX * 2];
 } synctab;
 
 static synctab      g_tabs[MAXTABS];
@@ -114,6 +122,8 @@ static trk_view    *g_tracker;
 static GtkWidget   *g_tracker_page;
 /* The menu bar follows the tab in front -- see sync_menus. */
 static GMenu       *g_bar, *g_file_m, *g_synth_m, *g_samples_m, *g_view_m, *g_help_m, *g_help_trk;
+static GMenu       *g_connect_m;       /* Connect > REAPER, shown while a synth is loaded */
+static int          g_connect_shown;
 static void sync_menus(GtkWidget *front);
 static synctab     *g_front;           /* the synth tab the keys play, if one is */
 
@@ -137,6 +147,7 @@ static void status(const char *msg)
 
 static ao *g_ao;               /* the JACK or ALSA backend, when that is what runs */
 static _Atomic int g_parked, g_park_req;
+static _Atomic int g_direct_busy;     /* tabs' own streams inside a render right now */
 static struct pw_thread_loop *g_pw_loop;
 static struct pw_stream      *g_pw_stream;
 static double    *g_pw_buf;
@@ -192,7 +203,8 @@ static void render_block(double *buf, int frames)
     memset(buf, 0, (size_t)n * 2 * sizeof *buf);
     if (atomic_load_explicit(&g_in_on, memory_order_acquire)) { input_block(n); in = g_in_buf; }
     for (t = 0; t < MAXTABS; t++) {
-        if (!g_tabs[t].used || !plugview_active(g_tabs[t].pv)) continue;
+        if (!g_tabs[t].used || atomic_load_explicit(&g_tabs[t].direct, memory_order_acquire) ||
+            !plugview_active(g_tabs[t].pv)) continue;
         if (plugview_render_io(g_tabs[t].pv, in, g_plug_buf, n)) {
             const float tg = atomic_load_explicit(&g_tabs[t].tgain, memory_order_relaxed);
             for (i = 0; i < n * 2; i++) buf[i] += g_plug_buf[i] * tg;
@@ -415,10 +427,17 @@ static void engine_park(void)
     /* Bounded wait: a suspended PipeWire node or a wedged device never calls
      * back, and spinning forever here would freeze the UI. */
     for (spins = 0; spins < 1000; spins++) {
-        if (atomic_load_explicit(&g_parked, memory_order_acquire)) return;
+        if (atomic_load_explicit(&g_parked, memory_order_acquire)) break;
         { struct timespec ts = { 0, 500000 }; nanosleep(&ts, NULL); }
     }
-    fprintf(stderr, "audio: park timed out -- callback not running?\n");
+    if (spins == 1000) fprintf(stderr, "audio: park timed out -- callback not running?\n");
+    /* The tabs' own streams (Connect > REAPER) take the request too: one that
+     * began before it is waited for, one that begins after sees it and plays
+     * silence. */
+    for (spins = 0; spins < 1000 && atomic_load(&g_direct_busy) > 0; spins++) {
+        struct timespec ts = { 0, 500000 };
+        nanosleep(&ts, NULL);
+    }
 }
 
 static void engine_unpark(void)
@@ -1031,15 +1050,45 @@ static pthread_t       g_mthread;
 static int             g_mpipe[2] = { -1, -1 };
 static int             g_mon;
 
-static void midi_deliver(int st, int d1, int d2)
+static int             g_mbase = -1;      /* the "in" port: plays whichever tab is in front */
+
+/* To the tab whose own port `port` is, else -- the "in" port -- the tab in front. */
+static void midi_deliver(int port, int st, int d1, int d2)
 {
     struct timespec ts;
     double wall;
+    synctab *to = NULL;
+    int t;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     wall = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
     pthread_mutex_lock(&g_midi_mx);
-    if (g_front && g_front->used && g_front->pv) plugview_inject_midi(g_front->pv, wall, st, d1, d2);
+    for (t = 0; t < MAXTABS; t++) if (g_tabs[t].used && g_tabs[t].mport == port && port >= 0) to = &g_tabs[t];
+    if (!to && port == g_mbase) to = g_front;
+    if (to && to->used && to->pv) plugview_inject_midi(to->pv, wall, st, d1, d2);
     pthread_mutex_unlock(&g_midi_mx);
+}
+
+/* A port for each synth tab, so something outside -- REAPER -- can play one synth
+ * and not whichever is in front. Named "synth NN" by the tab's slot. */
+static void midi_tab_port_open(synctab *tab)
+{
+    char name[16];
+    if (!g_mseq) return;
+    snprintf(name, sizeof name, "synth %02d", (int)(tab - g_tabs) + 1);
+    tab->mport = snd_seq_create_simple_port(g_mseq, name,
+                     SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
+                     SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+    if (tab->mport < 0) tab->mport = -1;
+}
+
+static void midi_tab_port_close(synctab *tab)
+{
+    int port;
+    pthread_mutex_lock(&g_midi_mx);        /* no event is on its way to the tab by this port after this */
+    port = tab->mport;
+    tab->mport = -1;
+    pthread_mutex_unlock(&g_midi_mx);
+    if (g_mseq && port >= 0) snd_seq_delete_simple_port(g_mseq, port);
 }
 
 static void *midi_main(void *u)
@@ -1058,26 +1107,26 @@ static void *midi_main(void *u)
             const int ch = ev->data.note.channel & 15;
             switch (ev->type) {
             case SND_SEQ_EVENT_NOTEON:
-                if (ev->data.note.velocity) midi_deliver(0x90 | ch, ev->data.note.note, ev->data.note.velocity);
-                else                        midi_deliver(0x80 | ch, ev->data.note.note, 0);
+                if (ev->data.note.velocity) midi_deliver(ev->dest.port, 0x90 | ch, ev->data.note.note, ev->data.note.velocity);
+                else                        midi_deliver(ev->dest.port, 0x80 | ch, ev->data.note.note, 0);
                 break;
-            case SND_SEQ_EVENT_NOTEOFF:   midi_deliver(0x80 | ch, ev->data.note.note, ev->data.note.velocity); break;
-            case SND_SEQ_EVENT_KEYPRESS:  midi_deliver(0xA0 | ch, ev->data.note.note, ev->data.note.velocity); break;
+            case SND_SEQ_EVENT_NOTEOFF:   midi_deliver(ev->dest.port, 0x80 | ch, ev->data.note.note, ev->data.note.velocity); break;
+            case SND_SEQ_EVENT_KEYPRESS:  midi_deliver(ev->dest.port, 0xA0 | ch, ev->data.note.note, ev->data.note.velocity); break;
             case SND_SEQ_EVENT_CONTROLLER:
-                midi_deliver(0xB0 | (ev->data.control.channel & 15), ev->data.control.param & 127,
+                midi_deliver(ev->dest.port, 0xB0 | (ev->data.control.channel & 15), ev->data.control.param & 127,
                              ev->data.control.value & 127);
                 break;
             case SND_SEQ_EVENT_PGMCHANGE:
-                midi_deliver(0xC0 | (ev->data.control.channel & 15), ev->data.control.value & 127, 0);
+                midi_deliver(ev->dest.port, 0xC0 | (ev->data.control.channel & 15), ev->data.control.value & 127, 0);
                 break;
             case SND_SEQ_EVENT_CHANPRESS:
-                midi_deliver(0xD0 | (ev->data.control.channel & 15), ev->data.control.value & 127, 0);
+                midi_deliver(ev->dest.port, 0xD0 | (ev->data.control.channel & 15), ev->data.control.value & 127, 0);
                 break;
             case SND_SEQ_EVENT_PITCHBEND: {
                 int v = ev->data.control.value + 8192;
                 if (v < 0) v = 0;
                 if (v > 16383) v = 16383;
-                midi_deliver(0xE0 | (ev->data.control.channel & 15), v & 127, (v >> 7) & 127);
+                midi_deliver(ev->dest.port, 0xE0 | (ev->data.control.channel & 15), v & 127, (v >> 7) & 127);
                 break;
             }
             default: break;
@@ -1097,7 +1146,7 @@ static void midi_start(void)
         return;
     }
     snd_seq_set_client_name(g_mseq, "studiogtk");
-    port = snd_seq_create_simple_port(g_mseq, "in",
+    port = g_mbase = snd_seq_create_simple_port(g_mseq, "in",
                SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
                SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
     if (port < 0 || pipe(g_mpipe) != 0 ||
@@ -1122,6 +1171,237 @@ static void midi_stop(void)
     snd_seq_close(g_mseq);
     g_mseq = NULL;
     g_mon = 0;
+}
+
+/* ----------------------------------------------------------- Connect: REAPER --
+ *
+ * With REAPER on, each loaded synth gets a stream of its own in the PipeWire
+ * graph (the shared mix leaves it out) and its own MIDI port, and reaperlink.c
+ * links them to REAPER's inputs and outputs as REAPER appears: synth k to
+ * REAPER's audio inputs 2k+1 and 2k+2 and the k-th of REAPER's MIDI outputs. The
+ * synth tabs' order is the order of the tracks to set up in REAPER. */
+static rl                   *g_rl;
+static GSimpleAction        *g_reaper_act;
+static struct pw_thread_loop *g_dl_loop;           /* the tabs' own streams run on this one */
+static char                  g_connect_sig[1024];
+static char                  g_connect_info[300];
+
+static void direct_process(void *ud)
+{
+    synctab *tab = ud;
+    struct pw_buffer *b;
+    struct spa_buffer *sb;
+    float *dst;
+    int n, i;
+
+    if (!tab->dstream || !(b = pw_stream_dequeue_buffer(tab->dstream))) return;
+    sb = b->buffer;
+    if (!(dst = sb->datas[0].data)) { pw_stream_queue_buffer(tab->dstream, b); return; }
+    n = (int)(sb->datas[0].maxsize / (sizeof(float) * 2));
+    if (b->requested && (int)b->requested < n) n = (int)b->requested;
+    if (n > PERIOD_MAX) n = PERIOD_MAX;
+    if (!g_teb_ready) { pehost_thread_init(); g_teb_ready = 1; }
+
+    atomic_fetch_add(&g_direct_busy, 1);                 /* before looking at the park request, which is set before it is read */
+    if (atomic_load(&g_park_req) || !tab->used || !plugview_active(tab->pv) ||
+        !plugview_render_io(tab->pv, NULL, tab->dbuf, n)) {
+        memset(dst, 0, (size_t)n * 2 * sizeof *dst);
+    } else {
+        const float tg = atomic_load_explicit(&tab->tgain, memory_order_relaxed);
+        for (i = 0; i < n * 2; i++) dst[i] = out_soft((double)(tab->dbuf[i] * tg));
+        atomic_fetch_add_explicit(&tab->callbacks, 1, memory_order_relaxed);
+    }
+    atomic_fetch_sub(&g_direct_busy, 1);
+    mixbus_feed_f(tab->dmix, dst, n);                    /* a recording of the mix still has it */
+    sb->datas[0].chunk->offset = 0;
+    sb->datas[0].chunk->stride = sizeof(float) * 2;
+    sb->datas[0].chunk->size = (uint32_t)(n * 2 * sizeof(float));
+    pw_stream_queue_buffer(tab->dstream, b);
+}
+
+static const struct pw_stream_events g_direct_events = { PW_VERSION_STREAM_EVENTS, .process = direct_process };
+
+static void direct_node_name(const synctab *tab, char *out, size_t n)
+{ snprintf(out, n, "studiogtk synth %02d", (int)(tab - g_tabs) + 1); }
+
+static void tab_direct_stop(synctab *tab)
+{
+    atomic_store_explicit(&tab->direct, 0, memory_order_release);     /* the shared mix takes it back first */
+    if (tab->dstream && g_dl_loop) {
+        pw_thread_loop_lock(g_dl_loop);
+        pw_stream_destroy(tab->dstream);                              /* returns once its callback is out */
+        tab->dstream = NULL;
+        pw_thread_loop_unlock(g_dl_loop);
+    }
+    if (tab->dmix >= 0) { mixbus_release(tab->dmix); tab->dmix = -1; }
+}
+
+static int tab_direct_start(synctab *tab)
+{
+    const struct spa_pod *params[1];
+    uint8_t pod[1024];
+    struct spa_pod_builder bb = SPA_POD_BUILDER_INIT(pod, sizeof pod);
+    struct spa_audio_info_raw info;
+    char lat[64], name[48];
+
+    if (tab->dstream) return 0;
+    if (!g_dl_loop) {
+        if (!(g_dl_loop = pw_thread_loop_new("studiogtk synths", NULL))) return -1;
+        if (pw_thread_loop_start(g_dl_loop) < 0) { pw_thread_loop_destroy(g_dl_loop); g_dl_loop = NULL; return -1; }
+    }
+    direct_node_name(tab, name, sizeof name);
+    snprintf(lat, sizeof lat, "%d/%d", g_period, SR);
+    pw_thread_loop_lock(g_dl_loop);
+    tab->dstream = pw_stream_new_simple(pw_thread_loop_get_loop(g_dl_loop), name,
+        pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback",
+                          PW_KEY_MEDIA_ROLE, "Music", PW_KEY_NODE_LATENCY, lat, NULL),
+        &g_direct_events, tab);
+    if (tab->dstream) {
+        spa_zero(info);
+        info.format = SPA_AUDIO_FORMAT_F32;
+        info.rate = SR;
+        info.channels = 2;
+        info.position[0] = SPA_AUDIO_CHANNEL_FL;
+        info.position[1] = SPA_AUDIO_CHANNEL_FR;
+        params[0] = spa_format_audio_raw_build(&bb, SPA_PARAM_EnumFormat, &info);
+        if (pw_stream_connect(tab->dstream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+                              PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+                              PW_STREAM_FLAG_RT_PROCESS, params, 1) < 0) {
+            pw_stream_destroy(tab->dstream);
+            tab->dstream = NULL;
+        }
+    }
+    pw_thread_loop_unlock(g_dl_loop);
+    if (!tab->dstream) return -1;
+    tab->dmix = mixbus_register();
+    atomic_store_explicit(&tab->direct, 1, memory_order_release);     /* now the shared mix leaves it out */
+    return 0;
+}
+
+static const char *connect_pref_path(char *buf, size_t n)
+{
+    const char *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
+    if (x && *x) snprintf(buf, n, "%s/vst-ace/connect", x);
+    else if (h && *h) snprintf(buf, n, "%s/.config/vst-ace/connect", h);
+    else return NULL;
+    return buf;
+}
+
+static int connect_pref_load(void)
+{
+    char path[1100], line[64];
+    FILE *f;
+    int on = 0;
+    if (!connect_pref_path(path, sizeof path) || !(f = fopen(path, "r"))) return 0;
+    while (fgets(line, sizeof line, f)) if (!strncmp(line, "reaper 1", 8)) on = 1;
+    fclose(f);
+    return on;
+}
+
+static void connect_pref_save(int on)
+{
+    char path[1100], tmp[1120], dir[1100], *slash;
+    FILE *f;
+    if (!connect_pref_path(path, sizeof path)) return;
+    snprintf(dir, sizeof dir, "%s", path);
+    if ((slash = strrchr(dir, '/'))) { *slash = 0; g_mkdir_with_parents(dir, 0700); }
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    if (!(f = fopen(tmp, "w"))) return;
+    fprintf(f, "reaper %d\n", on ? 1 : 0);
+    if (fclose(f) != 0 || rename(tmp, path) != 0) g_unlink(tmp);
+}
+
+/* The info line under the REAPER item, rebuilt when its text changes. */
+static void connect_rebuild_menu(void)
+{
+    GMenuItem *info;
+    if (!g_connect_m) return;
+    g_menu_remove_all(g_connect_m);
+    g_menu_append(g_connect_m, "REAPER", "win.connect-reaper");
+    info = g_menu_item_new(g_connect_info, "win.no-connect-info");      /* no such action: shown greyed */
+    g_menu_append_item(g_connect_m, info);
+    g_object_unref(info);
+}
+
+/* Once a second, and when the switch moves: which synths are loaded, in tab
+ * order; their own streams while REAPER is on; the linker told when any of that
+ * changed; the menu shown while there is a synth to connect. */
+static void connect_update(void)
+{
+    rl_synth rs[MAXTABS];
+    synctab *order[MAXTABS];
+    char sig[1024] = "", info[300] = "REAPER: off";
+    int n = 0, i, on = 0;
+    int pages = g_notebook ? gtk_notebook_get_n_pages(GTK_NOTEBOOK(g_notebook)) : 0;
+
+    if (g_reaper_act) {
+        GVariant *st = g_action_get_state(G_ACTION(g_reaper_act));
+        on = st && g_variant_get_boolean(st);
+        if (st) g_variant_unref(st);
+    }
+
+    for (i = 0; i < pages; i++) {
+        synctab *tab = tab_of_page(gtk_notebook_get_nth_page(GTK_NOTEBOOK(g_notebook), i));
+        if (tab && tab->used && plugview_loaded_path(tab->pv)[0] && n < MAXTABS) order[n++] = tab;
+    }
+    for (i = 0; i < MAXTABS; i++) {            /* every tab: its own stream exactly while REAPER is on and it is loaded */
+        synctab *tab = &g_tabs[i];
+        int loaded = 0, k;
+        if (!tab->used) continue;
+        for (k = 0; k < n; k++) if (order[k] == tab) loaded = 1;
+        if (on && loaded && !tab->dstream) tab_direct_start(tab);
+        else if ((!on || !loaded) && tab->dstream) tab_direct_stop(tab);
+    }
+    for (i = 0; i < n; i++) {
+        char node[48];
+        memset(&rs[i], 0, sizeof rs[i]);
+        direct_node_name(order[i], node, sizeof node);
+        snprintf(rs[i].node, sizeof rs[i].node, "%s", node);
+        snprintf(rs[i].alsa_client, sizeof rs[i].alsa_client, "studiogtk");
+        snprintf(rs[i].midi_port, sizeof rs[i].midi_port, "synth %02d", (int)(order[i] - g_tabs) + 1);
+        snprintf(sig + strlen(sig), sizeof sig - strlen(sig), "|%s", node);
+    }
+    if (g_rl) {
+        char sg[1100];
+        snprintf(sg, sizeof sg, "%s%s", on ? "on" : "off", sig);
+        if (strcmp(sg, g_connect_sig)) {
+            snprintf(g_connect_sig, sizeof g_connect_sig, "%s", sg);
+            rl_set(g_rl, rs, n, on);
+        }
+        rl_status(g_rl, info, sizeof info);
+    }
+    if (strcmp(info, g_connect_info)) {
+        snprintf(g_connect_info, sizeof g_connect_info, "%s", info);
+        connect_rebuild_menu();
+    }
+    if ((n > 0) != g_connect_shown) {
+        int cur = g_notebook ? gtk_notebook_get_current_page(GTK_NOTEBOOK(g_notebook)) : -1;
+        g_connect_shown = n > 0;
+        sync_menus(cur >= 0 ? gtk_notebook_get_nth_page(GTK_NOTEBOOK(g_notebook), cur) : NULL);
+    }
+}
+
+static void act_connect_reaper(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    int on = g_variant_get_boolean(v);
+    (void)u;
+    if (on && !g_rl && !(g_rl = rl_open())) {
+        status("could not connect to PipeWire -- REAPER links need it");
+        return;                                  /* the check stays off */
+    }
+    g_simple_action_set_state(a, v);
+    connect_pref_save(on);
+    g_connect_sig[0] = 0;                        /* push the new state at the next look */
+    connect_update();
+}
+
+/* At the end: the tabs' streams and the links go before the tabs are freed. */
+static void connect_shutdown(void)
+{
+    int i;
+    if (g_rl) { rl_close(g_rl); g_rl = NULL; }
+    for (i = 0; i < MAXTABS; i++) if (g_tabs[i].used && g_tabs[i].dstream) tab_direct_stop(&g_tabs[i]);
+    if (g_dl_loop) { pw_thread_loop_stop(g_dl_loop); pw_thread_loop_destroy(g_dl_loop); g_dl_loop = NULL; }
 }
 
 static gboolean on_key(GtkEventControllerKey *c, guint kv, guint kc,
@@ -1390,6 +1670,9 @@ static synctab *add_synth_tab(void)
     atomic_store(&tab->tgain, 1.0f);
     tab->used = 1;
     tab->sink_id = -1;
+    tab->mport = -1;
+    tab->dmix = -1;
+    midi_tab_port_open(tab);
     tab->pv = plugview_new(engine_park, engine_unpark, SR, g_period);
     plugview_scan(tab->pv, NULL);
     tab->pane = kb_wrap(tab, plugview_pane(tab->pv));
@@ -1415,6 +1698,8 @@ static void close_synth_tab(synctab *tab)
      * their ALSA windows. */
     if (g_trk && tab->sink_id >= 0) trk_remove_sink(g_trk, tab->sink_id);
     tab->sink_id = -1;
+    tab_direct_stop(tab);               /* its own stream, if REAPER has it, before the plug-in goes */
+    midi_tab_port_close(tab);
     pthread_mutex_lock(&g_midi_mx);       /* no MIDI event is on its way to this tab after this */
     if (g_front == tab) g_front = NULL;
     pthread_mutex_unlock(&g_midi_mx);
@@ -2438,6 +2723,7 @@ static gboolean watch_tabs(gpointer u)
     int t;
     static int gone;
     (void)u;
+    connect_update();
     /* A JACK server that went away, or a device that cannot be recovered: three
      * looks in a row (an underrun the thread recovers from is not this), then
      * the audio is brought up somewhere else rather than left silent. */
@@ -2648,6 +2934,7 @@ static void sync_menus(GtkWidget *front)
     g_menu_remove_all(g_help_m);
     if (is_tracker) g_menu_append_section(g_help_m, NULL, G_MENU_MODEL(g_help_trk));
     g_menu_append(g_help_m, "About studiogtk", "win.about");
+    if (g_connect_shown && g_connect_m) g_menu_append_submenu(g_bar, "Connect", G_MENU_MODEL(g_connect_m));
     g_menu_append_submenu(g_bar, "Help", G_MENU_MODEL(g_help_m));
 }
 
@@ -3268,6 +3555,7 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "audio-settings", act_audio, NULL, NULL, NULL, {0} },
         { "effect-input", NULL, NULL, "false", act_effect_input, {0} },
         { "record-mix", NULL, NULL, "false", act_record_mix, {0} },
+        { "connect-reaper", NULL, NULL, "false", act_connect_reaper, {0} },
         { "enter-key",   act_enter_key,   NULL, NULL, NULL, {0} },
         { "toggle-editor", act_toggle_editor, NULL, NULL, NULL, {0} },
         { "panic",       act_panic,       NULL, NULL, NULL, {0} },
@@ -3295,6 +3583,10 @@ static GtkWidget *build_menubar(GtkApplication *app)
                                     G_N_ELEMENTS(entries), NULL);
     g_new_tracker_act = G_SIMPLE_ACTION(
         g_action_map_lookup_action(G_ACTION_MAP(g_win), "new-tracker"));
+    g_reaper_act = G_SIMPLE_ACTION(g_action_map_lookup_action(G_ACTION_MAP(g_win), "connect-reaper"));
+    g_connect_m = g_menu_new();
+    snprintf(g_connect_info, sizeof g_connect_info, "REAPER: off");
+    connect_rebuild_menu();
     /* Everything on these menus carries Ctrl: the note keys are plain
      * letters, and a bare shortcut would be a letter that no longer plays. */
     gtk_application_set_accels_for_action(app, "win.new-synth",
@@ -3597,6 +3889,8 @@ static void activate(GtkApplication *app, gpointer ud)
     g_mix_synth = mixbus_register();
     engine_start_audio();
     midi_start();
+    if (connect_pref_load() && !g_rl && (g_rl = rl_open()))       /* Connect > REAPER, as it was left */
+        g_simple_action_set_state(g_reaper_act, g_variant_new_boolean(TRUE));
     if (getenv("STUDIOGTK_EFFECT_INPUT") && effect_input_start() == 0)   /* scripted: the menu item, from the environment */
         fprintf(stderr, "studiogtk: effect input on\n");
     update_canvas();
@@ -3749,6 +4043,7 @@ int main(int argc, char **argv)
         mixbus_stop(f, sizeof f);
         fprintf(stderr, "studiogtk: wrote %s\n", f);
     }
+    connect_shutdown();
     midi_stop();
     effect_input_stop();
     engine_stop_audio();

@@ -44,6 +44,7 @@ extern "C" {
 #include "patch.h"
 #include "sessfile.h"
 #include "recentfiles.h"
+#include "reaperlink.h"
 }
 
 /* The tracker's delivery into a synth tab: the engine's delivery thread calls
@@ -87,6 +88,11 @@ static void sinkDeliver(void *ud, double wall, const trk_sink_ev *evs, int n)
 class SessionShell : public QMainWindow, public HostShell, public TrackerHost {
     Q_OBJECT
 public:
+    /* Said first thing: the tabs are deleted as the window's children, after this
+     * body, and a tab that is still being sent events while it goes must not ask
+     * the half-destroyed tab bar which tab is in front -- see setFrontCheck below. */
+    ~SessionShell() override { closing_ = true; }
+
     SessionShell()
     {
         setWindowTitle("studio -- vst-ace session");
@@ -131,11 +137,25 @@ public:
         file->addSeparator();
         QAction *quit = file->addAction("&Quit", QKeySequence::Quit, this, &QWidget::close);
 
+        /* Connect: the loaded synths to other programs. REAPER first: with it on,
+         * the studio links each synth to REAPER's inputs and outputs in the
+         * PipeWire graph as REAPER appears -- see reaperlink.h. Only there while
+         * there is a synth loaded to connect. */
+        connectMenu_ = menuBar()->addMenu("&Connect");
+        reaperAct_ = connectMenu_->addAction("&REAPER");
+        reaperAct_->setCheckable(true);
+        reaperAct_->setToolTip("Link the loaded synths to REAPER: each synth's audio to a pair of REAPER's inputs, "
+                               "and a REAPER MIDI output to each synth, in tab order");
+        connectInfo_ = connectMenu_->addAction("REAPER: off");
+        connectInfo_->setEnabled(false);
+        connectMenu_->menuAction()->setVisible(false);
+        connect(reaperAct_, &QAction::toggled, this, &SessionShell::reaperToggled);
+
         QMenu *help = menuBar()->addMenu("&Help");
         helpAnchor_ = help->addAction("&About studio", this, &SessionShell::about);
         fileMenu_ = file;
         helpMenu_ = help;
-        shellMenus_ << file << help;
+        shellMenus_ << file << connectMenu_ << help;
 
         /* No tabs at start: the canvas opens blank, with the way in said on
          * it. The stack is the hint page until the first tab exists. */
@@ -170,6 +190,7 @@ public:
         watch->start(1000);
 
         statusBar()->showMessage("open a synth or the tracker from the File menu", 0);
+        if (loadReaperPref()) reaperAct_->setChecked(true);      /* kept from last time */
     }
 
     /* The command line's session: each --synth a tab, --tracker the tracker,
@@ -726,6 +747,7 @@ protected:
          * exactly as closing its tab does. */
         if (tracker_ && !tracker_->confirmClose()) { e->ignore(); return; }
         if (MixBus::instance().active()) stopMixRecord(false);      /* the take is finished, not lost */
+        if (rl_) { rl_close(rl_); rl_ = nullptr; }                  /* the links it made go with it */
         /* --save-session writes here, on the clean exit: the song question
          * above has been answered by now, so what gets written is what the
          * answer left behind. */
@@ -765,7 +787,7 @@ private:
         /* Whether this tab answers the computer keyboard is read at each key
          * from where the tab bar is now, not from a flag set on tab changes:
          * see HostWidget::setFrontCheck. */
-        h->setFrontCheck([this, h] { return tabs_ && tabs_->currentWidget() == h; });
+        h->setFrontCheck([this, h] { return !closing_ && tabs_ && tabs_->currentWidget() == h; });
 
         const int ix = tabs_->addTab(h, title.isEmpty() ? QString("synth") : title);
         /* Which plug-in is loaded, on the tab. HostWidget sets its widget
@@ -1383,8 +1405,75 @@ private:
      * says so on its face until it is reloaded; every tab's tooltip says what
      * its audio is doing, from the engine's callback counter against the
      * ~187.5 blocks a second a 256-frame quantum at 48 kHz should be making. */
+    /* Connect > REAPER. The choice is kept between runs, in the same folder as
+     * the audio choice. */
+    static QString connectPrefPath()
+    {
+        const QByteArray x = qgetenv("XDG_CONFIG_HOME");
+        const QString base = x.isEmpty() ? QDir::homePath() + "/.config" : QString::fromLocal8Bit(x);
+        return base + "/vst-ace/connect";
+    }
+    static bool loadReaperPref()
+    {
+        QFile f(connectPrefPath());
+        return f.open(QIODevice::ReadOnly) && QString::fromUtf8(f.readAll()).contains("reaper 1");
+    }
+    static void saveReaperPref(bool on)
+    {
+        QDir().mkpath(QFileInfo(connectPrefPath()).absolutePath());
+        QSaveFile f(connectPrefPath());
+        if (f.open(QIODevice::WriteOnly)) { f.write(on ? "reaper 1\n" : "reaper 0\n"); f.commit(); }
+    }
+
+    void reaperToggled(bool on)
+    {
+        if (on && !rl_) {
+            rl_ = rl_open();
+            if (!rl_) {
+                statusBar()->showMessage("could not connect to PipeWire -- REAPER links need it", 0);
+                reaperAct_->blockSignals(true);
+                reaperAct_->setChecked(false);
+                reaperAct_->blockSignals(false);
+                return;
+            }
+        }
+        saveReaperPref(on);
+        connectSig_.clear();                 /* push the new state at the next look */
+        updateConnect();
+    }
+
+    /* The loaded synths, in tab order, to the linker -- when they or the switch
+     * have changed -- and its one-line status to the menu. */
+    void updateConnect()
+    {
+        QList<QPair<QByteArray, QString>> synths;
+        for (int i = 0; i < tabs_->count(); i++) {
+            auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
+            if (h && !h->loadedPath().isEmpty()) synths.append({ h->graphNodeName(), h->midiClientName() });
+        }
+        connectMenu_->menuAction()->setVisible(!synths.isEmpty());
+        if (!rl_) return;
+        QString sig = reaperAct_->isChecked() ? "on" : "off";
+        for (const auto &s : synths) sig += "|" + QString::fromUtf8(s.first) + "/" + s.second;
+        if (sig != connectSig_) {
+            connectSig_ = sig;
+            rl_synth rs[32];
+            const int n = std::min<int>(synths.size(), 32);
+            for (int i = 0; i < n; i++) {
+                memset(&rs[i], 0, sizeof rs[i]);
+                snprintf(rs[i].node, sizeof rs[i].node, "%s", synths[i].first.constData());
+                snprintf(rs[i].alsa_client, sizeof rs[i].alsa_client, "%s", synths[i].second.toUtf8().constData());
+            }
+            rl_set(rl_, rs, n, reaperAct_->isChecked());
+        }
+        char st[300];
+        rl_status(rl_, st, sizeof st);
+        connectInfo_->setText(QString::fromUtf8(st));
+    }
+
     void watchTabs()
     {
+        updateConnect();
         for (int i = 0; i < tabs_->count(); i++) {
             auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
             if (!h) continue;
@@ -1749,6 +1838,11 @@ private:
     QLabel         *hint_ = nullptr;
     QAction        *newTracker_ = nullptr;
     QMenu          *recentMenu_ = nullptr;
+    bool            closing_ = false;           /* the window is being destroyed */
+    QMenu          *connectMenu_ = nullptr;   /* Connect > REAPER */
+    QAction        *reaperAct_ = nullptr, *connectInfo_ = nullptr;
+    rl             *rl_ = nullptr;
+    QString         connectSig_;                /* what the linker was last told */
     QAction        *mixAct_ = nullptr;      /* File > Record studio mix */
     QLabel         *mixLabel_ = nullptr;
     QTimer         *mixTimer_ = nullptr;

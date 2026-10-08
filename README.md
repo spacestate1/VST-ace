@@ -106,6 +106,20 @@ take with the window and `--play` starts the song. A synth tab's own **Record**
 button still records that tab alone. Not captured: tracks routed to an outside
 ALSA program, which make their sound somewhere this program cannot hear.
 
+**Connect > REAPER** (both shells, shown while a synth is loaded): switch it on and
+the studio links each loaded synth to REAPER in the PipeWire graph, as REAPER and
+the synths appear -- synth 1's stereo output to REAPER's audio inputs 1 and 2,
+synth 2's to 3 and 4, and so on in tab order, and REAPER's first MIDI output to
+synth 1's MIDI input, the second to synth 2's. Links go when it is switched off or
+the studio closes, and the choice is kept. In the GTK shell each synth gets its own
+stream and MIDI port ("studiogtk synth 01") while this is on, so REAPER can take
+them one by one. Start REAPER through pipewire-jack (`pw-jack reaper`) so that its
+inputs are in the graph, and add input channels in REAPER's audio preferences for
+more than one synth. REAPER's MIDI outputs are linked once they appear in the graph;
+otherwise the studio's MIDI port ("pestudio in", "studiogtk synth 01") should be
+listed in REAPER's MIDI device preferences, to enable as an output (not tried with
+REAPER itself; the links above were checked against REAPER for audio only).
+
 ## In a DAW
 
 The hosts above are programs you run. The same loaders are also a Linux VST2

@@ -68,13 +68,13 @@ if(Qt6_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../peload peload-build EXCLUDE_FROM_ALL)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tracker tracker-build EXCLUDE_FROM_ALL)
 
-  add_executable(studio qt/main.cpp sessfile.c recentfiles.c
+  add_executable(studio qt/main.cpp sessfile.c recentfiles.c reaperlink.c
                  ${CMAKE_CURRENT_SOURCE_DIR}/../tracker/qt/trackerwidget.h)
   target_include_directories(studio PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}
       ${CMAKE_CURRENT_SOURCE_DIR}/../peload/qtgui
       ${CMAKE_CURRENT_SOURCE_DIR}/../tracker/qt)
-  target_link_libraries(studio PRIVATE qthost trkcore Qt6::Widgets)
+  target_link_libraries(studio PRIVATE qthost trkcore Qt6::Widgets PkgConfig::PIPEWIRE)
 else()
   message(STATUS "studio skipped (needs Qt6Widgets, libpipewire-0.3 and alsa)")
 endif()
@@ -88,7 +88,7 @@ pkg_check_modules(GTK4 IMPORTED_TARGET gtk4)
 pkg_check_modules(X11 IMPORTED_TARGET x11)
 if(GTK4_FOUND AND X11_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND AND TARGET trkgtk)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../gui gui-build EXCLUDE_FROM_ALL)
-  add_executable(studiogtk gtk/main.c sessfile.c recentfiles.c mixbus.c)
+  add_executable(studiogtk gtk/main.c sessfile.c recentfiles.c mixbus.c reaperlink.c)
   target_include_directories(studiogtk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(studiogtk PRIVATE gtkhost trkgtk audioout
       PkgConfig::PIPEWIRE PkgConfig::ALSA m pthread)
