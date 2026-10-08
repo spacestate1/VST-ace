@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <time.h>
 #include <thread>
@@ -1338,6 +1339,16 @@ protected:
         g.fillRect(rect(), QColor(24, 24, 28));
         const int hi = highestNote();
         int wi = 0;
+        // The labels' fonts are the same for every key -- the keys are one width --
+        // so they are made once for the draw, not a font and its metrics per key.
+        QFont whiteFont = g.font(), blackFont = g.font();
+        {
+            const int kw = whiteRect(0).width();
+            whiteFont.setPointSizeF(qBound(6.0, kw * 0.30, 10.0));
+            blackFont.setPointSizeF(qBound(5.5, (kw / 2) * 0.46, 9.0));
+        }
+        const QFontMetrics whiteMetrics(whiteFont);
+        g.setFont(whiteFont);
         // white keys first
         for (int n = kLow; n <= hi; n++) {
             const int i = n - kLow;
@@ -1349,15 +1360,13 @@ protected:
             /* Every key named, not just the Cs. The octave is dropped when the
              * key is too narrow to hold it -- a truncated "C" is still the note,
              * a truncated "C4" is a lie about which one. */
-            QFont f = g.font();
-            f.setPointSizeF(qBound(6.0, r.width() * 0.30, 10.0));
-            g.setFont(f);
-            const bool room = QFontMetrics(f).horizontalAdvance(noteName(n)) <= r.width() - 4;
+            const bool room = whiteMetrics.horizontalAdvance(noteName(n)) <= r.width() - 4;
             g.setPen(n % 12 == 0 ? QColor(70, 70, 80) : QColor(130, 130, 140));
             g.drawText(r.adjusted(1, 0, -1, -3), Qt::AlignBottom | Qt::AlignHCenter,
                        noteName(n, room));
         }
         // black keys on top
+        g.setFont(blackFont);
         wi = 0;
         for (int n = kLow; n <= hi; n++) {
             const int i = n - kLow;
@@ -1371,9 +1380,6 @@ protected:
                 /* Black keys carry the accidental only. At half a white key
                  * wide there is no room for the octave, and the neighbouring
                  * white key already says which one it is. */
-                QFont f = g.font();
-                f.setPointSizeF(qBound(5.5, b.width() * 0.46, 9.0));
-                g.setFont(f);
                 g.setPen(QColor(190, 190, 200));
                 g.drawText(b.adjusted(0, 0, 0, -3), Qt::AlignBottom | Qt::AlignHCenter,
                            noteName(kLow + i + 1, false));
@@ -1766,6 +1772,7 @@ public:
         beginResetModel();
         host_ = h;
         rows_ = h ? pehost_num_params(h) : 0;
+        seen_.clear();
         endResetModel();
     }
 
@@ -1819,23 +1826,41 @@ public:
     {
         if (!host_ || !ix.isValid() || role != Qt::UserRole) return false;
         pehost_set_param(host_, ix.row(), float(v.toDouble()));
+        if (ix.row() < seen_.size()) seen_[ix.row()] = float(v.toDouble());
         emit dataChanged(index(ix.row(), ColValue), index(ix.row(), ColDisplay));
         return true;
     }
 
-    /* Repaint a span without touching the plugin for rows nobody can see. */
+    /* Repaint the rows of a span whose value has changed -- not the whole span
+     * at every poll, which had the view ask the plug-in for each row's display
+     * string twelve times a second whether anything had moved or not. The value
+     * is the cheap thing to ask; a plug-in's display follows it. */
     void refresh(int first, int last)
     {
-        if (rows_ <= 0) return;
+        if (rows_ <= 0 || !host_) return;
         first = qBound(0, first, rows_ - 1);
         last  = qBound(0, last,  rows_ - 1);
         if (last < first) return;
-        emit dataChanged(index(first, ColValue), index(last, ColDisplay));
+        if (seen_.size() != rows_) seen_.fill(std::numeric_limits<float>::quiet_NaN(), rows_);
+        int run = -1;
+        for (int r = first; r <= last + 1; r++) {
+            bool changed = false;
+            if (r <= last) {
+                const float v = pehost_get_param(host_, r);
+                if (!(v == seen_[r])) { seen_[r] = v; changed = true; }    /* NaN: never seen */
+            }
+            if (changed && run < 0) run = r;
+            if (!changed && run >= 0) {
+                emit dataChanged(index(run, ColValue), index(r - 1, ColDisplay));
+                run = -1;
+            }
+        }
     }
 
 private:
     pehost *host_ = nullptr;
     int     rows_ = 0;
+    QVector<float> seen_;     /* each row's value as last drawn; empty to draw all */
 };
 
 /* Draws the value column as a bar. */
@@ -2561,6 +2586,13 @@ private:
         }
         if (!reported_) { reported_ = true;
             fprintf(stderr, "pestudio: editor pixels %dx%d\n", w, h); fflush(stderr); }
+        /* Nothing to draw into while the tab is not showing, and nothing to draw
+         * when the plug-in has not painted since the last look: the copy and the
+         * repaint are for a frame that is new. The pump above ran regardless. */
+        if (!isVisible()) return;
+        if (!img_.isNull() && img_.width() == w && img_.height() == h && img_.bytesPerLine() == w * 4 &&
+            memcmp(img_.constBits(), px, size_t(w) * size_t(h) * 4) == 0)
+            return;
         /* The buffer is 32-bit BGRX top-down, which is exactly Format_RGB32 on a
          * little-endian machine, so this wraps rather than converts. */
         img_ = QImage(reinterpret_cast<const uchar *>(px), w, h,
@@ -4660,7 +4692,7 @@ private:
          * entry into a plugin that is already running. The level meter above
          * touches nothing of the plugin's, so it still updates. */
         if (g_inPlugin) return;
-        refreshVisible();
+        if (paramTable_ && paramTable_->isVisible()) refreshVisible();      /* nobody sees a hidden table */
 
         /* Follow the transport rather than assume it. Once a sequencer's clock is
          * driving the tempo, the box shows what it is doing instead of what

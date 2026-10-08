@@ -545,23 +545,39 @@ static const char *kb_name(int n, int with_octave, char *buf, size_t bufn)
 }
 
 /* Centred on the key, sitting on `bottom`. */
+/* One layout for every key label, made once and moved onto each draw's cairo
+ * context: a keyboard has fifty-odd labels and is redrawn at every key, and
+ * building a layout and a font description for each was most of the draw. */
+static PangoLayout *g_kb_layout;
+static double       g_kb_size;
+
+static void kb_label_free(void)
+{
+    if (g_kb_layout) { g_object_unref(g_kb_layout); g_kb_layout = NULL; }
+}
+
 static void kb_label(cairo_t *cr, const char *text, double cx, double bottom, double size)
 {
-    PangoLayout *l = pango_cairo_create_layout(cr);
-    PangoFontDescription *fd = pango_font_description_from_string("sans");
+    PangoLayout *l;
     int tw, th;
+    if (!g_kb_layout) { g_kb_layout = pango_cairo_create_layout(cr); g_kb_size = 0; }
+    l = g_kb_layout;
+    pango_cairo_update_layout(cr, l);
     /* Pango rather than cairo's toy text API, which has no font fallback and
      * draws the sharp sign as a missing-glyph box. */
-    pango_font_description_set_absolute_size(fd, size * PANGO_SCALE);
-    pango_layout_set_font_description(l, fd);
+    if (size != g_kb_size) {
+        PangoFontDescription *fd = pango_font_description_from_string("sans");
+        pango_font_description_set_absolute_size(fd, size * PANGO_SCALE);
+        pango_layout_set_font_description(l, fd);
+        pango_font_description_free(fd);
+        g_kb_size = size;
+    }
     pango_layout_set_text(l, text, -1);
     pango_layout_get_pixel_size(l, &tw, &th);
     /* `bottom` is the text's baseline in the old code; the layout's own
      * baseline is what it is aligned to now. */
     cairo_move_to(cr, cx - tw / 2.0, bottom - pango_layout_get_baseline(l) / (double)PANGO_SCALE);
     pango_cairo_show_layout(cr, l);
-    pango_font_description_free(fd);
-    g_object_unref(l);
     (void)th;
 }
 
@@ -1512,6 +1528,8 @@ static void sink_deliver(void *ud, double wall, const trk_sink_ev *evs, int n)
 }
 
 /* Redraw a tab's keyboard when the tracker has moved a key on it. */
+static guint g_kb_poll_id;          /* the poll runs only while a tracker is there to play keys */
+
 static gboolean kb_poll(gpointer u)
 {
     int t;
@@ -1767,6 +1785,7 @@ static int open_tracker_tab(void)
         status(msg);
         return 0;
     }
+    if (!g_kb_poll_id) g_kb_poll_id = g_timeout_add(40, kb_poll, NULL);   /* keys the tracker is playing */
     if (g_mix_trk < 0) g_mix_trk = mixbus_register();
     trk_set_tap(g_trk, tracker_tap, (void *)(intptr_t)g_mix_trk);
     g_tracker = trk_view_new(g_trk);
@@ -1802,6 +1821,7 @@ static void tracker_close_ok(void *ud)
     trk_view_free(g_tracker);
     g_tracker = NULL;
     g_tracker_page = NULL;
+    if (g_kb_poll_id) { g_source_remove(g_kb_poll_id); g_kb_poll_id = 0; }
     trk_set_tap(g_trk, NULL, NULL);     /* returns once no call is in flight */
     mixbus_release(g_mix_trk);
     g_mix_trk = -1;
@@ -3895,7 +3915,7 @@ static void activate(GtkApplication *app, gpointer ud)
         fprintf(stderr, "studiogtk: effect input on\n");
     update_canvas();
     g_timeout_add(1000, watch_tabs, NULL);
-    g_timeout_add(40, kb_poll, NULL);          /* keys the tracker is playing */
+    /* (the keys the tracker is playing are polled from open_tracker_tab on) */
 
     if (g_want_session[0]) open_session_path(g_want_session);
 
@@ -4044,6 +4064,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "studiogtk: wrote %s\n", f);
     }
     connect_shutdown();
+    kb_label_free();
     midi_stop();
     effect_input_stop();
     engine_stop_audio();

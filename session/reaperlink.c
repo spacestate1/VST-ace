@@ -9,7 +9,6 @@
 #include <string.h>
 #include <strings.h>
 
-#define MAXN 512
 #define MAXSYN 32
 
 typedef struct { uint32_t id; char name[128], app[128], bin[64]; } rnode;
@@ -29,15 +28,30 @@ struct rl {
     struct pw_registry    *reg;
     struct spa_hook        core_l, reg_l;
     struct spa_source     *timer;
-    rnode  nodes[MAXN];  int nn;
-    rport  ports[MAXN * 2]; int np;
-    rlink  links[MAXN * 2]; int nl;
-    made  *mine[MAXN];   int nm;            /* heap-allocated: the hook inside is a list node */
+    /* Everything the graph holds, growing as it does -- a studio with many
+     * streams and a REAPER with many channels is a big graph, and one that
+     * outgrew a fixed table would silently stop being linked. */
+    rnode *nodes;  int nn, cn;
+    rport *ports;  int np, cp;
+    rlink *links;  int nl, cl;
+    made **mine;   int nm, cm;              /* each heap-allocated: the hook inside is a list node */
     rl_synth syn[MAXSYN]; int nsyn;
     int    enabled, dirty;
     int    reaper_nodes, linked_audio, linked_midi;
     char   status[200];
 };
+
+/* Room for one more of whatever `*arr` holds. */
+static int grow(void **arr, int *cap, int n, size_t sz)
+{
+    void *g;
+    if (n < *cap) return 1;
+    g = realloc(*arr, (size_t)(*cap ? *cap * 2 : 64) * sz);
+    if (!g) return 0;
+    *arr = g;
+    *cap = *cap ? *cap * 2 : 64;
+    return 1;
+}
 
 static int icontains(const char *hay, const char *needle)
 {
@@ -58,7 +72,7 @@ static void reg_global(void *d, uint32_t id, uint32_t perm, const char *type, ui
     const char *v;
     (void)perm; (void)ver;
     if (!props) return;
-    if (!strcmp(type, PW_TYPE_INTERFACE_Node) && r->nn < MAXN) {
+    if (!strcmp(type, PW_TYPE_INTERFACE_Node) && grow((void **)&r->nodes, &r->cn, r->nn, sizeof *r->nodes)) {
         rnode *n = &r->nodes[r->nn++];
         memset(n, 0, sizeof *n);
         n->id = id;
@@ -66,7 +80,7 @@ static void reg_global(void *d, uint32_t id, uint32_t perm, const char *type, ui
         if ((v = spa_dict_lookup(props, PW_KEY_APP_NAME)))             snprintf(n->app, sizeof n->app, "%s", v);
         if ((v = spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY)))   snprintf(n->bin, sizeof n->bin, "%s", v);
         r->dirty = 1;
-    } else if (!strcmp(type, PW_TYPE_INTERFACE_Port) && r->np < MAXN * 2) {
+    } else if (!strcmp(type, PW_TYPE_INTERFACE_Port) && grow((void **)&r->ports, &r->cp, r->np, sizeof *r->ports)) {
         rport *p = &r->ports[r->np++];
         memset(p, 0, sizeof *p);
         p->id = id;
@@ -79,7 +93,7 @@ static void reg_global(void *d, uint32_t id, uint32_t perm, const char *type, ui
             p->audio = icontains(v, "audio");
         }
         r->dirty = 1;
-    } else if (!strcmp(type, PW_TYPE_INTERFACE_Link) && r->nl < MAXN * 2) {
+    } else if (!strcmp(type, PW_TYPE_INTERFACE_Link) && grow((void **)&r->links, &r->cl, r->nl, sizeof *r->links)) {
         rlink *l = &r->links[r->nl++];
         l->id = id;
         l->out = (v = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_PORT)) ? (uint32_t)atoi(v) : 0;
@@ -108,9 +122,11 @@ static const rnode *node_of(rl *r, uint32_t id)
     return NULL;
 }
 
+/* REAPER, and not anything with the word in its name: the node is called REAPER
+ * (a JACK client), or it belongs to an application or binary called reaper. */
 static int is_reaper_node(const rnode *n)
 {
-    return icontains(n->name, "reaper") || icontains(n->app, "reaper") || icontains(n->bin, "reaper");
+    return !strcasecmp(n->name, "reaper") || !strcasecmp(n->app, "reaper") || !strcasecmp(n->bin, "reaper");
 }
 
 /* Ports in a stable order -- by name, numbers compared as numbers, so in2 comes
@@ -151,7 +167,7 @@ static void make_link(rl *r, uint32_t out, uint32_t in)
     struct pw_proxy *px;
     made *m;
     char a[24], b[24];
-    if (r->nm >= MAXN || !(m = calloc(1, sizeof *m))) return;
+    if (!grow((void **)&r->mine, &r->cm, r->nm, sizeof *r->mine) || !(m = calloc(1, sizeof *m))) return;
     snprintf(a, sizeof a, "%u", out);
     snprintf(b, sizeof b, "%u", in);
     p = pw_properties_new(PW_KEY_LINK_OUTPUT_PORT, a, PW_KEY_LINK_INPUT_PORT, b,
@@ -198,9 +214,9 @@ static void remove_mine(rl *r, int keep_desired, const uint32_t *want_out, const
  * no longer should. On the loop's thread. */
 static void reconcile(rl *r)
 {
-    uint32_t wo[MAXN], wi[MAXN];
+    uint32_t *wo = NULL, *wi = NULL;
     int nw = 0, i, s;
-    rport *rin[64], *rmidi[32];
+    rport **rin = NULL, **rmidi = NULL;
     int nrin = 0, nrmidi = 0, found = 0;
     uint32_t anode = 0;                     /* the one REAPER node whose inputs are used */
 
@@ -211,6 +227,12 @@ static void reconcile(rl *r)
 
     for (i = 0; i < r->nn; i++) if (is_reaper_node(&r->nodes[i])) found++;
     r->reaper_nodes = found;
+
+    wo = malloc(sizeof *wo * (size_t)(r->nsyn * 4 + 4));
+    wi = malloc(sizeof *wi * (size_t)(r->nsyn * 4 + 4));
+    rin = malloc(sizeof *rin * (size_t)(r->np + 1));
+    rmidi = malloc(sizeof *rmidi * (size_t)(r->np + 1));
+    if (!wo || !wi || !rin || !rmidi) goto done;
 
     /* REAPER's audio inputs, and its MIDI outputs wherever they are: on a JACK
      * client called REAPER, or on the Midi-Bridge as a REAPER ALSA port. */
@@ -226,8 +248,8 @@ static void reconcile(rl *r)
         rport *p = &r->ports[i];
         const rnode *n = node_of(r, p->node);
         if (!n) continue;
-        if (anode && p->node == anode && p->audio && !p->dir_out && nrin < 64) rin[nrin++] = p;
-        if (p->midi && p->dir_out && nrmidi < 32 && (is_reaper_node(n) || istarts(p->name, "reaper"))) rmidi[nrmidi++] = p;
+        if (anode && p->node == anode && p->audio && !p->dir_out) rin[nrin++] = p;
+        if (p->midi && p->dir_out && (is_reaper_node(n) || istarts(p->name, "reaper:"))) rmidi[nrmidi++] = p;
     }
     qsort(rin, (size_t)nrin, sizeof rin[0], port_cmp);
     qsort(rmidi, (size_t)nrmidi, sizeof rmidi[0], port_cmp);
@@ -243,14 +265,14 @@ static void reconcile(rl *r)
             else if (!strcasecmp(p->chan, "FR") && !out[1]) out[1] = p;
         }
         for (i = 0; i < 2; i++)
-            if (out[i] && 2 * s + i < nrin && nw < MAXN) { wo[nw] = out[i]->id; wi[nw] = rin[2 * s + i]->id; nw++; r->linked_audio += 1; }
+            if (out[i] && 2 * s + i < nrin) { wo[nw] = out[i]->id; wi[nw] = rin[2 * s + i]->id; nw++; r->linked_audio += 1; }
         if (r->syn[s].alsa_client[0] && s < nrmidi) {
             snprintf(prefix, sizeof prefix, "%s:", r->syn[s].alsa_client);   /* "name: port" or "name:port", by the bridge's mood */
             for (i = 0; i < r->np; i++) {
                 rport *p = &r->ports[i];
                 if (p->midi && !p->dir_out && istarts(p->name, prefix) && icontains(p->name, "(playback)") &&
                     (!r->syn[s].midi_port[0] || icontains(p->name, r->syn[s].midi_port))) {
-                    if (nw < MAXN) { wo[nw] = rmidi[s]->id; wi[nw] = p->id; nw++; r->linked_midi++; }
+                    wo[nw] = rmidi[s]->id; wi[nw] = p->id; nw++; r->linked_midi++;
                     break;
                 }
             }
@@ -260,6 +282,8 @@ static void reconcile(rl *r)
     remove_mine(r, 1, wo, wi, nw);
     for (i = 0; i < nw; i++)
         if (!exists(r, wo[i], wi[i]) && !ours(r, wo[i], wi[i])) make_link(r, wo[i], wi[i]);
+done:
+    free(wo); free(wi); free(rin); free(rmidi);
 }
 
 static void on_timer(void *d, uint64_t exp)
@@ -322,6 +346,7 @@ void rl_close(rl *r)
     if (r->core) pw_core_disconnect(r->core);
     if (r->ctx) pw_context_destroy(r->ctx);
     if (r->loop) pw_thread_loop_destroy(r->loop);
+    free(r->nodes); free(r->ports); free(r->links); free(r->mine);
     free(r);
 }
 

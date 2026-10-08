@@ -898,7 +898,9 @@ static void xrun_note(trk_engine *e, double *said, const char *why)
 {
     const unsigned n = atomic_fetch_add_explicit(&e->xruns, 1, memory_order_relaxed) + 1;
     const double t = mono_now();
-    if (n <= 40 || t - *said >= 1.0) {
+    /* A write to stderr from the audio thread can itself stall it, so: the first
+     * few, then one in ten seconds. The count is what the windows show. */
+    if (n <= 3 || t - *said >= 10.0) {
         fprintf(stderr, "trk: sample output dropout #%u at %.3f s (%s)\n", n, t, why);
         *said = t;
     }
@@ -1383,7 +1385,7 @@ static int audio_open(trk_engine *e)
 static void *recover_main(void *ud)
 {
     trk_engine *e = ud;
-    int attempt;
+    int attempt, gave_up = 0;
     for (attempt = 0; attempt < 20 && !atomic_load(&e->closing); attempt++) {
         struct timespec ts = { 0, 0 };
         int r = -1;
@@ -1398,7 +1400,16 @@ static void *recover_main(void *ud)
         r = audio_open_l(e);
         pthread_mutex_unlock(&e->amx);
         fprintf(stderr, "trk: sample output reopened after losing PipeWire: %s\n", e->audio_msg);
-        if (r == 0) break;
+        if (r == 0) { gave_up = 0; break; }
+        gave_up = 1;
+    }
+    if (gave_up && !atomic_load(&e->closing)) {
+        /* Said where the user looks: the Audio output window and the status line. */
+        pthread_mutex_lock(&e->amx);
+        snprintf(e->audio_msg, sizeof e->audio_msg,
+                 "sample output lost and it would not come back -- choose it again in Audio output");
+        pthread_mutex_unlock(&e->amx);
+        fprintf(stderr, "trk: %s\n", e->audio_msg);
     }
     pthread_mutex_lock(&e->rmx);
     e->rrunning = 0;
