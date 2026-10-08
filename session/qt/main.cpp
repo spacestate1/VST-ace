@@ -43,6 +43,7 @@ extern "C" {
 #include "version.h"
 #include "patch.h"
 #include "sessfile.h"
+#include "recentfiles.h"
 }
 
 /* The tracker's delivery into a synth tab: the engine's delivery thread calls
@@ -51,6 +52,18 @@ extern "C" {
  * wall-clock time. Never blocks, never calls back into the tracker -- the
  * delivery lock is held while this runs. */
 struct SinkCtx { Engine *eng; HostWidget *tab; };
+
+/* The tracker's fader for a track alone on this synth: the tab's output gain. */
+static void sinkGain(void *ud, double g)
+{
+    static_cast<SinkCtx *>(ud)->eng->trackGain_.store(float(g), std::memory_order_relaxed);
+}
+
+/* The tracker's sample tracks on the studio mix bus (File > Record studio mix). */
+static void trackerTap(void *ud, const double *x, int frames)
+{
+    MixBus::instance().feed(int(intptr_t(ud)), x, frames);
+}
 
 static void sinkDeliver(void *ud, double wall, const trk_sink_ev *evs, int n)
 {
@@ -86,6 +99,10 @@ public:
         file->addAction("New &synth...", this, &SessionShell::newSynth);
         newTracker_ = file->addAction("New &tracker", this, &SessionShell::newTracker);
         openSongAct_ = file->addAction("&Open song...", this, &SessionShell::openSong);
+        /* Open Recent: songs and sessions, from the list the GTK shell keeps too.
+         * Built when the menu is about to show, so it is always current. */
+        recentMenu_ = file->addMenu("Open &Recent");
+        connect(recentMenu_, &QMenu::aboutToShow, this, &SessionShell::fillRecent);
         /* Where a tab's own File items go -- see attributeMenus. */
         fileAnchor_ = file->addSeparator();
         file->addAction("Op&en session...", this, &SessionShell::openSession);
@@ -100,6 +117,17 @@ public:
         file->addAction("&Plug-ins...", this, &SessionShell::pluginManager);
         file->addAction("Plug-in &folders...", this, &SessionShell::pluginFolders);
         file->addAction("&Audio output...", this, &SessionShell::audioSettings);
+        file->addSeparator();
+        /* One take of everything the studio plays: every synth tab and the
+         * tracker's sample tracks, mixed. The tabs' own Record buttons take
+         * one tab alone. */
+        mixAct_ = file->addAction("Record studio &mix", QKeySequence("Ctrl+Shift+R"), this,
+                                  &SessionShell::toggleMixRecord);
+        mixLabel_ = new QLabel;
+        mixLabel_->setStyleSheet("color: #d04040; font-weight: bold;");
+        statusBar()->addPermanentWidget(mixLabel_);
+        mixTimer_ = new QTimer(this);
+        connect(mixTimer_, &QTimer::timeout, this, &SessionShell::tickMixRecord);
         file->addSeparator();
         QAction *quit = file->addAction("&Quit", QKeySequence::Quit, this, &QWidget::close);
 
@@ -158,7 +186,33 @@ public:
         /* openPath tells the host -- songOpened below -- so the tracker
          * tab's own File > Open takes the same road as this one. */
         TrackerWidget *t = addTrackerTab();
-        return t && t->openPath(path);
+        const bool ok = t && t->openPath(path);
+        if (ok) recent_add("song", QFileInfo(path).absoluteFilePath().toLocal8Bit().constData());
+        return ok;
+    }
+
+    /* File > Open Recent. */
+    void fillRecent()
+    {
+        recentMenu_->clear();
+        recent_item items[RECENT_SHOWN];
+        const int n = recent_list(items, RECENT_SHOWN);
+        for (int i = 0; i < n; i++) {
+            const QString path = QString::fromLocal8Bit(items[i].path);
+            const bool session = !strcmp(items[i].kind, "session");
+            const QFileInfo fi(path);
+            QAction *a = recentMenu_->addAction(
+                QString("%1%2  \u2014  %3").arg(fi.fileName(), session ? " (session)" : "",
+                                              fi.absolutePath()).replace('&', "&&"));
+            a->setToolTip(path);
+            connect(a, &QAction::triggered, this, [this, path, session] {
+                if (session) openSessionPath(path); else openSongPath(path);
+            });
+        }
+        if (!n) recentMenu_->addAction("(nothing yet)")->setEnabled(false);
+        recentMenu_->addSeparator();
+        QAction *clear = recentMenu_->addAction("Clear Recent", this, [] { recent_clear(); });
+        clear->setEnabled(n > 0);
     }
     int tabCount() const { return tabs_->count(); }
 
@@ -180,6 +234,7 @@ public:
             fflush(stderr);
             return false;
         }
+        recent_add("session", QFileInfo(path).absoluteFilePath().toLocal8Bit().constData());
         /* A session names the plug-ins to load, and loading one runs it: a
          * file somebody sent is not to choose what runs. The ones in folders
          * set up for this program go ahead; any other is asked about. */
@@ -544,8 +599,18 @@ public:
     }
     /* A song was loaded -- the shell's Open, the tracker tab's own, or the
      * command line -- so the synths its sink lines name come back too. */
-    void songOpened() override { reopenSongSynths(); restoreSongSounds(); }
-    void songSaved(const QString &path) override { saveSongSounds(path); }
+    void songOpened() override
+    {
+        reopenSongSynths();
+        restoreSongSounds();
+        if (tracker_ && !tracker_->songPath().isEmpty())     /* the tracker's own Open too */
+            recent_add("song", QFileInfo(tracker_->songPath()).absoluteFilePath().toLocal8Bit().constData());
+    }
+    void songSaved(const QString &path) override
+    {
+        saveSongSounds(path);
+        recent_add("song", QFileInfo(path).absoluteFilePath().toLocal8Bit().constData());
+    }
 
     /* The sounds a song's synths were on. The song file is plain text for the
      * tracks and cells; what each synth was playing is a patch, and a patch is
@@ -632,6 +697,16 @@ public:
             const QString sink = QString::fromUtf8(r.sink ? r.sink : "");
             for (const SinkEntry &e : sinks_) {
                 if (e.name != sink) continue;
+                /* A tab of that name that now holds a different plug-in would be
+                 * handed another instrument's parameters: say so, and leave it. */
+                const char *want = s->synths[r.synth].plugin;
+                if (want && *want &&
+                    QFileInfo(QString::fromLocal8Bit(want)).fileName().compare(
+                        QFileInfo(e.tab->loadedPath()).fileName(), Qt::CaseInsensitive) != 0) {
+                    trouble << QString("%1 (a different plug-in)").arg(sink);
+                    done.insert(r.synth);
+                    break;
+                }
                 QString why;
                 if (!e.tab->applyPatchText(patch, &why))
                     trouble << QString("%1 (%2)").arg(sink, why);
@@ -650,6 +725,7 @@ protected:
         /* The tracker's song may have unsaved changes; closing the window asks
          * exactly as closing its tab does. */
         if (tracker_ && !tracker_->confirmClose()) { e->ignore(); return; }
+        if (MixBus::instance().active()) stopMixRecord(false);      /* the take is finished, not lost */
         /* --save-session writes here, on the clean exit: the song question
          * above has been answered by now, so what gets written is what the
          * answer left behind. */
@@ -686,6 +762,10 @@ private:
         auto *h = new HostWidget(this);
         building_ = false;
         attributeMenus(h);
+        /* Whether this tab answers the computer keyboard is read at each key
+         * from where the tab bar is now, not from a flag set on tab changes:
+         * see HostWidget::setFrontCheck. */
+        h->setFrontCheck([this, h] { return tabs_ && tabs_->currentWidget() == h; });
 
         const int ix = tabs_->addTab(h, title.isEmpty() ? QString("synth") : title);
         /* Which plug-in is loaded, on the tab. HostWidget sets its widget
@@ -721,6 +801,8 @@ private:
                                      .arg(QString::fromLocal8Bit(err)));
             return nullptr;
         }
+        trackerMixId_ = MixBus::instance().registerSource();
+        trk_set_tap(trkEngine_, &trackerTap, reinterpret_cast<void *>(intptr_t(trackerMixId_)));
         /* The engine did not exist when earlier synth tabs opened; register
          * their destinations now. */
         for (int i = 0; i < tabs_->count(); i++)
@@ -779,7 +861,7 @@ private:
         d->resize(640, 520);
         auto *v = new QVBoxLayout(d);
         auto *search = new QLineEdit;
-        search->setPlaceholderText("Search");
+        search->setPlaceholderText("Search: a letter, then a keyword");
         search->setClearButtonEnabled(true);
         auto *list = new QListWidget;
         auto *note = new QLabel;
@@ -840,8 +922,10 @@ private:
             } else if (HostWidget *h = anyHost(false)) {
                 for (const HostWidget::PluginRef &e : h->availablePlugins()) {
                     total++;
-                    if (!needle.isEmpty() && !e.label.contains(needle, Qt::CaseInsensitive) &&
-                        !e.path.contains(needle, Qt::CaseInsensitive)) continue;
+                    // One letter: names that start with it; more: a keyword.
+                    if (needle.size() == 1 ? !e.label.startsWith(needle, Qt::CaseInsensitive)
+                                           : (!needle.isEmpty() && !e.label.contains(needle, Qt::CaseInsensitive) &&
+                                              !e.path.contains(needle, Qt::CaseInsensitive))) continue;
                     const bool loaded = hostHolding(e.path) != nullptr;
                     auto *it = new QListWidgetItem((loaded ? "● " : "") + e.label + (loaded ? "   loaded" : ""));
                     it->setData(Qt::UserRole, e.path);
@@ -1172,10 +1256,99 @@ private:
             return false;
         }
         sessionPath_ = path;
+        recent_add("session", QFileInfo(path).absoluteFilePath().toLocal8Bit().constData());
         statusBar()->showMessage("session saved to " + path, 5000);
         fprintf(stderr, "session: saved %s\n", qPrintable(path));
         fflush(stderr);
         return true;
+    }
+
+    /* File > Record studio mix. */
+    void toggleMixRecord()
+    {
+        MixBus &mb = MixBus::instance();
+        if (mb.active()) {
+            stopMixRecord(true);
+            return;
+        }
+        QDir().mkpath("renders");
+        beginMixRecord(QString("renders/mix-%1.wav")
+            .arg(QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss")));
+    }
+
+public:
+    /* --record-mix <file>: the take starts as the window comes up, and is
+     * finished, with no question asked, when it closes. */
+    bool beginMixRecord(const QString &file)
+    {
+        if (!MixBus::instance().start(file, kSampleRate)) {
+            statusBar()->showMessage("could not open " + file + " for writing", 0);
+            return false;
+        }
+        mixAct_->setText("Stop recording studio &mix");
+        mixTimer_->start(200);
+        statusBar()->showMessage("recording the studio mix to " + file, 0);
+        fprintf(stderr, "studio: recording the mix to %s\n", qPrintable(file));
+        fflush(stderr);
+        return true;
+    }
+    bool playSong()
+    {
+        if (!trkEngine_) return false;
+        trk_play(trkEngine_, TRK_PLAY_SONG, 0, 0);
+        return true;
+    }
+
+private:
+
+    void tickMixRecord()
+    {
+        MixBus &mb = MixBus::instance();
+        if (!mb.active()) { mixLabel_->clear(); return; }
+        const double secs = double(mb.frames()) / kSampleRate;
+        mixLabel_->setText(QString("\u25cf mix  %1:%2.%3")
+            .arg(int(secs) / 60, 2, 10, QChar('0'))
+            .arg(int(secs) % 60, 2, 10, QChar('0'))
+            .arg(int(secs * 10) % 10));
+    }
+
+    /* Ends the take. `ask`: offer to move it, as a tab's recorder does -- not on
+     * quit, where the file is simply left in renders/. */
+    void stopMixRecord(bool ask)
+    {
+        MixBus &mb = MixBus::instance();
+        const uint64_t dropped = mb.dropped();
+        const QString file = mb.stop();
+        if (file.isEmpty()) return;
+        const double secs = double(MixBus::instance().frames()) / kSampleRate;
+        mixTimer_->stop();
+        mixLabel_->clear();
+        mixAct_->setText("Record studio &mix");
+        QString finalPath = file;
+        if (ask) {
+            QString target = QFileDialog::getSaveFileName(
+                this, "Save the studio mix as",
+                QDir(mixDir_.isEmpty() ? QFileInfo(file).absolutePath() : mixDir_)
+                    .filePath(QFileInfo(file).fileName()),
+                "WAV audio (*.wav);;All files (*)");
+            if (!target.isEmpty() &&
+                QFileInfo(target).absoluteFilePath() != QFileInfo(file).absoluteFilePath()) {
+                if (!target.endsWith(".wav", Qt::CaseInsensitive)) target += ".wav";
+                QFile::remove(target);
+                if (QFile::rename(file, target) || (QFile::copy(file, target) && QFile::remove(file))) {
+                    finalPath = target;
+                    mixDir_ = QFileInfo(target).absolutePath();
+                } else {
+                    statusBar()->showMessage("could not write " + target + " -- left it in " + file, 0);
+                }
+            }
+        }
+        QString msg = QString("wrote %1 -- %2.%3 s").arg(finalPath).arg(int(secs)).arg(int(secs * 10) % 10);
+        if (dropped) msg += QString("  (%1 frames dropped -- the disk could not keep up)").arg(dropped);
+        if (mb.failed()) msg += "  (a write failed -- the disk is full? the file is incomplete)";
+        statusBar()->showMessage(msg, 0);
+        fprintf(stderr, "studio: %s\n", qPrintable(msg));
+        fflush(stderr);
     }
 
     /* File > Reload plug-in: the way back for a tab whose plug-in stopped
@@ -1281,6 +1454,9 @@ private:
         if (w == tracker_) {
             delete w;                    /* done with the engine: playback is stopped */
             tracker_ = nullptr;
+            trk_set_tap(trkEngine_, nullptr, nullptr);     /* returns once no call is in flight */
+            MixBus::instance().releaseSource(trackerMixId_);
+            trackerMixId_ = -1;
             trk_close(trkEngine_);
             trkEngine_ = nullptr;
             sinks_.clear();            /* the destinations died with the engine */
@@ -1335,6 +1511,7 @@ private:
                                     uniqueSinkName(h->windowTitle(), h).toUtf8().constData(),
                                     &sinkDeliver, ctx);
         if (id < 0) { delete ctx; return; }
+        trk_sink_set_gain_cb(trkEngine_, id, &sinkGain);
         char nm[TRK_DEST_LEN] = "";
         trk_sink_name(trkEngine_, id, nm, sizeof nm);
         sinks_.append({ h, id, QString::fromUtf8(nm), ctx });
@@ -1520,7 +1697,11 @@ private:
         QWidget *cur = tabs_->currentWidget();
         for (int i = 0; i < tabs_->count(); i++)
             if (auto *h = qobject_cast<HostWidget *>(tabs_->widget(i)))
-                h->setKeysLive(h->isVisible() && tabs_->widget(i) == cur);
+                /* Not also `h->isVisible()`: a tab opened at startup is arbitrated
+                 * before the window is shown, so it was switched off for good --
+                 * the keys then worked only while the on-screen keyboard itself
+                 * had focus, and died the moment a program or patch was clicked. */
+                h->setKeysLive(tabs_->widget(i) == cur);
         syncMenus();
     }
 
@@ -1567,6 +1748,12 @@ private:
     QTabWidget     *tabs_;
     QLabel         *hint_ = nullptr;
     QAction        *newTracker_ = nullptr;
+    QMenu          *recentMenu_ = nullptr;
+    QAction        *mixAct_ = nullptr;      /* File > Record studio mix */
+    QLabel         *mixLabel_ = nullptr;
+    QTimer         *mixTimer_ = nullptr;
+    QString         mixDir_;                /* where the last mix went */
+    int             trackerMixId_ = -1;     /* the tracker's place on the mix bus */
     QAction        *reloadAct_ = nullptr;
     TrackerWidget  *tracker_ = nullptr;
     QMenu          *helpMenu_ = nullptr;   /* the window's own, kept last in the bar */
@@ -1647,7 +1834,8 @@ int main(int argc, char **argv)
      */
     QStringList synths;
     QString song, session, saveSession;
-    bool wantTracker = false;
+    bool wantTracker = false, wantPlay = false;
+    QString recordMix;
     int quitAfter = 0, smoke = 0, route = -1;
     /* Read before QApplication sees argv, which it edits: Qt takes
      * -session/--session as its own X11 session-management option and removes
@@ -1672,10 +1860,24 @@ int main(int argc, char **argv)
             quitAfter = atoi(argv[++i]);
         else if (a == "--smoke" && i + 1 < argc)
             smoke = atoi(argv[++i]);
+        else if (a == "--record-mix" && i + 1 < argc)
+            recordMix = QString::fromLocal8Bit(argv[++i]);
+        else if (a == "--play")
+            wantPlay = true;
+        else if (a == "--backend" && i + 1 < argc) {
+            /* The audio choice reads DW_BACKEND itself, so the flag is that. */
+            const char *name = argv[++i];
+            if (ao_backend_from_name(name) < 0)
+                fprintf(stderr, "studio: unknown backend '%s' (want auto, pipewire, jack or alsa) -- using the saved choice\n", name);
+            else
+                setenv("DW_BACKEND", name, 1);
+        }
         else if (a == "--help" || a == "-h") {
             printf("studio [--synth <plug-in>]... [--tracker] [--song <file.trk>]\n"
                    "       [--session <file.vstace>] [--save-session <file.vstace>]\n"
-                   "       [--route <track>] [--smoke <ms>] [--quit-after <ms>]\n\n"
+                   "       [--route <track>] [--smoke <ms>] [--quit-after <ms>]\n"
+                   "       [--backend auto|pipewire|jack|alsa]\n"
+                   "       [--record-mix <file.wav>] [--play]\n\n"
                    "The session window: a tab per synth plug-in, one for the "
                    "tracker.\nWith no arguments it opens on a blank canvas.\n"
                    "--session restores a session saved with File > Save session; "
@@ -1708,6 +1910,8 @@ int main(int argc, char **argv)
     for (const QString &s : synths) w.openSynth(s);
     if (wantTracker) w.openTracker();
     if (!song.isEmpty()) w.openSongPath(song);
+    if (!recordMix.isEmpty()) w.beginMixRecord(recordMix);
+    if (wantPlay) w.playSong();
     if (!saveSession.isEmpty()) w.saveSessionOnExit(saveSession);
     if (route > 0 && !w.routeTrack(route - 1))
         fprintf(stderr, "studio: --route %d failed (no synth tab, or no tracker?)\n", route);

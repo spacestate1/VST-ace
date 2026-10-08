@@ -20,9 +20,12 @@
 #include <QProcess>
 #include <QtWidgets>
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <memory>
+#include <time.h>
 #include <thread>
 #include <vector>
 
@@ -347,9 +350,261 @@ inline std::atomic<int> g_hostInstances{0};
 /* Owns the plugin and the PipeWire stream. The park handshake exists because
  * loading a new plugin frees the old one while the realtime callback may be
  * inside pehost_render(). */
+/* ---------------------------------------------------------------- mix bus */
+
+/* A recorder of everything the studio plays. Each synth tab has an Engine with
+ * its own audio stream, and the tracker's sample tracks have another; none of
+ * them knows of the others, so there is no single place the whole mix passes
+ * through. Each of them instead adds what it renders into this bus, and one
+ * writer thread takes the sum to a WAV.
+ *
+ * The sources are on the same 48 kHz clock but their callbacks are not aligned.
+ * Each source keeps a cursor of its own, which starts at the wall-clock position
+ * of its first block and moves on by exactly what it feeds, so a source's blocks
+ * join up with no gap or overlap whatever the jitter between callbacks; a source
+ * that has been quiet for a while (parked, or a tab that opened late) is put
+ * back on the wall clock. The writer only takes what every source still feeding
+ * has gone past (less a margin), so each of them has delivered it -- measured on
+ * the sources' own cursors, not the wall clock, which an audio device's clock
+ * drifts from.
+ *
+ * Adding is atomic -- two audio threads can land on the same frame -- and the
+ * writer takes each frame with an exchange to zero, so the ring is clean for its
+ * next lap. Nothing here allocates, locks or makes a system call on an audio
+ * thread. */
+class MixBus {
+public:
+    static MixBus &instance() { static MixBus b; return b; }
+
+    int registerSource()
+    {
+        for (int i = 0; i < kSources; i++) {
+            bool want = false;
+            if (src_[i].used.compare_exchange_strong(want, true)) {
+                src_[i].gen.store(0, std::memory_order_relaxed);
+                return i;
+            }
+        }
+        return -1;
+    }
+    void releaseSource(int id)
+    {
+        if (id >= 0 && id < kSources) src_[id].used.store(false, std::memory_order_release);
+    }
+    int sources() const
+    {
+        int n = 0;
+        for (int i = 0; i < kSources; i++) if (src_[i].used.load(std::memory_order_relaxed)) n++;
+        return n;
+    }
+
+    bool start(const QString &path, int rate)
+    {
+        if (active_.load(std::memory_order_acquire)) return false;
+        out_.open(path.toLocal8Bit().constData(), std::ios::binary | std::ios::trunc);
+        if (!out_) return false;
+        rate_ = rate;
+        /* Made once and never freed: an audio thread that was inside a feed when
+         * the last take ended may still be reading it. A later take that needs
+         * more room than the first is refused. */
+        if (!ring_) {
+            cap_ = size_t(rate) * kSeconds;
+            ring_ = std::make_unique<std::atomic<float>[]>(cap_ * 2);
+        } else if (size_t(rate) * kSeconds > cap_) {
+            out_.close();
+            return false;
+        }
+        for (size_t i = 0; i < cap_ * 2; i++) ring_[i].store(0.0f, std::memory_order_relaxed);
+        failed_.store(false, std::memory_order_relaxed);
+        drained_.store(0, std::memory_order_relaxed);
+        written_.store(0, std::memory_order_relaxed);
+        dropped_.store(0, std::memory_order_relaxed);
+        t0_ = now();
+        gen_.fetch_add(1, std::memory_order_relaxed);
+        writeHeader(0);
+        path_ = path;
+        active_.store(true, std::memory_order_release);
+        writer_ = std::thread([this] { drainLoop(); });
+        return true;
+    }
+
+    /* The finished file, or an empty string if nothing was recording. */
+    QString stop()
+    {
+        if (!active_.exchange(false, std::memory_order_acq_rel)) return QString();
+        for (int i = 0; i < 100 && inflight_.load(std::memory_order_acquire) > 0; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));   /* a block in flight lands */
+        if (writer_.joinable()) writer_.join();
+        drainTo(highWater_.load(std::memory_order_relaxed));
+        out_.flush();
+        writeHeader(written_.load(std::memory_order_relaxed));
+        if (!out_ || out_.fail()) failed_.store(true, std::memory_order_relaxed);
+        out_.close();
+        return path_;
+    }
+
+    bool     active()  const { return active_.load(std::memory_order_acquire); }
+    bool     failed()  const { return failed_.load(std::memory_order_relaxed); }   /* a write failed: the file is short */
+    uint64_t frames()  const { return written_.load(std::memory_order_relaxed); }
+    uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
+
+    ~MixBus() { stop(); }       /* a take still running at exit joins its writer, rather than terminating */
+
+    /* Audio threads. */
+    void feed(int id, const float *x, int frames) { add(id, x, nullptr, frames); }
+    void feed(int id, const double *x, int frames) { add(id, nullptr, x, frames); }
+
+private:
+    static const int kSources = 64;
+    static const int kSeconds = 8;
+    static const uint64_t kSafety = 2048;          /* 43 ms: a margin under what the slowest source has delivered */
+
+    struct Source {
+        std::atomic<bool>     used{false};
+        std::atomic<unsigned> gen{0};
+        std::atomic<uint64_t> cursor{0};
+        std::atomic<double>   last{0.0};
+    };
+
+    static double now()
+    {
+        timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+    }
+
+    void add(int id, const float *f, const double *d, int frames)
+    {
+        if (!active_.load(std::memory_order_acquire) || id < 0 || id >= kSources) return;
+        inflight_.fetch_add(1, std::memory_order_acq_rel);
+        if (active_.load(std::memory_order_acquire)) {
+            Source &s = src_[id];
+            const double t = now();
+            const uint64_t wall = t > t0_ ? uint64_t((t - t0_) * rate_) : 0;
+            uint64_t c = s.cursor.load(std::memory_order_relaxed);
+            const unsigned g = gen_.load(std::memory_order_relaxed);
+            /* Started with this take, or quiet since a while: back on the wall clock. */
+            if (s.gen.load(std::memory_order_relaxed) != g || t - s.last.load(std::memory_order_relaxed) > 0.25) {
+                c = wall;
+                s.gen.store(g, std::memory_order_relaxed);
+            }
+            const uint64_t dr = drained_.load(std::memory_order_acquire);
+            if (c < dr) c = dr;                         /* late: what is past is gone */
+            if (c + uint64_t(frames) - dr > cap_) {     /* the writer is far behind */
+                dropped_.fetch_add(uint64_t(frames), std::memory_order_relaxed);
+            } else {
+                for (int i = 0; i < frames * 2; i++) {
+                    const float v = f ? f[i] : float(d[i]);
+                    const size_t slot = size_t((c * 2 + uint64_t(i)) % (cap_ * 2));
+                    ring_[slot].fetch_add(v, std::memory_order_relaxed);
+                }
+            }
+            c += uint64_t(frames);
+            s.cursor.store(c, std::memory_order_relaxed);
+            s.last.store(t, std::memory_order_relaxed);
+            uint64_t hw = highWater_.load(std::memory_order_relaxed);
+            while (c > hw && !highWater_.compare_exchange_weak(hw, c, std::memory_order_relaxed)) {}
+        }
+        inflight_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    /* How far the writer may go: what every source still feeding has gone past.
+     * The wall clock is not used for this -- an audio device's clock runs a
+     * little off the system's, and over a long take a source on a slow clock
+     * would fall behind a limit taken from the wall and have its blocks arrive
+     * too late to be kept. A source that has not fed for a quarter of a second,
+     * or not since this take began, is not waited for. */
+    bool writerLimit(double t, uint64_t *limit) const
+    {
+        const unsigned g = gen_.load(std::memory_order_relaxed);
+        uint64_t low = UINT64_MAX;
+        bool any = false;
+        for (int i = 0; i < kSources; i++) {
+            const Source &s = src_[i];
+            if (!s.used.load(std::memory_order_relaxed) || s.gen.load(std::memory_order_relaxed) != g) continue;
+            if (t - s.last.load(std::memory_order_relaxed) > 0.25) continue;
+            low = std::min(low, s.cursor.load(std::memory_order_relaxed));
+            any = true;
+        }
+        if (!any || low <= kSafety) return false;
+        *limit = low - kSafety;
+        return true;
+    }
+
+    void drainLoop()
+    {
+        while (active_.load(std::memory_order_acquire)) {
+            uint64_t limit;
+            if (writerLimit(now(), &limit)) drainTo(limit);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+
+    /* Everything before `limit`, to the file. Writer thread (or stop(), after it has joined). */
+    void drainTo(uint64_t limit)
+    {
+        uint64_t pos = drained_.load(std::memory_order_relaxed);
+        if (limit <= pos) return;
+        static thread_local std::vector<int16_t> pcm;
+        while (pos < limit) {
+            const size_t chunk = size_t(std::min<uint64_t>(limit - pos, 4096));
+            pcm.resize(chunk * 2);
+            for (size_t i = 0; i < chunk * 2; i++) {
+                const size_t slot = size_t((pos * 2 + i) % (cap_ * 2));
+                float v = ring_[slot].exchange(0.0f, std::memory_order_acq_rel);
+                v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+                pcm[i] = int16_t(v * 32767.0f);
+            }
+            out_.write(reinterpret_cast<const char *>(pcm.data()), std::streamsize(chunk * 2 * sizeof(int16_t)));
+            if (!out_) failed_.store(true, std::memory_order_relaxed);        /* a full disk, say */
+            pos += chunk;
+            written_.fetch_add(chunk, std::memory_order_relaxed);
+            drained_.store(pos, std::memory_order_release);
+        }
+        writeHeader(written_.load(std::memory_order_relaxed));      /* playable at any moment, as the tab recorder's is */
+    }
+
+    void writeHeader(uint64_t frames)
+    {
+        const uint32_t bytes = uint32_t(frames * 2 * sizeof(int16_t));
+        unsigned char h[44];
+        memcpy(h, "RIFF", 4);
+        { uint32_t v = 36 + bytes;      memcpy(h + 4, &v, 4); }
+        memcpy(h + 8, "WAVEfmt ", 8);
+        { uint32_t v = 16;              memcpy(h + 16, &v, 4); }
+        { uint16_t v = 1;               memcpy(h + 20, &v, 2); }
+        { uint16_t v = 2;               memcpy(h + 22, &v, 2); }
+        { uint32_t v = uint32_t(rate_); memcpy(h + 24, &v, 4); }
+        { uint32_t v = uint32_t(rate_) * 4; memcpy(h + 28, &v, 4); }
+        { uint16_t v = 4;               memcpy(h + 32, &v, 2); }
+        { uint16_t v = 16;              memcpy(h + 34, &v, 2); }
+        memcpy(h + 36, "data", 4);
+        memcpy(h + 40, &bytes, 4);
+        const auto keep = out_.tellp();
+        out_.seekp(0);
+        out_.write(reinterpret_cast<const char *>(h), sizeof h);
+        if (keep > std::streampos(0)) out_.seekp(keep);
+        out_.flush();
+    }
+
+    Source                               src_[kSources];
+    std::unique_ptr<std::atomic<float>[]> ring_;
+    size_t                               cap_ = 0;
+    int                                  rate_ = 48000;
+    double                               t0_ = 0.0;
+    std::atomic<bool>                    active_{false}, failed_{false};
+    std::atomic<int>                     inflight_{0};
+    std::atomic<unsigned>                gen_{0};
+    std::atomic<uint64_t>                drained_{0}, written_{0}, dropped_{0}, highWater_{0};
+    std::ofstream                        out_;
+    std::thread                          writer_;
+    QString                              path_;
+};
+
 class Engine {
 public:
-    ~Engine() { stopAudio(); unload(); }
+    Engine() : mixId_(MixBus::instance().registerSource()) {}
+    ~Engine() { stopAudio(); unload(); MixBus::instance().releaseSource(mixId_); }
 
     /* The choice kept between runs (File > Audio), falling back to PipeWire
      * when what was asked for will not open. `note` says what happened. */
@@ -360,20 +615,60 @@ public:
         return startAudioWith(c, err, note);
     }
 
+    /* Start what `c` asks for. What cannot be honoured falls back -- PipeWire,
+     * then ALSA's default -- and `note` says so, so the sound never just goes
+     * missing because a setting would not open. Automatic is PipeWire first (its
+     * callback runs on a realtime thread the system granted), then ALSA, which is
+     * what the GTK studio does as well. */
     bool startAudioWith(const ao_choice &c, QString *err, QString *note = nullptr)
     {
-        backend_ = c.backend == AO_AUTO ? AO_PIPEWIRE : c.backend;
-        if (backend_ != AO_PIPEWIRE) {
-            char why[256] = "";
-            if (openAo(backend_, c.device, why, sizeof why)) {
-                if (note) *note = QString::fromUtf8(ao_describe(ao_));
+        if (note) note->clear();
+        auto tryPipewire = [&](QString *why) {
+            QString e;
+            if (startPipewire(&e, true)) { backend_ = AO_PIPEWIRE; return true; }
+            stopAudio();                        /* whatever the attempt left behind */
+            *why = e;
+            return false;
+        };
+        auto tryAlsa = [&](const char *dev, QString *why) {
+            char w[256] = "";
+            if (openAo(AO_ALSA, dev, w, sizeof w)) { backend_ = AO_ALSA; return true; }
+            *why = QString::fromUtf8(w);
+            return false;
+        };
+        QString why1, why2;
+        const int want = c.backend;
+        if (want == AO_AUTO || want == AO_PIPEWIRE) {
+            if (tryPipewire(&why1)) return true;
+            if (tryAlsa("", &why2)) {
+                if (note) *note = QString("PipeWire: %1 -- using ALSA (%2)")
+                                      .arg(why1, QString::fromUtf8(ao_describe(ao_)));
                 return true;
             }
-            if (note) *note = QString("%1: %2 -- using PipeWire")
-                                  .arg(ao_backend_name(backend_), why);
-            backend_ = AO_PIPEWIRE;
+            *err = "PipeWire: " + why1 + "; ALSA: " + why2;
+            return false;
         }
-        return startPipewire(err, backend_ == AO_PIPEWIRE);
+        char why[256] = "";
+        if (openAo(want, c.device, why, sizeof why)) {
+            backend_ = want;
+            if (note) *note = QString::fromUtf8(ao_describe(ao_));
+            return true;
+        }
+        why1 = QString::fromUtf8(why);
+        if (tryPipewire(&why2)) {
+            if (note) *note = QString("%1: %2 -- using PipeWire").arg(ao_backend_name(want), why1);
+            return true;
+        }
+        if (want != AO_ALSA || c.device[0]) {
+            QString why3;
+            if (tryAlsa("", &why3)) {
+                if (note) *note = QString("%1: %2 -- using ALSA (%3)")
+                                      .arg(ao_backend_name(want), why1, QString::fromUtf8(ao_describe(ao_)));
+                return true;
+            }
+        }
+        *err = QString("%1: %2; PipeWire: %3").arg(ao_backend_name(want), why1, why2);
+        return false;
     }
 
     int backend() const { return backend_; }
@@ -705,6 +1000,7 @@ private:
              * should leave a gap you can hear, not shorten the recording and
              * pull everything after it earlier. */
             rec_.feed(dst, n);
+            MixBus::instance().feed(mixId_, dst, n);
         } else {
             parked_.store(false, std::memory_order_release);
             /* Injected MIDI goes in first, so a note due at this block's very
@@ -733,7 +1029,7 @@ private:
             }
             float pk = 0.0f;
             for (int i = 0; i < n * 2; i++) {
-                float v = buf_[i] * gain_;
+                float v = buf_[i] * gain_ * trackGain_.load(std::memory_order_relaxed);
                 /* A NaN from a plug-in is neither above nor below the rails and
                  * would pass the clip straight to the speakers as a burst. */
                 if (v != v) v = 0.0f;
@@ -757,6 +1053,7 @@ private:
             /* After the gain and the clip, so the file is what came out of the
              * speakers rather than what the plugin produced before the fader. */
             rec_.feed(dst, n);
+            MixBus::instance().feed(mixId_, dst, n);
         }
     }
 
@@ -788,7 +1085,11 @@ private:
 
 public:
     Recorder rec_;
+    int mixId_ = -1;        /* this engine's place on the studio mix bus */
     float gain_ = 0.8f;
+    /* The tracker's fader for a track that plays this synth alone: a second
+     * gain, set from another thread, so it is atomic. */
+    std::atomic<float> trackGain_{1.0f};
 
     /* What to feed a plugin that processes rather than generates. An effect given
      * silence correctly produces silence, so with no source at all a compressor
@@ -2577,6 +2878,14 @@ public:
     }
     bool keysLive() const { return keysLive_; }
 
+    /* The shell's live answer to "is my tab the one in front?". When set, it is
+     * asked at every key event instead of trusting the stored flag above: a flag
+     * is only as current as the last time somebody remembered to set it, and one
+     * left false -- a tab arbitrated before its window was shown -- silenced the
+     * computer keyboard until the on-screen keyboard was clicked. Asking at the
+     * moment of the key cannot go stale. */
+    void setFrontCheck(std::function<bool()> f) { frontCheck_ = std::move(f); }
+
     /* Forget the plug-in that was loading when the last session died.
      *
      * Reaching this means we are exiting under our own power, so whatever is
@@ -2672,7 +2981,7 @@ public:
         pluginList_ = new QListWidget;
         lv->addWidget(new QLabel("Plugins"));
         searchEdit_ = new QLineEdit;
-        searchEdit_->setPlaceholderText("Search plug-ins");
+        searchEdit_->setPlaceholderText("Search: a letter, then a keyword");
         searchEdit_->setClearButtonEnabled(true);
         lv->addWidget(searchEdit_);
         lv->addWidget(pluginList_, 3);
@@ -3504,8 +3813,11 @@ private slots:
             const QString f = e.fmt.isEmpty() ? QString("Unrecognised") : e.fmt;
             if (!wantType.isEmpty() && f != wantType) continue;
             if (!wantOs.isEmpty() && e.os != wantOs) continue;
-            if (!needle.isEmpty() && !e.label.contains(needle, Qt::CaseInsensitive) &&
-                !e.path.contains(needle, Qt::CaseInsensitive)) continue;
+            /* One letter: the plug-ins that start with it. Two or more: a
+             * keyword, anywhere in the name or path. */
+            if (needle.size() == 1 ? !e.name.startsWith(needle, Qt::CaseInsensitive)
+                                   : (!needle.isEmpty() && !e.label.contains(needle, Qt::CaseInsensitive) &&
+                                      !e.path.contains(needle, Qt::CaseInsensitive))) continue;
             paths_ << e.path;
             pluginList_->addItem(e.label);
             if (!e.loadable) unloadable_.insert(e.path);
@@ -4546,7 +4858,7 @@ private:
         /* Not the live tab: everything passes by untouched. Several of these
          * filters share the application in a multi-host shell, and only the
          * one whose tab is in front may answer keys -- see setKeysLive. */
-        if (!keysLive_) return QWidget::eventFilter(o, ev);
+        if (!(frontCheck_ ? frontCheck_() : keysLive_)) return QWidget::eventFilter(o, ev);
         switch (ev->type()) {
         case QEvent::KeyPress:
         case QEvent::KeyRelease: {
@@ -6049,6 +6361,7 @@ private:
     QString       saveDir_;      /* where the last take was saved */
     bool          pianoWasLive_ = true;  /* had focus before typing began */
     bool          keysLive_ = true;      /* the shell's say -- setKeysLive() */
+    std::function<bool()> frontCheck_;    /* or its live answer -- setFrontCheck() */
     QLabel       *recLabel_ = nullptr;
     QLabel       *patchLabel_;
     QDoubleSpinBox *tempoBox_ = nullptr;

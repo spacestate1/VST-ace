@@ -815,7 +815,9 @@ static void fill_browser(plugview *pv)
         if (wo && strcmp(e->os, wo)) continue;
         if (*ln) {
             char *n1 = g_utf8_strdown(e->name, -1), *n2 = g_utf8_strdown(e->path, -1);
-            int hit = strstr(n1, ln) || strstr(n2, ln);
+            /* One letter: the plug-ins that start with it. More: a keyword. */
+            int hit = g_utf8_strlen(ln, -1) == 1 ? g_str_has_prefix(n1, ln)
+                                                 : (strstr(n1, ln) || strstr(n2, ln));
             g_free(n1); g_free(n2);
             if (!hit) continue;
         }
@@ -3619,7 +3621,7 @@ GtkWidget *plugview_pane(plugview *pv)
     gtk_box_append(GTK_BOX(left), top);
     gtk_box_append(GTK_BOX(left), gtk_label_new("Plug-ins"));
     pv->search = gtk_search_entry_new();
-    gtk_search_entry_set_placeholder_text(GTK_SEARCH_ENTRY(pv->search), "Search plug-ins");
+    gtk_search_entry_set_placeholder_text(GTK_SEARCH_ENTRY(pv->search), "Search: a letter, then a keyword");
     g_signal_connect(pv->search, "search-changed", G_CALLBACK(on_search_changed), pv);
     gtk_box_append(GTK_BOX(left), pv->search);
     gtk_box_append(GTK_BOX(left), sw);

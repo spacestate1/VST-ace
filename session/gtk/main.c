@@ -37,6 +37,8 @@
 #include "audioout.h"
 #include "vstdirs.h"
 #include "sessfile.h"
+#include "recentfiles.h"
+#include "mixbus.h"
 
 #include <alsa/asoundlib.h>
 #include <pipewire/pipewire.h>
@@ -45,6 +47,7 @@
 #include <gtk/gtk.h>
 #include <glib/gstdio.h>
 #include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -99,6 +102,7 @@ typedef struct {
     _Atomic unsigned char play[128];   /* notes the tracker has sounding here: set by its delivery thread */
     _Atomic unsigned play_gen;         /* bumped on every change, so the GUI thread knows to redraw */
     unsigned      play_seen;
+    _Atomic float tgain;               /* the tracker's fader for a track alone on this synth */
     GtkWidget    *wheel;       /* the pitch wheel left of it */
     GtkWidget    *kbrow;       /* wheel and keys: what View > On-screen keyboard shows */
     int           bend, bend_drag, bend_grab_v;   /* 14-bit, 8192 at rest */
@@ -148,15 +152,50 @@ static __thread int g_teb_ready;
  * the audio thread never allocates. */
 static float g_plug_buf[PERIOD_MAX * 2];
 
+/* The studio mix bus (File > Record studio mix): the synth tabs' mix is one
+ * source, the tracker's sample tracks another. */
+static int g_mix_synth = -1, g_mix_trk = -1;
+
+/* What an effect plug-in processes: the system's capture input, when "Effect
+ * input" is on. PipeWire's capture callback writes stereo frames into a ring
+ * and render_block takes one block's worth out of it. Without it an effect is
+ * handed silence, and an effect given silence produces silence. */
+#define CAP_FRAMES 16384                      /* a power of two */
+static float            g_cap_ring[CAP_FRAMES * 2];
+static _Atomic unsigned g_cap_head, g_cap_tail;
+static _Atomic int      g_in_on;
+static float            g_in_buf[PERIOD_MAX * 2];
+
+/* One block of input into g_in_buf: what has arrived, silence for what has not.
+ * A backlog is dropped down to a block and a half -- taking one block a read and
+ * leaving the rest would let the input run further and further behind. */
+static void input_block(int n)
+{
+    unsigned head = atomic_load_explicit(&g_cap_head, memory_order_acquire);
+    unsigned tail = atomic_load_explicit(&g_cap_tail, memory_order_relaxed);
+    unsigned avail = head - tail, want = (unsigned)n, i;
+    if (avail > want * 3) { tail = head - want * 3 / 2; avail = head - tail; }
+    if (avail > want) avail = want;
+    for (i = 0; i < avail; i++) {
+        g_in_buf[2 * i]     = g_cap_ring[2 * ((tail + i) & (CAP_FRAMES - 1))];
+        g_in_buf[2 * i + 1] = g_cap_ring[2 * ((tail + i) & (CAP_FRAMES - 1)) + 1];
+    }
+    if (avail < want) memset(g_in_buf + 2 * avail, 0, (size_t)(want - avail) * 2 * sizeof(float));
+    atomic_store_explicit(&g_cap_tail, tail + avail, memory_order_release);
+}
+
 static void render_block(double *buf, int frames)
 {
     int i, t, n = frames > PERIOD_MAX ? PERIOD_MAX : frames;
+    const float *in = NULL;
 
     memset(buf, 0, (size_t)n * 2 * sizeof *buf);
+    if (atomic_load_explicit(&g_in_on, memory_order_acquire)) { input_block(n); in = g_in_buf; }
     for (t = 0; t < MAXTABS; t++) {
         if (!g_tabs[t].used || !plugview_active(g_tabs[t].pv)) continue;
-        if (plugview_render(g_tabs[t].pv, g_plug_buf, n)) {
-            for (i = 0; i < n * 2; i++) buf[i] += g_plug_buf[i];
+        if (plugview_render_io(g_tabs[t].pv, in, g_plug_buf, n)) {
+            const float tg = atomic_load_explicit(&g_tabs[t].tgain, memory_order_relaxed);
+            for (i = 0; i < n * 2; i++) buf[i] += g_plug_buf[i] * tg;
             atomic_fetch_add_explicit(&g_tabs[t].callbacks, 1, memory_order_relaxed);
         }
     }
@@ -175,11 +214,13 @@ static void ao_render_cb(void *ud, float *out, int frames)
     if (atomic_load_explicit(&g_park_req, memory_order_acquire)) {
         atomic_store_explicit(&g_parked, 1, memory_order_release);
         memset(out, 0, (size_t)frames * 2 * sizeof *out);
+        mixbus_feed_f(g_mix_synth, out, frames);        /* silence, so a recording keeps its length */
         return;
     }
     atomic_store_explicit(&g_parked, 0, memory_order_release);
     render_block(g_ao_buf, frames);
     for (i = 0; i < frames * 2; i++) out[i] = out_soft(g_ao_buf[i]);
+    mixbus_feed_f(g_mix_synth, out, frames);
 }
 
 static void pw_on_process(void *ud)
@@ -212,6 +253,7 @@ static void pw_on_process(void *ud)
         }
     }
 
+    mixbus_feed_f(g_mix_synth, dst, n);                  /* what leaves, parked (silence) or not */
     sb->datas[0].chunk->offset = 0;
     sb->datas[0].chunk->stride = sizeof(float) * 2;
     sb->datas[0].chunk->size   = (uint32_t)(n * 2 * sizeof(float));
@@ -756,6 +798,332 @@ static synctab *current_synth_tab(void)
     return page ? tab_of_page(page) : NULL;
 }
 
+/* ----------------------------------------------------- record studio mix --
+ *
+ * File > Record studio mix: one WAV of everything the studio plays -- every synth
+ * tab, mixed as it goes to the speakers, and the tracker's sample tracks -- from
+ * the mix bus (mixbus.c). The synth tabs' own audio is one source and the
+ * tracker's another; neither knows of the other, which is why there is a bus.
+ * Stopping offers to move the file out of renders/, as the Qt shell does. */
+static GSimpleAction *g_mix_act;
+static GtkWidget     *g_mix_label;
+static guint          g_mix_timer;
+static char           g_mix_dir[4096];
+
+static gboolean mix_tick(gpointer u)
+{
+    double secs;
+    char buf[64];
+    (void)u;
+    if (!mixbus_active()) { g_mix_timer = 0; return G_SOURCE_REMOVE; }
+    secs = (double)mixbus_frames() / 48000.0;
+    snprintf(buf, sizeof buf, "● mix  %02d:%02d.%d", (int)secs / 60, (int)secs % 60, (int)(secs * 10) % 10);
+    if (g_mix_label) gtk_label_set_text(GTK_LABEL(g_mix_label), buf);
+    return G_SOURCE_CONTINUE;
+}
+
+static int mix_begin(const char *path)
+{
+    char msg[4300];
+    if (mixbus_start(path, 48000)) {
+        snprintf(msg, sizeof msg, "could not open %s for writing", path);
+        status(msg);
+        return -1;
+    }
+    if (g_mix_act) g_simple_action_set_state(g_mix_act, g_variant_new_boolean(TRUE));
+    if (!g_mix_timer) g_mix_timer = g_timeout_add(200, mix_tick, NULL);
+    snprintf(msg, sizeof msg, "recording the studio mix to %s", path);
+    status(msg);
+    fprintf(stderr, "studiogtk: %s\n", msg);
+    return 0;
+}
+
+static void mix_saved(GObject *src, GAsyncResult *res, gpointer u)
+{
+    char *file = u, msg[8300];
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
+    char *target = f ? g_file_get_path(f) : NULL;
+    if (target) {
+        char with_ext[4200], *dir;
+        snprintf(with_ext, sizeof with_ext, "%s%s", target,
+                 g_str_has_suffix(target, ".wav") || g_str_has_suffix(target, ".WAV") ? "" : ".wav");
+        if (strcmp(with_ext, file)) {
+            g_remove(with_ext);
+            if (g_rename(file, with_ext) == 0) {
+                dir = g_path_get_dirname(with_ext);
+                snprintf(g_mix_dir, sizeof g_mix_dir, "%s", dir);
+                g_free(dir);
+                snprintf(msg, sizeof msg, "moved the studio mix to %s", with_ext);
+            } else {
+                snprintf(msg, sizeof msg, "could not write %s -- left it in %s", with_ext, file);
+            }
+            status(msg);
+        }
+    }
+    g_free(target);
+    if (f) g_object_unref(f);
+    g_free(file);
+}
+
+/* Ends the take. `ask`: offer to move it -- not on quit, where it stays in renders/. */
+static void mix_finish(int ask)
+{
+    char file[4096], msg[4400];
+    double secs;
+    uint64_t dropped;
+    if (mixbus_stop(file, sizeof file)) return;
+    secs = (double)mixbus_frames() / 48000.0;
+    dropped = mixbus_dropped();
+    if (g_mix_act) g_simple_action_set_state(g_mix_act, g_variant_new_boolean(FALSE));
+    if (g_mix_label) gtk_label_set_text(GTK_LABEL(g_mix_label), "");
+    snprintf(msg, sizeof msg, "wrote %s -- %d.%d s", file, (int)secs, (int)(secs * 10) % 10);
+    if (dropped)
+        snprintf(msg + strlen(msg), sizeof msg - strlen(msg), "  (%llu frames dropped -- the disk could not keep up)",
+                 (unsigned long long)dropped);
+    if (mixbus_failed())
+        snprintf(msg + strlen(msg), sizeof msg - strlen(msg), "  (a write failed -- the disk is full? the file is incomplete)");
+    status(msg);
+    fprintf(stderr, "studiogtk: %s\n", msg);
+    if (ask && g_win) {
+        GtkFileDialog *d = gtk_file_dialog_new();
+        char *base = g_path_get_basename(file), *abs = g_canonicalize_filename(file, NULL), *dir;
+        gtk_file_dialog_set_title(d, "Save the studio mix as");
+        dir = g_path_get_dirname(abs);
+        {
+            char *start = g_build_filename(g_mix_dir[0] ? g_mix_dir : dir, base, NULL);
+            GFile *gf = g_file_new_for_path(start);
+            gtk_file_dialog_set_initial_file(d, gf);
+            g_object_unref(gf);
+            g_free(start);
+        }
+        gtk_file_dialog_save(d, GTK_WINDOW(g_win), NULL, mix_saved, g_strdup(abs));
+        g_object_unref(d);
+        g_free(base); g_free(abs); g_free(dir);
+    }
+}
+
+static void act_record_mix(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    (void)a; (void)u;
+    if (g_variant_get_boolean(v)) {
+        char path[256];
+        time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        g_mkdir_with_parents("renders", 0755);
+        strftime(path, sizeof path, "renders/mix-%Y%m%d-%H%M%S.wav", &tmv);
+        mix_begin(path);              /* sets the state itself, and leaves it off on a failure */
+    } else {
+        mix_finish(1);
+    }
+}
+
+/* ------------------------------------------------------- effect input --
+ *
+ * A PipeWire capture stream of its own, on a thread loop of its own, so it
+ * works whichever backend the output uses. Off until asked for (Synth menu >
+ * Effect input), so that nothing opens the microphone unprompted. */
+static struct pw_thread_loop *g_cap_loop;
+static struct pw_stream      *g_cap_stream;
+
+static void cap_on_process(void *ud)
+{
+    struct pw_buffer *b;
+    struct spa_buffer *sb;
+    (void)ud;
+    if (!(b = pw_stream_dequeue_buffer(g_cap_stream))) return;
+    sb = b->buffer;
+    if (sb->datas[0].data && sb->datas[0].chunk) {
+        const float *src = (const float *)((const char *)sb->datas[0].data + sb->datas[0].chunk->offset);
+        unsigned n = sb->datas[0].chunk->size / (sizeof(float) * 2), i;
+        unsigned head = atomic_load_explicit(&g_cap_head, memory_order_relaxed);
+        unsigned tail = atomic_load_explicit(&g_cap_tail, memory_order_acquire);
+        if (n > CAP_FRAMES - (head - tail)) n = CAP_FRAMES - (head - tail);    /* full: drop the rest */
+        for (i = 0; i < n; i++) {
+            g_cap_ring[2 * ((head + i) & (CAP_FRAMES - 1))]     = src[2 * i];
+            g_cap_ring[2 * ((head + i) & (CAP_FRAMES - 1)) + 1] = src[2 * i + 1];
+        }
+        atomic_store_explicit(&g_cap_head, head + n, memory_order_release);
+    }
+    pw_stream_queue_buffer(g_cap_stream, b);
+}
+
+static const struct pw_stream_events g_cap_events = { PW_VERSION_STREAM_EVENTS, .process = cap_on_process };
+
+static void effect_input_stop(void)
+{
+    if (g_cap_loop) fprintf(stderr, "studiogtk: effect input off (%u frames captured)\n",
+                            atomic_load_explicit(&g_cap_head, memory_order_relaxed));
+    atomic_store_explicit(&g_in_on, 0, memory_order_release);
+    if (g_cap_loop)   pw_thread_loop_stop(g_cap_loop);
+    if (g_cap_stream) { pw_stream_destroy(g_cap_stream); g_cap_stream = NULL; }
+    if (g_cap_loop)   { pw_thread_loop_destroy(g_cap_loop); g_cap_loop = NULL; }
+}
+
+static int effect_input_start(void)
+{
+    const struct spa_pod *params[1];
+    uint8_t pod[1024];
+    struct spa_pod_builder bb = SPA_POD_BUILDER_INIT(pod, sizeof pod);
+    struct spa_audio_info_raw info;
+    char lat[64];
+
+    if (g_cap_loop) return 0;
+    atomic_store(&g_cap_head, 0);
+    atomic_store(&g_cap_tail, 0);
+    if (!(g_cap_loop = pw_thread_loop_new("studiogtk input", NULL))) return -1;
+    snprintf(lat, sizeof lat, "%d/%d", g_period, SR);
+    g_cap_stream = pw_stream_new_simple(
+        pw_thread_loop_get_loop(g_cap_loop), "studiogtk input",
+        pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture",
+                          PW_KEY_MEDIA_ROLE, "Production", PW_KEY_NODE_LATENCY, lat, NULL),
+        &g_cap_events, NULL);
+    if (!g_cap_stream) { effect_input_stop(); return -1; }
+    spa_zero(info);
+    info.format = SPA_AUDIO_FORMAT_F32;
+    info.rate = SR;
+    info.channels = 2;
+    info.position[0] = SPA_AUDIO_CHANNEL_FL;
+    info.position[1] = SPA_AUDIO_CHANNEL_FR;
+    params[0] = spa_format_audio_raw_build(&bb, SPA_PARAM_EnumFormat, &info);
+    if (pw_stream_connect(g_cap_stream, PW_DIRECTION_INPUT, PW_ID_ANY,
+                          PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+                          PW_STREAM_FLAG_RT_PROCESS, params, 1) < 0 ||
+        pw_thread_loop_start(g_cap_loop) < 0) {
+        effect_input_stop();
+        return -1;
+    }
+    atomic_store_explicit(&g_in_on, 1, memory_order_release);
+    return 0;
+}
+
+static void act_effect_input(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    (void)u;
+    if (g_variant_get_boolean(v)) {
+        if (effect_input_start()) {
+            status("could not open the audio input -- effects stay silent");
+            g_simple_action_set_state(a, g_variant_new_boolean(FALSE));
+            return;
+        }
+        status("effect input on: effects now process the system's audio input");
+    } else {
+        effect_input_stop();
+        status("effect input off");
+    }
+    g_simple_action_set_state(a, v);
+}
+
+/* ---------------------------------------------------------- MIDI input --
+ *
+ * One ALSA-sequencer port, "studiogtk:in", for a keyboard or a sequencer to be
+ * connected to (aconnect, qjackctl, a DAW). What arrives plays the synth tab in
+ * front, the same one the computer keyboard plays. A thread of its own reads
+ * the port and hands each event to the pane's lock-free queue
+ * (plugview_inject_midi), which places it in the next block it renders -- so
+ * nothing here touches GTK or waits on the audio.
+ *
+ * g_midi_mx guards the front tab against the one thing that can go wrong: the
+ * tab being closed while an event is on its way to it. */
+static pthread_mutex_t g_midi_mx = PTHREAD_MUTEX_INITIALIZER;
+static snd_seq_t      *g_mseq;
+static pthread_t       g_mthread;
+static int             g_mpipe[2] = { -1, -1 };
+static int             g_mon;
+
+static void midi_deliver(int st, int d1, int d2)
+{
+    struct timespec ts;
+    double wall;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    wall = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    pthread_mutex_lock(&g_midi_mx);
+    if (g_front && g_front->used && g_front->pv) plugview_inject_midi(g_front->pv, wall, st, d1, d2);
+    pthread_mutex_unlock(&g_midi_mx);
+}
+
+static void *midi_main(void *u)
+{
+    struct pollfd pfd[8];
+    int n;
+    (void)u;
+    n = snd_seq_poll_descriptors(g_mseq, pfd, 7, POLLIN);
+    pfd[n].fd = g_mpipe[0];
+    pfd[n].events = POLLIN;
+    for (;;) {
+        snd_seq_event_t *ev;
+        if (poll(pfd, (nfds_t)n + 1, -1) < 0) continue;
+        if (pfd[n].revents & POLLIN) break;
+        while (snd_seq_event_input(g_mseq, &ev) >= 0) {
+            const int ch = ev->data.note.channel & 15;
+            switch (ev->type) {
+            case SND_SEQ_EVENT_NOTEON:
+                if (ev->data.note.velocity) midi_deliver(0x90 | ch, ev->data.note.note, ev->data.note.velocity);
+                else                        midi_deliver(0x80 | ch, ev->data.note.note, 0);
+                break;
+            case SND_SEQ_EVENT_NOTEOFF:   midi_deliver(0x80 | ch, ev->data.note.note, ev->data.note.velocity); break;
+            case SND_SEQ_EVENT_KEYPRESS:  midi_deliver(0xA0 | ch, ev->data.note.note, ev->data.note.velocity); break;
+            case SND_SEQ_EVENT_CONTROLLER:
+                midi_deliver(0xB0 | (ev->data.control.channel & 15), ev->data.control.param & 127,
+                             ev->data.control.value & 127);
+                break;
+            case SND_SEQ_EVENT_PGMCHANGE:
+                midi_deliver(0xC0 | (ev->data.control.channel & 15), ev->data.control.value & 127, 0);
+                break;
+            case SND_SEQ_EVENT_CHANPRESS:
+                midi_deliver(0xD0 | (ev->data.control.channel & 15), ev->data.control.value & 127, 0);
+                break;
+            case SND_SEQ_EVENT_PITCHBEND: {
+                int v = ev->data.control.value + 8192;
+                if (v < 0) v = 0;
+                if (v > 16383) v = 16383;
+                midi_deliver(0xE0 | (ev->data.control.channel & 15), v & 127, (v >> 7) & 127);
+                break;
+            }
+            default: break;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void midi_start(void)
+{
+    int port;
+    if (g_mon) return;
+    if (snd_seq_open(&g_mseq, "default", SND_SEQ_OPEN_INPUT, SND_SEQ_NONBLOCK) < 0) {
+        g_mseq = NULL;
+        fprintf(stderr, "studiogtk: no MIDI input (the ALSA sequencer would not open)\n");
+        return;
+    }
+    snd_seq_set_client_name(g_mseq, "studiogtk");
+    port = snd_seq_create_simple_port(g_mseq, "in",
+               SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
+               SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+    if (port < 0 || pipe(g_mpipe) != 0 ||
+        pthread_create(&g_mthread, NULL, midi_main, NULL) != 0) {
+        fprintf(stderr, "studiogtk: no MIDI input (could not set the port up)\n");
+        if (g_mpipe[0] >= 0) { close(g_mpipe[0]); close(g_mpipe[1]); g_mpipe[0] = g_mpipe[1] = -1; }
+        snd_seq_close(g_mseq);
+        g_mseq = NULL;
+        return;
+    }
+    g_mon = 1;
+}
+
+static void midi_stop(void)
+{
+    char b = 1;
+    if (!g_mon) return;
+    if (write(g_mpipe[1], &b, 1) < 0) { /* the thread is stopped by the close below too */ }
+    pthread_join(g_mthread, NULL);
+    close(g_mpipe[0]); close(g_mpipe[1]);
+    g_mpipe[0] = g_mpipe[1] = -1;
+    snd_seq_close(g_mseq);
+    g_mseq = NULL;
+    g_mon = 0;
+}
+
 static gboolean on_key(GtkEventControllerKey *c, guint kv, guint kc,
                        GdkModifierType st, gpointer u)
 {
@@ -813,7 +1181,9 @@ static void on_switch_page(GtkNotebook *nb, GtkWidget *page, guint num, gpointer
 {
     (void)nb; (void)num; (void)u;
     release_tab(g_front);
+    pthread_mutex_lock(&g_midi_mx);
     g_front = tab_of_page(page);
+    pthread_mutex_unlock(&g_midi_mx);
     sync_menus(page);       /* the signal comes before the notebook's own current page moves */
 }
 
@@ -834,6 +1204,12 @@ static void on_win_active(GObject *o, GParamSpec *ps, gpointer u)
  * calls this with one block of events; the pane re-places them into its own
  * rendered block by wall-clock time. Never blocks, never calls back into the
  * tracker -- the delivery lock is held while this runs. */
+static void sink_gain(void *ud, double g)
+{
+    synctab *tab = ud;
+    atomic_store_explicit(&tab->tgain, (float)g, memory_order_relaxed);
+}
+
 static void sink_deliver(void *ud, double wall, const trk_sink_ev *evs, int n)
 {
     synctab *tab = ud;
@@ -901,6 +1277,7 @@ static void ensure_sink(synctab *tab)
     id = trk_add_sink(g_trk, name, &sink_deliver, tab);
     if (id < 0) return;
     tab->sink_id = id;
+    trk_sink_set_gain_cb(g_trk, id, &sink_gain);
     trk_sink_name(g_trk, id, tab->sink_name, sizeof tab->sink_name);
 }
 
@@ -1010,6 +1387,7 @@ static synctab *add_synth_tab(void)
      * plugview's own loads park it again inside. */
     engine_park();
     memset(tab, 0, sizeof *tab);
+    atomic_store(&tab->tgain, 1.0f);
     tab->used = 1;
     tab->sink_id = -1;
     tab->pv = plugview_new(engine_park, engine_unpark, SR, g_period);
@@ -1037,7 +1415,9 @@ static void close_synth_tab(synctab *tab)
      * their ALSA windows. */
     if (g_trk && tab->sink_id >= 0) trk_remove_sink(g_trk, tab->sink_id);
     tab->sink_id = -1;
+    pthread_mutex_lock(&g_midi_mx);       /* no MIDI event is on its way to this tab after this */
     if (g_front == tab) g_front = NULL;
+    pthread_mutex_unlock(&g_midi_mx);
     /* plugview_shutdown closes the plug-in the callback may be rendering out
      * of, so the audio is parked first. Removing the page destroys the pane's
      * widgets afterwards, as the pane expects. */
@@ -1054,6 +1434,7 @@ static void close_synth_tab(synctab *tab)
 /* ------------------------------------------------------------- the tracker */
 
 static void reopen_song_synths(void);
+static void remember(const char *kind, const char *path);       /* Open Recent's list */
 
 /* The view's song-opened hook: its Open button and the shell's open song
  * paths alike land here, and every one of them reopens the song's synths. */
@@ -1064,13 +1445,23 @@ static void song_opened_cb(void *ud)
 {
     (void)ud;
     reopen_song_synths();
-    if (g_tracker && trk_view_path(g_tracker)[0]) restore_song_sounds(trk_view_path(g_tracker));
+    if (g_tracker && trk_view_path(g_tracker)[0]) {
+        restore_song_sounds(trk_view_path(g_tracker));
+        remember("song", trk_view_path(g_tracker));      /* the tracker's own Open button too */
+    }
 }
 
 static void song_saved_cb(const char *path, void *ud)
 {
     (void)ud;
     save_song_sounds(path);
+    remember("song", path);
+}
+
+/* The tracker's sample tracks on the studio mix bus. */
+static void tracker_tap(void *ud, const double *x, int frames)
+{
+    mixbus_feed_d((int)(intptr_t)ud, x, frames);
 }
 
 static int open_tracker_tab(void)
@@ -1091,6 +1482,8 @@ static int open_tracker_tab(void)
         status(msg);
         return 0;
     }
+    if (g_mix_trk < 0) g_mix_trk = mixbus_register();
+    trk_set_tap(g_trk, tracker_tap, (void *)(intptr_t)g_mix_trk);
     g_tracker = trk_view_new(g_trk);
     trk_view_set_embedded(g_tracker, 1);      /* the menu bar carries its commands */
     g_tracker_page = trk_view_widget(g_tracker);
@@ -1124,6 +1517,9 @@ static void tracker_close_ok(void *ud)
     trk_view_free(g_tracker);
     g_tracker = NULL;
     g_tracker_page = NULL;
+    trk_set_tap(g_trk, NULL, NULL);     /* returns once no call is in flight */
+    mixbus_release(g_mix_trk);
+    g_mix_trk = -1;
     trk_close(g_trk);
     g_trk = NULL;
     for (t = 0; t < MAXTABS; t++)
@@ -1548,6 +1944,50 @@ static void reopen_song_synths(void)
     status(msg);
 }
 
+/* ----------------------------------------------------------------- recent --
+ *
+ * File > Open Recent: the songs and sessions last opened or saved, from the list
+ * the Qt shell keeps too (recentfiles.c). The submenu is rebuilt whenever the
+ * list changes. */
+static GMenu *g_recent_m;
+
+static void recent_refresh(void)
+{
+    recent_item *it = g_new(recent_item, RECENT_SHOWN);
+    int n, i;
+    if (!g_recent_m) { g_free(it); return; }
+    g_menu_remove_all(g_recent_m);
+    n = recent_list(it, RECENT_SHOWN);
+    for (i = 0; i < n; i++) {
+        GMenuItem *mi;
+        char *base = g_path_get_basename(it[i].path), *dir = g_path_get_dirname(it[i].path);
+        char *label = g_strdup_printf("%s%s  —  %s", base, strcmp(it[i].kind, "session") ? "" : " (session)", dir);
+        char *target = g_strdup_printf("%s\t%s", it[i].kind, it[i].path);
+        mi = g_menu_item_new(label, NULL);
+        g_menu_item_set_action_and_target_value(mi, "win.open-recent", g_variant_new_string(target));
+        g_menu_append_item(g_recent_m, mi);
+        g_object_unref(mi);
+        g_free(base); g_free(dir); g_free(label); g_free(target);
+    }
+    if (n) {
+        GMenu *clr = g_menu_new();
+        g_menu_append(clr, "Clear Recent", "win.clear-recent");
+        g_menu_append_section(g_recent_m, NULL, G_MENU_MODEL(clr));
+        g_object_unref(clr);
+    } else {
+        GMenuItem *none = g_menu_item_new("(nothing yet)", "win.no-recent");
+        g_menu_append_item(g_recent_m, none);
+        g_object_unref(none);
+    }
+    g_free(it);
+}
+
+static void remember(const char *kind, const char *path)
+{
+    recent_add(kind, path);
+    recent_refresh();
+}
+
 static int open_song_path(const char *path)
 {
     if (!open_tracker_tab()) return 0;
@@ -1557,6 +1997,7 @@ static int open_song_path(const char *path)
         status(msg);
         return 0;
     }
+    remember("song", path);
     /* The tracks may name synth tabs they were playing; trk_view_open's
      * song_opened hook (song_opened_cb) brings those back. */
     return 1;
@@ -1649,6 +2090,7 @@ static int write_session(const char *path)
         return 0;
     }
     snprintf(g_session_path, sizeof g_session_path, "%s", path);
+    remember("session", path);
     snprintf(msg, sizeof msg, "session saved to %s", path);
     status(msg);
     fprintf(stderr, "session: saved %s\n", path);
@@ -1731,6 +2173,21 @@ static void restore_song_sounds(const char *song)
         for (t = 0; t < MAXTABS; t++) {
             if (!g_tabs[t].used || g_tabs[t].sink_id < 0 ||
                 strcmp(g_tabs[t].sink_name, r->sink ? r->sink : "")) continue;
+            /* A tab of that name that now holds a different plug-in would be
+             * handed another instrument's parameters: say so, and leave it. */
+            {
+                const char *want = s->synths[r->synth].plugin;
+                char *a = g_path_get_basename(want ? want : ""),
+                     *b = g_path_get_basename(plugview_loaded_path(g_tabs[t].pv));
+                const int same = !want || !*want || !g_ascii_strcasecmp(a, b);
+                g_free(a); g_free(b);
+                if (!same) {
+                    snprintf(bad + strlen(bad), sizeof bad - strlen(bad), "%s%s (a different plug-in)",
+                             bad[0] ? ", " : "", g_tabs[t].sink_name);
+                    done |= 1u << r->synth;
+                    break;
+                }
+            }
             if (plugview_apply_patch(g_tabs[t].pv, s->synths[r->synth].patch))
                 snprintf(bad + strlen(bad), sizeof bad - strlen(bad), "%s%s",
                          bad[0] ? ", " : "", g_tabs[t].sink_name);
@@ -1956,6 +2413,7 @@ static int open_session_path(const char *path)
         fflush(stderr);
         return 0;
     }
+    remember("session", path);
     if (g_tracker && trk_view_dirty(g_tracker)) {
         sess_free(g_pending_restore);
         g_pending_restore = s;
@@ -2053,6 +2511,23 @@ static void on_song_opened(GObject *src, GAsyncResult *res, gpointer u)
         g_free(path);
     }
     g_object_unref(f);
+}
+
+static void act_open_recent(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    const char *v = p ? g_variant_get_string(p, NULL) : NULL;
+    const char *tab = v ? strchr(v, '\t') : NULL;
+    (void)a; (void)u;
+    if (!tab) return;
+    if (!strncmp(v, "session\t", 8)) open_session_path(tab + 1);
+    else open_song_path(tab + 1);
+}
+
+static void act_clear_recent(GSimpleAction *a, GVariant *p, gpointer u)
+{
+    (void)a; (void)p; (void)u;
+    recent_clear();
+    recent_refresh();
 }
 
 static void act_open_song(GSimpleAction *a, GVariant *p, gpointer u)
@@ -2376,7 +2851,13 @@ static void pm_refill(void)
             GtkWidget *row, *l;
             plugview_available(t->pv, i, &path, &name, &kind, &loadable);
             total++;
-            if (*needle && !g_strrstr(name, needle) && !g_strrstr(path, needle)) continue;
+            if (*needle) {   /* one letter: names starting with it; more: a keyword */
+                char *ln = g_utf8_strdown(needle, -1), *ln1 = g_utf8_strdown(name, -1), *ln2 = g_utf8_strdown(path, -1);
+                int hit = g_utf8_strlen(ln, -1) == 1 ? g_str_has_prefix(ln1, ln)
+                                                     : (strstr(ln1, ln) || strstr(ln2, ln));
+                g_free(ln); g_free(ln1); g_free(ln2);
+                if (!hit) continue;
+            }
             esc = g_markup_escape_text(name, -1);
             label = g_strdup_printf("%s%s%s%s%s", tab_holding(path) ? "<b>● " : "", esc,
                                     tab_holding(path) ? "</b>   loaded" : "",
@@ -2769,6 +3250,8 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "export-midi",  act_export_midi,  NULL, NULL, NULL, {0} },
         { "export-take",  act_export_take,  NULL, NULL, NULL, {0} },
         { "open-session",    act_open_session,    NULL, NULL, NULL, {0} },
+        { "open-recent",     act_open_recent,     "s",  NULL, NULL, {0} },
+        { "clear-recent",    act_clear_recent,    NULL, NULL, NULL, {0} },
         { "save-session",    act_save_session,    NULL, NULL, NULL, {0} },
         { "save-session-as", act_save_session_as, NULL, NULL, NULL, {0} },
         { "reload-plugin",   act_reload_plugin,   NULL, NULL, NULL, {0} },
@@ -2783,6 +3266,8 @@ static GtkWidget *build_menubar(GtkApplication *app)
         { "keep-folder", act_keep_folder, NULL, NULL, NULL, {0} },
         { "plugin-manager", act_plugin_manager, NULL, NULL, NULL, {0} },
         { "audio-settings", act_audio, NULL, NULL, NULL, {0} },
+        { "effect-input", NULL, NULL, "false", act_effect_input, {0} },
+        { "record-mix", NULL, NULL, "false", act_record_mix, {0} },
         { "enter-key",   act_enter_key,   NULL, NULL, NULL, {0} },
         { "toggle-editor", act_toggle_editor, NULL, NULL, NULL, {0} },
         { "panic",       act_panic,       NULL, NULL, NULL, {0} },
@@ -2846,6 +3331,9 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append(file, "New tracker", "win.new-tracker");
     g_menu_append(file, "New song",    "win.new-song");
     g_menu_append(file, "Open song…",  "win.open-song");
+    g_recent_m = g_menu_new();
+    g_menu_append_submenu(file, "Open Recent", G_MENU_MODEL(g_recent_m));
+    recent_refresh();
     g_menu_append(file, "Save song",     "win.save-song");
     g_menu_append(file, "Save song as…", "win.save-song-as");
     g_menu_append(file, "Export song as MIDI…", "win.export-midi");
@@ -2856,6 +3344,8 @@ static GtkWidget *build_menubar(GtkApplication *app)
     g_menu_append_section(file, NULL, G_MENU_MODEL(sess));
     g_menu_append(sect, "Plug-ins…", "win.plugin-manager");
     g_menu_append(sect, "Audio…", "win.audio-settings");
+    g_menu_append(sect, "Effect input (microphone)", "win.effect-input");
+    g_menu_append(sect, "Record studio mix", "win.record-mix");
     g_menu_append(sect, "Plug-in folders…", "win.plugin-folders-any");
     g_menu_append(sect, "Close tab",   "win.close-tab");
     g_menu_append(sect, "Quit",        "win.quit");
@@ -3040,6 +3530,8 @@ static char   g_want_synths[MAXTABS][1024];
 static int    g_nwant_synths;
 static int    g_want_tracker;
 static char   g_want_song[4096];
+static char   g_want_record[4096];             /* --record-mix: start a take with the window */
+static int    g_want_play;                     /* --play: start the song when it is open */
 static char   g_want_session[4096];
 static int    g_want_route = -1;
 static int    g_quit_after;
@@ -3082,7 +3574,15 @@ static void activate(GtkApplication *app, gpointer ud)
 
     g_status = gtk_label_new("open a synth or the tracker from the File menu");
     gtk_label_set_xalign(GTK_LABEL(g_status), 0.0);
-    gtk_box_append(GTK_BOX(outer), g_status);
+    gtk_widget_set_hexpand(g_status, TRUE);
+    g_mix_label = gtk_label_new("");
+    gtk_widget_add_css_class(g_mix_label, "error");         /* red: a take is running */
+    {
+        GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+        gtk_box_append(GTK_BOX(bar), g_status);
+        gtk_box_append(GTK_BOX(bar), g_mix_label);
+        gtk_box_append(GTK_BOX(outer), bar);
+    }
     gtk_window_set_child(GTK_WINDOW(g_win), outer);
 
     /* The computer keyboard plays the front tab's piano; see on_key. The
@@ -3094,7 +3594,11 @@ static void activate(GtkApplication *app, gpointer ud)
     gtk_widget_add_controller(g_win, kc);
     g_signal_connect(g_win, "notify::is-active", G_CALLBACK(on_win_active), NULL);
 
+    g_mix_synth = mixbus_register();
     engine_start_audio();
+    midi_start();
+    if (getenv("STUDIOGTK_EFFECT_INPUT") && effect_input_start() == 0)   /* scripted: the menu item, from the environment */
+        fprintf(stderr, "studiogtk: effect input on\n");
     update_canvas();
     g_timeout_add(1000, watch_tabs, NULL);
     g_timeout_add(40, kb_poll, NULL);          /* keys the tracker is playing */
@@ -3111,6 +3615,8 @@ static void activate(GtkApplication *app, gpointer ud)
     }
     if (g_want_tracker) open_tracker_tab();
     if (g_want_song[0]) open_song_path(g_want_song);
+    if (g_want_record[0]) mix_begin(g_want_record);
+    if (g_want_play && g_trk) trk_play(g_trk, TRK_PLAY_SONG, 0, 0);
     if (g_want_route > 0 && !route_track(g_want_route - 1))
         fprintf(stderr, "studiogtk: --route %d failed (no synth tab, or no tracker?)\n",
                 g_want_route);
@@ -3187,6 +3693,10 @@ int main(int argc, char **argv)
             g_smoke_ms = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--quit-after") && i + 1 < argc) {
             g_quit_after = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--record-mix") && i + 1 < argc) {
+            snprintf(g_want_record, sizeof g_want_record, "%s", argv[++i]);
+        } else if (!strcmp(argv[i], "--play")) {
+            g_want_play = 1;
         } else if (!strcmp(argv[i], "--backend") && i + 1 < argc) {
             g_backend_want = argv[++i];
             g_backend_cli = 1;
@@ -3194,7 +3704,8 @@ int main(int argc, char **argv)
             printf("studiogtk [--synth <plug-in>]... [--tracker] [--song <file.trk>]\n"
                    "          [--session <file.vstace>] [--save-session <file.vstace>]\n"
                    "          [--route <track>] [--smoke <ms>] [--quit-after <ms>]\n"
-                   "          [--backend auto|pipewire|jack|alsa]\n\n"
+                   "          [--backend auto|pipewire|jack|alsa]\n"
+                   "          [--record-mix <file.wav>] [--play]\n\n"
                    "The session window, in GTK: a tab per synth plug-in, one for "
                    "the tracker.\nWith no arguments it opens on a blank canvas.\n"
                    "--session restores a session saved with File > Save session; "
@@ -3233,6 +3744,13 @@ int main(int argc, char **argv)
     /* Silence both backends before anything else goes away: PipeWire's data
      * loop is still calling render_block() at this point, and letting it run
      * into process teardown renders out of freed tab state. */
+    if (mixbus_active()) {          /* a take still running when the window closes is finished, not lost */
+        char f[4096];
+        mixbus_stop(f, sizeof f);
+        fprintf(stderr, "studiogtk: wrote %s\n", f);
+    }
+    midi_stop();
+    effect_input_stop();
     engine_stop_audio();
     pw_deinit();
     if (g_tracker) trk_view_free(g_tracker);  /* its widget died with the window */

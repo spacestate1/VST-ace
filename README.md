@@ -95,6 +95,17 @@ line of text rather than the session. `PEHOST_ISOLATE=0` runs everything
 in-process the way it used to; three plug-ins in the corpus only work in the
 helper.
 
+### The studio shells (`studio`, `studiogtk`)
+
+Both shells have **File > Open Recent** (songs and sessions, newest first, one
+list shared by the two shells in `~/.config/vst-ace/recent`) and **File > Record
+studio mix** (Ctrl+Shift+R in Qt): one WAV of everything the studio plays -- every
+synth tab and the tracker's sample tracks, summed -- into `renders/`, with an
+offer to move it when the take ends. For scripts: `--record-mix out.wav` starts a
+take with the window and `--play` starts the song. A synth tab's own **Record**
+button still records that tab alone. Not captured: tracks routed to an outside
+ALSA program, which make their sound somewhere this program cannot hear.
+
 ## In a DAW
 
 The hosts above are programs you run. The same loaders are also a Linux VST2
