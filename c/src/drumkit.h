@@ -109,6 +109,13 @@ void drumkit_render(drumkit *k, double *out, int frames);   /* interleaved stere
 
 void drumkit_set_gain(drumkit *k, double g);
 
+/* Leave the output unlimited. By default drumkit_render ends in a per-sample
+ * soft limiter, which bends the waveform of every hit that peaks above 0.7
+ * and, on stacked hits, adds audible distortion. A host that mixes several
+ * kits and limits the sum itself (the tracker does, with a look-ahead
+ * limiter) turns it off. */
+void drumkit_set_raw(drumkit *k, int raw);
+
 /* ------------------------------------------------------- finding kits -- */
 
 #define DK_MAX_KITS 64

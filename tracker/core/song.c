@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define TRK_PPQ 960                  /* engine.c's queue resolution */
@@ -175,12 +176,20 @@ static const char *one_line(const char *in, char *out, size_t n)
 
 int trk_song_save(const trk_song *s, const char *path, char *err, size_t errn)
 {
-    char  tmp[4096];
+    char  tmp[4096], real[PATH_MAX];
     FILE *f;
     int   t, p, r, i;
     char  ln[TRK_PATH_LEN + 1];
+    struct stat st;
+    const char *dst = path;
 
-    snprintf(tmp, sizeof tmp, "%s.new", path);
+    /* A song that is a link is written through it, not replaced by a plain
+     * file; and the file it replaces keeps its permissions. */
+    if (realpath(path, real)) dst = real;
+    if (snprintf(tmp, sizeof tmp, "%s.new", dst) >= (int)sizeof tmp) {
+        snprintf(err, errn, "%s: the path is too long", path);
+        return -1;
+    }
     if (!(f = fopen(tmp, "w"))) {
         snprintf(err, errn, "%s: %s", tmp, strerror(errno));
         return -1;
@@ -231,15 +240,38 @@ int trk_song_save(const trk_song *s, const char *path, char *err, size_t errn)
         unlink(tmp);
         return -1;
     }
-    fclose(f);
+    /* On the disk before it replaces the old song: a crash or a power cut
+     * between the rename and the write-out would otherwise leave an empty
+     * file where the song was. A full disk can also show only at the close. */
+    if (stat(dst, &st) == 0) { if (fchmod(fileno(f), st.st_mode & 07777) != 0) { /* keep the default */ } }
+    if (fsync(fileno(f)) != 0 || fclose(f) != 0) {
+        snprintf(err, errn, "%s: %s", tmp, strerror(errno));
+        unlink(tmp);
+        return -1;
+    }
     /* Renamed into place, so a failed save leaves the old song rather than
      * half of the new one. */
-    if (rename(tmp, path)) {
+    if (rename(tmp, dst)) {
         snprintf(err, errn, "%s: %s", path, strerror(errno));
         unlink(tmp);
         return -1;
     }
     return 0;
+}
+
+/* The value of a name-like field: what follows the `n` words and the ONE space
+ * that parts it from them -- exactly what save wrote, so a name that begins
+ * with a space comes back with it. A hand-edited file with a run of spaces
+ * keeps the extra ones, which is what it says. */
+static const char *value_after(const char *line, int n)
+{
+    const char *p = line;
+    while (n-- > 0) {
+        while (*p == ' ' || *p == '\t') p++;
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    if (*p == ' ' || *p == '\t') p++;
+    return p;
 }
 
 /* The rest of a line after `n` words, for the values that may hold spaces --
@@ -262,7 +294,7 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
     trk_song *s = malloc(sizeof *s);
     char      line[1024];
     FILE     *f;
-    int       ln = 0, ok = 0, hi = -1;           /* hi: the highest track the file mentions */
+    int       ln = 0, ok = 0, hi = -1, nskip = 0;   /* hi: the highest track the file mentions */
 
     if (!s) { snprintf(err, errn, "out of memory"); return -1; }
     if (!(f = fopen(path, "r"))) {
@@ -305,13 +337,13 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
             if (a > hi) hi = a;
             k = &s->track[a];
             if (!strcmp(w[2], "name"))
-                snprintf(k->name, sizeof k->name, "%s", after_words(line, 3));
+                snprintf(k->name, sizeof k->name, "%s", value_after(line, 3));
             else if (!strcmp(w[2], "client"))
-                snprintf(k->client, sizeof k->client, "%s", after_words(line, 3));
+                snprintf(k->client, sizeof k->client, "%s", value_after(line, 3));
             else if (!strcmp(w[2], "port"))
-                snprintf(k->port, sizeof k->port, "%s", after_words(line, 3));
+                snprintf(k->port, sizeof k->port, "%s", value_after(line, 3));
             else if (!strcmp(w[2], "sink"))
-                snprintf(k->sink, sizeof k->sink, "%s", after_words(line, 3));
+                snprintf(k->sink, sizeof k->sink, "%s", value_after(line, 3));
             else if (!strcmp(w[2], "octave")) {
                 int o = n >= 4 ? atoi(w[3]) : -1;
                 if (n < 4 || o < 0 || o > 9) goto bad;
@@ -321,8 +353,10 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
                 if (n < 4 || v < 0 || v > 100) goto bad;
                 k->volume = v;
             } else if (!strcmp(w[2], "samples"))
-                snprintf(k->samples, sizeof k->samples, "%s", after_words(line, 3));
-            else {
+                snprintf(k->samples, sizeof k->samples, "%s", value_after(line, 3));
+            else if (strcmp(w[2], "channel")) {
+                nskip++;                                /* a field of a newer build: not ours to read */
+            } else {
                 int ch = 1, vel = 100, mute = 0;
                 if (sscanf(line, "track %*d channel %d velocity %d mute %d",
                            &ch, &vel, &mute) != 3) goto bad;
@@ -331,10 +365,10 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
             }
         } else if (!strcmp(w[0], "order")) {
             const char *p = after_words(line, 1);
-            while (*p && s->norder < TRK_ORDER_MAX) {
+            while (*p) {
                 char *end;
                 long  v = strtol(p, &end, 10);
-                if (end == p) goto bad;
+                if (end == p || s->norder >= TRK_ORDER_MAX) goto bad;   /* not silently cut short */
                 if (v < 0 || v >= TRK_PATTERNS) goto bad;
                 s->order[s->norder++] = (int)v;
                 p = end;
@@ -343,7 +377,7 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
         } else if (!strcmp(w[0], "pattern") && n >= 3 && !strcmp(w[2], "name")) {
             a = atoi(w[1]);
             if (a < 0 || a >= TRK_PATTERNS) goto bad;
-            snprintf(s->pattern[a].name, sizeof s->pattern[a].name, "%s", after_words(line, 3));
+            snprintf(s->pattern[a].name, sizeof s->pattern[a].name, "%s", value_after(line, 3));
         } else if (!strcmp(w[0], "pattern") && n >= 4) {
             a = atoi(w[1]); b = atoi(w[3]);
             if (a < 0 || a >= TRK_PATTERNS || b < 1 || b > TRK_ROWS_MAX) goto bad;
@@ -364,8 +398,11 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
             cl = &s->pattern[a].cell[b][c];
             cl->note = (uint8_t)note; cl->vel = (uint8_t)iv;
             cl->cc = (uint8_t)icc;    cl->val = (uint8_t)ival;
+        } else if (!strcmp(w[0], "bpm") || !strcmp(w[0], "volume") || !strcmp(w[0], "lpb") ||
+                   !strcmp(w[0], "tracks") || !strcmp(w[0], "track") || !strcmp(w[0], "pattern")) {
+            goto bad;                                   /* a line we know, cut short or malformed */
         } else {
-            goto bad;
+            nskip++;                                    /* a line of a newer build: skipped, and said so */
         }
     }
     fclose(f);
@@ -378,6 +415,9 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
     if (s->ntracks < hi + 1) s->ntracks = hi + 1;       /* a track the file uses is a track the song has */
     memcpy(out, s, sizeof *s);
     free(s);
+    if (nskip && errn) snprintf(err, errn, "%d line%s this version does not know %s ignored", nskip,
+                                nskip == 1 ? "" : "s", nskip == 1 ? "was" : "were");
+    else if (errn) err[0] = 0;
     return 0;
 
 bad:

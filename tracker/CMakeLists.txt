@@ -23,13 +23,20 @@ pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 
 # The drum kits are vst-ace's own sample engine, from c/src.
 set(VA_ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../c/src)
-add_library(trkcore STATIC core/midiexport.c core/song.c core/engine.c core/editor.c
+add_library(trkcore STATIC core/midiexport.c core/song.c core/engine.c core/editor.c core/rt.c
             ${VA_ENGINE_DIR}/drumkit.c ${VA_ENGINE_DIR}/wav.c ${VA_ENGINE_DIR}/dw_dsp.c)
 target_include_directories(trkcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core)
 # Public: the windows' sample-set editors read and write a set through
 # drumkit.h's dk_map.
 target_include_directories(trkcore PUBLIC ${VA_ENGINE_DIR})
-target_link_libraries(trkcore PUBLIC PkgConfig::ALSA Threads::Threads m)
+target_link_libraries(trkcore PUBLIC PkgConfig::ALSA Threads::Threads m ${CMAKE_DL_LIBS})
+# PipeWire, when it is there: the sample output is then a PipeWire stream (its
+# realtime callback, one clock with the synth tabs); without it, ALSA as before.
+pkg_check_modules(PIPEWIRE IMPORTED_TARGET libpipewire-0.3)
+if(PIPEWIRE_FOUND)
+  target_link_libraries(trkcore PUBLIC PkgConfig::PIPEWIRE)
+  target_compile_definitions(trkcore PUBLIC TRK_HAVE_PIPEWIRE)
+endif()
 # Truncating a long kit or client name to its field is the intent, and the
 # compiler cannot tell; c/'s Makefile turns this off for the same reason.
 target_compile_options(trkcore PRIVATE -Wall -Wextra -Wno-format-truncation)

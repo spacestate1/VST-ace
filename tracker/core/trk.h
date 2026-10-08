@@ -237,6 +237,20 @@ typedef void (*trk_sink_fn)(void *ud, double wall, const trk_sink_ev *evs, int n
 /* A named in-process destination -- the name is what a destination list
  * shows. Returns its id (>= 0), or -1 when the slots are full. */
 int  trk_add_sink(trk_engine *e, const char *name, trk_sink_fn fn, void *ud);
+
+/* A sink's output gain. A track's volume fader is exact for a synth only if it
+ * scales what the synth *sounds*: velocity does nothing on a synth that is not
+ * velocity-sensitive, and most ignore channel volume. So a sink with a gain
+ * callback is handed the loudest fader (0..1) among the tracks playing it as its
+ * output gain -- for one track alone, exactly its volume -- and each track's
+ * notes are scaled by velocity only relative to that loudest one. The callback
+ * runs under the engine's lock, from whichever thread changed the routing or
+ * the volume: it must only store the number, with the `ud` the sink was added
+ * with. */
+typedef void (*trk_gain_fn)(void *ud, double gain);
+void trk_sink_set_gain_cb(trk_engine *e, int id, trk_gain_fn cb);
+/* Recompute every sink's gain after a track's volume changed. */
+void trk_sink_gains_refresh(trk_engine *e);
 /* Unregister: tracks routed to the sink go back to their ALSA windows (what
  * they have sounding is released to the sink first, while it is still there
  * to hear it), and any delivery call in flight is waited out -- after this
@@ -269,6 +283,16 @@ void trk_position(trk_engine *e, int *order, int *pattern, int *row);
  * sounds (previews too), then falling away. Call it on a UI timer; it
  * takes the lock itself. */
 void trk_levels(trk_engine *e, float out[TRK_TRACKS]);
+
+/* Everything a window's playback timer reads, in one take of the engine's lock. */
+typedef struct {
+    int      order, pattern, row;       /* the row sounding, or -1 */
+    int      playing, recording;        /* recording: 0, 1, or 2 for the count-in */
+    float    level[TRK_TRACKS];
+    unsigned xruns;
+    int      quiet;                     /* idle, and the meters have died away */
+} trk_poll_state;
+void trk_poll(trk_engine *e, trk_poll_state *st);
 void trk_set_bpm(trk_engine *e, double bpm);     /* takes effect at once */
 
 /* Play one note now, as feedback while entering it. Released by
@@ -487,6 +511,15 @@ int  trk_track_set_volume(trk_engine *e, int track, int percent);
  * when the volume is 0 and nothing should sound. */
 int  trk_track_velocity(const trk_track *k, int cell_velocity);
 
+/* Ask for realtime scheduling for the calling thread (rt.c): directly if the
+ * user's limits allow, else through RealtimeKit over the system bus. Returns 1
+ * when it got it; either way `how` says what happened, for a log line. The
+ * sample audio thread calls this so a busy machine does not starve it into a
+ * dropout. */
+int  trk_audio_thread_realtime(int priority, char *how, size_t hown);
+/* Back to ordinary scheduling, for the calling thread (see rt.c). */
+void trk_audio_thread_normal(void);
+
 /* The colour a note is drawn in when notes are coloured by pitch: low to high
  * across the rainbow, red at C1 to violet at C7 (clamped beyond). `dark` is a
  * dark page, which takes brighter colours than a light one. */
@@ -504,7 +537,23 @@ const char *trk_columns_help(void);
  * play through PipeWire, a separate path. */
 int         trk_audio_devices(char names[][TRK_DEST_LEN], char labels[][96], int max);
 const char *trk_audio_device(trk_engine *e);
+
+/* How much room the sample output has before it runs dry: 0 "Low latency" ..
+ * TRK_BUFFER_LEVELS-1 "Extra safe". Bigger is safer on a busy machine and delays
+ * only a note typed to be heard; a playing song lines up at any size. Changed
+ * live and kept between runs. */
+#define TRK_BUFFER_LEVELS 4
+int         trk_audio_buffer(trk_engine *e);
+int         trk_audio_set_buffer(trk_engine *e, int level);
+const char *trk_audio_buffer_label(int level);
 int         trk_audio_set_device(trk_engine *e, const char *name);
+
+/* A tap on the sample output, for a recorder of the whole studio: `fn` is called
+ * from the audio thread with every block as it leaves -- interleaved stereo
+ * doubles at TRK_SINK_RATE, after the master volume and the limiter. It must not
+ * block or allocate. NULL removes it; the call returns once none is in flight. */
+typedef void (*trk_tap_fn)(void *ud, const double *interleaved, int frames);
+void        trk_set_tap(trk_engine *e, trk_tap_fn fn, void *ud);
 
 /* The cheat sheet for track t, lines of at most `width` characters: for a
  * track playing a sample set, each sample with its note and the key that

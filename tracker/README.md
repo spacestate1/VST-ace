@@ -282,3 +282,24 @@ clicking one switches to it, live, and remembers it
 chosen). Synth tabs in the studio play through PipeWire, a separate path; it
 serves JACK programs through pipewire-jack and ALSA programs through
 pipewire-alsa.
+
+### How the sample audio is kept free of clicks
+
+- **The default output is a native PipeWire stream**, "tracker samples": PipeWire
+  calls the tracker from its own realtime thread, on the same clock as the synth
+  tabs' streams. Any device chosen by name in the Audio Output list, and
+  `TRK_PCM`, still go through ALSA directly, on a thread of the tracker's that
+  asks for realtime priority (directly, or through RealtimeKit). Built without
+  PipeWire, or with no PipeWire server running, the default falls back to ALSA's.
+- **Buffer**, in the same window: Low latency, Balanced (the default), Safe,
+  Extra safe. A bigger buffer is safer on a busy machine and delays only a note
+  typed to be heard -- a playing song is scheduled ahead and lines up at any size.
+  Kept in `audio-output` beside the device.
+- **The mix is limited, not clipped:** the kits no longer limit per sample (that
+  bent the waveform of every loud hit); the tracker applies one look-ahead limiter
+  to the whole mix instead.
+- **The lock the audio thread shares** with the threads that load and route sample
+  sets is priority-inheriting, so a low-priority thread holding it cannot stall a
+  realtime one.
+- **Dropouts are counted and logged** (`trk: sample output dropout #N at …`) for
+  the ALSA output; a PipeWire stream's own are in `pw-top`'s ERR column.

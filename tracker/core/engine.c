@@ -34,6 +34,10 @@
 #include "drumkit.h"
 
 #include <alsa/asoundlib.h>
+#ifdef TRK_HAVE_PIPEWIRE
+#include <pipewire/pipewire.h>
+#include <spa/param/audio/format-utils.h>
+#endif
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -45,6 +49,11 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef TRK_HAVE_PIPEWIRE
+#define TRK_DEFAULT_LABEL "System default (PipeWire)"
+#else
+#define TRK_DEFAULT_LABEL "System default"
+#endif
 #define TRK_PPQ       960            /* divisible by every lpb trk_lpb_ok allows, and by 24 */
 #define CLOCK_TICKS   (TRK_PPQ / 24) /* MIDI clock is 24 per quarter note */
 #define LOOKAHEAD_S   0.12
@@ -72,6 +81,8 @@ typedef struct {
     void       *ud;
     sink_qev    q[SINK_Q];
     int         nq;
+    trk_gain_fn gain_cb;            /* the output gain, when one track plays this sink alone */
+    double      gain_sent;
 } trk_sink;
 
 /* Something for the audio thread to do, at a queue tick or as soon as it can
@@ -126,6 +137,7 @@ struct trk_engine {
     unsigned        rec_lead;             /* the count-in's length in ticks, 0 for none */
     int             rec_track;            /* where the MIDI input goes: the cursor's */
     int             rec_note[TRK_TRACKS]; /* recorded on and not yet released, or -1 */
+    int             vol_sent[TRK_TRACKS]; /* channel volume (CC 7) last sent for the track: (value + 1) | channel << 8, 0 for none */
     int             rec_pat[TRK_TRACKS], rec_row[TRK_TRACKS];   /* ... and where it went */
     take_ev        *take;
     size_t          ntake, captake;
@@ -183,11 +195,39 @@ struct trk_engine {
     drumkit_place   places[DK_MAX_KITS];  /* every set there is, as last scanned */
     int             nplaces;
     double          scanned_at;
+    pthread_mutex_t kmx;                  /* places[], the scan clock and the failure memory below */
+    double          forced_at;            /* when the list was last re-read for a name it lacked */
+    int             kits_stale;           /* a set was added or reloaded: the next miss may rescan at once */
+    struct { char name[TRK_PATH_LEN]; double at; } bad[4];   /* sets that would not load, and when */
+    int             nbad;
+    _Atomic double  audio_fail_at;        /* when opening the output last failed */
 
     /* Their output. */
     snd_pcm_t      *pcm;
     pthread_t       athread;
     int             audio_on, aperiod;
+    int             use_pw;               /* the output is a PipeWire stream, not the ALSA thread */
+    int             buf_level;            /* 0..TRK_BUFFER_LEVELS-1: the buffer-size setting */
+#ifdef TRK_HAVE_PIPEWIRE
+    struct pw_thread_loop *pwloop;
+    struct pw_stream      *pwstream;
+    double                 pw_last, pw_blk, pw_said;   /* the stream callback's own, for dropouts */
+    _Atomic int            pw_up;        /* the stream is running: its loss is then news */
+    _Atomic int            pw_dead;      /* ... and it was lost: the output wants reopening */
+#endif
+    pthread_mutex_t amx;                  /* opening and closing the output, one at a time */
+    pthread_mutex_t rmx;                  /* the recovery thread's handle */
+    pthread_t       rthread;
+    int             rstarted, rrunning;   /* the recovery thread was made / is still going (under rmx) */
+    _Atomic int     closing;              /* the engine is going: nothing new starts */
+    pthread_mutex_t tapmx;                /* the output tap: set under it, called under it */
+    trk_tap_fn      tap;
+    void           *tap_ud;
+    _Atomic int     tap_on;
+    /* What one block of sample audio is rendered with, shared by both outputs. */
+    double         *a_mix, *a_tmp;
+    void           *a_due;               /* due_ev[SEV_MAX] */
+    void           *a_lim;               /* limiter */
     _Atomic int     aquit;                /* stop flags: read by threads that do not hold the lock */
     double          alat;                 /* seconds from a hit's time to its sound */
     _Atomic double  bpm_now;              /* the queue's tempo, for the audio thread */
@@ -348,6 +388,26 @@ static void track_ev(trk_engine *e, int t, unsigned tick, int asap, int st, int 
     }
     if (asap) now(e, &ev);
     else at_tick(e, &ev, tick);
+}
+
+static int track_on_gain(trk_engine *e, int t);
+static int track_rel_volume(trk_engine *e, int t);
+
+/* A track's volume as the synth's own channel volume (CC 7), sent ahead of a
+ * note when it is not what the synth was last told. Scaling the velocity alone
+ * does nothing on a synth that is not velocity-sensitive -- its amp's velocity
+ * amount at zero is common -- so the fader also moves the channel volume. A
+ * track left at 100 that never moved the fader sends nothing: the synth keeps
+ * its own level. */
+static void track_volume(trk_engine *e, int t, unsigned tick, int asap)
+{
+    const int vol = e->song.track[t].volume, ch = e->song.track[t].channel & 15;
+    const int want = vol >= 100 ? 127 : (vol * 127 + 50) / 100;
+    const int mark = (want + 1) | (ch << 8);
+    if (e->vol_sent[t] == mark) return;
+    if (!e->vol_sent[t] && vol >= 100) return;       /* never touched: leave the synth's level */
+    track_ev(e, t, tick, asap, 0xB0 | ch, 7, want);
+    e->vol_sent[t] = mark;
 }
 
 /* Clock, transport and song position to every sink a track plays, once each
@@ -514,7 +574,14 @@ static void schedule_row(trk_engine *e)
             e->held[t] = -1;
         }
         if (c->note <= 127 && trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel) > 0) {
-            const int vel = trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel);
+            /* A track alone on an in-process synth is faded by that synth's
+             * output gain instead, so its velocities stay the song's. */
+            const int on_gain = track_on_gain(e, t);
+            trk_track kk = *k;
+            int vel;
+            kk.volume = track_rel_volume(e, t);
+            vel = trk_track_velocity(&kk, c->vel == TRK_EMPTY ? 0 : c->vel);
+            if (!on_gain) track_volume(e, t, e->next_tick, 0);
             track_ev(e, t, e->next_tick, 0, 0x90 | ch, c->note, vel);
             e->held[t] = c->note;
             e->held_ch[t] = ch;
@@ -649,88 +716,232 @@ static void apply_due(trk_engine *e, const sample_ev *v)
     }
 }
 
-/* One period at a time: which pending hits fall inside it, and where; then
- * every kit rendered, split at those points so each hit starts on its own
- * sample. A hit's time is its tick turned into wall time, plus alat -- the
- * output's buffer -- so that one scheduled just ahead of the queue is never
- * already late; the period's own time is now plus what the device still
- * holds. Late anyway (an underrun), it plays at the period's start. */
+
+/* ------------------------------------------------------------ the limiter --
+ *
+ * The sample tracks' mix can pass full scale -- stacked hits peaking near 1
+ * sum to well over it. The kits used to squash that with a per-sample soft
+ * limiter, which bends the waveform of every loud hit and measured about 3.5%
+ * distortion on a drum pattern: a crunch on exactly the loudest transients.
+ * This one never touches the waveform. It looks LIM_L frames ahead, works out
+ * the gain that keeps the peak under the ceiling, spreads that gain change over
+ * the lookahead so it is a smooth dip rather than a step, and lets it recover
+ * slowly. Each frame is delayed by LIM_L (about a millisecond) so the dip is in
+ * place before the peak arrives.
+ *
+ * Why the result cannot pass the ceiling: the frame leaving now has target t.
+ * Every gain-reduction value averaged below was the minimum over a window that
+ * includes that frame, so each is <= t, and so is their average. */
+#define LIM_L       48                  /* lookahead, frames */
+#define LIM_N       (LIM_L + 1)
+#define LIM_CEIL    0.97
+#define LIM_REL     0.00045             /* recovery per frame: ~45 ms to come back up */
+
+typedef struct {
+    double dx[LIM_N][2];                /* the audio, delayed by LIM_L frames */
+    double tg[LIM_N];                   /* the gain each frame needs on its own */
+    double sm[LIM_N];                   /* the windowed minimum, for the average */
+    double smsum, gf;
+    int    w;
+} limiter;
+
+static void lim_init(limiter *m)
+{
+    int i;
+    memset(m, 0, sizeof *m);
+    for (i = 0; i < LIM_N; i++) { m->tg[i] = 1.0; m->sm[i] = 1.0; }
+    m->smsum = LIM_N;
+    m->gf = 1.0;
+}
+
+static void lim_process(limiter *m, double *buf, int frames)
+{
+    int i, k;
+    for (i = 0; i < frames; i++) {
+        const double l = buf[2 * i], r = buf[2 * i + 1];
+        double pk = l < 0 ? -l : l, pr = r < 0 ? -r : r, gmin = 1.0, avg;
+        const int w = m->w, oldest = (w + 1) % LIM_N;
+        if (pr > pk) pk = pr;
+        if (pk != pk) { buf[2 * i] = buf[2 * i + 1] = 0.0; m->dx[w][0] = m->dx[w][1] = 0.0; pk = 0.0; }
+        m->dx[w][0] = l == l ? l : 0.0;
+        m->dx[w][1] = r == r ? r : 0.0;
+        m->tg[w] = pk > LIM_CEIL ? LIM_CEIL / pk : 1.0;
+        for (k = 0; k < LIM_N; k++) if (m->tg[k] < gmin) gmin = m->tg[k];
+        m->smsum += gmin - m->sm[w];
+        m->sm[w] = gmin;
+        avg = m->smsum / LIM_N;
+        m->gf = m->gf + (1.0 - m->gf) * LIM_REL;       /* recovering... */
+        if (avg < m->gf) m->gf = avg;                  /* ...never above what the peak needs */
+        buf[2 * i]     = m->dx[oldest][0] * m->gf;
+        buf[2 * i + 1] = m->dx[oldest][1] * m->gf;
+        m->w = oldest;
+    }
+}
+
+#define AUD_MAX 8192                    /* the most frames one block may be */
+
+/* The room one block of sample audio is made in, kept from open to close so
+ * neither output allocates while it runs. */
+static int audio_state_alloc(trk_engine *e)
+{
+    e->a_mix = calloc((size_t)AUD_MAX * 2, sizeof(double));
+    e->a_tmp = calloc((size_t)AUD_MAX * 2, sizeof(double));
+    e->a_due = calloc(SEV_MAX, sizeof(due_ev));
+    e->a_lim = calloc(1, sizeof(limiter));
+    if (!e->a_mix || !e->a_tmp || !e->a_due || !e->a_lim) {
+        free(e->a_mix); free(e->a_tmp); free(e->a_due); free(e->a_lim);
+        e->a_mix = e->a_tmp = e->a_due = e->a_lim = NULL;
+        return -1;
+    }
+    lim_init(e->a_lim);
+    return 0;
+}
+
+static void audio_state_free(trk_engine *e)
+{
+    free(e->a_mix); free(e->a_tmp); free(e->a_due); free(e->a_lim);
+    e->a_mix = e->a_tmp = e->a_due = e->a_lim = NULL;
+}
+
+/* One block of P frames, into e->a_mix (interleaved stereo, limited): which
+ * pending hits fall inside it, and where; then every kit rendered, split at
+ * those points so each hit starts on its own sample. A hit's time is its tick
+ * turned into wall time, plus alat -- the output's latency -- so that one
+ * scheduled just ahead of the queue is never already late; the block's own
+ * time is now plus `delay_s`, what the device still holds ahead of it. Late
+ * anyway (an underrun), a hit plays at the block's start. Used by both
+ * outputs: the ALSA thread and the PipeWire stream's callback. */
+static void audio_render(trk_engine *e, int P, double delay_s)
+{
+    double *mix = e->a_mix, *tmp = e->a_tmp;
+    due_ev *due = e->a_due;
+    double now, pwall, spt;
+    unsigned cur;
+    int i, j, nd = 0, a, k;
+
+    if (P > AUD_MAX) P = AUD_MAX;
+    now = mono_now();
+    pwall = now + delay_s;
+    cur = queue_tick(e);
+    spt = 60.0 / ((e->bpm_now > 0 ? e->bpm_now : 120.0) * TRK_PPQ);
+
+    pthread_mutex_lock(&e->smx);
+    for (i = j = 0; i < e->nsev; i++) {
+        const sample_ev *v = &e->sev[i];
+        int off = 0;
+        if (!v->asap) {
+            double wall = now + (double)(int)(v->tick - cur) * spt + e->alat;
+            double f = floor((wall - pwall) * KIT_RATE);
+            off = f < 0 ? 0 : f > P ? P : (int)f;
+        }
+        if (off < P) {
+            /* In time order, a hit stays behind the ones before it. */
+            int at = nd;
+            while (at > 0 && due[at - 1].off > off) { due[at] = due[at - 1]; at--; }
+            due[at].off = off; due[at].v = *v;
+            nd++;
+        } else {
+            e->sev[j++] = *v;
+        }
+    }
+    e->nsev = j;
+
+    memset(mix, 0, (size_t)P * 2 * sizeof *mix);
+    for (a = 0, k = 0; a < P; ) {
+        int b, n;
+        while (k < nd && due[k].off <= a) { apply_due(e, &due[k].v); k++; }
+        b = k < nd ? due[k].off : P;
+        for (i = 0; b > a && i <= e->nkit; i++) {
+            drumkit *dk = i < e->nkit ? e->kit[i].dk : e->aud;
+            if (!dk) continue;
+            drumkit_render(dk, tmp, b - a);
+            for (n = 0; n < (b - a) * 2; n++) mix[a * 2 + n] += tmp[n];
+        }
+        for (n = a; n < b && e->click_left > 0; n++, e->click_left--) {
+            const double env = (double)e->click_left / (double)e->click_total;
+            const double v = e->click_amp * env * sin(e->click_ph);
+            e->click_ph += 6.283185307179586 * e->click_freq / KIT_RATE;
+            mix[n * 2] += v;
+            mix[n * 2 + 1] += v;
+        }
+        a = b;
+    }
+    pthread_mutex_unlock(&e->smx);
+
+    {   /* The master volume, from the copy published at unlock. */
+        const int vol = atomic_load_explicit(&e->vol_live, memory_order_relaxed);
+        const double g = (vol < 0 ? 0 : vol > 150 ? 150 : vol) / 100.0;
+        for (i = 0; i < P * 2; i++) mix[i] *= g;
+    }
+    lim_process(e->a_lim, mix, P);
+    /* What a recorder of the whole studio takes: the mix as it leaves, limited. */
+    if (atomic_load_explicit(&e->tap_on, memory_order_acquire)) {
+        pthread_mutex_lock(&e->tapmx);
+        if (e->tap) e->tap(e->tap_ud, mix, P);
+        pthread_mutex_unlock(&e->tapmx);
+    }
+}
+
+void trk_set_tap(trk_engine *e, trk_tap_fn fn, void *ud)
+{
+    pthread_mutex_lock(&e->tapmx);            /* waits out a call in flight */
+    e->tap = fn;
+    e->tap_ud = ud;
+    atomic_store_explicit(&e->tap_on, fn != NULL, memory_order_release);
+    pthread_mutex_unlock(&e->tapmx);
+}
+
+/* A dropout of the sample output, either kind: counted, and said with the time,
+ * so a regular stall (something that runs once a second) shows as such. The
+ * first few are all said, then one a second. Each one is an audible click. */
+static void xrun_note(trk_engine *e, double *said, const char *why)
+{
+    const unsigned n = atomic_fetch_add_explicit(&e->xruns, 1, memory_order_relaxed) + 1;
+    const double t = mono_now();
+    if (n <= 40 || t - *said >= 1.0) {
+        fprintf(stderr, "trk: sample output dropout #%u at %.3f s (%s)\n", n, t, why);
+        *said = t;
+    }
+}
+
+/* The ALSA output: a thread of its own, one period at a time. */
 static void *audio_main(void *ud)
 {
     trk_engine *e = ud;
     const int P = e->aperiod;
-    double *mix = calloc((size_t)P * 2, sizeof *mix);
-    double *tmp = calloc((size_t)P * 2, sizeof *tmp);
-    short  *out = calloc((size_t)P * 2, sizeof *out);
-    due_ev *due = calloc(SEV_MAX, sizeof *due);
+    short *out = calloc((size_t)P * 2, sizeof *out);
+    double xr_said = -10.0;
+    int slow = 0, rt;
+    {   /* A busy machine must not starve this thread into a dropout. */
+        char how[160];
+        rt = trk_audio_thread_realtime(10, how, sizeof how);
+        fprintf(stderr, "trk: sample audio thread: %s\n", how);
+    }
 
-    while (mix && tmp && out && due && !e->aquit) {
-        snd_pcm_sframes_t delay = 0;
-        double now, pwall, spt;
-        unsigned cur;
-        int i, j, nd = 0, a, k;
-        snd_pcm_sframes_t w;
+    while (out && !e->aquit) {
+        snd_pcm_sframes_t delay = 0, w;
+        const double t0 = mono_now();
+        int i;
 
         if (snd_pcm_delay(e->pcm, &delay) < 0 || delay < 0) delay = 0;
-        now = mono_now();
-        pwall = now + (double)delay / KIT_RATE;
-        cur = queue_tick(e);
-        spt = 60.0 / ((e->bpm_now > 0 ? e->bpm_now : 120.0) * TRK_PPQ);
-
-        pthread_mutex_lock(&e->smx);
-        for (i = j = 0; i < e->nsev; i++) {
-            const sample_ev *v = &e->sev[i];
-            int off = 0;
-            if (!v->asap) {
-                double wall = now + (double)(int)(v->tick - cur) * spt + e->alat;
-                double f = floor((wall - pwall) * KIT_RATE);
-                off = f < 0 ? 0 : f > P ? P : (int)f;
+        audio_render(e, P, (double)delay / KIT_RATE);
+        /* A render that takes longer than the audio it makes, block after
+         * block, would hold a realtime thread on the CPU and starve the
+         * machine: give the priority back (the sound is late, not gone). */
+        if (rt) {
+            if (mono_now() - t0 > (double)P / KIT_RATE) slow++; else slow = 0;
+            if (slow >= 50) {
+                trk_audio_thread_normal();
+                rt = 0;
+                fprintf(stderr, "trk: sample audio thread: rendering is slower than real time, back to ordinary priority\n");
             }
-            if (off < P) {
-                /* In time order, a hit stays behind the ones before it. */
-                int at = nd;
-                while (at > 0 && due[at - 1].off > off) { due[at] = due[at - 1]; at--; }
-                due[at].off = off; due[at].v = *v;
-                nd++;
-            } else {
-                e->sev[j++] = *v;
-            }
-        }
-        e->nsev = j;
-
-        memset(mix, 0, (size_t)P * 2 * sizeof *mix);
-        for (a = 0, k = 0; a < P; ) {
-            int b, n;
-            while (k < nd && due[k].off <= a) { apply_due(e, &due[k].v); k++; }
-            b = k < nd ? due[k].off : P;
-            for (i = 0; b > a && i <= e->nkit; i++) {
-                drumkit *dk = i < e->nkit ? e->kit[i].dk : e->aud;
-                if (!dk) continue;
-                drumkit_render(dk, tmp, b - a);
-                for (n = 0; n < (b - a) * 2; n++) mix[a * 2 + n] += tmp[n];
-            }
-            for (n = a; n < b && e->click_left > 0; n++, e->click_left--) {
-                const double env = (double)e->click_left / (double)e->click_total;
-                const double v = e->click_amp * env * sin(e->click_ph);
-                e->click_ph += 6.283185307179586 * e->click_freq / KIT_RATE;
-                mix[n * 2] += v;
-                mix[n * 2 + 1] += v;
-            }
-            a = b;
-        }
-        pthread_mutex_unlock(&e->smx);
-
-        {   /* The master volume, from the copy published at unlock. */
-            const int vol = atomic_load_explicit(&e->vol_live, memory_order_relaxed);
-            const double g = (vol < 0 ? 0 : vol > 150 ? 150 : vol) / 100.0;
-            for (i = 0; i < P * 2; i++) mix[i] *= g;
         }
         for (i = 0; i < P * 2; i++) {
-            double v = mix[i] * 32767.0;
+            double v = e->a_mix[i] * 32767.0;
             out[i] = (short)(v > 32767.0 ? 32767 : v < -32768.0 ? -32768 : v);
         }
         w = snd_pcm_writei(e->pcm, out, (snd_pcm_uframes_t)P);
-        if (w < 0) atomic_fetch_add_explicit(&e->xruns, 1, memory_order_relaxed);
+        if (w < 0) xrun_note(e, &xr_said, snd_strerror((int)w));
         if (w < 0 && snd_pcm_recover(e->pcm, (int)w, 1) < 0) {
             struct timespec ts = { 0, 5000000 };
             nanosleep(&ts, NULL);                /* broken device: do not spin */
@@ -740,14 +951,14 @@ static void *audio_main(void *ud)
          * spin on smx, and everything else that wants the samples would
          * wait on it for good. */
         {
-            double took = mono_now() - now, want = (double)P / KIT_RATE;
+            double took = mono_now() - t0, want = (double)P / KIT_RATE;
             if (took < want / 4) {
                 struct timespec ts = { 0, (long)((want - took) * 1e9) };
                 nanosleep(&ts, NULL);
             }
         }
     }
-    free(mix); free(tmp); free(out); free(due);
+    free(out);
     return NULL;
 }
 
@@ -815,43 +1026,234 @@ static void *delivery_main(void *ud)
     return NULL;
 }
 
-static void audio_close(trk_engine *e)
+/* The buffer-size setting: how much room the output has before it runs dry.
+ * Bigger is safer on a busy machine and costs latency, which only a note typed
+ * to be heard (a preview) feels -- a song playing is scheduled ahead and lines
+ * up whatever the size. ALSA is asked for milliseconds, PipeWire for a block
+ * size in frames. */
+static const int k_alsa_us[TRK_BUFFER_LEVELS]   = { 20000, 30000, 60000, 100000 };
+static const int k_pw_frames[TRK_BUFFER_LEVELS] = { 256, 512, 1024, 2048 };
+static const char *const k_buf_label[TRK_BUFFER_LEVELS] = {
+    "Low latency", "Balanced", "Safe", "Extra safe"
+};
+
+const char *trk_audio_buffer_label(int level)
+{ return level >= 0 && level < TRK_BUFFER_LEVELS ? k_buf_label[level] : ""; }
+
+#ifdef TRK_HAVE_PIPEWIRE
+/* The PipeWire output: a stream whose process callback runs on PipeWire's own
+ * realtime thread, with the priority PipeWire itself obtained. That removes the
+ * ALSA layer and the thread of ours, and puts the drums on the same clock as
+ * the synth tabs' streams instead of a separate one. */
+static void pw_process(void *ud)
+{
+    trk_engine *e = ud;
+    struct pw_buffer *b;
+    struct spa_buffer *sb;
+    struct pw_time t;
+    float *dst;
+    double delay_s;
+    int n, i;
+
+    /* PipeWire does not hand a stream its xruns; a callback that comes much later
+     * than the block before it was long is the same thing to the ear. A gap of
+     * a second or more is the stream having been paused, not a dropout. */
+    {
+        const double now = mono_now(), gap = now - e->pw_last, blk = e->pw_blk;
+        if (e->pw_last > 0 && blk > 0 && gap > 2.5 * blk && gap < 1.0) xrun_note(e, &e->pw_said, "late callback");
+        e->pw_last = now;
+    }
+    if (!(b = pw_stream_dequeue_buffer(e->pwstream))) return;
+    sb = b->buffer;
+    if (!(dst = sb->datas[0].data)) { pw_stream_queue_buffer(e->pwstream, b); return; }
+    n = (int)(sb->datas[0].maxsize / (sizeof(float) * 2));
+    if (b->requested && (int)b->requested < n) n = (int)b->requested;
+    if (n > AUD_MAX) n = AUD_MAX;
+
+    e->pw_blk = (double)n / KIT_RATE;
+    delay_s = (double)n / KIT_RATE;                 /* the next cycle, if the graph says nothing more */
+    if (pw_stream_get_time_n(e->pwstream, &t, sizeof t) == 0 && t.rate.denom > 0 && t.delay > 0)
+        delay_s = (double)t.delay * (double)t.rate.num / (double)t.rate.denom;
+    if (!e->a_mix || e->aquit) {
+        memset(dst, 0, (size_t)n * 2 * sizeof *dst);
+    } else {
+        audio_render(e, n, delay_s);
+        for (i = 0; i < n * 2; i++) {
+            const double v = e->a_mix[i];
+            dst[i] = (float)(v > 1.0 ? 1.0 : v < -1.0 ? -1.0 : v);
+        }
+    }
+    sb->datas[0].chunk->offset = 0;
+    sb->datas[0].chunk->stride = sizeof(float) * 2;
+    sb->datas[0].chunk->size = (uint32_t)(n * 2 * sizeof(float));
+    pw_stream_queue_buffer(e->pwstream, b);
+}
+
+static void pw_recover_schedule(trk_engine *e);
+
+/* The PipeWire server going away (a restart, a crash, the user's session
+ * ending) leaves the stream in error or unconnected, and nothing plays any
+ * more. Said here, on PipeWire's thread, which must not tear itself down: it
+ * only flags the loss and wakes the thread that reopens the output. */
+static void pw_state(void *ud, enum pw_stream_state old, enum pw_stream_state st, const char *error)
+{
+    trk_engine *e = ud;
+    (void)old;
+    if (!atomic_load_explicit(&e->pw_up, memory_order_acquire)) return;
+    if (st == PW_STREAM_STATE_ERROR || st == PW_STREAM_STATE_UNCONNECTED) {
+        fprintf(stderr, "trk: PipeWire sample stream lost (%s)\n", error ? error : "server gone");
+        atomic_store(&e->pw_dead, 1);
+        pw_recover_schedule(e);
+    }
+}
+
+static const struct pw_stream_events k_pw_events = {
+    PW_VERSION_STREAM_EVENTS, .process = pw_process, .state_changed = pw_state };
+
+static void pw_stop(trk_engine *e)
+{
+    atomic_store_explicit(&e->pw_up, 0, memory_order_release);   /* the teardown's own state changes are not a loss */
+    if (e->pwloop)   pw_thread_loop_stop(e->pwloop);
+    if (e->pwstream) { pw_stream_destroy(e->pwstream); e->pwstream = NULL; }
+    if (e->pwloop)   { pw_thread_loop_destroy(e->pwloop); e->pwloop = NULL; }
+}
+
+static int pw_start(trk_engine *e, char *why, size_t whyn)
+{
+    static int inited;
+    const struct spa_pod *params[1];
+    uint8_t pod[1024];
+    struct spa_pod_builder bb = SPA_POD_BUILDER_INIT(pod, sizeof pod);
+    struct spa_audio_info_raw info;
+    char lat[64];
+    const int frames = k_pw_frames[e->buf_level];
+    int tries;
+
+    if (!inited) { pw_init(NULL, NULL); inited = 1; }
+    if (!(e->pwloop = pw_thread_loop_new("vst-ace tracker", NULL))) {
+        snprintf(why, whyn, "PipeWire is not available");
+        return -1;
+    }
+    snprintf(lat, sizeof lat, "%d/%d", frames, KIT_RATE);
+    e->pwstream = pw_stream_new_simple(
+        pw_thread_loop_get_loop(e->pwloop), "tracker samples",
+        pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback",
+                          PW_KEY_MEDIA_ROLE, "Music", PW_KEY_NODE_LATENCY, lat,
+                          PW_KEY_APP_NAME, "vst-ace tracker", NULL),
+        &k_pw_events, e);
+    if (!e->pwstream) { snprintf(why, whyn, "no PipeWire server"); pw_stop(e); return -1; }
+
+    spa_zero(info);
+    info.format = SPA_AUDIO_FORMAT_F32;
+    info.rate = KIT_RATE;
+    info.channels = 2;
+    info.position[0] = SPA_AUDIO_CHANNEL_FL;
+    info.position[1] = SPA_AUDIO_CHANNEL_FR;
+    params[0] = spa_format_audio_raw_build(&bb, SPA_PARAM_EnumFormat, &info);
+    if (pw_stream_connect(e->pwstream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+                          PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
+                          PW_STREAM_FLAG_RT_PROCESS, params, 1) < 0) {
+        snprintf(why, whyn, "PipeWire refused the stream");
+        pw_stop(e);
+        return -1;
+    }
+    if (pw_thread_loop_start(e->pwloop) < 0) { snprintf(why, whyn, "PipeWire loop would not start"); pw_stop(e); return -1; }
+
+    /* Connected, or not: wait a moment for the stream to leave "connecting". */
+    for (tries = 0; tries < 100; tries++) {
+        struct timespec ts = { 0, 10000000 };
+        enum pw_stream_state st;
+        pw_thread_loop_lock(e->pwloop);
+        st = pw_stream_get_state(e->pwstream, NULL);
+        pw_thread_loop_unlock(e->pwloop);
+        if (st == PW_STREAM_STATE_ERROR) { snprintf(why, whyn, "PipeWire stream error"); pw_stop(e); return -1; }
+        if (st == PW_STREAM_STATE_PAUSED || st == PW_STREAM_STATE_STREAMING) {
+            atomic_store(&e->pw_dead, 0);
+            atomic_store_explicit(&e->pw_up, 1, memory_order_release);
+            return 0;
+        }
+        nanosleep(&ts, NULL);
+    }
+    snprintf(why, whyn, "PipeWire did not answer");
+    pw_stop(e);
+    return -1;
+}
+#endif
+
+static void audio_close_l(trk_engine *e)
 {
     if (!e->audio_on) return;
     e->aquit = 1;
-    pthread_join(e->athread, NULL);
-    snd_pcm_drop(e->pcm);
-    snd_pcm_close(e->pcm);
-    e->pcm = NULL;
+#ifdef TRK_HAVE_PIPEWIRE
+    if (e->use_pw) pw_stop(e);
+    else
+#endif
+    {
+        pthread_join(e->athread, NULL);
+        snd_pcm_drop(e->pcm);
+        snd_pcm_close(e->pcm);
+        e->pcm = NULL;
+    }
+    audio_state_free(e);
+    e->use_pw = 0;
     e->audio_on = 0;
+#ifdef TRK_HAVE_PIPEWIRE
+    atomic_store(&e->pw_dead, 0);
+#endif
     e->aquit = 0;
 }
 
 /* The output, opened the first time a track wants a kit. The device is the
  * one chosen in the Audio output window (kept in a file beside the folder
- * lists), else TRK_PCM, else the system's "default" -- which on a PipeWire
- * system is PipeWire's, and with pipewire-jack under it, reaches JACK too. */
-static int audio_open(trk_engine *e)
+ * lists), else TRK_PCM, else the system's default -- which is PipeWire's own
+ * stream where PipeWire is there (and it falls back to ALSA's "default" where
+ * it is not). Any named ALSA device, and TRK_PCM, are opened directly through
+ * ALSA as before. */
+static int audio_open_l(trk_engine *e)
 {
     const char *dev = e->pcm_name[0] ? e->pcm_name : getenv("TRK_PCM");
     snd_pcm_uframes_t buf = 0, per = 0;
     int r;
+    char pwwhy[96] = "";
 
     if (e->audio_on) return 0;
-    if (!dev || !*dev) dev = "default";
-    if ((r = snd_pcm_open(&e->pcm, dev, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
-        snprintf(e->audio_msg, sizeof e->audio_msg, "no audio output (%s): %s", dev, snd_strerror(r));
-        e->pcm = NULL;
+    if (audio_state_alloc(e)) {
+        snprintf(e->audio_msg, sizeof e->audio_msg, "out of memory opening the audio output");
         return -1;
     }
-    /* 30 ms: short enough to play along to, long enough not to drop out at
-     * ordinary priority. */
+    e->aquit = 0;
+#ifdef TRK_HAVE_PIPEWIRE
+    if (!dev || !*dev) {
+        if (pw_start(e, pwwhy, sizeof pwwhy) == 0) {
+            e->use_pw = 1;
+            e->pw_last = 0; e->pw_blk = 0; e->pw_said = -10.0;
+            e->aperiod = k_pw_frames[e->buf_level];
+            e->alat = 2.0 * e->aperiod / KIT_RATE;
+            e->audio_on = 1;
+            snprintf(e->audio_msg, sizeof e->audio_msg, "samples: PipeWire, %d frames (%.0f ms), %s",
+                     e->aperiod, 1000.0 * e->aperiod / KIT_RATE, k_buf_label[e->buf_level]);
+            return 0;
+        }
+        /* No PipeWire: the ALSA default, as it always was. */
+    }
+#endif
+    if (!dev || !*dev) dev = "default";
+    if ((r = snd_pcm_open(&e->pcm, dev, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+        snprintf(e->audio_msg, sizeof e->audio_msg, "no audio output (%s): %s%s%s", dev, snd_strerror(r),
+                 pwwhy[0] ? "; PipeWire: " : "", pwwhy);
+        e->pcm = NULL;
+        audio_state_free(e);
+        return -1;
+    }
+    /* 30 ms by default: short enough to play along to, long enough not to
+     * drop out when the machine is busy. The buffer-size setting moves it. */
     if ((r = snd_pcm_set_params(e->pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                                2, KIT_RATE, 1, 30000)) < 0) {
-        snprintf(e->audio_msg, sizeof e->audio_msg, "audio output (%s) refused 48 kHz stereo: %s",
-                 dev, snd_strerror(r));
+                                2, KIT_RATE, 1, k_alsa_us[e->buf_level])) < 0) {
+        snprintf(e->audio_msg, sizeof e->audio_msg, "audio output (%s) refused 48 kHz stereo: %s%s%s",
+                 dev, snd_strerror(r), pwwhy[0] ? "; PipeWire: " : "", pwwhy);
         snd_pcm_close(e->pcm);
         e->pcm = NULL;
+        audio_state_free(e);
         return -1;
     }
     snd_pcm_get_params(e->pcm, &buf, &per);
@@ -862,37 +1264,159 @@ static int audio_open(trk_engine *e)
         snprintf(e->audio_msg, sizeof e->audio_msg, "could not start the audio thread");
         snd_pcm_close(e->pcm);
         e->pcm = NULL;
+        audio_state_free(e);
         return -1;
     }
     e->audio_on = 1;
-    snprintf(e->audio_msg, sizeof e->audio_msg, "samples: %s, %.0f ms", dev, e->alat * 1000);
+    snprintf(e->audio_msg, sizeof e->audio_msg, "samples: %s, %.0f ms%s%s", dev, e->alat * 1000,
+             pwwhy[0] ? " -- " : "", pwwhy);
     return 0;
 }
 
+/* The list of sample-set folders on disk. Read at most every KIT_RESCAN_S; the
+ * scan is a walk of the folders, and it is not done under the engine's lock.
+ * kmx guards the list, and is never held while taking the engine's lock. */
 static void scan_kits(trk_engine *e, int force)
 {
-    if (!force && e->nplaces && mono_now() - e->scanned_at < KIT_RESCAN_S) return;
-    e->nplaces = drumkit_find(e->places, DK_MAX_KITS);
-    e->scanned_at = mono_now();
+    pthread_mutex_lock(&e->kmx);
+    if (force || !e->nplaces || mono_now() - e->scanned_at >= KIT_RESCAN_S) {
+        e->nplaces = drumkit_find(e->places, DK_MAX_KITS);
+        e->scanned_at = mono_now();
+    }
+    pthread_mutex_unlock(&e->kmx);
+}
+
+/* A set that would not load is not tried again at every pass of the 2 s route
+ * timer -- that is a disk read and a decode each time for a file that is still
+ * bad -- but after KIT_RESCAN_S, or when the user reloads it. */
+static int kit_known_bad(trk_engine *e, const char *name)
+{
+    int i, r = 0;
+    pthread_mutex_lock(&e->kmx);
+    for (i = 0; i < e->nbad; i++)
+        if (!strcmp(e->bad[i].name, name) && mono_now() - e->bad[i].at < KIT_RESCAN_S) r = 1;
+    pthread_mutex_unlock(&e->kmx);
+    return r;
+}
+
+static void kit_mark_bad(trk_engine *e, const char *name)
+{
+    int i;
+    pthread_mutex_lock(&e->kmx);
+    for (i = 0; i < e->nbad; i++) if (!strcmp(e->bad[i].name, name)) break;
+    if (i == e->nbad) i = e->nbad < 4 ? e->nbad++ : 0;
+    snprintf(e->bad[i].name, sizeof e->bad[i].name, "%s", name);
+    e->bad[i].at = mono_now();
+    pthread_mutex_unlock(&e->kmx);
+}
+
+static void kit_forget_bad(trk_engine *e, const char *name)
+{
+    int i;
+    pthread_mutex_lock(&e->kmx);
+    e->kits_stale = 1;
+    for (i = 0; i < e->nbad; i++) if (!strcmp(e->bad[i].name, name)) e->bad[i].at = -1e9;
+    pthread_mutex_unlock(&e->kmx);
 }
 
 /* A sample set's folder from what a song calls it: the name the track's
  * list gives it, the last part of that ("Clap" for "The Cave Drumkit V3 /
  * Clap"), or a path -- what Load Sample Set gives. */
-static const char *kit_path(trk_engine *e, const char *name)
+static int kit_lookup(trk_engine *e, const char *name, char *out, size_t n)
 {
-    int pass, i;
-    if (name[0] == '/') return name;
-    for (pass = 0; pass < 2; pass++) {
-        scan_kits(e, pass);                    /* the second time, a fresh look */
-        for (i = 0; i < e->nplaces; i++) if (!strcmp(e->places[i].name, name)) return e->places[i].path;
-        for (i = 0; i < e->nplaces; i++) {
-            const char *last = strstr(e->places[i].name, " / ");
-            if (last && !strcmp(last + 3, name)) return e->places[i].path;
-        }
+    int i, r = -1;
+    pthread_mutex_lock(&e->kmx);
+    for (i = 0; i < e->nplaces && r < 0; i++)
+        if (!strcmp(e->places[i].name, name)) { snprintf(out, n, "%s", e->places[i].path); r = 0; }
+    for (i = 0; i < e->nplaces && r < 0; i++) {
+        const char *last = strstr(e->places[i].name, " / ");
+        if (last && !strcmp(last + 3, name)) { snprintf(out, n, "%s", e->places[i].path); r = 0; }
     }
+    pthread_mutex_unlock(&e->kmx);
+    return r;
+}
+
+/* A name that is not in the list gets a fresh look at the disk -- a folder may
+ * have been put there since -- but not more than once in KIT_RESCAN_S, or the
+ * route timer would walk every kit folder every pass for a set that is simply
+ * missing. A set the user just added or reloaded may rescan at once. */
+static int kit_path(trk_engine *e, const char *name, char *out, size_t n)
+{
+    int again;
+    if (name[0] == '/') { snprintf(out, n, "%s", name); return 0; }
+    scan_kits(e, 0);
+    if (kit_lookup(e, name, out, n) == 0) return 0;
+    pthread_mutex_lock(&e->kmx);
+    again = e->kits_stale || mono_now() - e->forced_at >= KIT_RESCAN_S;
+    if (again) { e->kits_stale = 0; e->forced_at = mono_now(); }
+    pthread_mutex_unlock(&e->kmx);
+    if (!again) return -1;
+    scan_kits(e, 1);
+    return kit_lookup(e, name, out, n);
+}
+
+/* Opening and closing the output are one at a time: several paths ask for it
+ * (loading a set, a take's click, an audition, the settings window), and two
+ * at once would build the buffers twice under a running audio thread. The
+ * _l forms are for a caller that already holds amx and does several steps. */
+static void audio_close(trk_engine *e)
+{
+    pthread_mutex_lock(&e->amx);
+    audio_close_l(e);
+    pthread_mutex_unlock(&e->amx);
+}
+
+static int audio_open(trk_engine *e)
+{
+    int r;
+    pthread_mutex_lock(&e->amx);
+    r = audio_open_l(e);
+    pthread_mutex_unlock(&e->amx);
+    e->audio_fail_at = r ? mono_now() : 0;
+    return r;
+}
+
+#ifdef TRK_HAVE_PIPEWIRE
+/* Reopens the output after the PipeWire stream was lost: a moment's wait for
+ * the server to be back, then close and open again -- which is PipeWire if it
+ * is there, ALSA if it is not -- and again, a few times, if that fails. */
+static void *recover_main(void *ud)
+{
+    trk_engine *e = ud;
+    int attempt;
+    for (attempt = 0; attempt < 20 && !atomic_load(&e->closing); attempt++) {
+        struct timespec ts = { 0, 0 };
+        int r = -1;
+        const int ms = 300 * (attempt + 1) > 3000 ? 3000 : 300 * (attempt + 1);
+        ts.tv_sec = ms / 1000; ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+        nanosleep(&ts, NULL);
+        if (atomic_load(&e->closing)) break;
+        pthread_mutex_lock(&e->amx);
+        if (e->audio_on && !atomic_load(&e->pw_dead)) { pthread_mutex_unlock(&e->amx); break; }   /* sorted already */
+        if (!e->audio_on && attempt == 0) { pthread_mutex_unlock(&e->amx); break; }               /* closed on purpose */
+        audio_close_l(e);
+        r = audio_open_l(e);
+        pthread_mutex_unlock(&e->amx);
+        fprintf(stderr, "trk: sample output reopened after losing PipeWire: %s\n", e->audio_msg);
+        if (r == 0) break;
+    }
+    pthread_mutex_lock(&e->rmx);
+    e->rrunning = 0;
+    pthread_mutex_unlock(&e->rmx);
     return NULL;
 }
+
+static void pw_recover_schedule(trk_engine *e)
+{
+    pthread_mutex_lock(&e->rmx);
+    if (!atomic_load(&e->closing) && !e->rrunning) {
+        if (e->rstarted) pthread_join(e->rthread, NULL);       /* the last one has finished */
+        e->rrunning = pthread_create(&e->rthread, NULL, recover_main, e) == 0;
+        e->rstarted = e->rrunning;
+    }
+    pthread_mutex_unlock(&e->rmx);
+}
+#endif
 
 /* Every set the tracks name, loaded; the ones nothing names any more, freed;
  * one just edited, read again. The WAVs are read outside every lock -- that
@@ -916,18 +1440,22 @@ static int load_samples(trk_engine *e)
     pthread_mutex_unlock(&e->lock);
 
     for (t = 0; t < TRK_TRACKS; t++) {
-        const char *path;
+        char path[TRK_PATH_LEN];
         int have = 0;
         if (!want[t][0]) continue;
         if (strcmp(want[t], stale))
             for (i = 0; i < e->nkit; i++) if (!strcmp(e->kit[i].name, want[t])) have = 1;
         for (i = 0; i < nfresh; i++) if (!strcmp(fresh[i].name, want[t])) have = 1;
-        if (have || !(path = kit_path(e, want[t]))) continue;
+        if (have || kit_known_bad(e, want[t]) || kit_path(e, want[t], path, sizeof path)) continue;
         snprintf(fresh[nfresh].name, sizeof fresh[nfresh].name, "%s", want[t]);
         fresh[nfresh].dk = drumkit_load(path, KIT_RATE);
+        drumkit_set_raw(fresh[nfresh].dk, 1);          /* the mix is limited in audio_main */
         if (fresh[nfresh].dk) nfresh++;
+        else kit_mark_bad(e, want[t]);
     }
-    if (any) audio_open(e);
+    /* Not at every pass of the route timer when it has just failed: opening a
+     * device that is not there is a PipeWire attempt and an ALSA one. */
+    if (any && !(e->audio_fail_at > 0 && mono_now() - e->audio_fail_at < KIT_RESCAN_S)) audio_open(e);
 
     pthread_mutex_lock(&e->lock);
     pthread_mutex_lock(&e->smx);
@@ -1038,6 +1566,7 @@ int trk_route(trk_engine *e)
             release_track(e, t);
             snd_seq_disconnect_to(e->seq, e->port[t], e->dest[t].client, e->dest[t].port);
             e->routed[t] = 0;
+            e->vol_sent[t] = 0;          /* the next synth has not been told the level */
         }
         if (ok[t]) {
             /* Connected already answers EBUSY, which is still connected. A
@@ -1085,6 +1614,75 @@ int trk_routed(trk_engine *e, int t)
 
 /* ------------------------------------------------------------------ sinks */
 
+/* The loudest fader among the tracks that play sink `s`, 0..100, or -1 when no
+ * track plays it. */
+static int sink_max_volume(trk_engine *e, int s)
+{
+    int t, best = -1;
+    for (t = 0; t < e->song.ntracks && t < TRK_TRACKS; t++)
+        if (e->track_sink[t] == s && e->song.track[t].volume > best) best = e->song.track[t].volume;
+    return best;
+}
+
+/* Hand each sink its gain: the loudest fader among the tracks playing it. One
+ * track alone is that synth's fader exactly; several share one synth output, so
+ * the output follows the loudest and each track is made quieter than that by
+ * velocity (see track_rel_volume). Called with the engine's lock held. */
+static void sink_gains_locked(trk_engine *e)
+{
+    int s;
+    for (s = 0; s < TRK_SINKS; s++) {
+        int m;
+        double g = 1.0;
+        if (!e->sink[s].used || !e->sink[s].gain_cb) continue;
+        m = sink_max_volume(e, s);
+        if (m >= 0) g = m / 100.0;
+        if (g != e->sink[s].gain_sent) {
+            e->sink[s].gain_sent = g;
+            e->sink[s].gain_cb(e->sink[s].ud, g);
+        }
+    }
+}
+
+void trk_sink_set_gain_cb(trk_engine *e, int id, trk_gain_fn cb)
+{
+    if (!e || id < 0 || id >= TRK_SINKS) return;
+    pthread_mutex_lock(&e->lock);
+    if (e->sink[id].used) {
+        e->sink[id].gain_cb = cb;
+        e->sink[id].gain_sent = -1.0;              /* so the first refresh always sends */
+        sink_gains_locked(e);
+    }
+    pthread_mutex_unlock(&e->lock);
+}
+
+void trk_sink_gains_refresh(trk_engine *e)
+{
+    if (!e) return;
+    pthread_mutex_lock(&e->lock);
+    sink_gains_locked(e);
+    pthread_mutex_unlock(&e->lock);
+}
+
+/* A track on a sink that has a gain: its fader is carried by that gain, and what
+ * is left for the notes is its volume relative to the loudest track on the same
+ * synth (100 for the loudest, or the only one). Any other track keeps its own
+ * volume as the velocity scale. */
+static int track_on_gain(trk_engine *e, int t)
+{
+    const int s = e->track_sink[t];
+    return s >= 0 && e->sink[s].gain_cb;
+}
+
+static int track_rel_volume(trk_engine *e, int t)
+{
+    const int v = e->song.track[t].volume;
+    int m;
+    if (!track_on_gain(e, t) || v <= 0) return v;
+    m = sink_max_volume(e, e->track_sink[t]);
+    return m > 0 ? v * 100 / m : v;
+}
+
 int trk_add_sink(trk_engine *e, const char *name, trk_sink_fn fn, void *ud)
 {
     int s;
@@ -1096,6 +1694,8 @@ int trk_add_sink(trk_engine *e, const char *name, trk_sink_fn fn, void *ud)
     e->sink[s].fn = fn;
     e->sink[s].ud = ud;
     e->sink[s].nq = 0;
+    e->sink[s].gain_cb = NULL;
+    e->sink[s].gain_sent = 1.0;
     e->sink[s].used = 1;
     /* The delivery thread starts with the first sink. */
     if (!e->delivery_on) {
@@ -1126,6 +1726,7 @@ void trk_remove_sink(trk_engine *e, int id)
         if (e->track_sink[t] == id) {
             release_track(e, t);
             e->track_sink[t] = -1;
+            e->vol_sent[t] = 0;
             memset(e->song.track[t].sink, 0, sizeof e->song.track[t].sink);
         }
     /* The releases just queued are only releases once they are delivered:
@@ -1194,6 +1795,7 @@ void trk_route_sink(trk_engine *e, int t, int id)
             e->routed[t] = 0;
         }
         e->track_sink[t] = id;
+        e->vol_sent[t] = 0;              /* a different synth: tell it the level afresh */
         /* The pick is part of the song now -- saved with the track, so the
          * shell opens the same synth again when the song is opened. Routing
          * back clears it. Cleared whole, so a reloaded song matches the live
@@ -1208,6 +1810,7 @@ void trk_route_sink(trk_engine *e, int t, int id)
         pthread_mutex_unlock(&e->dmx);
         if (e->playing) top_up(e);
     }
+    sink_gains_locked(e);
     pthread_mutex_unlock(&e->lock);
     if (id < 0) trk_route(e);            /* back to the window: reconnect it */
 }
@@ -1256,7 +1859,10 @@ int trk_list_dests(trk_engine *e, char *buf, size_t n)
     if (n) buf[0] = 0;
     snd_seq_client_info_alloca(&ci);
     snd_seq_port_info_alloca(&pi);
-    pthread_mutex_lock(&e->lock);
+    /* No engine lock: the queries are ioctls that read the kernel's client and
+     * port tables, they touch none of the handle's buffers, and e->seq and
+     * e->client do not change after open. Held, this walk -- a kernel round
+     * trip per client and port -- stalled the note path every 2 s. */
     snd_seq_client_info_set_client(ci, -1);
     while (snd_seq_query_next_client(e->seq, ci) >= 0) {
         int cl = snd_seq_client_info_get_client(ci);
@@ -1276,7 +1882,6 @@ int trk_list_dests(trk_engine *e, char *buf, size_t n)
         }
     }
 done:
-    pthread_mutex_unlock(&e->lock);
     return count;
 }
 
@@ -1285,8 +1890,9 @@ int trk_list_sample_sets(trk_engine *e, char *buf, size_t n)
     size_t used = 0;
     int i, count = 0;
     if (n) buf[0] = 0;
+    scan_kits(e, 0);                    /* the folders are walked before the engine's lock is taken */
     pthread_mutex_lock(&e->lock);
-    scan_kits(e, 0);
+    pthread_mutex_lock(&e->kmx);
     /* The ones loaded from elsewhere first: they were asked for by name. */
     for (i = 0; i < e->nadded + e->nplaces; i++) {
         const char *name = i < e->nadded ? e->added[i] : e->places[i - e->nadded].name;
@@ -1296,6 +1902,7 @@ int trk_list_sample_sets(trk_engine *e, char *buf, size_t n)
         used += (size_t)w;
         count++;
     }
+    pthread_mutex_unlock(&e->kmx);
     pthread_mutex_unlock(&e->lock);
     return count;
 }
@@ -1303,6 +1910,7 @@ int trk_list_sample_sets(trk_engine *e, char *buf, size_t n)
 void trk_add_sample_set(trk_engine *e, const char *path)
 {
     int i;
+    kit_forget_bad(e, path);
     pthread_mutex_lock(&e->lock);
     for (i = 0; i < e->nadded; i++) if (!strcmp(e->added[i], path)) break;
     if (i == e->nadded) {
@@ -1317,12 +1925,10 @@ void trk_add_sample_set(trk_engine *e, const char *path)
 
 int trk_sample_set_dir(trk_engine *e, const char *name, char *out, size_t n)
 {
-    const char *p;
-    pthread_mutex_lock(&e->lock);
-    p = kit_path(e, name);
-    if (p) snprintf(out, n, "%s", p);
-    pthread_mutex_unlock(&e->lock);
-    return p ? 0 : -1;
+    char p[TRK_PATH_LEN];
+    if (kit_path(e, name, p, sizeof p)) return -1;      /* a disk walk at worst: not under the engine's lock */
+    snprintf(out, n, "%s", p);
+    return 0;
 }
 
 int trk_sample_at(trk_engine *e, int t, int note, char *name, size_t n)
@@ -1397,6 +2003,7 @@ int trk_list_pads(trk_engine *e, int t, char *buf, size_t n)
 
 void trk_reload_sample_set(trk_engine *e, const char *name)
 {
+    kit_forget_bad(e, name);
     pthread_mutex_lock(&e->lock);
     snprintf(e->stale, sizeof e->stale, "%s", name);
     pthread_mutex_unlock(&e->lock);
@@ -1414,6 +2021,7 @@ int trk_audition(trk_engine *e, const char *dir, const char *file, double gain_d
     snprintf(m->pad[0].file, sizeof m->pad[0].file, "%s", file);
     m->pad[0].gain_db = gain_db;
     k = drumkit_load_map(m, KIT_RATE);
+    drumkit_set_raw(k, 1);                          /* the mix is limited in audio_main */
     free(m);
     if (!k || audio_open(e)) { drumkit_free(k); return -1; }
     pthread_mutex_lock(&e->smx);
@@ -1508,6 +2116,7 @@ static void play_locked(trk_engine *e, int mode, int order, int row, unsigned le
 void trk_play(trk_engine *e, int mode, int order, int row)
 {
     pthread_mutex_lock(&e->lock);
+    memset(e->vol_sent, 0, sizeof e->vol_sent);      /* a fresh run tells each synth its level again */
     play_locked(e, mode, order, row, 0);
     pthread_mutex_unlock(&e->lock);
 }
@@ -1528,10 +2137,9 @@ int trk_playing(trk_engine *e)
     return p;
 }
 
-void trk_position(trk_engine *e, int *order, int *pattern, int *row)
+static void position_locked(trk_engine *e, int *order, int *pattern, int *row)
 {
     int o = -1, p = -1, r = -1;
-    pthread_mutex_lock(&e->lock);
     if (e->playing && e->npos) {
         unsigned cur = queue_tick(e), i, n = e->npos < POS_RING ? e->npos : POS_RING;
         /* The latest row whose time has come. Scheduled ones still ahead of
@@ -1541,20 +2149,25 @@ void trk_position(trk_engine *e, int *order, int *pattern, int *row)
             if (m->tick <= cur) { o = m->order; p = m->pattern; r = m->row; break; }
         }
     }
-    pthread_mutex_unlock(&e->lock);
     if (order) *order = o;
     if (pattern) *pattern = p;
     if (row) *row = r;
 }
 
-void trk_levels(trk_engine *e, float out[TRK_TRACKS])
+void trk_position(trk_engine *e, int *order, int *pattern, int *row)
+{
+    pthread_mutex_lock(&e->lock);
+    position_locked(e, order, pattern, row);
+    pthread_mutex_unlock(&e->lock);
+}
+
+static void levels_locked(trk_engine *e, float out[TRK_TRACKS])
 {
     struct timespec ts;
     double now, dt;
     int t;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     now = ts.tv_sec + ts.tv_nsec * 1e-9;
-    pthread_mutex_lock(&e->lock);
     dt = e->meter_time > 0 ? now - e->meter_time : 0;
     if (dt < 0 || dt > 1) dt = 0.033;
     e->meter_time = now;
@@ -1581,6 +2194,12 @@ void trk_levels(trk_engine *e, float out[TRK_TRACKS])
         e->meter_seen = e->npos;
     }
     for (t = 0; t < TRK_TRACKS; t++) out[t] = e->meter[t];
+}
+
+void trk_levels(trk_engine *e, float out[TRK_TRACKS])
+{
+    pthread_mutex_lock(&e->lock);
+    levels_locked(e, out);
     pthread_mutex_unlock(&e->lock);
 }
 
@@ -1620,7 +2239,12 @@ void trk_preview(trk_engine *e, int t, int note, int vel)
     int ch;
     if (t < 0 || t >= TRK_TRACKS || note < 0 || note > 127) return;
     pthread_mutex_lock(&e->lock);
-    vel = trk_track_velocity(&e->song.track[t], vel);        /* the track's fader applies to what is typed too */
+    {   /* the track's fader applies to what is typed too: through the synth's gain
+         * when the track is alone on it, else as velocity */
+        trk_track kk = e->song.track[t];
+        kk.volume = track_rel_volume(e, t);
+        vel = trk_track_velocity(&kk, vel);
+    }
     if (vel < 1) { pthread_mutex_unlock(&e->lock); return; }
     e->meter[t] = vel / 127.0f;
     if (is_sampled(&e->song.track[t])) {
@@ -1633,6 +2257,7 @@ void trk_preview(trk_engine *e, int t, int note, int vel)
     }
     preview_off_locked(e, t);
     ch = e->song.track[t].channel & 15;
+    if (!track_on_gain(e, t)) track_volume(e, t, 0, 1);
     track_ev(e, t, 0, 1, 0x90 | ch, note, vel);
     snd_seq_drain_output(e->seq);
     e->prev_note[t] = note;
@@ -1846,13 +2471,35 @@ void trk_record_arm(trk_engine *e, int track)
     pthread_mutex_unlock(&e->lock);
 }
 
+static int recording_locked(trk_engine *e)
+{
+    return e->recording && e->playing ? (e->rec_lead && queue_tick(e) < e->rec_first_tick ? 2 : 1) : 0;
+}
+
 int trk_recording(trk_engine *e)
 {
-    int r = 0;
+    int r;
     pthread_mutex_lock(&e->lock);
-    if (e->recording && e->playing) r = e->rec_lead && queue_tick(e) < e->rec_first_tick ? 2 : 1;
+    r = recording_locked(e);
     pthread_mutex_unlock(&e->lock);
     return r;
+}
+
+/* What a window's playback timer wants, from one take of the lock instead of
+ * three, thirty times a second. `quiet` says nothing is playing or recording
+ * and every meter has died away: the timer can slow down until that changes. */
+void trk_poll(trk_engine *e, trk_poll_state *st)
+{
+    int t;
+    pthread_mutex_lock(&e->lock);
+    position_locked(e, &st->order, &st->pattern, &st->row);
+    levels_locked(e, st->level);
+    st->recording = recording_locked(e);
+    st->playing = e->playing;
+    pthread_mutex_unlock(&e->lock);
+    st->xruns = trk_audio_xruns(e);
+    st->quiet = !st->playing && !st->recording;
+    for (t = 0; t < TRK_TRACKS && st->quiet; t++) if (st->level[t] > 0.004f) st->quiet = 0;
 }
 
 void trk_record_start(trk_engine *e, int mode, int order, int row)
@@ -2266,7 +2913,26 @@ trk_engine *trk_open(char *err, size_t errn)
     trk_song_init(&e->song);
     atomic_store(&e->vol_live, e->song.volume);
     pthread_mutex_init(&e->lock, NULL);
-    pthread_mutex_init(&e->smx, NULL);
+    {   /* The sample audio runs at realtime priority and shares this lock with
+         * threads that do not: priority inheritance lets a low-priority holder
+         * finish at the audio thread's priority instead of making it wait. */
+        pthread_mutexattr_t ma;
+        pthread_mutexattr_init(&ma);
+        pthread_mutexattr_setprotocol(&ma, PTHREAD_PRIO_INHERIT);
+        pthread_mutex_init(&e->smx, &ma);
+        pthread_mutexattr_destroy(&ma);
+    }
+    e->buf_level = 1;
+    pthread_mutex_init(&e->amx, NULL);
+    pthread_mutex_init(&e->kmx, NULL);
+    {   /* the audio thread takes this: priority-inheriting, as smx is */
+        pthread_mutexattr_t ta;
+        pthread_mutexattr_init(&ta);
+        pthread_mutexattr_setprotocol(&ta, PTHREAD_PRIO_INHERIT);
+        pthread_mutex_init(&e->tapmx, &ta);
+        pthread_mutexattr_destroy(&ta);
+    }
+    pthread_mutex_init(&e->rmx, NULL);
     pthread_mutex_init(&e->dmx, NULL);
     for (t = 0; t < TRK_TRACKS; t++) e->track_kit[t] = -1;
     for (t = 0; t < TRK_TRACKS; t++) e->track_sink[t] = -1;
@@ -2312,6 +2978,20 @@ void trk_close(trk_engine *e)
         pthread_mutex_unlock(&e->dmx);
         pthread_join(e->dthread, NULL);
     }
+    /* A synth the tracker's fader was holding down must not stay quiet once the
+     * tracker is gone: every sink with a gain goes back to full. The shells
+     * close the engine while their tabs still exist, so `ud` is good here. */
+    pthread_mutex_lock(&e->lock);
+    for (i = 0; i < TRK_SINKS; i++)
+        if (e->sink[i].used && e->sink[i].gain_cb) {
+            e->sink[i].gain_cb(e->sink[i].ud, 1.0);
+            e->sink[i].gain_sent = 1.0;
+        }
+    pthread_mutex_unlock(&e->lock);
+    atomic_store(&e->closing, 1);
+    pthread_mutex_lock(&e->rmx);
+    if (e->rstarted) { pthread_mutex_unlock(&e->rmx); pthread_join(e->rthread, NULL); pthread_mutex_lock(&e->rmx); e->rstarted = 0; }
+    pthread_mutex_unlock(&e->rmx);
     audio_close(e);
     for (i = 0; i < e->nkit; i++) drumkit_free(e->kit[i].dk);
     drumkit_free(e->aud);
@@ -2319,6 +2999,10 @@ void trk_close(trk_engine *e)
     while (e->nredo) free(e->redo[--e->nredo]);
     pthread_mutex_destroy(&e->smx);
     pthread_mutex_destroy(&e->dmx);
+    pthread_mutex_destroy(&e->amx);
+    pthread_mutex_destroy(&e->kmx);
+    pthread_mutex_destroy(&e->tapmx);
+    pthread_mutex_destroy(&e->rmx);
     snd_seq_free_queue(e->seq, e->queue);
     snd_seq_close(e->seq);
     pthread_mutex_destroy(&e->lock);
@@ -2347,6 +3031,10 @@ static void audio_conf_load(trk_engine *e)
         while (l && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = 0;
         snprintf(e->pcm_name, sizeof e->pcm_name, "%s", line);
     }
+    if (fgets(line, sizeof line, f) && !strncmp(line, "buffer ", 7)) {
+        const int lv = atoi(line + 7);
+        if (lv >= 0 && lv < TRK_BUFFER_LEVELS) e->buf_level = lv;
+    }
     fclose(f);
 }
 
@@ -2365,6 +3053,7 @@ static void audio_conf_save(trk_engine *e)
     snprintf(tmp, sizeof tmp, "%s.new", path);
     if (!(f = fopen(tmp, "w"))) return;
     fprintf(f, "%s\n", e->pcm_name);
+    fprintf(f, "buffer %d\n", e->buf_level);
     if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
 }
 
@@ -2390,7 +3079,7 @@ int trk_audio_devices(char names[][TRK_DEST_LEN], char labels[][96], int max)
             for (i = 0; i < n; i++) if (!strcmp(names[i], name)) dup = 1;
             if (dup) goto next;
             snprintf(names[n], TRK_DEST_LEN, "%s", name);
-            if (!strcmp(name, "default"))        snprintf(labels[n], 96, "System default");
+            if (!strcmp(name, "default"))        snprintf(labels[n], 96, "%s", TRK_DEFAULT_LABEL);
             else if (!strcmp(name, "sysdefault")) snprintf(labels[n], 96, "ALSA default (sysdefault)");
             else if (!strcmp(name, "pipewire"))  snprintf(labels[n], 96, "PipeWire");
             else if (!strcmp(name, "jack"))      snprintf(labels[n], 96, "JACK");
@@ -2425,25 +3114,46 @@ int trk_audio_devices(char names[][TRK_DEST_LEN], char labels[][96], int max)
 
 const char *trk_audio_device(trk_engine *e) { return e->pcm_name; }
 
+int trk_audio_buffer(trk_engine *e) { return e->buf_level; }
+
+/* The buffer-size setting, changed live: the output is let go of and opened
+ * again at the new size (the sample sets stay loaded). Kept between runs. */
+int trk_audio_set_buffer(trk_engine *e, int level)
+{
+    int was_on;
+    if (level < 0 || level >= TRK_BUFFER_LEVELS) return -1;
+    if (level == e->buf_level) return 0;
+    pthread_mutex_lock(&e->amx);
+    was_on = e->audio_on;
+    audio_close_l(e);
+    e->buf_level = level;
+    if (was_on) audio_open_l(e);
+    pthread_mutex_unlock(&e->amx);
+    audio_conf_save(e);
+    return 0;
+}
+
 /* Switch the sample output. "" is the default (TRK_PCM, else the system's).
  * Switched live: the old device is let go of and the new one opened; if it will
  * not open, the default is put back and the reason is in trk_audio_status.
  * Returns 0, or -1 when the chosen device would not open. */
 int trk_audio_set_device(trk_engine *e, const char *name)
 {
-    const int was_on = e->audio_on;
-    int r = 0;
+    int was_on, r = 0;
     if (!name) name = "";
-    audio_close(e);
+    pthread_mutex_lock(&e->amx);
+    was_on = e->audio_on;
+    audio_close_l(e);
     snprintf(e->pcm_name, sizeof e->pcm_name, "%s", name);
-    if (was_on && audio_open(e) != 0) {
+    if (was_on && audio_open_l(e) != 0) {
         char why[sizeof e->audio_msg];
         snprintf(why, sizeof why, "%s", e->audio_msg);
         e->pcm_name[0] = 0;
-        audio_open(e);
+        audio_open_l(e);
         snprintf(e->audio_msg, sizeof e->audio_msg, "%s -- back on the default", why);
         r = -1;
     }
+    pthread_mutex_unlock(&e->amx);
     audio_conf_save(e);
     return r;
 }
@@ -2686,6 +3396,8 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
         e->track_sink[t] = -1;
     }
     sync_sink_names(e);
+    sink_gains_locked(e);
+    memset(e->vol_sent, 0, sizeof e->vol_sent);      /* tracks changed places */
     for (t = 0; t < TRK_TRACKS; t++) e->rec_note[t] = -1;
     if (e->playing) top_up(e);
 }

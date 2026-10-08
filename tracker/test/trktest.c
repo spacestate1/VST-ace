@@ -130,6 +130,8 @@ static snd_seq_t *make_rx(const char *name)
     return s;
 }
 
+void test_gain_cb(void *ud, double g) { *(double *)ud = g; }
+
 static void check(int ok, const char *what)
 {
     printf("  %s  %s\n", ok ? "ok  " : "FAIL", what);
@@ -1005,6 +1007,72 @@ int main(void)
         unlink(vpath);
     }
 
+    printf("track volume through a synth's gain\n");
+    {
+        static double got = -5;
+        int gid, a;
+        void (*gcb)(void *, double) = NULL;
+        (void)gcb;
+        {
+            /* a callback that records what the engine hands the sink */
+            extern void test_gain_cb(void *, double);
+            gid = trk_add_sink(e, "gain sink", sink_cb, &got);
+            trk_sink_set_gain_cb(e, gid, test_gain_cb);
+        }
+        check(got == -5 || got == 1.0, "a sink with no track on it is at unity");
+        trk_route_sink(e, 4, gid);
+        trk_track_set_volume(e, 4, 40);
+        check(got > 0.39 && got < 0.41, "a track alone on a synth fades that synth's gain");
+        trk_lock(e);
+        a = trk_track_velocity(&trk_song_of(e)->track[4], 100);
+        trk_unlock(e);
+        check(a == 40, "(the velocity function itself is unchanged)");
+        trk_route_sink(e, 5, gid);
+        check(got == 1.0, "two tracks on one synth: the gain follows the louder one");
+        trk_track_set_volume(e, 5, 60);
+        check(got > 0.59 && got < 0.61, "and drops with it when both are down");
+        trk_track_set_volume(e, 5, 100);
+        trk_route_sink(e, 5, -1);
+        check(got > 0.39 && got < 0.41, "one left: the gain follows again");
+        trk_track_set_volume(e, 4, 100);
+        check(got == 1.0, "and returns to unity at 100");
+        trk_route_sink(e, 4, -1);
+        trk_remove_sink(e, gid);
+    }
+
+    printf("a synth's gain after the tracker closes\n");
+    {
+        char cerr[256];
+        static double gg = -5;
+        trk_engine *e2 = trk_open(cerr, sizeof cerr);
+        int sid;
+        check(e2 != NULL, "a second engine opens");
+        if (e2) {
+            sid = trk_add_sink(e2, "gain sink 2", sink_cb, &gg);
+            trk_sink_set_gain_cb(e2, sid, test_gain_cb);
+            trk_route_sink(e2, 0, sid);
+            trk_track_set_volume(e2, 0, 30);
+            check(gg > 0.29 && gg < 0.31, "the fader holds the synth down");
+            trk_close(e2);
+            check(gg == 1.0, "closing the engine gives the synth its full level back");
+        }
+    }
+
+    printf("the window timer's poll\n");
+    {
+        trk_poll_state ps;
+        int o, pp, rr;
+        trk_stop(e);
+        for (int q = 0; q < 80; q++) { trk_poll(e, &ps); usleep(50000); }   /* the meters die away, as the timer lets them */
+        check(ps.quiet && !ps.playing && ps.recording == 0 && ps.pattern == -1, "idle: quiet, nothing playing");
+        trk_play(e, TRK_PLAY_PATTERN, 0, 0);
+        usleep(150000);
+        trk_poll(e, &ps);
+        trk_position(e, &o, &pp, &rr);
+        check(!ps.quiet && ps.playing && ps.pattern >= 0, "playing: not quiet, a position");
+        trk_stop(e);
+    }
+
     printf("octave moves the notes\n");
     {
         trk_editor ed;
@@ -1544,6 +1612,33 @@ int main(void)
             fprintf(fp, "tracker 1\ntracks 99\n");
             fclose(fp);
             check(trk_song_load(b, path, err, sizeof err) != 0, "a count past the maximum is refused");
+            fp = fopen(path, "w");
+            fprintf(fp, "tracker 1\norder");
+            for (int q = 0; q < TRK_ORDER_MAX + 1; q++) fprintf(fp, " 0");
+            fprintf(fp, "\n");
+            fclose(fp);
+            check(trk_song_load(b, path, err, sizeof err) != 0, "an order list longer than the maximum is refused, not cut short");
+            fp = fopen(path, "w");
+            fprintf(fp, "tracker 1\nbpm 120\nlpb 4\nwobble 7\ntrack 1 pan 3\norder 0\n");
+            fclose(fp);
+            check(trk_song_load(b, path, err, sizeof err) == 0 && strstr(err, "ignored"),
+                  "lines of a newer build are skipped, and said so");
+            fp = fopen(path, "w");
+            fprintf(fp, "tracker 1\nbpm\n");
+            fclose(fp);
+            check(trk_song_load(b, path, err, sizeof err) != 0, "but a known line cut short is still refused");
+            strcpy(a->track[2].name, "  padded");
+            check(trk_song_save(a, path, err, sizeof err) == 0 && trk_song_load(b, path, err, sizeof err) == 0 &&
+                  !strcmp(b->track[2].name, "  padded"), "a name that begins with spaces comes back with them");
+            {   /* a song that is a link is written through it */
+                char lnk[4200];
+                struct stat sb;
+                snprintf(lnk, sizeof lnk, "%s.lnk", path);
+                unlink(lnk);
+                check(symlink(path, lnk) == 0 && trk_song_save(a, lnk, err, sizeof err) == 0 &&
+                      lstat(lnk, &sb) == 0 && S_ISLNK(sb.st_mode), "saving to a link keeps the link");
+                unlink(lnk);
+            }
         }
         unlink(path); snprintf(tmp, sizeof tmp, "%s.new", path); unlink(tmp);
 

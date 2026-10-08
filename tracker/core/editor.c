@@ -138,6 +138,7 @@ int trk_track_set_volume(trk_engine *e, int track, int percent)
     trk_lock(e);
     trk_song_of(e)->track[track].volume = percent;
     trk_unlock(e);
+    trk_sink_gains_refresh(e);          /* a track alone on a synth fades that synth */
     return percent;
 }
 

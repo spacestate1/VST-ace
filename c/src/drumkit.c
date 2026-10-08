@@ -19,7 +19,9 @@
 
 /* A pad cut off -- by its choke group, or by being hit again -- fades over
  * this long rather than stopping dead, which clicks. */
+#ifndef DK_FADE_S
 #define DK_FADE_S 0.004
+#endif
 /* A hit comes in over this long, and its last stretch goes out over this
  * long: a sample that starts or ends off zero (trimmed, or chopped from a
  * longer one) would otherwise step -- a click -- at both ends. Short enough
@@ -60,6 +62,7 @@ struct drumkit {
     dk_voice  voice[DK_MAX_VOICES];
     double    sr, gain, fade_step, attack_step;
     size_t    pcm_bytes;          /* what the samples hold, against DK_BUDGET */
+    int       raw;                /* no limiter of its own: the host limits the mix */
     unsigned  next;
 };
 
@@ -455,6 +458,8 @@ int drumkit_write_map(const drumkit *k, const char *dir)
     return 0;
 }
 
+void drumkit_set_raw(drumkit *k, int raw) { if (k) k->raw = raw != 0; }
+
 void drumkit_set_gain(drumkit *k, double g) { if (k) k->gain = g; }
 
 /* ------------------------------------------------------- finding kits -- */
@@ -680,7 +685,12 @@ void drumkit_render(drumkit *k, double *out, int frames)
 
             v->pos += s->step * v->rate;
         }
-        out[2 * n]     = dw_limit(l * k->gain);
-        out[2 * n + 1] = dw_limit(r * k->gain);
+        if (k->raw) {
+            out[2 * n]     = l * k->gain;
+            out[2 * n + 1] = r * k->gain;
+        } else {
+            out[2 * n]     = dw_limit(l * k->gain);
+            out[2 * n + 1] = dw_limit(r * k->gain);
+        }
     }
 }
