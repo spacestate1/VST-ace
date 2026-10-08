@@ -2506,6 +2506,17 @@ public:
                (arch.isEmpty() ? QString() : "-" + arch);
     }
 
+    /* A note the tracker is playing into this tab, shown on its keyboard.
+     * Called from the engine's delivery thread, so the keys are changed on the
+     * GUI thread; note < 0 lets every key up. */
+    void showPlayedNote(int note, bool on)
+    {
+        QMetaObject::invokeMethod(this, [this, note, on] {
+            if (!piano_) return;
+            if (note < 0) { for (int n = 0; n < 128; n++) piano_->setHeld(n, false); }
+            else          piano_->setHeld(note, on);
+        }, Qt::QueuedConnection);
+    }
     void rescanPlugins() { rescan(); }
     QString loadedPluginPath() const { return loadedPath_; }
 

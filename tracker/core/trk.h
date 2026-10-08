@@ -78,6 +78,7 @@ typedef struct {
     int  channel;                    /* 0..15 */
     int  octave;                     /* 0..9: the note keys' octave on this track */
     int  velocity;                   /* used where a cell gives none */
+    int  volume;                     /* 0..100 percent: scales every note's velocity on this track */
     int  mute;
 } trk_track;
 
@@ -474,6 +475,17 @@ int  trk_track_set_octave(trk_engine *e, int track, int octave);
  * note keys land on the pads. Returns the octave, -1 when the track plays
  * no loaded set. Call after trk_route; takes the lock itself. */
 int  trk_track_fit_octave(trk_engine *e, int track);
+
+/* A track's volume, 0..100 percent: a fader over every note on it. It scales
+ * the velocity each note plays at, so it works on synths and sample tracks
+ * alike. Takes the engine's lock itself; returns the value set, -1 on a bad
+ * track. At 0 the track plays nothing. */
+int  trk_track_set_volume(trk_engine *e, int track, int percent);
+
+/* The velocity a note plays at on track `k`: the cell's, or the track's own
+ * where the cell gives none, scaled by the track's volume, 1..127 -- or 0
+ * when the volume is 0 and nothing should sound. */
+int  trk_track_velocity(const trk_track *k, int cell_velocity);
 
 /* The colour a note is drawn in when notes are coloured by pitch: low to high
  * across the rainbow, red at C1 to violet at C7 (clamped beyond). `dark` is a

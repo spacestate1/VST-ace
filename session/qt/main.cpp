@@ -50,12 +50,22 @@ extern "C" {
  * offset; the tab's Engine re-places them into its own rendered block by
  * wall-clock time. Never blocks, never calls back into the tracker -- the
  * delivery lock is held while this runs. */
+struct SinkCtx { Engine *eng; HostWidget *tab; };
+
 static void sinkDeliver(void *ud, double wall, const trk_sink_ev *evs, int n)
 {
-    Engine *eng = static_cast<Engine *>(ud);
-    for (int i = 0; i < n; i++)
-        eng->injectMidi(wall + double(evs[i].frame) / TRK_SINK_RATE,
-                        evs[i].status, evs[i].d1, evs[i].d2);
+    SinkCtx *ctx = static_cast<SinkCtx *>(ud);
+    for (int i = 0; i < n; i++) {
+        ctx->eng->injectMidi(wall + double(evs[i].frame) / TRK_SINK_RATE,
+                             evs[i].status, evs[i].d1, evs[i].d2);
+        /* The keys of the tab it plays on follow the notes: a note-on lights
+         * one, a note-off or a note-on at velocity 0 puts it up, and the
+         * all-notes-off controllers let every key up. */
+        const int st = evs[i].status & 0xF0;
+        if (st == 0x90 && evs[i].d2 > 0)            ctx->tab->showPlayedNote(evs[i].d1, true);
+        else if (st == 0x80 || st == 0x90)          ctx->tab->showPlayedNote(evs[i].d1, false);
+        else if (st == 0xB0 && (evs[i].d1 == 123 || evs[i].d1 == 120)) ctx->tab->showPlayedNote(-1, false);
+    }
 }
 
 /* The shell answers to both widgets' host interfaces. HostShell::addMenu and
@@ -1302,7 +1312,7 @@ private:
     }
 
     /* The tracker destinations: one per synth tab, named by its plug-in. */
-    struct SinkEntry { HostWidget *tab; int id; QString name; };
+    struct SinkEntry { HostWidget *tab; int id; QString name; SinkCtx *ctx; };
 
     QString uniqueSinkName(const QString &base, const HostWidget *exclude) const
     {
@@ -1320,19 +1330,21 @@ private:
     {
         if (!trkEngine_ || !h) return;
         for (const SinkEntry &s : sinks_) if (s.tab == h) return;
+        SinkCtx *ctx = new SinkCtx{ h->engine(), h };
         const int id = trk_add_sink(trkEngine_,
                                     uniqueSinkName(h->windowTitle(), h).toUtf8().constData(),
-                                    &sinkDeliver, h->engine());
-        if (id < 0) return;
+                                    &sinkDeliver, ctx);
+        if (id < 0) { delete ctx; return; }
         char nm[TRK_DEST_LEN] = "";
         trk_sink_name(trkEngine_, id, nm, sizeof nm);
-        sinks_.append({ h, id, QString::fromUtf8(nm) });
+        sinks_.append({ h, id, QString::fromUtf8(nm), ctx });
     }
     void removeSink(HostWidget *h)
     {
         for (int i = 0; i < sinks_.size(); i++)
             if (sinks_[i].tab == h) {
-                if (trkEngine_) trk_remove_sink(trkEngine_, sinks_[i].id);
+                if (trkEngine_) trk_remove_sink(trkEngine_, sinks_[i].id);   // waits out a delivery in flight
+                delete sinks_[i].ctx;
                 sinks_.removeAt(i);
                 return;
             }

@@ -96,6 +96,9 @@ typedef struct {
     int           dead_marked; /* the tab already says (stopped) */
     unsigned long last_calls;  /* callback count a second ago, for the tooltip */
     GtkWidget    *kbd;         /* the on-screen keyboard under the pane */
+    _Atomic unsigned char play[128];   /* notes the tracker has sounding here: set by its delivery thread */
+    _Atomic unsigned play_gen;         /* bumped on every change, so the GUI thread knows to redraw */
+    unsigned      play_seen;
     GtkWidget    *wheel;       /* the pitch wheel left of it */
     GtkWidget    *kbrow;       /* wheel and keys: what View > On-screen keyboard shows */
     int           bend, bend_drag, bend_grab_v;   /* 14-bit, 8192 at rest */
@@ -517,7 +520,8 @@ static void kb_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
         double fs = KB_W * 0.30;
         cairo_text_extents_t te;
         if (!kb_white(n)) continue;
-        if (tab && tab->held[n]) cairo_set_source_rgb(cr, 0.47, 0.67, 1.0);
+        if (tab && (tab->held[n] || atomic_load_explicit(&tab->play[n], memory_order_relaxed)))
+                                 cairo_set_source_rgb(cr, 0.47, 0.67, 1.0);
         else                     cairo_set_source_rgb(cr, 0.933, 0.933, 0.941);
         cairo_rectangle(cr, x0 + i * KB_W, 0, KB_W - 1, h);
         cairo_fill_preserve(cr);
@@ -542,7 +546,8 @@ static void kb_draw(GtkDrawingArea *a, cairo_t *cr, int w, int h, gpointer u)
         if (n + 1 <= hi && !kb_white(n + 1)) {
             char buf[16];
             double bw = KB_W * 0.62, fs = bw * 0.46;
-            if (tab && tab->held[n + 1]) cairo_set_source_rgb(cr, 0.275, 0.471, 0.824);
+            if (tab && (tab->held[n + 1] || atomic_load_explicit(&tab->play[n + 1], memory_order_relaxed)))
+                                         cairo_set_source_rgb(cr, 0.275, 0.471, 0.824);
             else                         cairo_set_source_rgb(cr, 0.078, 0.078, 0.094);
             cairo_rectangle(cr, x0 + i * KB_W + KB_W * 0.68, 0, bw, h * 0.62);
             cairo_fill(cr);
@@ -831,11 +836,38 @@ static void on_win_active(GObject *o, GParamSpec *ps, gpointer u)
  * tracker -- the delivery lock is held while this runs. */
 static void sink_deliver(void *ud, double wall, const trk_sink_ev *evs, int n)
 {
-    plugview *pv = ud;
+    synctab *tab = ud;
     int i;
-    for (i = 0; i < n; i++)
-        plugview_inject_midi(pv, wall + (double)evs[i].frame / TRK_SINK_RATE,
+    for (i = 0; i < n; i++) {
+        const int st = evs[i].status & 0xF0, note = evs[i].d1 & 0x7f;
+        plugview_inject_midi(tab->pv, wall + (double)evs[i].frame / TRK_SINK_RATE,
                              evs[i].status, evs[i].d1, evs[i].d2);
+        /* The keys of the tab it plays on follow the notes. This is the
+         * tracker's delivery thread, so only the atomics change here; the GUI
+         * thread redraws when it sees the generation move (kb_poll). */
+        if (st == 0x90 && evs[i].d2 > 0)  atomic_store_explicit(&tab->play[note], 1, memory_order_relaxed);
+        else if (st == 0x80 || st == 0x90) atomic_store_explicit(&tab->play[note], 0, memory_order_relaxed);
+        else if (st == 0xB0 && (evs[i].d1 == 123 || evs[i].d1 == 120)) {
+            int k;
+            for (k = 0; k < 128; k++) atomic_store_explicit(&tab->play[k], 0, memory_order_relaxed);
+        } else continue;
+        atomic_fetch_add_explicit(&tab->play_gen, 1, memory_order_release);
+    }
+}
+
+/* Redraw a tab's keyboard when the tracker has moved a key on it. */
+static gboolean kb_poll(gpointer u)
+{
+    int t;
+    (void)u;
+    for (t = 0; t < MAXTABS; t++) {
+        synctab *tab = &g_tabs[t];
+        unsigned g;
+        if (!tab->used || !tab->kbd) continue;
+        g = atomic_load_explicit(&tab->play_gen, memory_order_acquire);
+        if (g != tab->play_seen) { tab->play_seen = g; gtk_widget_queue_draw(tab->kbd); }
+    }
+    return G_SOURCE_CONTINUE;
 }
 
 static void unique_sink_name(const char *base, const synctab *exclude,
@@ -866,7 +898,7 @@ static void ensure_sink(synctab *tab)
 
     if (!g_trk || !tab || tab->sink_id >= 0) return;
     unique_sink_name(plugview_loaded_name(tab->pv), tab, name, sizeof name);
-    id = trk_add_sink(g_trk, name, &sink_deliver, tab->pv);
+    id = trk_add_sink(g_trk, name, &sink_deliver, tab);
     if (id < 0) return;
     tab->sink_id = id;
     trk_sink_name(g_trk, id, tab->sink_name, sizeof tab->sink_name);
@@ -3065,6 +3097,7 @@ static void activate(GtkApplication *app, gpointer ud)
     engine_start_audio();
     update_canvas();
     g_timeout_add(1000, watch_tabs, NULL);
+    g_timeout_add(40, kb_poll, NULL);          /* keys the tracker is playing */
 
     if (g_want_session[0]) open_session_path(g_want_session);
 

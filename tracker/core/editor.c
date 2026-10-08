@@ -130,6 +130,17 @@ void trk_note_rgb(int note, int dark, unsigned char rgb[3])
     rgb[2] = (unsigned char)(b * 255.0 + 0.5);
 }
 
+int trk_track_set_volume(trk_engine *e, int track, int percent)
+{
+    if (track < 0 || track >= TRK_TRACKS) return -1;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    trk_lock(e);
+    trk_song_of(e)->track[track].volume = percent;
+    trk_unlock(e);
+    return percent;
+}
+
 int trk_track_fit_octave(trk_engine *e, int track)
 {
     unsigned char mask[16];
@@ -169,6 +180,10 @@ const char *trk_columns_help(void)
         "  oct       The octave the note keys type at. Changing it moves the\n"
         "            track's notes too. A sample set sets it to where its\n"
         "            first sample is.\n"
+        "  vol       This track's volume, 0 to 100%. A fader over every note on\n"
+        "            the track, scaling the velocity each plays at; 0 plays\n"
+        "            nothing. Saved with the song. Works on synths and sample\n"
+        "            tracks alike.\n"
         "  mute      Silences the track. Its notes stay.\n"
         "  dot       Green: connected. Red: that window or sample set was not\n"
         "            found.\n"

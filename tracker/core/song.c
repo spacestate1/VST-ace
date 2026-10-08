@@ -29,6 +29,7 @@ void trk_song_init(trk_song *s)
         snprintf(s->track[t].name, sizeof s->track[t].name, "Track %d", t + 1);
         s->track[t].channel  = 0;
         s->track[t].velocity = 100;
+        s->track[t].volume   = 100;
         s->track[t].octave   = 4;
     }
     for (p = 0; p < TRK_PATTERNS; p++) {
@@ -110,6 +111,16 @@ static int parse_hex2(const char *s)
     return (int)v;
 }
 
+int trk_track_velocity(const trk_track *k, int cell_velocity)
+{
+    int v = cell_velocity >= 1 && cell_velocity <= 127 ? cell_velocity : k->velocity;
+    if (v < 1) v = 1;
+    if (v > 127) v = 127;
+    if (k->volume <= 0) return 0;
+    if (k->volume < 100) v = (v * k->volume + 50) / 100;
+    return v < 1 ? 1 : v > 127 ? 127 : v;
+}
+
 const char *trk_cell_text(const trk_cell *c, char *buf)
 {
     char n[4];
@@ -142,6 +153,7 @@ const char *trk_cell_text(const trk_cell *c, char *buf)
  *   track 1 port pestudio in
  *   track 1 sink this window: FB-7999  an in-process synth, as the shell named it
  *   track 1 octave 3                 the note keys' octave on it, when not 4
+ *   track 1 volume 80                its fader, in percent, when not 100
  *   track 2 samples drum-singles     a sample set, which the tracker plays
  *   order 0 0 1 2
  *   pattern 0 rows 64
@@ -184,6 +196,7 @@ int trk_song_save(const trk_song *s, const char *path, char *err, size_t errn)
                 t + 1, k->channel + 1, k->velocity, k->mute ? 1 : 0);
         fprintf(f, "track %d name %s\n", t + 1, one_line(k->name, ln, sizeof ln));
         if (k->octave != 4) fprintf(f, "track %d octave %d\n", t + 1, k->octave);
+        if (k->volume != 100) fprintf(f, "track %d volume %d\n", t + 1, k->volume);
         if (k->samples[0]) fprintf(f, "track %d samples %s\n", t + 1, one_line(k->samples, ln, sizeof ln));
         if (k->client[0]) fprintf(f, "track %d client %s\n", t + 1, one_line(k->client, ln, sizeof ln));
         if (k->port[0])   fprintf(f, "track %d port %s\n", t + 1, one_line(k->port, ln, sizeof ln));
@@ -303,6 +316,10 @@ int trk_song_load(trk_song *out, const char *path, char *err, size_t errn)
                 int o = n >= 4 ? atoi(w[3]) : -1;
                 if (n < 4 || o < 0 || o > 9) goto bad;
                 k->octave = o;
+            } else if (!strcmp(w[2], "volume")) {
+                int v = n >= 4 ? atoi(w[3]) : -1;
+                if (n < 4 || v < 0 || v > 100) goto bad;
+                k->volume = v;
             } else if (!strcmp(w[2], "samples"))
                 snprintf(k->samples, sizeof k->samples, "%s", after_words(line, 3));
             else {

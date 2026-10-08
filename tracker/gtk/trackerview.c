@@ -99,6 +99,7 @@ struct trk_view {
     GtkWidget  *name[TRK_TRACKS], *dest[TRK_TRACKS], *chan[TRK_TRACKS];
     GtkWidget  *mute[TRK_TRACKS], *state[TRK_TRACKS], *oct[TRK_TRACKS];
     GtkWidget  *meter[TRK_TRACKS];   /* a track's level bar */
+    GtkWidget  *tvol[TRK_TRACKS];    /* a track's volume slider */
     float       level[TRK_TRACKS];
     unsigned    xruns;
     int         meters_off;    /* View > Level meters unticked */
@@ -411,6 +412,7 @@ static void sync_from_song(ui *U)
         gtk_editable_set_text(GTK_EDITABLE(U->name[t]), s->track[t].name);
         gtk_drop_down_set_selected(GTK_DROP_DOWN(U->chan[t]), (guint)s->track[t].channel);
         gtk_drop_down_set_selected(GTK_DROP_DOWN(U->oct[t]), (guint)s->track[t].octave);
+        if (U->tvol[t]) gtk_range_set_value(GTK_RANGE(U->tvol[t]), s->track[t].volume);
         gtk_check_button_set_active(GTK_CHECK_BUTTON(U->mute[t]), s->track[t].mute);
     }
     trk_unlock(U->e);
@@ -2509,6 +2511,20 @@ static void on_dest(GtkDropDown *d, GParamSpec *ps, gpointer u)
 
 /* A track's octave from its own box; the toolbar's follows when it is the
  * cursor's track. */
+/* A track's volume slider: the engine scales every note on the track from the
+ * next one it schedules. */
+static void on_tvol(GtkRange *r, gpointer u)
+{
+    ui_ref *ref = u;
+    ui *U = ref->U;
+    GtkWidget *lbl = g_object_get_data(G_OBJECT(r), "vol-label");
+    char txt[16];
+    snprintf(txt, sizeof txt, "vol %d", (int)gtk_range_get_value(r));
+    if (lbl) gtk_label_set_text(GTK_LABEL(lbl), txt);       /* shown even while a song loads */
+    if (U->loading) return;
+    trk_track_set_volume(U->e, ref->n, (int)gtk_range_get_value(r));
+}
+
 static void on_oct(GtkDropDown *d, GParamSpec *ps, gpointer u)
 {
     ui_ref *r = u;
@@ -3614,8 +3630,8 @@ static GtkWidget *tracker_view_new(ui *U)
         gtk_widget_set_focus_on_click(del, FALSE);
         g_signal_connect(add, "clicked", G_CALLBACK(on_track_add), U);
         g_signal_connect(del, "clicked", G_CALLBACK(on_track_remove), U);
+        gtk_box_append(GTK_BOX(bar), del);          /* − Track, then + Track */
         gtk_box_append(GTK_BOX(bar), add);
-        gtk_box_append(GTK_BOX(bar), del);
     }
     gtk_box_append(GTK_BOX(v), bar);
 
@@ -3683,6 +3699,24 @@ static GtkWidget *tracker_view_new(ui *U)
         gtk_box_append(GTK_BOX(box), U->dest[t]);
         gtk_box_append(GTK_BOX(box), U->sample[t]);
         gtk_box_append(GTK_BOX(box), row);
+        {   /* This track's volume: a fader over every note on it only. */
+            GtkWidget *vrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4), *vl = gtk_label_new("vol 100");
+            gtk_widget_add_css_class(vl, "dim-label");
+            U->tvol[t] = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
+            gtk_range_set_value(GTK_RANGE(U->tvol[t]), 100);
+            gtk_scale_set_draw_value(GTK_SCALE(U->tvol[t]), FALSE);
+            gtk_label_set_width_chars(GTK_LABEL(vl), 7);
+            gtk_label_set_xalign(GTK_LABEL(vl), 0.0f);
+            g_object_set_data(G_OBJECT(U->tvol[t]), "vol-label", vl);
+            gtk_widget_set_hexpand(U->tvol[t], TRUE);
+            gtk_widget_set_focus_on_click(U->tvol[t], FALSE);
+            gtk_widget_set_tooltip_text(U->tvol[t], "This track's volume, in percent");
+            g_signal_connect(U->tvol[t], "value-changed", G_CALLBACK(on_tvol),
+                             ui_ref_new(U, t, G_OBJECT(U->tvol[t])));
+            gtk_box_append(GTK_BOX(vrow), vl);
+            gtk_box_append(GTK_BOX(vrow), U->tvol[t]);
+            gtk_box_append(GTK_BOX(box), vrow);
+        }
         U->meter[t] = gtk_drawing_area_new();
         gtk_widget_set_size_request(U->meter[t], -1, 14);
         gtk_widget_set_tooltip_text(U->meter[t], "This track's level: the velocity of the notes as they sound");

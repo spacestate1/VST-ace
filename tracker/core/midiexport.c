@@ -67,10 +67,8 @@ int trk_song_events(const trk_song *s, int t, trk_mev **out, int *n)
                 PUSH(1, tick, tick, k->channel & 15, c->cc, c->val);
             if (c->note == TRK_EMPTY) continue;
             if (!sampled && held >= 0) { ev[held].end = tick; held = -1; }
-            if (c->note <= 127) {
-                int vel = c->vel != TRK_EMPTY ? c->vel : k->velocity;
-                if (vel < 1) vel = 1;
-                if (vel > 127) vel = 127;
+            if (c->note <= 127 && trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel) > 0) {
+                const int vel = trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel);
                 PUSH(0, tick, sampled ? tick + row : 0, k->channel & 15, c->note, vel);
                 if (!sampled) held = (int)cnt - 1;
             }

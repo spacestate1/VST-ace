@@ -486,10 +486,9 @@ static void schedule_row(trk_engine *e)
                 drop_track_samples(e, t);
                 continue;
             }
-            if (c->note <= 127 && e->track_kit[t] >= 0) {
-                int vel = c->vel != TRK_EMPTY ? c->vel : k->velocity;
-                push_sample(e, e->next_tick, 0, SEV_PLAY, e->track_kit[t], c->note,
-                            vel < 1 ? 1 : vel > 127 ? 127 : vel, t);
+            if (c->note <= 127 && e->track_kit[t] >= 0 && trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel) > 0) {
+                const int vel = trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel);
+                push_sample(e, e->next_tick, 0, SEV_PLAY, e->track_kit[t], c->note, vel, t);
                 e->held[t] = c->note;   /* may be sounding: what a mute fades */
             }
             continue;
@@ -514,10 +513,8 @@ static void schedule_row(trk_engine *e)
             track_ev(e, t, e->next_tick, 0, 0x80 | e->held_ch[t], e->held[t], 0);
             e->held[t] = -1;
         }
-        if (c->note <= 127) {
-            int vel = c->vel != TRK_EMPTY ? c->vel : k->velocity;
-            if (vel < 1) vel = 1;
-            if (vel > 127) vel = 127;
+        if (c->note <= 127 && trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel) > 0) {
+            const int vel = trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel);
             track_ev(e, t, e->next_tick, 0, 0x90 | ch, c->note, vel);
             e->held[t] = c->note;
             e->held_ch[t] = ch;
@@ -1623,19 +1620,19 @@ void trk_preview(trk_engine *e, int t, int note, int vel)
     int ch;
     if (t < 0 || t >= TRK_TRACKS || note < 0 || note > 127) return;
     pthread_mutex_lock(&e->lock);
-    e->meter[t] = (vel >= 1 && vel <= 127 ? vel : e->song.track[t].velocity) / 127.0f;
+    vel = trk_track_velocity(&e->song.track[t], vel);        /* the track's fader applies to what is typed too */
+    if (vel < 1) { pthread_mutex_unlock(&e->lock); return; }
+    e->meter[t] = vel / 127.0f;
     if (is_sampled(&e->song.track[t])) {
         /* Played out rather than held: a preview of a drum should be the
          * whole hit, however quickly the key comes back up. */
         if (e->track_kit[t] >= 0)
-            push_sample(e, 0, 1, SEV_PLAY, e->track_kit[t], note,
-                        vel >= 1 && vel <= 127 ? vel : e->song.track[t].velocity, t);
+            push_sample(e, 0, 1, SEV_PLAY, e->track_kit[t], note, vel, t);
         pthread_mutex_unlock(&e->lock);
         return;
     }
     preview_off_locked(e, t);
     ch = e->song.track[t].channel & 15;
-    if (vel < 1 || vel > 127) vel = e->song.track[t].velocity;
     track_ev(e, t, 0, 1, 0x90 | ch, note, vel);
     snd_seq_drain_output(e->seq);
     e->prev_note[t] = note;
@@ -2662,6 +2659,7 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
             snprintf(s->track[at].name, sizeof s->track[at].name, "Track %d", num);
         }
         s->track[at].velocity = 100;
+        s->track[at].volume = 100;
         s->track[at].octave = 4;
         e->track_sink[at] = -1;
         s->ntracks++;
@@ -2671,6 +2669,7 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
         memset(&s->track[TRK_TRACKS - 1], 0, sizeof s->track[0]);
         snprintf(s->track[TRK_TRACKS - 1].name, sizeof s->track[0].name, "Track %d", TRK_TRACKS);
         s->track[TRK_TRACKS - 1].velocity = 100;
+        s->track[TRK_TRACKS - 1].volume = 100;
         s->track[TRK_TRACKS - 1].octave = 4;
         e->track_sink[TRK_TRACKS - 1] = -1;
         s->ntracks--;
@@ -2682,6 +2681,7 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
         memset(&s->track[t], 0, sizeof s->track[t]);
         snprintf(s->track[t].name, sizeof s->track[t].name, "Track %d", t + 1);
         s->track[t].velocity = 100;
+        s->track[t].volume = 100;
         s->track[t].octave = 4;
         e->track_sink[t] = -1;
     }

@@ -978,6 +978,33 @@ int main(void)
         unlink(path);
     }
 
+    printf("track volume\n");
+    {
+        trk_song *vb = malloc(sizeof *vb);
+        char vpath[] = "/tmp/trk-vol-XXXXXX";
+        int vfd = mkstemp(vpath), vn;
+        if (vfd >= 0) close(vfd);
+        check(trk_track_set_volume(e, 1, 50) == 50, "a track's volume is set");
+        check(trk_track_set_volume(e, 1, 250) == 100 && trk_track_set_volume(e, 1, -4) == 0, "and clamped to 0..100");
+        check(trk_track_set_volume(e, TRK_TRACKS, 50) == -1, "a bad track is refused");
+        trk_track_set_volume(e, 1, 50);
+        trk_lock(e);
+        check(trk_track_velocity(&s->track[1], 100) == 50, "half volume halves a velocity");
+        check(trk_track_velocity(&s->track[1], 0) == (s->track[1].velocity * 50 + 50) / 100, "and the track's own default");
+        check(trk_track_velocity(&s->track[1], 1) == 1, "never below 1 while the track is up");
+        s->track[1].volume = 0;
+        check(trk_track_velocity(&s->track[1], 100) == 0, "volume 0 plays nothing");
+        s->track[1].volume = 50;
+        check(trk_track_velocity(&s->track[0], 100) == 100, "another track is unaffected");
+        vn = trk_song_save(s, vpath, err, sizeof err);
+        trk_unlock(e);
+        check(vn == 0 && trk_song_load(vb, vpath, err, sizeof err) == 0 && vb->track[1].volume == 50 &&
+              vb->track[0].volume == 100, "the volume survives a save and a load");
+        trk_track_set_volume(e, 1, 100);
+        free(vb);
+        unlink(vpath);
+    }
+
     printf("octave moves the notes\n");
     {
         trk_editor ed;

@@ -1432,8 +1432,8 @@ public:
         delTr->setFocusPolicy(Qt::NoFocus);
         connect(addTr, &QPushButton::clicked, this, [this] { addTrack(); });
         connect(delTr, &QPushButton::clicked, this, [this] { removeTrack(); });
+        bar->addWidget(delTr);          // − Track, then + Track
         bar->addWidget(addTr);
-        bar->addWidget(delTr);
         bar->addStretch(1);
         v->addLayout(bar);
 
@@ -1493,6 +1493,19 @@ public:
             bl->addWidget(dest_[t]);
             bl->addWidget(sample_[t]);
             bl->addLayout(row);
+            // This track's volume: a fader over every note on it only.
+            vol_[t] = new QSlider(Qt::Horizontal);
+            vol_[t]->setRange(0, 100);
+            vol_[t]->setValue(100);
+            vol_[t]->setFocusPolicy(Qt::NoFocus);
+            vol_[t]->setToolTip("This track's volume: 100%");
+            auto *volRow = new QHBoxLayout;
+            volRow->setSpacing(4);
+            auto *volLbl = new QLabel("vol");
+            volLbl->setEnabled(false);
+            volRow->addWidget(volLbl);
+            volRow->addWidget(vol_[t], 1);
+            bl->addLayout(volRow);
             meter_[t] = new LevelMeter;
             bl->addWidget(meter_[t]);
             hl->addWidget(box);
@@ -1675,6 +1688,13 @@ public:
                 }
                 refreshDests(true);
                 view_->setFocus();
+            });
+            // A track's volume, from its own slider: the engine scales every
+            // note on the track from the next one it schedules.
+            connect(vol_[t], &QSlider::valueChanged, this, [this, t](int v) {
+                if (loading_) return;
+                trk_track_set_volume(e_, t, v);
+                vol_[t]->setToolTip(QString("This track's volume: %1%").arg(v));
             });
             // A track's octave, from its own box. The call locks itself and
             // moves the track's notes with the change, so the grid redraws.
@@ -1875,6 +1895,8 @@ private:
             chan_[t]->setValue(s->track[t].channel + 1);
             oct_[t]->setCurrentIndex(s->track[t].octave);
             mute_[t]->setChecked(s->track[t].mute);
+            vol_[t]->setValue(s->track[t].volume);
+            vol_[t]->setToolTip(QString("This track's volume: %1%").arg(s->track[t].volume));
         }
         trk_unlock(e_);
         loading_ = false;
@@ -2723,6 +2745,7 @@ private:
     QPointer<QDialog> recDlg_;
     QSpinBox *chan_[TRK_TRACKS];
     QComboBox *oct_[TRK_TRACKS];
+    QSlider   *vol_[TRK_TRACKS];
     QCheckBox *mute_[TRK_TRACKS];
     QLabel *state_[TRK_TRACKS];
 };
