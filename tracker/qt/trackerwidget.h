@@ -211,9 +211,15 @@ protected:
 
         // Which notes each sample-set track has a sample on -- asked before
         // the song's lock is taken, which this call takes itself.
+        // Only for the tracks this repaint reaches: the call takes two locks and
+        // walks 128 notes, and most of 16 tracks are off the dirty rectangle.
         unsigned char masks[TRK_TRACKS][16];
-        bool sampled[TRK_TRACKS];
-        for (int t = 0; t < TRK_TRACKS; t++) sampled[t] = trk_sample_mask(e_, t, masks[t]);
+        bool sampled[TRK_TRACKS], vis[TRK_TRACKS];
+        for (int t = 0; t < TRK_TRACKS; t++) {
+            const int x = gutter() + t * colWidth();
+            vis[t] = t < nt() && x + colWidth() >= ev->rect().left() && x - cw_ <= ev->rect().right();
+            sampled[t] = vis[t] && trk_sample_mask(e_, t, masks[t]);
+        }
         const QColor missing(220, 50, 47);
 
         // What is drawn is copied out under the lock and drawn after it: the
@@ -247,6 +253,7 @@ protected:
         faint.setAlpha(55);
         QColor selTint = pal.color(QPalette::Highlight);
         selTint.setAlpha(80);
+        const bool pitchDark = pal.color(QPalette::Base).lightness() < 128;
 
         for (int r = r0; r <= r1; r++) {
             const int y = r * ch_;
@@ -262,6 +269,7 @@ protected:
             p.drawText(cw_ / 2, y + asc_, QString::fromLatin1(num));
 
             for (int t = 0; t < ntr; t++) {
+                if (!vis[t]) continue;
                 const int x = gutter() + t * colWidth();
                 char txt[TRK_CELL_CHARS + 1];
                 trk_cell_text(&cells[r][t], txt);
@@ -275,31 +283,41 @@ protected:
                              len[ed_->field] * cw_ + 2, ch_);
                     p.fillRect(fr, pal.color(QPalette::Highlight));
                 }
-                // Each field drawn on its own so the empty dots can be
-                // fainter than what is actually there.
-                for (int c = 0; c < TRK_CELL_CHARS; c++) {
-                    const bool cur = r == ed_->row && t == ed_->track &&
-                        ((ed_->field == TRK_F_NOTE && c < 3) ||
-                         (ed_->field == TRK_F_VEL && c >= 4 && c < 6) ||
-                         (ed_->field == TRK_F_CC && c >= 7 && c < 9) ||
-                         (ed_->field == TRK_F_VAL && c >= 10));
-                    if (txt[c] == ' ') continue;
+                // An empty cell -- nearly all of them -- is one run of dots in the
+                // faint colour, not twelve characters.
+                const trk_cell &cell = cells[r][t];
+                const bool curCell = r == ed_->row && t == ed_->track;
+                if (!curCell && txt[0] == '.' && txt[4] == '.' && txt[7] == '.' && txt[10] == '.') {
+                    QColor col = faint;
+                    if (mutes & (1 << t)) col.setAlpha(col.alpha() / 3);
+                    p.setPen(col);
+                    p.drawText(x, y + asc_, QLatin1String(txt, TRK_CELL_CHARS));
+                    continue;
+                }
+                // Each field drawn on its own, as one string, so the empty dots
+                // can be fainter than what is actually there. A field is all dots
+                // or none, so it has one colour.
+                static const int fstart[TRK_FIELDS] = { 0, 4, 7, 10 };
+                static const int flen[TRK_FIELDS]   = { 3, 2, 2, 2 };
+                for (int f = 0; f < TRK_FIELDS; f++) {
+                    const int c = fstart[f];
+                    const bool cur = curCell && ed_->field == f;
                     QColor col = txt[c] == '.' ? faint : pal.color(QPalette::Text);
-                    if (c >= 4 && txt[c] != '.') col = dim.lighter(100);
+                    if (c >= 4 && txt[c] != '.') col = dim;
                     // A note its track's sample set has no sample on plays
                     // nothing: red, so it is seen before it is not heard.
-                    const int nt = cells[r][t].note;
+                    const int nt = cell.note;
                     if (c < 3 && sampled[t] && nt <= 127 && !(masks[t][nt >> 3] & (1u << (nt & 7))))
                         col = missing;
                     else if (pitchColors_ && c < 3 && nt <= 127) {
                         unsigned char rgb[3];
-                        trk_note_rgb(nt, pal.color(QPalette::Base).lightness() < 128, rgb);
+                        trk_note_rgb(nt, pitchDark, rgb);
                         col = QColor(rgb[0], rgb[1], rgb[2]);
                     }
                     if (mutes & (1 << t)) col.setAlpha(col.alpha() / 3);
                     if (cur) col = pal.color(QPalette::HighlightedText);
                     p.setPen(col);
-                    p.drawText(x + c * cw_, y + asc_, QString(QChar(txt[c])));
+                    p.drawText(x + c * cw_, y + asc_, QLatin1String(txt + c, flen[f]));
                 }
             }
         }
@@ -1785,9 +1803,9 @@ public:
 
         // Playback position, thirty times a second; routing every two, so a
         // window opened after the song was loaded is found and connected.
-        auto *tick = new QTimer(this);
-        connect(tick, &QTimer::timeout, this, &TrackerWidget::followPlayback);
-        tick->start(33);
+        tick_ = new QTimer(this);
+        connect(tick_, &QTimer::timeout, this, &TrackerWidget::followPlayback);
+        tick_->start(33);
         auto *route = new QTimer(this);
         connect(route, &QTimer::timeout, this, [this] { trk_route(e_); refreshDests(false); });
         route->start(2000);
@@ -2277,6 +2295,24 @@ private:
             host_->showStatus(note->text(), 5000);
         });
         v->addWidget(list, 1);
+        // The buffer: bigger is safer when the machine is busy -- a click or
+        // pop in the drums is the output running dry -- and only delays a note
+        // typed to be heard; a song playing lines up at any size.
+        auto *bufRow = new QHBoxLayout;
+        bufRow->addWidget(new QLabel("Buffer:"));
+        auto *buf = new QComboBox;
+        for (int i = 0; i < TRK_BUFFER_LEVELS; i++) buf->addItem(QString::fromUtf8(trk_audio_buffer_label(i)));
+        buf->setCurrentIndex(trk_audio_buffer(e_));
+        buf->setToolTip("Bigger is safer on a busy machine and delays only a note typed to be heard; "
+                        "a song playing lines up at any size.");
+        bufRow->addWidget(buf);
+        bufRow->addStretch(1);
+        v->addLayout(bufRow);
+        connect(buf, &QComboBox::activated, &d, [&](int lv) {
+            trk_audio_set_buffer(e_, lv);
+            note->setText(QString::fromUtf8(trk_audio_status(e_)));
+            host_->showStatus(note->text(), 5000);
+        });
         v->addWidget(note);
         auto *info = new QLabel("Synth tabs in the studio play through PipeWire, which also serves JACK programs "
                                 "(pipewire-jack) and ALSA programs (pipewire-alsa). This list is for the tracker's own "
@@ -2423,9 +2459,10 @@ private:
 
     // The Rec button says what the engine is doing: lit while a take runs,
     // and counting in while the click leads the take in.
-    void showRec()
+    void showRec() { showRecState(trk_recording(e_)); }
+
+    void showRecState(int rs)
     {
-        const int rs = trk_recording(e_);
         if (rs == recShown_) return;
         recShown_ = rs;
         recBtn_->setText(rs == 2 ? "● Count-in…" : rs ? "● Recording" : "● Rec");
@@ -2531,17 +2568,22 @@ private:
     void followPlayback()
     {
         int o, p, r;
-        showRec();
-        if (const unsigned x = trk_audio_xruns(e_); x != xruns_) {   // the sample output ran dry: a click
+        // Thirty times a second while there is anything to follow, ten when there
+        // is not, and not at all while the view is hidden: each tick is a take of
+        // the engine's lock.
+        if (!view_->isVisible()) { tick_->setInterval(250); return; }
+        trk_poll_state ps;
+        trk_poll(e_, &ps);
+        if (tick_->interval() != (ps.quiet ? 100 : 33)) tick_->setInterval(ps.quiet ? 100 : 33);
+        showRecState(ps.recording);
+        if (const unsigned x = ps.xruns; x != xruns_) {   // the sample output ran dry: a click
             xruns_ = x;
             host_->showStatus(QString("sample output dropped out (%1 so far) -- that is the click").arg(x), 4000);
         }
         {
-            float lv[TRK_TRACKS];
-            trk_levels(e_, lv);
-            for (int t = 0; t < TRK_TRACKS; t++) if (meter_[t]) meter_[t]->setLevel(lv[t]);
+            for (int t = 0; t < TRK_TRACKS; t++) if (meter_[t]) meter_[t]->setLevel(ps.level[t]);
         }
-        trk_position(e_, &o, &p, &r);
+        o = ps.order; p = ps.pattern; r = ps.row;
         view_->setPlayRow(p, r);
         // The part playing, marked; and, following, the one being edited.
         if (o != partPlaying_ || (o >= 0 && ed_.follow && o != partAt_)) {
@@ -2742,6 +2784,7 @@ private:
     QMenu     *samplesMenu_ = nullptr;
     QPushButton *recBtn_ = nullptr;
     int        recShown_ = 0;
+    QTimer    *tick_ = nullptr;      // the playback timer: 33 ms busy, 100 idle, 250 hidden
     QPointer<QDialog> recDlg_;
     QSpinBox *chan_[TRK_TRACKS];
     QComboBox *oct_[TRK_TRACKS];

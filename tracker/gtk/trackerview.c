@@ -102,6 +102,7 @@ struct trk_view {
     GtkWidget  *tvol[TRK_TRACKS];    /* a track's volume slider */
     float       level[TRK_TRACKS];
     unsigned    xruns;
+    char        audio_shown[256];  /* the sample-output status last put on the status line */
     int         meters_off;    /* View > Level meters unticked */
     int         pitch_off;     /* View > Color notes by pitch unticked */
     GtkWidget  *headbox[TRK_TRACKS];
@@ -147,6 +148,7 @@ struct trk_view {
     void       *song_saved_ud;
 
     guint       t_follow, t_reroute; /* the view's timers, removed on destroy */
+    guint       follow_ms;           /* the playback timer's period now */
     guint       t_refit;             /* a pending refit_columns, 0 when none is */
     int         embedded;            /* in a shell: its menus carry the file, samples and help commands */
 };
@@ -601,7 +603,12 @@ static void update_states(ui *U)
     }
     refresh_cheat(U);
     /* Where the samples play, or why they cannot. */
-    if (kits && *trk_audio_status(U->e)) status(U, trk_audio_status(U->e));
+    if (kits && *trk_audio_status(U->e) && strcmp(U->audio_shown, trk_audio_status(U->e))) {
+        /* Said when it changes, not at every 2 s pass: this line is where "Saved"
+         * and an error the user has not read yet are shown too. */
+        snprintf(U->audio_shown, sizeof U->audio_shown, "%s", trk_audio_status(U->e));
+        status(U, U->audio_shown);
+    }
 }
 
 /* Every window that can be played, plus whatever a track names that is not
@@ -995,7 +1002,7 @@ static void kb_choices(void)
         gtk_string_list_append(sl, lb);
         g_free(lb);
     }
-    g_ptr_array_free(a, FALSE);
+    g_free(g_ptr_array_free(a, FALSE));         /* the strings went to E.choice; the array of them is ours to free */
     E.filling = 1;
     for (n = KB_LO; n <= KB_HI; n++)
         if (E.kdd[n]) gtk_drop_down_set_model(GTK_DROP_DOWN(E.kdd[n]), G_LIST_MODEL(sl));
@@ -1254,9 +1261,6 @@ static void kb_folder_done(GObject *src, GAsyncResult *res, gpointer u)
     }
     if (added) { E.dirty = 1; E.curnote = first; }
     if (first >= 0) drumkit_note_name(first, nn);
-    snprintf(msg, sizeof msg, added ? "added %d WAV%s from %s starting at %s -- Save to keep them"
-                                    : "nothing new in %s (%d already in the set)%s",
-             added ? added : 0, "", path, nn);
     if (added) snprintf(msg, sizeof msg, "added %d WAV%s from %s starting at %s%s -- Save to keep them",
                         added, added == 1 ? "" : "s", path, nn, skipped ? " (some already in the set)" : "");
     else snprintf(msg, sizeof msg, "nothing new in %s (%d already in the set)", path, skipped);
@@ -2312,9 +2316,8 @@ static void transport(ui *U, int key)
 
 /* The Rec button says what the engine is doing: lit while a take runs, and
  * counting in while the click leads the take in. */
-static void show_rec(ui *U)
+static void show_rec_state(ui *U, int rs)
 {
-    const int rs = trk_recording(U->e);
     if (!U->recbtn || rs == U->rec_shown) return;
     U->rec_shown = rs;
     gtk_button_set_label(GTK_BUTTON(U->recbtn), rs == 2 ? "● Count-in…" : rs ? "● Recording" : "● Rec");
@@ -2323,13 +2326,33 @@ static void show_rec(ui *U)
     if (rs == 1) status(U, "recording -- play the keys; F7 or Stop ends the take");
 }
 
+static void show_rec(ui *U) { show_rec_state(U, trk_recording(U->e)); }
+
+/* The playback timer runs at 30 Hz while there is anything to follow -- a song
+ * playing, a take, a meter still falling -- and at 10 Hz when there is not, and
+ * not at all while the view is not on screen: it is two or three takes of the
+ * engine's lock a tick, which on a window nobody is looking at is pure cost. */
+static gboolean follow_playback(gpointer u);
+
+static void follow_rate(ui *U, guint ms)
+{
+    if (U->follow_ms == ms) return;
+    U->follow_ms = ms;
+    if (U->t_follow) g_source_remove(U->t_follow);
+    U->t_follow = g_timeout_add(ms, follow_playback, U);
+}
+
 static gboolean follow_playback(gpointer u)
 {
     ui *U = u;
+    trk_poll_state ps;
     int o, p, r;
-    show_rec(U);
+    if (!gtk_widget_get_mapped(U->area)) { follow_rate(U, 250); return G_SOURCE_CONTINUE; }
+    trk_poll(U->e, &ps);
+    follow_rate(U, ps.quiet ? 100 : 33);
+    show_rec_state(U, ps.recording);
     {   /* the sample output ran dry: a click */
-        unsigned x = trk_audio_xruns(U->e);
+        unsigned x = ps.xruns;
         if (x != U->xruns) {
             char m[96];
             U->xruns = x;
@@ -2338,9 +2361,8 @@ static gboolean follow_playback(gpointer u)
         }
     }
     {
-        float lv[TRK_TRACKS];
+        const float *lv = ps.level;
         int t;
-        trk_levels(U->e, lv);
         for (t = 0; t < TRK_TRACKS; t++) {
             if (U->meter[t] && (lv[t] - U->level[t] > 0.004f || U->level[t] - lv[t] > 0.004f)) {
                 U->level[t] = lv[t];
@@ -2348,7 +2370,7 @@ static gboolean follow_playback(gpointer u)
             }
         }
     }
-    trk_position(U->e, &o, &p, &r);
+    o = ps.order; p = ps.pattern; r = ps.row;
     /* The part playing, marked; and, following, the one being edited. */
     if (o != U->part_playing || (o >= 0 && U->ed.follow && o != U->part_at)) {
         U->part_playing = o;
@@ -2598,6 +2620,22 @@ static void dest_setup(GtkSignalListItemFactory *f, GtkListItem *it, gpointer sh
     gtk_list_item_set_child(it, l);
 }
 
+/* The closed box cuts a long name short to keep to its column: the whole of what
+ * it holds is the tooltip, with what the box is for under it. */
+static void tip_selected(GObject *o, GParamSpec *ps, gpointer base)
+{
+    GtkStringObject *so = gtk_drop_down_get_selected_item(GTK_DROP_DOWN(o));
+    const char *sel = so ? gtk_string_object_get_string(so) : NULL;
+    (void)ps;
+    if (sel && *sel) {
+        char *t = g_strdup_printf("%s\n(%s)", sel, (const char *)base);
+        gtk_widget_set_tooltip_text(GTK_WIDGET(o), t);
+        g_free(t);
+    } else {
+        gtk_widget_set_tooltip_text(GTK_WIDGET(o), base);
+    }
+}
+
 static void dest_bind(GtkSignalListItemFactory *f, GtkListItem *it, gpointer u)
 {
     GtkStringObject *o = gtk_list_item_get_item(it);
@@ -2688,7 +2726,13 @@ static void save_as(ui *U, int close_after)
     GtkFileDialog *d = song_dialog("Save song");
     {   /* A song opened by a bare file name has no '/' in its path. */
         const char *slash = strrchr(U->path, '/');
-        gtk_file_dialog_set_initial_name(d, !U->path[0] ? "song.trk" : slash ? slash + 1 : U->path);
+        if (slash) {   /* the folder it came from, as well as the name */
+            GFile *f = g_file_new_for_path(U->path);
+            gtk_file_dialog_set_initial_file(d, f);
+            g_object_unref(f);
+        } else {
+            gtk_file_dialog_set_initial_name(d, !U->path[0] ? "song.trk" : U->path);
+        }
     }
     {
         ui_ref *r = g_new(ui_ref, 1);
@@ -3000,6 +3044,15 @@ static void audio_row_activated(GtkListBox *b, GtkListBoxRow *row, gpointer u)
     audio_fill(A);
 }
 
+static void audio_buffer_changed(GObject *dd, GParamSpec *ps, gpointer u)
+{
+    audio_dlg *A = u;
+    (void)ps;
+    trk_audio_set_buffer(A->U->e, (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(dd)));
+    gtk_label_set_text(GTK_LABEL(A->note), trk_audio_status(A->U->e));
+    status(A->U, gtk_label_get_text(GTK_LABEL(A->note)));
+}
+
 static void audio_gone(GtkWidget *w, gpointer u) { (void)w; g_free(u); }
 
 static void show_audio_output(ui *U)
@@ -3024,6 +3077,23 @@ static void show_audio_output(ui *U)
     gtk_widget_set_vexpand(sw, TRUE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(sw), A->list);
     gtk_box_append(GTK_BOX(box), sw);
+    {   /* The buffer: bigger is safer when the machine is busy -- a click or pop in
+         * the drums is the output running dry -- and only delays a note typed to
+         * be heard; a song playing lines up at any size. */
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8), *dd;
+        const char *labels[TRK_BUFFER_LEVELS + 1];
+        int k;
+        for (k = 0; k < TRK_BUFFER_LEVELS; k++) labels[k] = trk_audio_buffer_label(k);
+        labels[TRK_BUFFER_LEVELS] = NULL;
+        dd = gtk_drop_down_new_from_strings(labels);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(dd), (guint)trk_audio_buffer(U->e));
+        gtk_widget_set_tooltip_text(dd, "Bigger is safer on a busy machine and delays only a note typed to be "
+                                        "heard; a song playing lines up at any size.");
+        gtk_box_append(GTK_BOX(row), gtk_label_new("Buffer:"));
+        gtk_box_append(GTK_BOX(row), dd);
+        gtk_box_append(GTK_BOX(box), row);
+        g_signal_connect(dd, "notify::selected", G_CALLBACK(audio_buffer_changed), A);
+    }
     A->note = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(A->note), 0.0f);
     gtk_label_set_wrap(GTK_LABEL(A->note), TRUE);
@@ -3218,6 +3288,42 @@ static void on_rec_button(GtkButton *b, gpointer u)
     gtk_widget_grab_focus(U->area);
 }
 static void on_rec_options(GtkButton *b, gpointer u) { (void)b; show_rec_options(u); }
+
+/* The panic is a shortcut on the view, in the capture phase: Escape and F12 must
+ * release every note wherever the focus is -- a name field, a spin button -- not
+ * only in the grid. */
+static void on_panic_act(GSimpleAction *a, GVariant *v, gpointer u) { (void)a; (void)v; trk_panic(((ui *)u)->e); }
+static void on_new_act(GSimpleAction *a, GVariant *v, gpointer u) { (void)a; (void)v; confirm_then(u, AFTER_NEW); }
+static void on_open_act(GSimpleAction *a, GVariant *v, gpointer u) { (void)a; (void)v; confirm_then(u, AFTER_OPEN); }
+static void on_save_act(GSimpleAction *a, GVariant *v, gpointer u) { (void)a; (void)v; do_save(u, 0); }
+static void on_save_as_act(GSimpleAction *a, GVariant *v, gpointer u) { (void)a; (void)v; save_as(u, 0); }
+static void on_quit_act(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    ui *U = u;
+    (void)a; (void)v;
+    if (U->win) gtk_window_close(GTK_WINDOW(U->win));      /* through the unsaved-song question */
+}
+static void on_export_take_act(GSimpleAction *a, GVariant *v, gpointer u) { (void)a; (void)v; export_take(u); }
+static void on_view_meters(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    g_simple_action_set_state(a, v);
+    trk_view_set_meters(u, g_variant_get_boolean(v));
+}
+static void on_view_pitch(GSimpleAction *a, GVariant *v, gpointer u)
+{
+    g_simple_action_set_state(a, v);
+    trk_view_set_pitch_colors(u, g_variant_get_boolean(v));
+}
+
+static void view_menu(GtkMenuButton *mb, gpointer u)
+{
+    GMenu *m = g_menu_new();
+    (void)u;
+    g_menu_append(m, "Level meters", "win.view-meters");
+    g_menu_append(m, "Color notes by pitch", "win.view-pitch");
+    gtk_menu_button_set_menu_model(mb, G_MENU_MODEL(m));
+    g_object_unref(m);
+}
 
 static void on_button(GtkButton *b, gpointer u)
 {
@@ -3500,6 +3606,15 @@ static GtkWidget *tracker_view_new(ui *U)
         { "clear",        on_clear,        NULL, NULL, NULL, {0} },
         { "select-column", on_selcol,      NULL, NULL, NULL, {0} },
         { "select-all",   on_selall,       NULL, NULL, NULL, {0} },
+        { "panic",        on_panic_act,    NULL, NULL, NULL, {0} },
+        { "new",          on_new_act,      NULL, NULL, NULL, {0} },
+        { "open",         on_open_act,     NULL, NULL, NULL, {0} },
+        { "save",         on_save_act,     NULL, NULL, NULL, {0} },
+        { "save-as",      on_save_as_act,  NULL, NULL, NULL, {0} },
+        { "quit",         on_quit_act,     NULL, NULL, NULL, {0} },
+        { "export-take",  on_export_take_act, NULL, NULL, NULL, {0} },
+        { "view-meters",  NULL, NULL, "true", on_view_meters, {0} },
+        { "view-pitch",   NULL, NULL, "true", on_view_pitch,  {0} },
     };
     const char *lpbn[NLPB + 1], *chans[17];
     char lpbs[NLPB][16], chs[16][8];
@@ -3529,6 +3644,31 @@ static GtkWidget *tracker_view_new(ui *U)
                              gtk_named_action_new("win.cheat")));
         gtk_widget_add_controller(v, sc);
     }
+    {   /* Panic, from anywhere in the view. */
+        GtkEventController *pc = gtk_shortcut_controller_new();
+        gtk_event_controller_set_propagation_phase(pc, GTK_PHASE_CAPTURE);
+        gtk_shortcut_controller_add_shortcut(GTK_SHORTCUT_CONTROLLER(pc),
+            gtk_shortcut_new(gtk_keyval_trigger_new(GDK_KEY_Escape, 0), gtk_named_action_new("win.panic")));
+        gtk_shortcut_controller_add_shortcut(GTK_SHORTCUT_CONTROLLER(pc),
+            gtk_shortcut_new(gtk_keyval_trigger_new(GDK_KEY_F12, 0), gtk_named_action_new("win.panic")));
+        gtk_widget_add_controller(v, pc);
+    }
+    if (!U->embedded) {   /* The file keys, standalone: embedded, the shell's menu bar has them. */
+        static const struct { guint key; GdkModifierType mod; const char *act; } fk[] = {
+            { GDK_KEY_n, GDK_CONTROL_MASK, "win.new" },
+            { GDK_KEY_o, GDK_CONTROL_MASK, "win.open" },
+            { GDK_KEY_s, GDK_CONTROL_MASK, "win.save" },
+            { GDK_KEY_s, GDK_CONTROL_MASK | GDK_SHIFT_MASK, "win.save-as" },
+            { GDK_KEY_S, GDK_CONTROL_MASK | GDK_SHIFT_MASK, "win.save-as" },
+            { GDK_KEY_q, GDK_CONTROL_MASK, "win.quit" },
+        };
+        GtkEventController *fc2 = gtk_shortcut_controller_new();
+        size_t q;
+        for (q = 0; q < G_N_ELEMENTS(fk); q++)
+            gtk_shortcut_controller_add_shortcut(GTK_SHORTCUT_CONTROLLER(fc2),
+                gtk_shortcut_new(gtk_keyval_trigger_new(fk[q].key, fk[q].mod), gtk_named_action_new(fk[q].act)));
+        gtk_widget_add_controller(v, fc2);
+    }
 
     bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     for (i = 0; i < 9; i++) {
@@ -3537,6 +3677,12 @@ static GtkWidget *tracker_view_new(ui *U)
          * MIDI, Samples and Help; only the transport stays on the toolbar. */
         if (U->embedded && i >= 4) continue;
         if (i == 8) {
+            GtkWidget *vb = gtk_menu_button_new();
+            gtk_menu_button_set_label(GTK_MENU_BUTTON(vb), "View");
+            gtk_widget_set_tooltip_text(vb, "Level meters, and the note column coloured by pitch");
+            gtk_widget_set_focus_on_click(vb, FALSE);
+            gtk_menu_button_set_create_popup_func(GTK_MENU_BUTTON(vb), view_menu, NULL, NULL);
+            gtk_box_append(GTK_BOX(bar), vb);
             /* Help, where Keys was: Keys and the cheat sheet. */
             GtkWidget *mb = gtk_menu_button_new();
             gtk_menu_button_set_label(GTK_MENU_BUTTON(mb), "Help");
@@ -3572,6 +3718,13 @@ static GtkWidget *tracker_view_new(ui *U)
             gtk_widget_set_focus_on_click(eb, FALSE);
             g_signal_connect(eb, "clicked", G_CALLBACK(on_export_button), U);
             gtk_box_append(GTK_BOX(bar), eb);
+            {
+                GtkWidget *tb = gtk_button_new_with_label("Export take…");
+                gtk_widget_set_tooltip_text(tb, "Write the last recorded take as a MIDI file");
+                gtk_widget_set_focus_on_click(tb, FALSE);
+                gtk_actionable_set_action_name(GTK_ACTIONABLE(tb), "win.export-take");
+                gtk_box_append(GTK_BOX(bar), tb);
+            }
         }
         if (i == 7) {
             /* Samples, beside the file buttons: load a set from anywhere,
@@ -3663,6 +3816,7 @@ static GtkWidget *tracker_view_new(ui *U)
         g_object_unref(fshort);
         g_object_unref(flong);
         gtk_widget_set_tooltip_text(U->dest[t], "Which window this track plays");
+        g_signal_connect(U->dest[t], "notify::selected", G_CALLBACK(tip_selected), (gpointer)"Which window this track plays");
         U->sample[t] = gtk_drop_down_new(NULL, NULL);
         {   /* Shortened in the box, whole in the list, as the window box is:
              * sample names run long, and the header must stay over its column. */
@@ -3679,6 +3833,8 @@ static GtkWidget *tracker_view_new(ui *U)
         }
         gtk_widget_set_tooltip_text(U->sample[t], "A sample set for this track to play instead "
                                                  "of a window: the note picks the sample");
+        g_signal_connect(U->sample[t], "notify::selected", G_CALLBACK(tip_selected),
+                         (gpointer)"A sample set for this track to play instead of a window: the note picks the sample");
         row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
         U->chan[t] = gtk_drop_down_new_from_strings(chans);
         gtk_widget_set_tooltip_text(U->chan[t], "MIDI channel");
@@ -3826,6 +3982,7 @@ static GtkWidget *tracker_view_new(ui *U)
     g_signal_connect(U->editbox, "toggled", G_CALLBACK(on_editbox), U);
 
     U->play_pat = U->play_row = -1;
+    U->follow_ms = 33;
     U->t_follow = g_timeout_add(33, follow_playback, U);
     U->t_reroute = g_timeout_add(2000, reroute, U);
     g_signal_connect(v, "map", G_CALLBACK(on_view_map), U);
@@ -4080,6 +4237,31 @@ static gboolean uitest(gpointer u)
         check(U->ed.edit == !was, "Space toggles edit mode");
         key(U, GDK_KEY_space);
         check(U->ed.edit == was, "and back");
+    }
+
+    printf("standalone actions\n");
+    {
+        static const char *const names[] = { "panic", "new", "open", "save", "save-as", "quit",
+                                             "export-take", "view-meters", "view-pitch" };
+        size_t q;
+        int all = 1;
+        for (q = 0; q < G_N_ELEMENTS(names); q++)
+            if (!g_action_map_lookup_action(G_ACTION_MAP(U->ag), names[q])) { all = 0; printf("        missing %s\n", names[q]); }
+        check(all, "the file, panic, export-take and view actions are there");
+        g_action_group_change_action_state(G_ACTION_GROUP(U->ag), "view-meters", g_variant_new_boolean(FALSE));
+        check(!trk_view_meters(U) && !gtk_widget_get_visible(U->meter[0]), "View > Level meters off hides the meters");
+        g_action_group_change_action_state(G_ACTION_GROUP(U->ag), "view-meters", g_variant_new_boolean(TRUE));
+        check(trk_view_meters(U) && gtk_widget_get_visible(U->meter[0]), "and on shows them");
+        g_action_group_change_action_state(G_ACTION_GROUP(U->ag), "view-pitch", g_variant_new_boolean(FALSE));
+        check(!trk_view_pitch_colors(U), "View > Color notes by pitch off");
+        g_action_group_change_action_state(G_ACTION_GROUP(U->ag), "view-pitch", g_variant_new_boolean(TRUE));
+        check(trk_view_pitch_colors(U), "and on");
+        gtk_widget_grab_focus(U->name[0]);                 /* focus in a header field, not the grid */
+        trk_preview(U->e, 0, 60, 100);
+        g_action_group_activate_action(G_ACTION_GROUP(U->ag), "panic", NULL);
+        pump(100);
+        check(trk_playing(U->e) == 0, "panic runs from a header field");
+        check(gtk_widget_get_tooltip_text(U->dest[0]) != NULL, "a destination box has a tooltip");
     }
 
     printf("saving\n");
