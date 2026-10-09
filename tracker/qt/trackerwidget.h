@@ -2416,6 +2416,11 @@ private:
             // A sample set picks its sample by the note itself, so the octave
             // -- which would only move those notes onto other samples -- is off.
             oct_[t]->setEnabled(!kit);
+            if (kit) {          // the engine put it where the set's pads are
+                const QSignalBlocker block(oct_[t]);
+                oct_[t]->setCurrentIndex(trk_song_of(e_)->track[t].octave);
+                if (t == ed_.track) ed_.octave = trk_song_of(e_)->track[t].octave;
+            }
             oct_[t]->setToolTip(kit ? "A sample set picks its sample by the note: the octave is fixed"
                                     : "The octave the note keys play on this track");
             state_[t]->setText(!named ? "" : ok ? "●" : "○");

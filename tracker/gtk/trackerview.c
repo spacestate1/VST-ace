@@ -592,6 +592,16 @@ static void update_states(ui *U)
         /* A sample set picks its sample by the note itself, so the octave
          * -- which would only move those notes onto other samples -- is off. */
         gtk_widget_set_sensitive(U->oct[t], !kit);
+        if (kit) {              /* the engine put it where the set's pads are */
+            int o = trk_song_of(U->e)->track[t].octave;
+            if ((int)gtk_drop_down_get_selected(GTK_DROP_DOWN(U->oct[t])) != o) {
+                int was = U->loading;
+                U->loading = 1;
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(U->oct[t]), (guint)o);
+                U->loading = was;
+            }
+            if (t == U->ed.track) U->ed.octave = o;
+        }
         gtk_widget_set_tooltip_text(U->oct[t], kit ? "A sample set picks its sample by the note: the octave is fixed"
                                                    : "The octave the note keys play on this track");
         gtk_label_set_markup(GTK_LABEL(U->state[t]),

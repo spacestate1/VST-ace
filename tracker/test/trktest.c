@@ -662,6 +662,12 @@ int main(void)
         trk_unlock(e);
         missing = trk_route(e);
         check(trk_routed(e, 3), "a track's set loads");
+        check(s->track[3].octave == 4, "a sample track's octave is set from its set (C-4 -> 4)");
+        trk_lock(e); s->track[3].octave = 7; trk_unlock(e);       /* what an old song file may hold */
+        trk_route(e);
+        check(s->track[3].octave == 4, "and put back by the next route, whatever the song held");
+        trk_track_set_octave(e, 3, 6);
+        check(s->track[3].octave == 4, "and an octave change on it is refused");
         check(!trk_routed(e, 4) && missing == 1, "one that is not there is reported missing");
         check(!strncmp(trk_audio_status(e), "samples: null", 13), "samples play out of TRK_PCM");
         printf("        %s\n", trk_audio_status(e));

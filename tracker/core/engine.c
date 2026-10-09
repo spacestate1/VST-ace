@@ -1549,6 +1549,25 @@ static int resolve(trk_engine *e, const char *client, const char *port,
 static int same_addr(snd_seq_addr_t a, snd_seq_addr_t b)
 { return a.client == b.client && a.port == b.port; }
 
+/* A sample track's note keys sit on its set: octave = the one holding the
+ * set's lowest pad. Whatever the song file or an earlier set left in the
+ * field is overwritten, and the UIs keep the control locked, so the pads
+ * stay under the keys. Called with e->lock held. */
+static void fit_sample_octaves(trk_engine *e)
+{
+    int t;
+    pthread_mutex_lock(&e->smx);
+    for (t = 0; t < TRK_TRACKS; t++) {
+        int k = e->track_kit[t], n, oct;
+        if (k < 0 || !is_sampled(&e->song.track[t])) continue;
+        for (n = 0; n < 128; n++) if (drumkit_slot_at(e->kit[k].dk, n) >= 0) break;
+        if (n == 128) continue;
+        oct = n / 12 - 1;
+        e->song.track[t].octave = oct < 0 ? 0 : oct > 9 ? 9 : oct;
+    }
+    pthread_mutex_unlock(&e->smx);
+}
+
 int trk_route(trk_engine *e)
 {
     snd_seq_addr_t want[TRK_TRACKS], clk[TRK_TRACKS];
@@ -1607,6 +1626,7 @@ int trk_route(trk_engine *e)
         e->clock_dest[i] = clk[i];
     }
     e->nclock = nclk;
+    fit_sample_octaves(e);
     if (moved && e->playing) top_up(e);
     pthread_mutex_unlock(&e->lock);
     return missing;

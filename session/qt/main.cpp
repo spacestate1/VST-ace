@@ -193,12 +193,33 @@ public:
         if (loadReaperPref()) reaperAct_->setChecked(true);      /* kept from last time */
     }
 
+    /* Loading a plug-in blocks this thread -- a Windows plug-in can take many
+     * seconds -- so the window sat unpainted and read as frozen. A busy bar is
+     * put up around the load; it moves when events are processed, which the
+     * input pump (pump_input) does from inside the load. */
+    bool loadBusy(HostWidget *h, const QString &path)
+    {
+        QProgressDialog bar("Loading " + QFileInfo(path).fileName() + " ...",
+                            QString(), 0, 0, this);
+        bar.setWindowTitle("Loading");
+        bar.setWindowModality(Qt::WindowModal);
+        bar.setCancelButton(nullptr);
+        bar.setMinimumDuration(0);
+        bar.setMinimumWidth(360);
+        bar.show();
+        statusBar()->showMessage("loading " + path + " ...", 0);
+        QCoreApplication::processEvents();
+        const bool ok = h->loadPlugin(path);
+        bar.close();
+        return ok;
+    }
+
     /* The command line's session: each --synth a tab, --tracker the tracker,
      * --song into it. */
     void openSynth(const QString &plugin)
     {
         HostWidget *h = addSynthTab();
-        if (!h->loadPlugin(plugin))
+        if (!loadBusy(h, plugin))
             statusBar()->showMessage("could not load " + plugin, 0);
     }
     bool openTracker() { return addTrackerTab() != nullptr; }
@@ -298,7 +319,7 @@ public:
             if (!s->synths[i].plugin || !*s->synths[i].plugin) continue;
             const QString plugin = QString::fromLocal8Bit(s->synths[i].plugin);
             HostWidget *h = addSynthTab();
-            if (!h->loadPlugin(plugin)) {
+            if (!loadBusy(h, plugin)) {
                 /* No empty tab left standing for it: the message says what
                  * did not come back, and an empty tab would be saved over the
                  * session as one that never had anything in it. */
@@ -985,7 +1006,7 @@ private:
             if (p.isEmpty()) return;
             if (HostWidget *held = hostHolding(p)) { tabs_->setCurrentWidget(held); return; }
             HostWidget *h = addSynthTab();
-            if (!h->loadPlugin(p)) {
+            if (!loadBusy(h, p)) {
                 closeTabNow(tabs_->indexOf(h));
                 statusBar()->showMessage("that plug-in could not be loaded", 5000);
             }
@@ -1135,7 +1156,7 @@ private:
                 const QString path = resolvePlugin(base);
                 if (path.isEmpty()) { missing << full; continue; }
                 HostWidget *h = addSynthTab();
-                if (!h->loadPlugin(path)) {
+                if (!loadBusy(h, path)) {
                     /* No empty tab left standing for it -- the session
                      * restore reasons the same way. */
                     closeTabNow(tabs_->indexOf(h));
@@ -1391,7 +1412,7 @@ private:
                                     perr, sizeof perr)
                     : nullptr;
         statusBar()->showMessage("reloading " + path + " ...", 3000);
-        if (!h->loadPlugin(path)) {
+        if (!loadBusy(h, path)) {
             statusBar()->showMessage("could not reload " + path, 0);
         } else if (sound) {
             QString why;
@@ -1536,8 +1557,11 @@ private:
          * whose slots were the dead widget's. */
         for (const auto &p : actionsOf_.take(w)) {
             p.first->removeAction(p.second);
-            if (QMenu *sub = p.second->menu()) delete sub;   /* its Inputs submenus */
-            delete p.second;
+            /* A submenu's action (its Inputs submenus) belongs to the menu:
+             * deleting the menu deletes the action, and deleting it again
+             * is a double free. */
+            if (QMenu *sub = p.second->menu()) delete sub;
+            else delete p.second;
         }
         tabs_->removeTab(ix);
         if (w == tracker_) {

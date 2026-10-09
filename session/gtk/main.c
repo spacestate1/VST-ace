@@ -139,6 +139,76 @@ static void status(const char *msg)
     if (GTK_IS_LABEL(g_status)) gtk_label_set_text(GTK_LABEL(g_status), msg);
 }
 
+/* ------------------------------------------------------- the loading bar
+ *
+ * Loading a plug-in blocks the main thread (a Windows plug-in can take many
+ * seconds), so the window used to sit unpainted and read as frozen. A small
+ * modal window with a pulsing bar is put up around the load. The bar only
+ * moves when the main context is run, so the pehost input pump -- called from
+ * inside the load -- is pointed at it for the duration. The periodic timers
+ * stand down while g_loading is set: they must not touch a tab that is half
+ * loaded. */
+static int         g_loading;
+static GtkWidget  *g_busy_win, *g_busy_bar;
+static gint64      g_busy_last;
+
+static void busy_flush(void)
+{
+    int n;
+    for (n = 0; n < 20 && g_main_context_iteration(NULL, FALSE); n++) ;
+}
+
+static void busy_pump(void *ud)
+{
+    gint64 now = g_get_monotonic_time();
+    (void)ud;
+    if (!g_busy_bar || now - g_busy_last < 40000) return;
+    g_busy_last = now;
+    gtk_progress_bar_pulse(GTK_PROGRESS_BAR(g_busy_bar));
+    busy_flush();
+}
+
+static int load_busy(plugview *pv, const char *path)
+{
+    const char *base = strrchr(path, '/');
+    char text[1200];
+    GtkWidget *box, *lab;
+    int ok;
+
+    if (g_loading || !GTK_IS_WINDOW(g_win)) return plugview_load_path(pv, path);
+    snprintf(text, sizeof text, "Loading %s ...", base ? base + 1 : path);
+    status(text);
+    g_busy_win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(g_busy_win), "Loading");
+    gtk_window_set_transient_for(GTK_WINDOW(g_busy_win), GTK_WINDOW(g_win));
+    gtk_window_set_modal(GTK_WINDOW(g_busy_win), TRUE);
+    gtk_window_set_deletable(GTK_WINDOW(g_busy_win), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(g_busy_win), FALSE);
+    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(box, 20); gtk_widget_set_margin_end(box, 20);
+    gtk_widget_set_margin_top(box, 16);   gtk_widget_set_margin_bottom(box, 16);
+    lab = gtk_label_new(text);
+    g_busy_bar = gtk_progress_bar_new();
+    gtk_widget_set_size_request(g_busy_bar, 320, -1);
+    gtk_box_append(GTK_BOX(box), lab);
+    gtk_box_append(GTK_BOX(box), g_busy_bar);
+    gtk_window_set_child(GTK_WINDOW(g_busy_win), box);
+    gtk_window_present(GTK_WINDOW(g_busy_win));
+    g_loading = 1;
+    pehost_set_input_pump(busy_pump, NULL);
+    g_busy_last = 0;
+    busy_pump(NULL);
+
+    ok = plugview_load_path(pv, path);
+
+    pehost_set_input_pump(NULL, NULL);
+    g_loading = 0;
+    gtk_window_destroy(GTK_WINDOW(g_busy_win));
+    g_busy_win = g_busy_bar = NULL;
+    busy_flush();
+    return ok;
+}
+
 /* ------------------------------------------------------------- the audio
  *
  * One stream, every tab mixed into it. dwstudio's arrangement, minus its
@@ -850,6 +920,7 @@ static gboolean mix_tick(gpointer u)
     double secs;
     char buf[64];
     (void)u;
+    if (g_loading) return G_SOURCE_CONTINUE;
     if (!mixbus_active()) { g_mix_timer = 0; return G_SOURCE_REMOVE; }
     secs = (double)mixbus_frames() / 48000.0;
     snprintf(buf, sizeof buf, "● mix  %02d:%02d.%d", (int)secs / 60, (int)secs % 60, (int)(secs * 10) % 10);
@@ -1534,6 +1605,7 @@ static gboolean kb_poll(gpointer u)
 {
     int t;
     (void)u;
+    if (g_loading) return G_SOURCE_CONTINUE;
     for (t = 0; t < MAXTABS; t++) {
         synctab *tab = &g_tabs[t];
         unsigned g;
@@ -2198,7 +2270,7 @@ static void reopen_song_synths(void)
             sink_base_name(names[i], base, sizeof base);
             if (find_plugin_path(base, path, sizeof path) &&
                 (tab = add_synth_tab()) &&
-                plugview_load_path(tab->pv, path)) {
+                load_busy(tab->pv, path)) {
                 /* The load named the tab's sink after the plug-in
                  * (ensure_sink via add_synth_tab, renamed by on_tab_loaded):
                  * the song's full name when the uniquifier came out the same,
@@ -2615,7 +2687,7 @@ static void restore_session(sess_file *s, const char *path)
         synctab *tab;
         if (!s->synths[i].plugin || !*s->synths[i].plugin) continue;
         if (!(tab = add_synth_tab())) break;
-        if (!plugview_load_path(tab->pv, s->synths[i].plugin)) {
+        if (!load_busy(tab->pv, s->synths[i].plugin)) {
             const char *base = strrchr(s->synths[i].plugin, '/');
             /* No empty tab left standing for it: the message says what did
              * not come back, and an empty tab would be saved over the session
@@ -2689,6 +2761,7 @@ static gboolean restore_pending(gpointer u)
 {
     sess_file *s = g_pending_restore;
     (void)u;
+    if (g_loading) return G_SOURCE_CONTINUE;
     g_pending_restore = NULL;
     if (s) restore_session(s, g_pending_restore_path);
     return G_SOURCE_REMOVE;
@@ -2743,6 +2816,7 @@ static gboolean watch_tabs(gpointer u)
     int t;
     static int gone;
     (void)u;
+    if (g_loading) return G_SOURCE_CONTINUE;
     connect_update();
     /* A JACK server that went away, or a device that cannot be recovered: three
      * looks in a row (an underrun the thread recovers from is not this), then
@@ -3208,7 +3282,7 @@ static void pm_on_load(GtkButton *b, gpointer u)
         return;
     }
     if (!(tab = add_synth_tab())) return;
-    if (!plugview_load_path(tab->pv, p)) {
+    if (!load_busy(tab->pv, p)) {
         close_synth_tab(tab);
         status("that plug-in could not be loaded");
     }
@@ -3500,7 +3574,7 @@ static void act_reload_plugin(GSimpleAction *a, GVariant *p, gpointer u)
     sound = plugview_capture_patch(t->pv);
     snprintf(msg, sizeof msg, "reloading %s ...", path);
     status(msg);
-    if (!plugview_load_path(t->pv, path)) {
+    if (!load_busy(t->pv, path)) {
         snprintf(msg, sizeof msg, "could not reload %s", path);
         status(msg);
     } else if (sound && plugview_apply_patch(t->pv, sound)) {
@@ -3917,11 +3991,14 @@ static void activate(GtkApplication *app, gpointer ud)
     g_timeout_add(1000, watch_tabs, NULL);
     /* (the keys the tracker is playing are polled from open_tracker_tab on) */
 
+    gtk_window_present(GTK_WINDOW(g_win));      /* up before the loads, which block */
+    busy_flush();
+
     if (g_want_session[0]) open_session_path(g_want_session);
 
     for (i = 0; i < g_nwant_synths; i++) {
         synctab *tab = add_synth_tab();
-        if (tab && !plugview_load_path(tab->pv, g_want_synths[i])) {
+        if (tab && !load_busy(tab->pv, g_want_synths[i])) {
             char msg[1100];
             snprintf(msg, sizeof msg, "could not load %s", g_want_synths[i]);
             status(msg);
