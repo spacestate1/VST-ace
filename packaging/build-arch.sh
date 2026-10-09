@@ -8,7 +8,7 @@
 #
 #   bash packaging/build-arch.sh 0.3.0
 #
-# The .pkg.tar.zst lands in release/. Build-dependencies:
+# The .pkg.tar.zst lands in release/VERSION/. Build-dependencies:
 #
 #   bash packaging/install-deps.sh --packaging
 #
@@ -27,7 +27,7 @@ VERSION="${1:-0.0.0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RELEASE_DIR="$REPO_ROOT/release"
+RELEASE_DIR="$REPO_ROOT/release/$VERSION"
 WORK_DIR="$(mktemp -d -t vst-ace-arch-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 

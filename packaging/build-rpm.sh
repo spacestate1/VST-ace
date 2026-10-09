@@ -7,7 +7,7 @@
 #
 #   bash packaging/build-rpm.sh 0.1.0
 #
-# The .rpm lands in release/, which is not tracked by git -- publish it on the
+# The .rpm lands in release/VERSION/, which is not tracked by git -- publish it on the
 # releases page. Build-dependencies come from packaging/install-deps.sh, or by
 # name:
 #
@@ -36,7 +36,7 @@ export VSTACE_GIT
 # rewritten below; this is the other half of that.
 export VSTACE_VERSION="$VERSION"
 
-RELEASE_DIR="$REPO_ROOT/release"
+RELEASE_DIR="$REPO_ROOT/release/$VERSION"
 WORK_DIR="$(mktemp -d -t vst-ace-rpm-build-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 

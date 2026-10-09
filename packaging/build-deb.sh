@@ -11,7 +11,7 @@
 #
 #   bash packaging/build-deb.sh 0.1.0
 #
-# The .deb lands in release/. Build-dependencies are listed in
+# The .deb lands in release/VERSION/. Build-dependencies are listed in
 # packaging/debian/control; `sudo apt build-dep .` installs them from a
 # checkout, or install them by name:
 #
@@ -25,7 +25,7 @@ VERSION="${1:-0.0.0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RELEASE_DIR="$REPO_ROOT/release"
+RELEASE_DIR="$REPO_ROOT/release/$VERSION"
 WORK_DIR="$(mktemp -d -t vst-ace-deb-XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 

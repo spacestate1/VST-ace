@@ -38,7 +38,7 @@ WHAT IS DONE
   [ ] Debian 13 check    not done
   [ ] GitHub Release     NOT created
 
-ARTIFACTS (release/, untracked)
+ARTIFACTS (release/0.3.1/, untracked)
 -------------------------------
 
   vst-ace_0.3.1-1_amd64.deb            3.8M
@@ -54,9 +54,9 @@ PUBLISHING
 
   git push origin main && git tag v0.3.1 d906ff3 && git push origin v0.3.1
   gh release create v0.3.1 \
-    release/vst-ace_0.3.1-1_amd64.deb \
-    release/vst-ace-0.3.1-1-x86_64.pkg.tar.zst \
-    release/vst-ace-0.3.1-x86_64.AppImage \
+    release/0.3.1/vst-ace_0.3.1-1_amd64.deb \
+    release/0.3.1/vst-ace-0.3.1-1-x86_64.pkg.tar.zst \
+    release/0.3.1/vst-ace-0.3.1-x86_64.AppImage \
     --title "vst-ace 0.3.1" --notes-file release-notes.txt
 
 
@@ -171,9 +171,9 @@ The tag already exists on origin and points at 2377625, the commit the
 package was built from -- attach to it, do not create a new one.
 
   gh release create v0.3.0 \
-    release/vst-ace_0.3.0-1_amd64.deb \
-    release/vst-ace-0.3.0-1.fc43.x86_64.rpm \
-    release/vst-ace-0.3.0-1-x86_64.pkg.tar.zst \
+    release/0.3.0/vst-ace_0.3.0-1_amd64.deb \
+    release/0.3.0/vst-ace-0.3.0-1.fc43.x86_64.rpm \
+    release/0.3.0/vst-ace-0.3.0-1-x86_64.pkg.tar.zst \
     --title "vst-ace 0.3.0" --notes "Ubuntu 24.04 / Debian 13+, Fedora 40+
 and Arch, all amd64.
 
