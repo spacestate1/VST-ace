@@ -595,8 +595,11 @@ static int dlg_below_editor(void)
  * NI Massive opens its editor that way. */
 static int dlg_allowed(void)
 {
+    /* Inside the user's click, or just after it: a plug-in may open its menu a
+     * moment later than the click that asked for it (iPlug2 on macOS does). */
     if (W.user_input > 0) return 1;
-    PLOG("  [w32] a dialog nobody asked for: dismissed\n");
+    if (W.last_click_ms > 0 && w32_now_ms() - W.last_click_ms < 1500.0) return 1;
+    PLOG("  [w32] a dialog nobody asked for: dismissed (user_input=%d)\n", W.user_input);
     return 0;
 }
 
@@ -1736,8 +1739,8 @@ static int pm_open_level(int k, int mi, int x, int y, int align_right, int align
     pm_size(mi, &w, &h, &total);
     if (align_right) x -= w;
     if (align_bottom) y -= h;
-    fw = (d && W.wnd[d].used) ? W.wnd[d].w : 0;
-    fh = (d && W.wnd[d].used) ? W.wnd[d].h : 0;
+    fw = (d && W.wnd[d].used) ? W.wnd[d].w : W.ext_w;     /* no window: a Mac editor's frame */
+    fh = (d && W.wnd[d].used) ? W.wnd[d].h : W.ext_h;
     if (k > 0) {                  /* a submenu fits the room the menus above it have made */
         int j, ox, oy, root = (W.host && W.wnd[W.host].used) ? W.host : 0;
         for (j = 0; j < k; j++) {
@@ -2059,6 +2062,64 @@ static void w32_dlg_reset(void)
     memset(&PM, 0, sizeof PM);
     memset(&MB, 0, sizeof MB);
     W.sheet = 0;
+}
+
+
+
+/* ---- for the loaders that are not Win32 ----------------------------------------
+ *
+ * A macOS plug-in's NSMenu is shown by the same popup: the Cocoa shim builds a
+ * menu here, has it shown, and gets back which item was chosen. Its frames do
+ * not come through w32_editor_pixels, so the host hands them to
+ * pe_overlay_compose, which adds whatever is up over them. */
+
+void *pe_menu_new(void) { return w32_menu_new(); }
+int pe_menu_append(void *m, uint32_t flags, uintptr_t id, const char *text)
+{ return menu_insert(w32_menu_idx(m), -1, flags, id, text); }
+void pe_menu_destroy(void *m) { int h = w32_menu_idx(m); if (h) menu_free(h); }
+/* The command chosen, or 0. `x`, `y` are in the editor frame, top left first. */
+int pe_menu_popup(void *m, int x, int y) { return pm_track(m, TPM_RETURNCMD, x, y, NULL); }
+/* Where the pointer last was, and how tall the editor's frame is: what a menu
+ * asked for in screen coordinates or a bottom-left origin needs. */
+void pe_pointer(int *x, int *y) { if (x) *x = W.mouse_x; if (y) *y = W.mouse_y; }
+int pe_frame_height(void) { return W.ext_h; }
+/* Marks the user's own click or key as inside the plug-in, so a menu or dialog
+ * it opens in answer is allowed. */
+void pe_user_input(int delta) { W.user_input += delta; if (delta > 0) W.last_click_ms = w32_now_ms(); }
+
+static w32_surf g_present_ov;
+int pe_overlay_compose(const unsigned int *base, int bw, int bh,
+                       const unsigned int **out, int *ow, int *oh)
+{
+    int ov[8], n, k, cw = bw, ch = bh, y;
+    W.ext_w = bw; W.ext_h = bh;
+    n = w32_overlays(ov, 8);
+    if (!n || !base) return 0;
+    for (k = 0; k < n; k++) {
+        int ox, oy;
+        w32_origin_of(ov[k], 0, &ox, &oy);
+        if (ox + W.wnd[ov[k]].w > cw) cw = ox + W.wnd[ov[k]].w;
+        if (oy + W.wnd[ov[k]].h > ch) ch = oy + W.wnd[ov[k]].h;
+    }
+    w32_surf_size(&g_present_ov, cw, ch);
+    if (!g_present_ov.px) return 0;
+    if (cw != bw || ch != bh) for (y = 0; y < cw * ch; y++) g_present_ov.px[y] = 0x00808080u;
+    for (y = 0; y < bh; y++) memcpy(g_present_ov.px + (size_t)y * cw, base + (size_t)y * bw, (size_t)bw * 4);
+    for (k = 0; k < n; k++) {
+        int ox, oy, yy, xx;
+        w32_wnd *o = &W.wnd[ov[k]];
+        w32_origin_of(ov[k], 0, &ox, &oy);
+        for (yy = 0; yy < o->surf.h; yy++) {
+            if (oy + yy < 0 || oy + yy >= ch) continue;
+            for (xx = 0; xx < o->surf.w; xx++) {
+                if (ox + xx < 0 || ox + xx >= cw) continue;
+                g_present_ov.px[(size_t)(oy + yy) * cw + ox + xx] = o->surf.px[(size_t)yy * o->surf.w + xx];
+            }
+        }
+        w32_composite_children(ov[k], &g_present_ov, ox, oy);
+    }
+    *out = g_present_ov.px; *ow = cw; *oh = ch;
+    return 1;
 }
 
 

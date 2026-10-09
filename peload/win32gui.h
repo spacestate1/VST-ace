@@ -292,6 +292,8 @@ static struct {
     int       sheet;               /* a dialog or property sheet shown under the editor, or 0 */
     int       modal_abort;         /* the host wants the plug-in back: leave the modal loop */
     int       user_input;          /* > 0 while a click or key of the user's is inside the plug-in */
+    int       ext_w, ext_h;        /* the size of the frame a non-Win32 editor last drew (for menus to fit) */
+    double    last_click_ms;       /* when the user last pressed or released a button or a key */
     w32_host_hooks hooks;
     long n_paint, n_getdc, n_beginpaint, n_stretch, n_bitblt, n_timerproc;
     double last_input_ms;          /* when input last arrived, for the valve */
@@ -6079,6 +6081,7 @@ void w32_mouse(int x, int y, int msg, int buttons, int wheel)
     /* Marked as the user's own: a plug-in that answers this click by putting up
      * a modal dialog is doing what the user asked, and may be given one. */
     W.user_input++;
+    if (msg != 0x0200 && msg != WM_MOUSEWHEEL) W.last_click_ms = w32_now_ms();
     if (msg == WM_MOUSEWHEEL)
         w32_call(w, WM_MOUSEWHEEL, ((W_WPARAM)(uint16_t)(int16_t)(wheel * 120) << 16) | (uint32_t)buttons,
                  (int64_t)(((uint32_t)(uint16_t)y << 16) | (uint16_t)x));
@@ -6099,6 +6102,7 @@ void w32_key(int vk, int down, int ch)
     w = &W.wnd[target];
     if (vk >= 0 && vk < 256) W.keys[vk] = down ? 1 : 0;
     W.user_input++;
+    if (down) W.last_click_ms = w32_now_ms();
     w32_call(w, down ? WM_KEYDOWN : WM_KEYUP, (uint64_t)vk, 1);
     if (down && ch > 0) w32_call(w, WM_CHAR, (uint64_t)ch, 1);
     W.user_input--;

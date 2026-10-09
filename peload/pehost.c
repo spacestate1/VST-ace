@@ -4446,7 +4446,7 @@ void pehost_editor_pump(pehost *h)
     if (h && h->is_v3 && h->v3) v3_ui_idle(h->v3);
 }
 
-int pehost_editor_pixels(pehost *h, const unsigned int **px, int *w, int *height)
+static int pehost_editor_pixels_raw(pehost *h, const unsigned int **px, int *w, int *height)
 {
     if (h && h->cl) {
         const unsigned int *p = pefvst_editor_pixels(h->cl, w, height);
@@ -4459,6 +4459,22 @@ int pehost_editor_pixels(pehost *h, const unsigned int **px, int *w, int *height
     if (h && h->is_v3 && v3_is_macho(h->v3))
         return macmetal_pixels(px, w, height) || macquartz_editor_pixels(px, w, height);
     return w32_editor_pixels(px, w, height);
+}
+
+int pe_overlay_compose(const unsigned int *base, int bw, int bh,
+                       const unsigned int **out, int *ow, int *oh);
+
+/* A macOS plug-in's frame, with whatever menu it has put up drawn over it. The
+ * Win32 layer composes its own overlays; a helper's frames arrive composed. */
+int pehost_editor_pixels(pehost *h, const unsigned int **px, int *w, int *height)
+{
+    int ok = pehost_editor_pixels_raw(h, px, w, height);
+    int macish = h && (h->mv || h->au || (h->is_v3 && v3_is_macho(h->v3)));
+    if (ok && macish && px && *px && w && height) {
+        const unsigned int *o; int ow, oh;
+        if (pe_overlay_compose(*px, *w, *height, &o, &ow, &oh)) { *px = o; *w = ow; *height = oh; }
+    }
+    return ok;
 }
 
 /* Let the host feed input to a plugin that is spinning in its own message loop.
@@ -4475,7 +4491,7 @@ void pehost_set_input_pump(void (*fn)(void *), void *ud)
     w32_set_input_pump(fn, ud);
 }
 
-void pehost_editor_mouse(pehost *h, int x, int y, int msg, int buttons, int wheel)
+static void pehost_editor_mouse_inner(pehost *h, int x, int y, int msg, int buttons, int wheel)
 {
     if (h && h->cl) {
         /* The window layer's messages are Win32 ones; all a Classic editor can
@@ -4495,7 +4511,19 @@ void pehost_editor_mouse(pehost *h, int x, int y, int msg, int buttons, int whee
     w32_mouse(x, y, msg, buttons, wheel);
 }
 
-void pehost_editor_key(pehost *h, int vk, int down, int ch)
+/* An open menu owns the pointer, whichever loader the plug-in came through; and
+ * a click is the user's own, so a menu or dialog it opens is allowed. */
+void pehost_editor_mouse(pehost *h, int x, int y, int msg, int buttons, int wheel)
+{
+    int macish = h && (h->mv || h->au || (h->is_v3 && v3_is_macho(h->v3)));
+    if (macish && w32_popup_mouse(x, y, msg, buttons, wheel)) return;
+    W.user_input++;
+    if (msg != 0x0200 && msg != 0x020A) W.last_click_ms = w32_now_ms();
+    pehost_editor_mouse_inner(h, x, y, msg, buttons, wheel);
+    W.user_input--;
+}
+
+static void pehost_editor_key_inner(pehost *h, int vk, int down, int ch)
 {
     if (h && h->cl) { if (down) pefvst_editor_key(h->cl, ch ? ch : vk); return; }
     if (h && h->mv) { macvst_editor_key(h->mv, vk, down, ch); return; }
@@ -4505,6 +4533,16 @@ void pehost_editor_key(pehost *h, int vk, int down, int ch)
         macns_post_key(vk, down, ch);
         return;
     } (void)h; w32_key(vk, down, ch); }
+
+void pehost_editor_key(pehost *h, int vk, int down, int ch)
+{
+    int macish = h && (h->mv || h->au || (h->is_v3 && v3_is_macho(h->v3)));
+    if (macish && w32_popup_key(vk, down, ch)) return;
+    W.user_input++;
+    if (down) W.last_click_ms = w32_now_ms();
+    pehost_editor_key_inner(h, vk, down, ch);
+    W.user_input--;
+}
 
 /* True for a plugin loaded from a Mach-O bundle. Callers use it to label what
  * they are looking at, not to change behaviour. */

@@ -3385,6 +3385,7 @@ public:
             const int was = editorH_;
             editorW_ = w; editorH_ = h;
             applyZoom();
+            if (fitAuto_) fitPending_ = true;     /* still fitted, so fit the new size too */
             QScrollBar *vb = editorScroll_->verticalScrollBar();
             QTimer::singleShot(0, vb, [vb, h, was] { vb->setValue(h > was ? vb->maximum() : 0); });
         });

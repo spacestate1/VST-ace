@@ -266,6 +266,7 @@ static void serve_pending(server *s)
         ssize_t n = recv(s->sock, &q, sizeof q, MSG_PEEK | MSG_DONTWAIT);
         if (n != (ssize_t)sizeof q) return;      /* nothing whole waiting */
         if (!safe_while_spinning(q.op)) {        /* leave it for the main loop, */
+            if (getenv("PELOAD_VERBOSE")) fprintf(stderr, "  [serve] request %d pending while spinning: cancelling a modal dialog\n", q.op);
             w32_modal_abort();                   /* and tell a modal dialog to give up */
             return;
         }

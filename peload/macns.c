@@ -1581,6 +1581,11 @@ static const entry g_table[] = {
     { "NSMutableString", "+stringWithString:",    str_with_string },
     { "NSString",        "+stringWithString:",    str_with_string },
     { "NSMutableString", "+string",               str_empty },
+    { "NSMutableString", "initWithCString:encoding:", str_init_cstring },
+    { "NSMutableString", "initWithUTF8String:",   str_init_utf8 },
+    { "NSMutableString", "init",                  str_init },
+    { "NSMutableString", "isEqualToString:",      str_is_equal },
+    { "NSMutableString", "cStringUsingEncoding:", str_cstring_enc },
     { "NSMutableString", "appendString:",         mstr_append },
     { "NSMutableString", "appendFormat:",         mstr_append_format },
     { "NSMutableString", "setString:",            mstr_set_string },
@@ -1805,6 +1810,10 @@ static const entry g_table[] = {
 /* Read any string, ours or CoreFoundation's, as UTF-8. macmetal.c needs this to
  * read a shader function name out of an @"..." literal. */
 const char *macns_utf8(void *str) { return str_bytes(str, NULL); }
+
+/* For the menu shim: an object of one of our stand-in classes, and a string. */
+void *macns_new_object(const char *cls) { return ns_new_of(cls); }
+void *macns_make_string(const char *utf8) { return str_make(utf8, -1); }
 
 /* A host-owned NSView, for a plugin that needs a parent to graft its own view
  * into. VST2 on macOS is handed NULL and makes its own top-level view, but VST3

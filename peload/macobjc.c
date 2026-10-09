@@ -273,9 +273,10 @@ extern void macobjc_nil_return(void);
  * installed on first use rather than from a constructor -- constructor order
  * between translation units is not specified, and they need the classes first. */
 extern void macns_install(void);
+extern void macmenu_install(void);
 extern void macmetal_install(void);
 static void ensure_installed(void)
-{ static int done; if (!done) { done = 1; macns_install(); macmetal_install(); } }
+{ static int done; if (!done) { done = 1; macns_install(); macmetal_install(); macmenu_install(); } }
 
 /* Every dispatch, not just the ones that miss. Expensive, so it is off unless
  * MACOBJC_TRACE names a substring to match -- "Bundle" to watch resource
