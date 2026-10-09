@@ -52,9 +52,9 @@ at 59 fps.*
 Packages are on the
 [releases page](https://github.com/spacestate1/VST-ace/releases):
 
-    sudo apt install ./vst-ace_0.3.0-1_amd64.deb         # Debian 13+, Ubuntu 24.04+
-    sudo dnf install ./vst-ace-0.3.0-1.fc43.x86_64.rpm   # Fedora 40+
-    sudo pacman -U ./vst-ace-0.3.0-1-x86_64.pkg.tar.zst  # Arch
+    sudo apt install ./vst-ace_0.3.1-1_amd64.deb         # Debian 13+, Ubuntu 24.04+
+    sudo dnf install ./vst-ace-0.3.1-1.fc43.x86_64.rpm   # Fedora 40+
+    sudo pacman -U ./vst-ace-0.3.1-1-x86_64.pkg.tar.zst  # Arch
 
 `apt install ./`, not `dpkg -i` — apt is what pulls in GTK 4, Qt 6 and the rest,
 and the `./` is what makes it read a path rather than a package name. `dnf
@@ -63,8 +63,8 @@ install ./` for the same reason; `pacman -U` takes a file either way. That puts
 
 There is also an AppImage, which installs nothing and needs no root:
 
-    chmod +x vst-ace-0.3.0-x86_64.AppImage
-    ./vst-ace-0.3.0-x86_64.AppImage
+    chmod +x vst-ace-0.3.1-x86_64.AppImage
+    ./vst-ace-0.3.1-x86_64.AppImage
 
 The `.deb` and the Arch package carry `peload32`, the i386 helper that hosts
 32-bit Windows VST2 plug-ins; the `.rpm` does not, since Fedora's 32-bit

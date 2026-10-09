@@ -21,7 +21,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 
 Name:           vst-ace
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        Run Windows, macOS and Linux audio plug-ins natively, without Wine
 
@@ -208,6 +208,14 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
 %{_mandir}/man1/studiogtk.1*
 
 %changelog
+* Thu Oct 08 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.1-1
+- Tracker and studio shells: click-free PipeWire sample output with recovery,
+  per-track volume and meters, Record studio mix, Open Recent, Connect >
+  REAPER, and a choice of PipeWire, JACK or ALSA for synth audio.
+- Show a loading bar while a plug-in loads; fix a crash closing a Qt studio tab
+  that had an Inputs submenu.
+- Fit a sample track's octave to its sample set, and keep it fixed.
+
 * Mon Sep 07 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.0-1
 - Send MIDI as well as receive it. Both windows carry an out port that was
   created and never written to; everything played locally now goes out of it,

@@ -11,9 +11,9 @@ Packages are on the
 Ubuntu 24.04 and Debian 13 or newer, an `.rpm` for Fedora 40 or newer, and a
 `.pkg.tar.zst` for Arch:
 
-    sudo apt install ./vst-ace_0.3.0-1_amd64.deb         # Debian, Ubuntu
-    sudo dnf install ./vst-ace-0.3.0-1.fc43.x86_64.rpm   # Fedora
-    sudo pacman -U ./vst-ace-0.3.0-1-x86_64.pkg.tar.zst  # Arch
+    sudo apt install ./vst-ace_0.3.1-1_amd64.deb         # Debian, Ubuntu
+    sudo dnf install ./vst-ace-0.3.1-1.fc43.x86_64.rpm   # Fedora
+    sudo pacman -U ./vst-ace-0.3.1-1-x86_64.pkg.tar.zst  # Arch
 
 `apt install`, not `dpkg -i`. The leading `./` is what makes apt read the
 argument as a file rather than a package name, and apt is what pulls in GTK 4,
@@ -32,8 +32,8 @@ That puts `va`, `pestudio` and `dwstudio` on `$PATH`, the patch banks in
 
 One file, no install, no root, every distribution:
 
-    chmod +x vst-ace-0.3.0-x86_64.AppImage
-    ./vst-ace-0.3.0-x86_64.AppImage
+    chmod +x vst-ace-0.3.1-x86_64.AppImage
+    ./vst-ace-0.3.1-x86_64.AppImage
 
 It carries GTK 4, Qt 6 and everything under them, and borrows the host's glibc,
 which is the one thing an AppImage cannot bundle. glibc is backward compatible
@@ -44,7 +44,7 @@ everything newer: built on Ubuntu 24.04, it wants glibc 2.39 and runs on Ubuntu
 The command line is inside it too. An AppImage takes the name it was invoked
 by, so a symlink is how you reach the other programs:
 
-    ln -s vst-ace-0.3.0-x86_64.AppImage peload
+    ln -s vst-ace-0.3.1-x86_64.AppImage peload
     ./peload plug.dll --render out.wav
 
 `peload`, `peserve`, `pestudio`, `dwstudio` and `peload32` all answer to that.
@@ -56,7 +56,7 @@ where an i386 runtime is installed — and say so plainly where it is not. And
 `runtime/` and `runtime32/` are inside a read-only image, so a Microsoft DLL
 cannot be dropped in beside them; `PELOAD_DLL_PATH` is the way in:
 
-    PELOAD_DLL_PATH=~/.local/share/vst-ace/runtime32 ./vst-ace-0.3.0-x86_64.AppImage
+    PELOAD_DLL_PATH=~/.local/share/vst-ace/runtime32 ./vst-ace-0.3.1-x86_64.AppImage
 
 Every package hosts 64-bit plug-ins. **32-bit Windows VST2** plug-ins are
 loaded by `peload32`, the i386 helper the 64-bit hosts bridge to out of
