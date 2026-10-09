@@ -19,6 +19,11 @@ patch banks, a recorder, and the plug-in's own editor.
 
 ## What it looks like
 
+![The studio's tracker](docs/tracker.png)
+
+*The studio's tracker with a drum song loaded: four sample tracks, each on its
+own set, and the note keys fixed to the set's octave.*
+
 ![Basic in pestudio](docs/basic.png)
 
 *Basic (Audio Damage), a **macOS** VST2 playing on Linux — 372 plug-ins in the
@@ -32,11 +37,6 @@ layer and blitted.*
 ![FB-7999 in pestudio](docs/fb-7999.png)
 
 *FB-7999, a Korg DW-8000 simulation and the plug-in this started on.*
-
-![FB-3300 in pestudio](docs/fb-3300.png)
-
-*FB-3300, four synthesiser blocks and 229 parameters, all of it drawn by the
-same layer.*
 
 ![TAL U-NO-62 in pestudio](docs/juno.png)
 
