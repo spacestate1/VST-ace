@@ -35,6 +35,10 @@ One file, no install, no root, every distribution:
     chmod +x vst-ace-0.3.1-x86_64.AppImage
     ./vst-ace-0.3.1-x86_64.AppImage
 
+Run with no arguments it opens the studio (the Qt session window); with
+arguments it behaves as `va` does, so `./vst-ace-0.3.1-x86_64.AppImage pe <dir>`
+opens the plug-in browser instead.
+
 It carries GTK 4, Qt 6 and everything under them, and borrows the host's glibc,
 which is the one thing an AppImage cannot bundle. glibc is backward compatible
 and not forward compatible, so the file runs on the release it was built on and

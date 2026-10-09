@@ -78,4 +78,12 @@ esac
 # c/src/dw.c looks ../lib/vst-ace from its own directory before it looks at any
 # path compiled in. That is what makes a mount point nobody knew at build time
 # work at all.
+#
+# Started with nothing to say -- a double click, or the bare file -- it opens
+# the studio (the Qt session window: a tab per plug-in beside the tracker)
+# rather than va's own pick of window. Any argument goes to va untouched, so
+# `AppImage pe <dir>`, `AppImage peload ...` and `--help` work as before.
+if [ "$#" -eq 0 ]; then
+    set -- studio
+fi
 exec "$APPDIR/usr/bin/va" "$@"
