@@ -2,8 +2,8 @@ vst-ace 0.3.1 -- release notes
 ==============================
 
   version   0.3.1
-  commit    d906ff3         "studios: loading bar around plug-in loads, ..."
-  tag       v0.3.1          NOT yet created -- see PUBLISHING
+  commit    006ef77         "AppImage: open the studio when started with no arguments"
+  tag       v0.3.1          on origin, at 006ef77
 
 47 commits since 0.3.0. The tracker and both studio shells grew up: click-free
 PipeWire sample output with recovery, per-track volume and meters, up to 16
@@ -12,6 +12,7 @@ and effect input in the GTK shell, Connect > REAPER, and a choice of PipeWire,
 JACK or ALSA for synth audio. See HANDOFF-2026-10-07 and HANDOFF-2026-10-08.
 
 Last changes before this release:
+  - The AppImage opens the studio (Qt) when started with no arguments.
   - Qt studio crashed closing a tab that had an "Inputs" submenu: the menu's
     own action was deleted a second time. Fixed.
   - Both studios show a "Loading" bar while a plug-in loads, instead of an
@@ -23,13 +24,13 @@ Last changes before this release:
 WHAT IS DONE
 ------------
 
-  [x] committed          d906ff3 on main (not pushed)
+  [x] committed          006ef77 on main, pushed
   [x] tracker tests      trktest: all passed, with new octave checks
-  [x] .deb built         ubuntu24.04 VM, rsync copy, VSTACE_GIT=d906ff3
+  [x] .deb built         ubuntu24.04 VM, rsync copy, VSTACE_GIT=006ef77
   [x] .deb checked       apt --simulate upgrade from 0.2.0 clean; windows
-                         carry "d906ff3"
+                         carry "006ef77"
   [x] AppImage built     ubuntu24.04 VM (needs glibc 2.38 at most); windows
-                         inside carry "d906ff3"
+                         inside carry "006ef77"
   [x] Arch package       built on the workstation
   [ ] NOT run            no package was installed and run on a desktop;
                          the loading bar and the sample-octave change were
@@ -42,17 +43,17 @@ ARTIFACTS (release/0.3.1/, untracked)
 -------------------------------
 
   vst-ace_0.3.1-1_amd64.deb            3.8M
-    sha256 39f8f5f9d02ef29cffbbeec640a47df3ff182b4147b34463299c6f75c5f65e2c
+    sha256 c91131fe1f1d3577851622ac0ee25c38254a1ab1db09e30d08582477ee94bbc8
   vst-ace-dbgsym_0.3.1-1_amd64.ddeb    20M   (optional, backtraces)
   vst-ace-0.3.1-1-x86_64.pkg.tar.zst   5.7M
-    sha256 d9784c5250e7b2af77ac24e76f56f3f251517dd985862587881e78cb345c47dc
+    sha256 4021ba408a304f15cdf0c04a035b266190232ae2726435b7ca529e104cd28702
   vst-ace-0.3.1-x86_64.AppImage        50M
-    sha256 16bd6777e046e78de25ad0e4068e05d75e7b63ea9e28055ce0beaa4a62f642f0
+    sha256 0129d84fd868630b52dc9cf243294879fbd4dae4dc0d7439d52e3571a72fd72e
 
 PUBLISHING
 ----------
 
-  git push origin main && git tag v0.3.1 d906ff3 && git push origin v0.3.1
+  (main and the v0.3.1 tag are already pushed, at 006ef77)
   gh release create v0.3.1 \
     release/0.3.1/vst-ace_0.3.1-1_amd64.deb \
     release/0.3.1/vst-ace-0.3.1-1-x86_64.pkg.tar.zst \
