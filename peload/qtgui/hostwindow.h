@@ -2403,6 +2403,11 @@ signals:
      * window owns the zoom, because the same buttons drive the native editor
      * as well and one of the two has to be in charge. */
     void zoomStep(int dir);
+    /* The plug-in's picture is a different size from the one it opened at: a
+     * skin switched, or a dialog it put up below its editor (a property sheet
+     * makes the frame taller until it is closed). The window owns the stack
+     * that holds this widget, so it is told. */
+    void editorResized(int w, int h);
 
 public:
     explicit PixelEditor(QWidget *p = nullptr) : QWidget(p)
@@ -2584,7 +2589,7 @@ private:
                 fprintf(stderr, "pestudio: editor produced no pixels\n"); fflush(stderr); }
             return;
         }
-        if (!reported_) { reported_ = true;
+        if (!reported_ || w != lastW_ || h != lastH_) { reported_ = true; lastW_ = w; lastH_ = h;
             fprintf(stderr, "pestudio: editor pixels %dx%d\n", w, h); fflush(stderr); }
         /* Nothing to draw into while the tab is not showing, and nothing to draw
          * when the plug-in has not painted since the last look: the copy and the
@@ -2609,7 +2614,7 @@ private:
         }
         /* The plug-in may have changed its own size under us -- opening a
          * larger panel, switching skin. Scale from whatever it is drawing now. */
-        if (w != natW_ || h != natH_) { natW_ = w; natH_ = h; applySize(); }
+        if (w != natW_ || h != natH_) { natW_ = w; natH_ = h; applySize(); emit editorResized(w, h); }
         update();
     }
 
@@ -2630,6 +2635,7 @@ private:
     int     natW_ = 0, natH_ = 0;   /* what the plug-in draws at */
     double  zoom_ = 1.0;
     bool    reported_ = false;
+    int     lastW_ = 0, lastH_ = 0;
 public:
     bool    dumped_ = false;
     QString dumpName_;
@@ -3372,6 +3378,16 @@ public:
             connect(zo, &QShortcut::activated, this, [this] { zoomStep(-1); });
         }
         connect(pixelEditor_, &PixelEditor::zoomStep, this, &HostWidget::zoomStep);
+        connect(pixelEditor_, &PixelEditor::editorResized, this, [this](int w, int h) {
+            /* The stack that holds the editor was sized for the size it opened
+             * at, and would clip anything taller. Follow the plug-in, and when
+             * it grew, scroll to the new part -- that is where a dialog is. */
+            const int was = editorH_;
+            editorW_ = w; editorH_ = h;
+            applyZoom();
+            QScrollBar *vb = editorScroll_->verticalScrollBar();
+            QTimer::singleShot(0, vb, [vb, h, was] { vb->setValue(h > was ? vb->maximum() : 0); });
+        });
         connect(recBtn_, &QPushButton::clicked, this, &HostWidget::toggleRecord);
         connect(panic, &QPushButton::clicked, this, [this] {
             if (piano_) piano_->releaseAll();

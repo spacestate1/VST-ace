@@ -65,6 +65,13 @@ void  w32_show_editor(void);
  * Drive this from a ~16 ms UI timer. */
 void  w32_pump(void);
 
+/* A plug-in can sit inside a modal dialog of its own -- a property sheet it
+ * called PropertySheet for -- with its thread parked in a loop that pumps input.
+ * The host asking for something only the main loop can answer (closing the
+ * editor, say) calls this first: the dialog is cancelled and the plug-in's call
+ * returns, so the request is not left waiting on a dialog nobody can see. */
+void  w32_modal_abort(void);
+
 /* Discard all window state. Call when the plugin that owns it goes away. */
 void  w32_reset(void);
 /* Threads currently executing inside the plug-in image. */

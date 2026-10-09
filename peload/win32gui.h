@@ -160,6 +160,14 @@ typedef struct {
     char   (*items)[64];           /* combo box and list box contents */
     int      nitems;
     int      enabled;
+    /* A push button held down, and a trackbar's range and position (its
+     * position is ctl_check, as a combo's selection is). */
+    int      ctl_down;
+    int      ctl_min, ctl_max, ctl_page, ctl_line, ctl_drag;
+    int      ctl_em;               /* text size for this control, 0 = the default */
+    /* A dialog's procedure, and the page of a property sheet it stands for. */
+    void    *dlgproc;
+    int      dlg_page;
     w32_surf surf;                 /* the client pixels the host displays */
     W32RECT  update;
     int      has_update;
@@ -281,10 +289,16 @@ static struct {
     int       display;             /* the plugin's own window, what we present */
     int       desktop;             /* the root window GetDesktopWindow names   */
     int       track_leave;         /* window awaiting WM_MOUSELEAVE, or 0     */
+    int       sheet;               /* a dialog or property sheet shown under the editor, or 0 */
+    int       modal_abort;         /* the host wants the plug-in back: leave the modal loop */
+    int       user_input;          /* > 0 while a click or key of the user's is inside the plug-in */
     w32_host_hooks hooks;
     long n_paint, n_getdc, n_beginpaint, n_stretch, n_bitblt, n_timerproc;
     double last_input_ms;          /* when input last arrived, for the valve */
 } W;
+
+/* The text size the control being painted wants, set around its WM_PAINT. */
+static int g_ctl_em;
 
 static double w32_now_ms(void)
 {
@@ -1121,7 +1135,7 @@ static int ctl_text_w(const char *txt)
 {
     int w = 0, h = 0;
     if (!txt || !*txt) return 0;
-    dw_text_measure(txt, (int)strlen(txt), 12, &w, &h, NULL);
+    dw_text_measure(txt, (int)strlen(txt), g_ctl_em ? g_ctl_em : 12, &w, &h, NULL);
     return w;
 }
 
@@ -1148,10 +1162,28 @@ static void ctl_paint_button(w32_wnd *w, int wi)
         type == BS_RADIOBUTTON || type == BS_AUTORADIOBUTTON ||
         type == BS_3STATE || type == BS_AUTO3STATE) {
         int box = 13, top = (ch - box) / 2;
+        int radio = type == BS_RADIOBUTTON || type == BS_AUTORADIOBUTTON;
         ctl_fill(t, 0, 0, cw, ch, CLR_FACE);
-        ctl_fill(t, 0, top, box, top + box, CLR_WINDOW);
-        ctl_bevel(t, 0, top, box, top + box, 1);
-        if (w->ctl_check) {
+        if (radio) {
+            /* A round well with a dot in it, from the distance to its centre. */
+            int x, y;
+            for (y = 0; y < box; y++)
+                for (x = 0; x < box; x++) {
+                    int dx = 2 * x - (box - 1), dy = 2 * y - (box - 1);
+                    int d2 = dx * dx + dy * dy, ry = top + y;
+                    uint32_t c;
+                    if (ry < 0 || ry >= t->h || x >= t->w) continue;
+                    if (d2 > (box - 1) * (box - 1)) continue;
+                    c = d2 > (box - 3) * (box - 3) ? (dy + dx < 0 ? CLR_SHADOW : CLR_HILIGHT)
+                                                   : CLR_WINDOW;
+                    if (w->ctl_check && d2 <= 8 * 8 / 4 * 2) c = fg;
+                    t->px[(size_t)ry * t->w + x] = c;
+                }
+        } else {
+            ctl_fill(t, 0, top, box, top + box, CLR_WINDOW);
+            ctl_bevel(t, 0, top, box, top + box, 1);
+        }
+        if (w->ctl_check && !radio) {
             /* A tick, drawn as the two strokes it is made of. */
             int i;
             for (i = 0; i < 3; i++) ctl_fill(t, 3 + i, top + 5 + i, 4 + i, top + 8 + i, fg);
@@ -1161,17 +1193,32 @@ static void ctl_paint_button(w32_wnd *w, int wi)
         return;
     }
     /* A push button: face, bevel, and the caption centred. */
-    ctl_fill(t, 0, 0, cw, ch, CLR_FACE);
-    ctl_bevel(t, 0, 0, cw, ch, w->ctl_check ? 1 : 0);
     {
-        int tw = ctl_text_w(w->text);
-        ctl_text(wi, (cw - tw) / 2 + (w->ctl_check ? 1 : 0),
-                 (ch - 14) / 2 + (w->ctl_check ? 1 : 0), w->text, fg);
+        int down = w->ctl_check || w->ctl_down;
+        ctl_fill(t, 0, 0, cw, ch, CLR_FACE);
+        if (type == BS_DEFPUSHBUTTON) {            /* the default button's black frame */
+            ctl_fill(t, 0, 0, cw, 1, CLR_DKSHADOW); ctl_fill(t, 0, ch - 1, cw, ch, CLR_DKSHADOW);
+            ctl_fill(t, 0, 0, 1, ch, CLR_DKSHADOW); ctl_fill(t, cw - 1, 0, cw, ch, CLR_DKSHADOW);
+            ctl_bevel(t, 1, 1, cw - 1, ch - 1, down);
+        } else {
+            ctl_bevel(t, 0, 0, cw, ch, down);
+        }
+        {
+            int tw = ctl_text_w(w->text);
+            ctl_text(wi, (cw - tw) / 2 + (down ? 1 : 0),
+                     (ch - 14) / 2 + (down ? 1 : 0), w->text, fg);
+        }
     }
 }
 
+static int w32_static_bitmap(w32_wnd *w, int wi);      /* win32dlg.h */
+
 static void ctl_paint_static(w32_wnd *w, int wi)
 {
+    if ((w->style & 0x1F) == 0x0E || (w->style & 0x1F) == 3) {   /* SS_BITMAP, SS_ICON */
+        w32_static_bitmap(w, wi);
+        return;
+    }
     /* SS_ styles 0-2 are text alignments; the frame and rectangle styles are
      * 4-7 and draw no text at all. */
     int style = w->style & 0x1F;
@@ -1291,6 +1338,34 @@ static W_LRESULT ctl_common(w32_wnd *w, int wi, uint32_t msg, W_WPARAM wp, W_LPA
     }
 }
 
+/* A completed click. A checkbox turns over, an automatic radio button takes
+ * the selection from the others in its group (the run of siblings from one
+ * WS_GROUP to the next), and the parent hears BN_CLICKED -- WM_COMMAND with
+ * the control id and the notification, which is how a dialog learns of it. */
+static void ctl_button_clicked(w32_wnd *w, int wi)
+{
+    int type = w->style & BS_TYPEMASK;
+    w32_wnd *p = (w->parent > 0 && W.wnd[w->parent].used) ? &W.wnd[w->parent] : NULL;
+    if (type == BS_AUTOCHECKBOX) w->ctl_check = !w->ctl_check;
+    else if (type == BS_AUTO3STATE) w->ctl_check = (w->ctl_check + 1) % 3;
+    else if (type == BS_AUTORADIOBUTTON) {
+        int lo = wi, hi = wi, i;
+        while (lo > 1 && !(W.wnd[lo].style & 0x20000) &&
+               W.wnd[lo - 1].used && W.wnd[lo - 1].parent == w->parent) lo--;
+        for (hi = wi + 1; hi < W32_MAX_WND && W.wnd[hi].used &&
+                          W.wnd[hi].parent == w->parent &&
+                          !(W.wnd[hi].style & 0x20000); hi++) ;
+        for (i = lo; i < hi; i++)
+            if ((W.wnd[i].style & BS_TYPEMASK) == BS_AUTORADIOBUTTON) {
+                W.wnd[i].ctl_check = (i == wi);
+                W.wnd[i].has_update = 1;
+            }
+    }
+    w->has_update = 1;
+    if (p) w32_call(p, WM_COMMAND, (W_WPARAM)((uint32_t)w->ctl_id & 0xffff),
+                    (W_LPARAM)(intptr_t)w32_h(W32_HWND_BASE, wi));
+}
+
 static MS W_LRESULT ctl_button_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
 {
     w32_wnd *w = w32_wget(hwnd);
@@ -1301,11 +1376,25 @@ static MS W_LRESULT ctl_button_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPA
     r = ctl_common(w, wi, msg, wp, lp, &handled);
     if (handled) return r;
     switch (msg) {
-    case WM_PAINT:      ctl_paint_button(w, wi); w->has_update = 0; return 0;
+    case WM_PAINT:      g_ctl_em = w->ctl_em; ctl_paint_button(w, wi); g_ctl_em = 0; w->has_update = 0; return 0;
     case BM_GETCHECK:   return w->ctl_check;
     case BM_SETCHECK:   w->ctl_check = (int)wp; w->has_update = 1; return 0;
-    case BM_GETSTATE:   return w->ctl_check;
+    case BM_GETSTATE:   return w->ctl_check | (w->ctl_down ? 4 : 0);
     case BM_SETSTATE:   w->ctl_check = (int)wp; w->has_update = 1; return 0;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        if (!w->enabled || (w->style & BS_TYPEMASK) == BS_GROUPBOX) return 0;
+        w->ctl_down = 1; w->has_update = 1;
+        W.capture = wi;                             /* the release comes back here */
+        return 0;
+    case WM_LBUTTONUP: {
+        int x = (int16_t)(lp & 0xFFFF), y = (int16_t)((lp >> 16) & 0xFFFF);
+        int was = w->ctl_down;
+        w->ctl_down = 0; w->has_update = 1;
+        if (W.capture == wi) W.capture = 0;
+        if (was && w->enabled && x >= 0 && y >= 0 && x < w->w && y < w->h)
+            ctl_button_clicked(w, wi);
+        return 0; }
     default:            return 0;
     }
 }
@@ -1318,7 +1407,7 @@ static MS W_LRESULT ctl_static_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPA
     if (!w) return 0;
     r = ctl_common(w, wi, msg, wp, lp, &handled);
     if (handled) return r;
-    if (msg == WM_PAINT) { ctl_paint_static(w, wi); w->has_update = 0; }
+    if (msg == WM_PAINT) { g_ctl_em = w->ctl_em; ctl_paint_static(w, wi); g_ctl_em = 0; w->has_update = 0; }
     return 0;
 }
 
@@ -1395,7 +1484,7 @@ static MS W_LRESULT ctl_edit_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARA
     if (w->ctl_limit > 0 && w->ctl_limit < cap) cap = w->ctl_limit;
 
     switch (msg) {
-    case WM_PAINT: ctl_paint_edit(w, wi); w->has_update = 0; return 0;
+    case WM_PAINT: g_ctl_em = w->ctl_em; ctl_paint_edit(w, wi); g_ctl_em = 0; w->has_update = 0; return 0;
     case WM_CHAR: {
         int ch = (int)(wp & 0xff);
         if (w->ctl_selall) {            /* typing over a select-all replaces it */
@@ -1463,7 +1552,7 @@ static MS W_LRESULT ctl_combo_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPAR
     r = ctl_common(w, wi, msg, wp, lp, &handled);
     if (handled) return r;
     switch (msg) {
-    case WM_PAINT:   ctl_paint_combo(w, wi); w->has_update = 0; return 0;
+    case WM_PAINT:   g_ctl_em = w->ctl_em; ctl_paint_combo(w, wi); g_ctl_em = 0; w->has_update = 0; return 0;
     case CB_ADDSTRING:
         if (!sz || !ctl_items_room(w)) return -1;   /* CB_ERRSPACE */
         snprintf(w->items[w->nitems], 64, "%s", sz);
@@ -1498,7 +1587,7 @@ static MS W_LRESULT ctl_list_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARA
     r = ctl_common(w, wi, msg, wp, lp, &handled);
     if (handled) return r;
     switch (msg) {
-    case WM_PAINT:  ctl_paint_listbox(w, wi); w->has_update = 0; return 0;
+    case WM_PAINT:  g_ctl_em = w->ctl_em; ctl_paint_listbox(w, wi); g_ctl_em = 0; w->has_update = 0; return 0;
     case LB_ADDSTRING:
         if (!sz || !ctl_items_room(w)) return -1;
         snprintf(w->items[w->nitems], 64, "%s", sz);
@@ -1529,10 +1618,28 @@ static MS W_LRESULT ctl_scroll_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPA
     return 0;
 }
 
+/* Defined in win32dlg.h, which needs the resource lookup that comes later. */
+static MS W_LRESULT ctl_trackbar_proc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp);
+static MS W_LRESULT w32_dlg_wndproc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp);
+static MS W_LRESULT w32_sheet_wndproc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp);
+static MS W_LRESULT w32_popup_wndproc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp);
+static MS W_LRESULT w32_msg_wndproc(void *hwnd, uint32_t msg, W_WPARAM wp, W_LPARAM lp);
+static void w32_dlg_reset(void);
+static int  w32_sheet_key(int vk, int down, int ch);
+static int  w32_popup_key(int vk, int down, int ch);
+static int  w32_popup_mouse(int x, int y, int msg, int buttons, int wheel);
+static int  w32_overlays(int *out, int max);
+static void w32_sheet_destroyed(int idx);
+
 /* The system classes, matched case-insensitively as Windows does. */
 static void *w32_builtin_class(const char *cls)
 {
     if (!cls) return NULL;
+    if (!strcasecmp(cls, "#32770"))    return (void *)w32_dlg_wndproc;
+    if (!strcasecmp(cls, "#peloadsheet")) return (void *)w32_sheet_wndproc;
+    if (!strcasecmp(cls, "#peloadpopup")) return (void *)w32_popup_wndproc;
+    if (!strcasecmp(cls, "#peloadmsg")) return (void *)w32_msg_wndproc;
+    if (!strcasecmp(cls, "msctls_trackbar32")) return (void *)ctl_trackbar_proc;
     if (!strcasecmp(cls, "BUTTON"))    return (void *)ctl_button_proc;
     if (!strcasecmp(cls, "STATIC"))    return (void *)ctl_static_proc;
     if (!strcasecmp(cls, "EDIT"))      return (void *)ctl_edit_proc;
@@ -1725,6 +1832,7 @@ static MS int32_t st_DestroyWindow(void *hwnd)
     if (!w) return 0;
     w32_call(w, WM_DESTROY, 0, 0);
     i = (int)(w - W.wnd);
+    w32_sheet_destroyed(i);          /* a dialog's controls go with it */
     w32_surf_free(&w->surf);
     memset(w, 0, sizeof *w);
     if (W.display == i) W.display = 0;
@@ -1881,8 +1989,25 @@ static MS int32_t st_GetClassNameW(void *hwnd, uint16_t *buf, int32_t n)
     if (n) buf[i] = 0;
     return i;
 }
-static MS int32_t st_SetWindowTextA(void *h, const char *s) { (void)h;(void)s; return 1; }
-static MS int32_t st_SetWindowTextW(void *h, const uint16_t *s) { (void)h;(void)s; return 1; }
+/* A built-in control keeps its text and repaints; for any other window this
+ * stays the no-op it was, since what a plug-in's own window does with
+ * WM_SETTEXT is its business and it never asked for the message. */
+static int w32_is_builtin_ctl(w32_wnd *w)
+{ return w && w->cls[0] && w32_builtin_class(w->cls) && strcasecmp(w->cls, "#peloadsheet") &&
+         strcasecmp(w->cls, "#peloadpopup") && strcasecmp(w->cls, "#peloadmsg"); }
+static MS int32_t st_SetWindowTextA(void *h, const char *s)
+{
+    w32_wnd *w = w32_wget(h);
+    if (w32_is_builtin_ctl(w)) w32_call(w, WM_SETTEXT, 0, (W_LPARAM)(uintptr_t)(s ? s : ""));
+    return 1;
+}
+static MS int32_t st_SetWindowTextW(void *h, const uint16_t *s)
+{
+    char b[256]; size_t i = 0;
+    if (s) for (; s[i] && i + 1 < sizeof b; i++) b[i] = s[i] < 0x100 ? (char)s[i] : '?';
+    b[i] = 0;
+    return st_SetWindowTextA(h, b);
+}
 static MS int32_t st_BringWindowToTop(void *h) { (void)h; return 1; }
 static MS uint32_t st_GetWindowThreadProcessId(void *h, uint32_t *pid)
 { (void)h; if (pid) *pid = (uint32_t)getpid(); return (uint32_t)(uintptr_t)pthread_self(); }
@@ -4530,6 +4655,7 @@ static int w32_font_px(const w32_dc *d)
     if (d && d->font && W.obj[d->font].used && W.obj[d->font].logfont_len >= 4)
         memcpy(&h, W.obj[d->font].logfont, 4);
     if (h < 0) h = -h;
+    if (h == 0 && g_ctl_em) return g_ctl_em;
     if (h < 4 || h > 400) h = 12;       /* the system font, near enough */
     return (int)h;
 }
@@ -5074,6 +5200,7 @@ static MS void *st_SetCapture(void *hwnd)
     return prev;
 }
 static int w32_child_at(int wnd, int *x, int *y);          /* below */
+static void w32_origin_of(int i, int root, int *ox, int *oy);   /* below */
 
 /* Which window is under a point. The editor picture is this host's whole
  * screen, so a screen point and a client point of the root are the same thing.
@@ -5451,10 +5578,6 @@ static MS int32_t st_SystemParametersInfoW(uint32_t a, uint32_t b, void *p, uint
 }
 static MS int32_t st_SystemParametersInfoA(uint32_t a, uint32_t b, void *p, uint32_t f)
 { return st_SystemParametersInfoW(a, b, p, f); }
-static MS int32_t st_MessageBoxA(void *h, const char *t, const char *c, uint32_t f)
-{ (void)h;(void)f; fprintf(stderr, "[plugin] %s: %s\n", c ? c : "", t ? t : ""); return 1; }
-static MS int32_t st_MessageBoxW(void *h, const uint16_t *t, const uint16_t *c, uint32_t f)
-{ (void)h;(void)t;(void)c;(void)f; return 1; }
 
 /* ---- timers ------------------------------------------------------------- */
 
@@ -5507,89 +5630,6 @@ static MS int32_t st_EmptyClipboard(void) { return 1; }
 static MS void *st_GetClipboardData(uint32_t f) { (void)f; return NULL; }
 static MS void *st_SetClipboardData(uint32_t f, void *h) { (void)f; return h; }
 static MS int32_t st_IsClipboardFormatAvailable(uint32_t f) { (void)f; return 0; }
-/* Menus: built, never shown, and consistent about it.
- *
- * A menu was one shared token handle and every call against it was accepted and
- * ignored -- which is fine until a plug-in builds a menu and then asks about it.
- * It appends five items and GetMenuItemCount says none, and the code that walks
- * them to set a check mark or find the selected one does nothing, silently.
- * Real handles and a count of what went in cost forty lines and make the
- * answers agree with each other.
- *
- * Nothing is ever displayed: TrackPopupMenu returns "nothing chosen", which is
- * what a user who dismissed the menu would have caused. */
-#define W32_MAX_MENU 32
-static struct { int used, items; } g_menus[W32_MAX_MENU];
-#define W32_HMENU_BASE 0x004D0000u              /* 'M' */
-
-static void *w32_menu_new(void)
-{
-    int i;
-    for (i = 1; i < W32_MAX_MENU; i++)
-        if (!g_menus[i].used) {
-            g_menus[i].used = 1;
-            g_menus[i].items = 0;
-            return (void *)(uintptr_t)(W32_HMENU_BASE | (unsigned)i);
-        }
-    return NULL;
-}
-static int w32_menu_idx(void *m)
-{
-    uintptr_t v = (uintptr_t)m;
-    int i = (int)(v & 0xFFFF);
-    if ((v & ~(uintptr_t)0xFFFF) != W32_HMENU_BASE) return 0;
-    return (i > 0 && i < W32_MAX_MENU && g_menus[i].used) ? i : 0;
-}
-static MS void *st_CreatePopupMenu(void) { return w32_menu_new(); }
-static MS void *st_CreateMenu(void) { return w32_menu_new(); }
-static MS int32_t st_AppendMenuA(void *m, uint32_t f, uintptr_t id, const char *s)
-{
-    int i = w32_menu_idx(m);
-    (void)f; (void)id; (void)s;
-    if (!i) return 0;
-    g_menus[i].items++;
-    return 1;
-}
-static MS int32_t st_AppendMenuW(void *m, uint32_t f, uintptr_t id, const uint16_t *s)
-{ (void)s; return st_AppendMenuA(m, f, id, NULL); }
-static MS int32_t st_InsertMenuItemA(void *m, uint32_t pos, int32_t bypos, const void *info)
-{ (void)pos; (void)bypos; (void)info; return st_AppendMenuA(m, 0, 0, NULL); }
-static MS int32_t st_InsertMenuItemW(void *m, uint32_t pos, int32_t bypos, const void *info)
-{ return st_InsertMenuItemA(m, pos, bypos, info); }
-static MS int32_t st_InsertMenuA(void *m, uint32_t pos, uint32_t f, uintptr_t id, const char *s)
-{ (void)pos; (void)s; return st_AppendMenuA(m, f, id, NULL); }
-static MS int32_t st_InsertMenuW(void *m, uint32_t pos, uint32_t f, uintptr_t id, const uint16_t *s)
-{ (void)pos; (void)s; return st_AppendMenuA(m, f, id, NULL); }
-/* -1 for a handle that is not a menu, which is what the documentation says and
- * what a caller loops against. */
-static MS int32_t st_GetMenuItemCount(void *m)
-{ int i = w32_menu_idx(m); return i ? g_menus[i].items : -1; }
-static MS uint32_t st_GetMenuItemID(void *m, int32_t pos)
-{ (void)m; (void)pos; return 0xFFFFFFFFu; }     /* not a command item */
-/* The item exists in the count and nowhere else, so nothing can be reported
- * about it. FALSE is the answer for an item that is not there. */
-static MS int32_t st_GetMenuItemInfoA(void *m, uint32_t item, int32_t bypos, void *info)
-{ (void)m; (void)item; (void)bypos; (void)info; return 0; }
-static MS int32_t st_GetMenuItemInfoW(void *m, uint32_t item, int32_t bypos, void *info)
-{ return st_GetMenuItemInfoA(m, item, bypos, info); }
-static MS int32_t st_SetMenuItemInfoA(void *m, uint32_t item, int32_t bypos, const void *info)
-{ (void)item; (void)bypos; (void)info; return w32_menu_idx(m) ? 1 : 0; }
-static MS int32_t st_SetMenuItemInfoW(void *m, uint32_t item, int32_t bypos, const void *info)
-{ return st_SetMenuItemInfoA(m, item, bypos, info); }
-static MS int32_t st_GetMenuInfo(void *m, void *info)
-{ (void)info; return w32_menu_idx(m) ? 1 : 0; }
-static MS int32_t st_SetMenuInfo(void *m, const void *info)
-{ (void)info; return w32_menu_idx(m) ? 1 : 0; }
-static MS int32_t st_SetMenu(void *hwnd, void *m)
-{ (void)hwnd; (void)m; return 1; }
-static MS int32_t st_DestroyMenu(void *m)
-{
-    int i = w32_menu_idx(m);
-    if (!i) return 0;
-    g_menus[i].used = 0;
-    return 1;
-}
-
 /* The caret does not blink here because there is no caret; 530 ms is the
  * Windows default, and a caller that uses it as a timer period wants a number
  * rather than zero -- which is "the caret does not blink" and, in some code,
@@ -5617,9 +5657,6 @@ static MS uint32_t st_PrivateExtractIconsA(const char *file, int32_t idx,
     (void)file;
     return st_PrivateExtractIconsW(NULL, idx, cx, cy, icons, ids, n, flags);
 }
-static MS int32_t st_TrackPopupMenu(void *m, uint32_t f, int32_t x, int32_t y,
-                                   int32_t r, void *h, const void *rc)
-{ (void)m;(void)f;(void)x;(void)y;(void)r;(void)h;(void)rc; return 0; }
 static MS int32_t st_RegisterTouchWindow(void *h, uint32_t f) { (void)h;(void)f; return 0; }
 static MS int32_t st_CloseTouchInputHandle(void *h) { (void)h; return 1; }
 static MS int32_t st_GetTouchInputInfo(void *h, uint32_t n, void *in, int32_t sz)
@@ -5824,14 +5861,44 @@ static void w32_composite_children(int parent, w32_surf *out, int ox, int oy)
 int w32_editor_pixels(const unsigned int **px, int *w, int *h)
 {
     int i = W.display ? W.display : W.host;
+    int ov[8], nov, k, cw, ch, y;
     w32_surf *s;
+    int root = (W.host && W.wnd[W.host].used) ? W.host : 0;
 
     if (!i || !W.wnd[i].used || !W.wnd[i].surf.px) return 0;
     s = &W.wnd[i].surf;
-    w32_surf_size(&g_present, s->w, s->h);
+    /* What the plug-in has put up over or under its editor -- a dialog, a
+     * property sheet, a menu -- is drawn into a frame as large as it needs, and
+     * the host shows whatever size this returns. Growing it is all it takes to
+     * make room; shrinking it again is all it takes to give the room back. */
+    nov = w32_overlays(ov, 8);
+    cw = s->w; ch = s->h;
+    for (k = 0; k < nov; k++) {
+        int ox, oy;
+        w32_origin_of(ov[k], root, &ox, &oy);
+        if (ox + W.wnd[ov[k]].w > cw) cw = ox + W.wnd[ov[k]].w;
+        if (oy + W.wnd[ov[k]].h > ch) ch = oy + W.wnd[ov[k]].h;
+    }
+    w32_surf_size(&g_present, cw, ch);
     if (!g_present.px) return 0;
-    memcpy(g_present.px, s->px, (size_t)s->w * s->h * 4);
+    if (cw != s->w || ch != s->h)
+        for (y = 0; y < ch * cw; y++) g_present.px[y] = 0x00808080u;
+    for (y = 0; y < s->h; y++)
+        memcpy(g_present.px + (size_t)y * cw, s->px + (size_t)y * s->w, (size_t)s->w * 4);
     w32_composite_children(i, &g_present, 0, 0);
+    for (k = 0; k < nov; k++) {
+        int ox, oy, yy, xx;
+        w32_wnd *o = &W.wnd[ov[k]];
+        w32_origin_of(ov[k], root, &ox, &oy);
+        for (yy = 0; yy < o->surf.h; yy++) {
+            if (oy + yy < 0 || oy + yy >= ch) continue;
+            for (xx = 0; xx < o->surf.w; xx++) {
+                if (ox + xx < 0 || ox + xx >= cw) continue;
+                g_present.px[(size_t)(oy + yy) * cw + ox + xx] = o->surf.px[(size_t)yy * o->surf.w + xx];
+            }
+        }
+        w32_composite_children(ov[k], &g_present, ox, oy);
+    }
     if (px) *px = g_present.px;
     if (w)  *w  = g_present.w;
     if (h)  *h  = g_present.h;
@@ -5892,6 +5959,7 @@ void w32_reset(void)
     /* First, because the rest of this drops the windows those threads would
      * paint into, and the plug-in's image goes right after it. */
     w32_stop_workers();
+    w32_dlg_reset();
     for (i = 1; i < W32_MAX_WND; i++) {
         if (!W.wnd[i].used) continue;
         w32_surf_free(&W.wnd[i].surf);
@@ -5967,6 +6035,7 @@ void w32_mouse(int x, int y, int msg, int buttons, int wheel)
     int cx = x, cy = y;
 
     if (!root) return;
+    if (w32_popup_mouse(x, y, msg, buttons, wheel)) return;   /* a menu is open: all of it is the menu's */
     if (W.capture && W.wnd[W.capture].used) {
         int ox, oy;
         w32_origin_of(W.capture, root, &ox, &oy);
@@ -6007,23 +6076,32 @@ void w32_mouse(int x, int y, int msg, int buttons, int wheel)
     W.keys[2] = (buttons & 2) ? 1 : 0;
     W.keys[4] = (buttons & 4) ? 1 : 0;
     W.last_input_ms = w32_now_ms();
+    /* Marked as the user's own: a plug-in that answers this click by putting up
+     * a modal dialog is doing what the user asked, and may be given one. */
+    W.user_input++;
     if (msg == WM_MOUSEWHEEL)
         w32_call(w, WM_MOUSEWHEEL, ((W_WPARAM)(uint16_t)(int16_t)(wheel * 120) << 16) | (uint32_t)buttons,
                  (int64_t)(((uint32_t)(uint16_t)y << 16) | (uint16_t)x));
     else
         w32_call(w, (uint32_t)msg, (uint64_t)buttons,
                  (int64_t)(((uint32_t)(uint16_t)y << 16) | (uint16_t)x));
+    W.user_input--;
 }
 
 void w32_key(int vk, int down, int ch)
 {
     w32_wnd *w;
-    int target = W.focus ? W.focus : (W.display ? W.display : W.host);
+    int target;
+    if (w32_popup_key(vk, down, ch)) return;      /* a menu is open: it takes the keys */
+    if (w32_sheet_key(vk, down, ch)) return;      /* a dialog is up: it takes Esc, Enter */
+    target = W.focus ? W.focus : (W.display ? W.display : W.host);
     if (!target || !W.wnd[target].used) return;
     w = &W.wnd[target];
     if (vk >= 0 && vk < 256) W.keys[vk] = down ? 1 : 0;
+    W.user_input++;
     w32_call(w, down ? WM_KEYDOWN : WM_KEYUP, (uint64_t)vk, 1);
     if (down && ch > 0) w32_call(w, WM_CHAR, (uint64_t)ch, 1);
+    W.user_input--;
 }
 
 #endif /* PELOAD_WIN32GUI_H */

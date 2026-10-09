@@ -242,6 +242,92 @@ static void sv_drain_input(serve_state *s)
 
 static void sv_publish_editor(serve_state *s);
 
+/* What the host may ask while the plug-in is spinning in a loop of its own --
+ * a drag, or a dialog it put up with PropertySheet. Reads only; the same list
+ * peserve.c keeps for a 64-bit plug-in. */
+static int sv_safe_while_spinning(int op)
+{
+    switch (op) {
+    case BR_PARAM_NAME: case BR_PARAM_LABEL: case BR_PARAM_DISPLAY:
+    case BR_PARAM_GET:  case BR_PROGRAM_NAME: case BR_GET_PROGRAM:
+    case BR_EDITOR_KIND: case BR_EDITOR_SIZE: case BR_IMPORT_STATS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Answer what is safe to answer while the plug-in spins, so a long modal dialog
+ * does not leave the host's parameter reads waiting out their deadline. Anything
+ * else -- closing the editor, a program change, quitting -- is left unread for
+ * the main loop, and the dialog is told to give up (w32_modal_abort) so the
+ * plug-in's call returns and the main loop gets there. */
+static void sv_serve_pending(serve_state *s)
+{
+    int i;
+    AEffect32 *fx = s->fx;
+    for (i = 0; i < 32; i++) {                       /* bounded: this is re-entrant */
+        bridge_req q;
+        bridge_rep r;
+        ssize_t n = recv(s->sock, &q, sizeof q, MSG_PEEK | MSG_DONTWAIT);
+        if (n != (ssize_t)sizeof q) return;          /* nothing whole waiting */
+        if (!sv_safe_while_spinning(q.op)) {
+            if (getenv("PELOAD_VERBOSE")) fprintf(stderr, "  [serve] request %d pending while spinning: cancelling a modal dialog\n", q.op);
+            w32_modal_abort();
+            return;
+        }
+        if (recv(s->sock, &q, sizeof q, MSG_WAITALL) != (ssize_t)sizeof q) return;
+        memset(&r, 0, sizeof r);
+        r.ok = 1;
+        switch (q.op) {
+        case BR_PARAM_NAME: {
+            char b[64] = { 0 };
+            fx->dispatcher(fx, effGetParamName, q.a, 0, b, 0.0f);
+            sv_text(&r, b); break;
+        }
+        case BR_PARAM_LABEL: {
+            char b[64] = { 0 };
+            fx->dispatcher(fx, effGetParamLabel, q.a, 0, b, 0.0f);
+            sv_text(&r, b); break;
+        }
+        case BR_PARAM_DISPLAY: {
+            char b[64] = { 0 };
+            fx->dispatcher(fx, effGetParamDisplay, q.a, 0, b, 0.0f);
+            sv_text(&r, b); break;
+        }
+        case BR_PARAM_GET:
+            r.f = (q.a >= 0 && q.a < fx->numParams) ? fx->getParameter(fx, q.a) : 0.0f;
+            break;
+        case BR_PROGRAM_NAME: {
+            char b[64] = { 0 };
+            if (!fx->dispatcher(fx, effGetProgramNameIndexed, q.a, -1, b, 0.0f) && !b[0])
+                snprintf(b, sizeof b, "Program %d", q.a + 1);
+            sv_text(&r, b); break;
+        }
+        case BR_GET_PROGRAM:
+            r.a = (int32_t)fx->dispatcher(fx, effGetProgram, 0, 0, NULL, 0.0f);
+            break;
+        case BR_EDITOR_KIND:
+            r.a = (fx->flags & EFF_HAS_EDITOR) ? 2 /* PIXELS */ : 0;
+            break;
+        case BR_EDITOR_SIZE: {
+            int w = 0, h = 0;
+            if (s->editor_open) { w = s->sh->ed_w; h = s->sh->ed_h; }
+            else ed_size(fx, &w, &h);
+            r.a = w; r.b = h; break;
+        }
+        case BR_IMPORT_STATS: {
+            int k, hit = 0;
+            for (k = 0; k < g_nimp; k++) if (g_imp[k].calls) hit++;
+            r.a = g_nresolved; r.b = g_nimp; r.c = hit;
+            break;
+        }
+        default: r.ok = 0; break;
+        }
+        if (send(s->sock, &r, sizeof r, MSG_NOSIGNAL) != (ssize_t)sizeof r) return;
+    }
+}
+
 /* Called from inside the plug-in while it spins in a loop of its own. Input has
  * to reach it, and -- just as important -- the frames it draws mid-drag have to
  * reach the host, or the whole drag renders as one jump at the end because the
@@ -256,6 +342,7 @@ static void sv_on_pump_input(void *ud)
     if (!s || inside) return;
     inside = 1;
     sv_drain_input(s);
+    sv_serve_pending(s);
     sv_publish_editor(s);
     inside = 0;
 }

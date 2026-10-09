@@ -163,6 +163,7 @@ static void *host_watchdog(void *ud)
     return NULL;
 }
 int w32_paint_in_progress(void);
+void w32_modal_abort(void);
 
 static void publish_pixels(server *s);
 
@@ -264,7 +265,10 @@ static void serve_pending(server *s)
         bridge_rep r;
         ssize_t n = recv(s->sock, &q, sizeof q, MSG_PEEK | MSG_DONTWAIT);
         if (n != (ssize_t)sizeof q) return;      /* nothing whole waiting */
-        if (!safe_while_spinning(q.op)) return;  /* leave it for the main loop */
+        if (!safe_while_spinning(q.op)) {        /* leave it for the main loop, */
+            w32_modal_abort();                   /* and tell a modal dialog to give up */
+            return;
+        }
         if (recv(s->sock, &q, sizeof q, MSG_WAITALL) != (ssize_t)sizeof q) return;
         memset(&r, 0, sizeof r);
         r.ok = 1;

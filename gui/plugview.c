@@ -190,6 +190,8 @@ struct plugview {
     /* How big the plug-in says its editor is, which is not the same as how big
      * the pane is and must not be confused with it -- see editor_bounds. */
     int        ed_nat_w, ed_nat_h;
+    int        ed_resize_pending, ed_pend_w, ed_pend_h;   /* the frame changed size under the draw */
+    guint      ed_resize_idle;
     /* The size the plug-in actually drew at, before the zoom. ed_nat_* is that
      * multiplied by ed_zoom, and is what the pane and the plug-in's window are
      * sized from; this is what the multiplication starts from, so that zooming
@@ -1309,6 +1311,23 @@ enum { WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202,
        WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208, WM_MOUSEWHEEL = 0x020A };
 enum { MK_LBUTTON = 0x0001, MK_RBUTTON = 0x0002, MK_MBUTTON = 0x0010 };
 
+/* The plug-in's frame is a different size from the one the pane was sized for:
+ * a skin switched, or a dialog put up below its editor (a property sheet makes
+ * the frame taller until it is closed). Not done inside the draw -- resizing a
+ * widget from its own draw handler is asking for a loop -- but from an idle. */
+static void zoom_apply(plugview *pv);
+
+static gboolean editor_resized_idle(gpointer ud)
+{
+    plugview *pv = ud;
+    pv->ed_resize_pending = 0;
+    pv->ed_resize_idle = 0;
+    if (!pv->host || !pv->ed_open || pv->ed_native) return G_SOURCE_REMOVE;
+    pv->ed_base_w = pv->ed_pend_w; pv->ed_base_h = pv->ed_pend_h;
+    zoom_apply(pv);
+    return G_SOURCE_REMOVE;
+}
+
 static void editor_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer ud)
 {
     const unsigned int *px = NULL;
@@ -1326,6 +1345,13 @@ static void editor_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointe
         cairo_rectangle(cr, 0, 0, w, h);
         cairo_fill(cr);
         return;
+    }
+
+    if (!pv->ed_native && pv->ed_base_w > 0 && (pw != pv->ed_base_w || ph != pv->ed_base_h) &&
+        !pv->ed_resize_pending) {
+        pv->ed_resize_pending = 1;
+        pv->ed_pend_w = pw; pv->ed_pend_h = ph;
+        pv->ed_resize_idle = g_idle_add(editor_resized_idle, pv);
     }
 
     /* pehost hands back 0x00RRGGBB, which is exactly CAIRO_FORMAT_RGB24 in
@@ -3500,6 +3526,7 @@ void plugview_shutdown(plugview *pv)
      * closed straight after a load -- a session's tab whose plug-in did not
      * come back -- was freed before it ran, and it ran anyway. */
     if (pv->ed_fit_idle) { g_source_remove(pv->ed_fit_idle); pv->ed_fit_idle = 0; }
+    if (pv->ed_resize_idle) { g_source_remove(pv->ed_resize_idle); pv->ed_resize_idle = 0; pv->ed_resize_pending = 0; }
     /* Every widget pointer, and before the unload rather than after it.
      *
      * Clearing `status` and `editor` fixed the meter and left the zoom bar,

@@ -5200,6 +5200,8 @@ static MS void *st_LoadBitmapA(void *inst, const char *name)
 static MS void *st_LoadBitmapW(void *inst, const void *name)
 { (void)inst; return load_bitmap_res(name); }
 
+#include "win32dlg.h"
+
 /* LoadString, for real -- same reasoning as LoadBitmap above: returning 0
  * unread is a plugin's cue that its own config/resource load failed, and
  * that is a way for VSTPluginMain to come back with no AEffect at all
@@ -12894,6 +12896,24 @@ static const winstub g_stubs[] = {
     S("user32.dll", GetWindow), S("user32.dll", GetTopWindow),
     S("user32.dll", GetDlgItem), S("user32.dll", GetDlgCtrlID),
     S("user32.dll", SendDlgItemMessageA), S("user32.dll", SendDlgItemMessageW),
+    /* Dialogs and property sheets, from win32dlg.h. */
+    S("user32.dll", CreateDialogParamA), S("user32.dll", CreateDialogParamW),
+    S("user32.dll", CreateDialogIndirectParamA), S("user32.dll", CreateDialogIndirectParamW),
+    S("user32.dll", DialogBoxParamA), S("user32.dll", DialogBoxParamW),
+    S("user32.dll", DialogBoxIndirectParamA), S("user32.dll", DialogBoxIndirectParamW),
+    S("user32.dll", EndDialog), S("user32.dll", CheckDlgButton),
+    S("user32.dll", IsDlgButtonChecked), S("user32.dll", CheckRadioButton),
+    S("user32.dll", SetDlgItemTextA), S("user32.dll", SetDlgItemTextW),
+    S("user32.dll", GetDlgItemTextA), S("user32.dll", SetDlgItemInt),
+    S("user32.dll", GetDlgItemInt), S("user32.dll", DefDlgProcA),
+    S("user32.dll", IsDialogMessageA),
+    S("user32.dll", GetSubMenu), S("user32.dll", GetMenuStringA), S("user32.dll", GetMenuStringW),
+    S("user32.dll", GetMenuState), S("user32.dll", CheckMenuItem), S("user32.dll", EnableMenuItem),
+    S("user32.dll", CheckMenuRadioItem), S("user32.dll", DeleteMenu), S("user32.dll", RemoveMenu),
+    S("user32.dll", ModifyMenuA), S("user32.dll", ModifyMenuW), S("user32.dll", SetMenuDefaultItem),
+    S("user32.dll", IsMenu), S("user32.dll", TrackPopupMenuEx),
+    S("comctl32.dll", PropertySheetA), S("comctl32.dll", CreatePropertySheetPageA),
+    S("comctl32.dll", DestroyPropertySheetPage), S("comctl32.dll", InitCommonControls),
     S("user32.dll", SetCursor), S("user32.dll", GetCursor), S("user32.dll", LoadCursorA),
     S("user32.dll", ShowCursor), S("user32.dll", GetKeyState), S("user32.dll", GetAsyncKeyState),
     S("user32.dll", GetKeyboardState), S("user32.dll", GetKeyboardLayout),
