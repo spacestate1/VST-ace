@@ -11,8 +11,14 @@ install into, and the files are all anyone wanted.
 What it handles, and what it does not:
 
   .msi          yes. The payload comes out under the installer's internal keys
-                rather than file names, so each PE is renamed from the
-                OriginalFilename in its own version resource.
+                rather than file names; the database's own File, Component and
+                Directory tables say what each one is called and where it goes,
+                and the tree is rebuilt from them. Whatever the installer puts
+                outside the plug-in folders -- skins, presets, sample libraries
+                under ProgramData or Common Files -- is also placed in the
+                loader's Windows tree (~/.peload, or --prefix), which is where
+                the plug-in will look for it. Without the tables, each PE is
+                still renamed from the OriginalFilename in its version resource.
   .exe (NSIS)   yes, through 7z.
   .zip .7z      yes.
   .exe (Inno)   only with innoextract installed, which this calls when it is
@@ -374,6 +380,208 @@ def expand_payloads(tree):
     return n
 
 
+def msi_tables(streams):
+    """The tables of an MSI database, from its streams as 7z -tCompound writes
+    them ("!File", "!_StringPool" ...). Returns a function from a table name to
+    its rows as dicts, or None when the database cannot be read.
+
+    The format: one string pool shared by every table, and each table stored a
+    column at a time -- all of column one, then all of column two. A string
+    cell is an index into the pool, two bytes or three when the pool says so;
+    an integer cell is two or four bytes with its sign bit flipped, and zero
+    meaning null. _Columns, itself a table, says which is which."""
+    def rd(n):
+        with open(os.path.join(streams, n), 'rb') as fh:
+            return fh.read(MAX_READ)
+    try:
+        pool, data, colraw = rd('!_StringPool'), rd('!_StringData'), rd('!_Columns')
+    except OSError:
+        return None
+    if len(pool) < 4:
+        return None
+    wide = 3 if struct.unpack_from('<I', pool, 0)[0] & 0x80000000 else 2
+    strings, off, i = [None], 0, 4
+    while i + 4 <= len(pool):
+        ln, refs = struct.unpack_from('<HH', pool, i)
+        i += 4
+        if ln == 0 and refs and i + 4 <= len(pool):     # over 64K: the high word first
+            lo, _r = struct.unpack_from('<HH', pool, i)
+            i += 4
+            ln = (refs << 16) | lo
+        strings.append(data[off:off + ln].decode('utf-8', 'replace'))
+        off += ln
+
+    def S(v):
+        return strings[v] if 0 < v < len(strings) else None
+
+    def cells(raw, o, w, n):
+        return [int.from_bytes(raw[o + k * w:o + k * w + w], 'little') for k in range(n)], o + n * w
+
+    # _Columns is Table (string), Number (i2), Name (string), Type (i2).
+    n = len(colraw) // (2 * wide + 4)
+    t, o = cells(colraw, 0, wide, n)
+    num, o = cells(colraw, o, 2, n)
+    nm, o = cells(colraw, o, wide, n)
+    ty, o = cells(colraw, o, 2, n)
+    cols = {}
+    for k in range(n):
+        cols.setdefault(S(t[k]), []).append((num[k] & 0x7fff, S(nm[k]), ty[k] & 0x7fff))
+
+    def table(name):
+        spec = sorted(cols.get(name, []))
+        try:
+            raw = rd('!' + name)
+        except OSError:
+            return []
+        # 0x0800 is a string column; otherwise the low byte is the width.
+        ws = [wide if ty & 0x0800 else (4 if ty & 0xff == 4 else 2) for _, _, ty in spec]
+        if not ws:
+            return []
+        rows = len(raw) // sum(ws)
+        out = [{} for _ in range(rows)]
+        o = 0
+        for (_, cname, ty), w in zip(spec, ws):
+            vals, o = cells(raw, o, w, rows)
+            for k, v in enumerate(vals):
+                if ty & 0x0800:
+                    out[k][cname] = S(v)
+                else:
+                    out[k][cname] = None if v == 0 else v - (0x8000 if w == 2 else 0x80000000)
+        return out
+    return table
+
+
+# Where Windows Installer's standard folders are, as the loader lays out its
+# Windows tree (winstubs.h, w32_env_dir). A shortcut folder is not anywhere: a
+# Start-menu entry is no use without a Start menu.
+MSI_FOLDERS = {
+    'TARGETDIR': '', 'SourceDir': '',
+    'ProgramFiles64Folder': 'Program Files',
+    'ProgramFilesFolder': 'Program Files (x86)',
+    'CommonFiles64Folder': 'Program Files/Common Files',
+    'CommonFilesFolder': 'Program Files (x86)/Common Files',
+    'CommonAppDataFolder': 'ProgramData',
+    'AppDataFolder': 'AppData/Roaming',
+    'LocalAppDataFolder': 'AppData/Local',
+    'PersonalFolder': 'Documents',
+    'MyPicturesFolder': 'Pictures',
+    'WIX_DIR_COMMON_DOCUMENTS': 'Public/Documents',
+    'WIX_DIR_PERSONAL': 'Documents',
+    'TempFolder': 'Temp',
+    # The Visual C++ runtime a merge module drops into System32 is the one
+    # thing an installer carries that the loader must not be handed: it has
+    # its own, and a copy in the tree is only a stale duplicate.
+    'WindowsFolder': None, 'SystemFolder': None, 'System64Folder': None,
+    'System16Folder': None, 'FontsFolder': None,
+    'ProgramMenuFolder': None, 'StartMenuFolder': None, 'StartupFolder': None,
+    'DesktopFolder': None, 'SendToFolder': None, 'FavoritesFolder': None,
+    'AdminToolsFolder': None, 'TemplateFolder': None,
+}
+
+
+def msi_layout(table):
+    """{file key: path relative to a Windows drive} from the MSI's tables.
+    A file whose directory is a shortcut folder, or that cannot be placed, is
+    left out."""
+    dirs = {r['Directory']: r for r in table('Directory') if r.get('Directory')}
+    comp = {r['Component']: r.get('Directory_') for r in table('Component') if r.get('Component')}
+    memo = {}
+    # A directory a custom action points somewhere at install time: type 35
+    # sets a directory, 51 a property, and a directory is a property. VST
+    # Classics files its presets under APPDATA and only says, here, that
+    # APPDATA is [CommonAppDataFolder]. The first such action wins.
+    for r in table('CustomAction'):
+        src, tgt = r.get('Source'), r.get('Target') or ''
+        if (r.get('Type') or 0) & 0x3f not in (35, 51) or src not in dirs or src in memo:
+            continue
+        m = re.match(r'^\[(\w+)\]\\?(.*)$', tgt)
+        if m and m.group(1) in MSI_FOLDERS:
+            base, rest = MSI_FOLDERS[m.group(1)], m.group(2).replace('\\', '/').strip('/')
+            memo[src] = None if base is None else '/'.join(q for q in (base, rest) if q)
+
+    def long_name(v):
+        # "short|long", and for a directory "target:source" before that.
+        v = (v or '').split(':')[0]
+        return v.split('|')[-1]
+
+    def path_of(d, depth=0):
+        if d in memo:
+            return memo[d]
+        # A merge module's copy of a standard folder carries its GUID:
+        # System64Folder.3CFBED52_9B44_....
+        std = d.split('.')[0] if d else d
+        if std in MSI_FOLDERS:
+            memo[d] = MSI_FOLDERS[std]
+            return memo[d]
+        r = dirs.get(d)
+        if r is None or depth > 64:
+            memo[d] = None
+            return None
+        parent = r.get('Directory_Parent')
+        base = path_of(parent, depth + 1) if parent and parent != d else ''
+        if base is None:
+            memo[d] = None
+            return None
+        leaf = long_name(r.get('DefaultDir'))
+        p = base if leaf in ('', '.', 'SourceDir') else '/'.join(q for q in (base, leaf) if q)
+        memo[d] = p
+        return p
+
+    out = {}
+    for r in table('File'):
+        key, c = r.get('File'), r.get('Component_')
+        d = comp.get(c)
+        base = path_of(d) if d else None
+        name = long_name(r.get('FileName'))
+        if not key or base is None or not name:
+            continue
+        name = name.replace('\\', '/').split('/')[-1]
+        if name in ('.', '..'):
+            continue
+        out[key] = '/'.join(q for q in (base, name) if q)
+    return out
+
+
+def msi_restore(path, into):
+    """Put each file 7z took out of an MSI's cabinet back under its real name,
+    in its real directory: `into`/Program Files/..., `into`/ProgramData/....
+    Returns the set of restored paths relative to `into` (empty when the
+    database could not be read, and the files keep their keys)."""
+    streams = tempfile.mkdtemp(prefix='vstinst-msidb-')
+    try:
+        r = run_tool(['7z', 'x', '-y', '-tCompound', '-o' + streams, path, '!*'])
+        if r is None or r.returncode != 0:
+            return set()
+        table = msi_tables(streams)
+        if table is None:
+            return set()
+        layout = msi_layout(table)
+    except (OSError, struct.error, IndexError, MemoryError):
+        return set()                    # a database we cannot read: keys it is
+    finally:
+        shutil.rmtree(streams, ignore_errors=True)
+    found = {}
+    for root, _dirs, files in os.walk(into):
+        for f in files:
+            if f in layout and f not in found:
+                found[f] = os.path.join(root, f)
+    restored = set()
+    for key, src in found.items():
+        dst = safe_member(into, layout[key])
+        if dst is None or os.path.exists(dst):
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.replace(src, dst)
+        restored.add(os.path.relpath(dst, into))
+    return restored
+
+
+# What the current install restored from MSI tables: (full path, path relative
+# to the Windows drive). A list, because an MSI can sit inside a zip and be
+# unpacked into a subdirectory of the tree.
+_msi_restored = []
+
+
 def extract(path, into, kind):
     """7z reads MSI, NSIS, xar and the plain archives; Inno Setup needs its own."""
     global _why
@@ -388,6 +596,9 @@ def extract(path, into, kind):
         return False
     if kind in ('pkg', 'dmg'):
         expand_payloads(into)
+    if kind == 'msi':
+        _msi_restored.extend((os.path.join(into, rel), rel)
+                             for rel in sorted(msi_restore(path, into)))
     return True
 
 
@@ -442,6 +653,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('installers', nargs='+')
     ap.add_argument('--dest', required=True, help='where the plug-ins go')
+    ap.add_argument('--prefix', default=os.path.join(os.path.expanduser('~'), '.peload'),
+                    help="the loader's Windows tree, where an MSI's data files "
+                         "(skins, presets, libraries) are placed")
     ap.add_argument('--peload', default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'peload', 'build'))
     ap.add_argument('--test', action='store_true',
@@ -469,6 +683,7 @@ def main():
             skipped.append((inst, 'unreadable'))
             continue
         tmp = tempfile.mkdtemp(prefix='vstinst-')
+        del _msi_restored[:]
         try:
             if not unpack(inst, tmp):
                 skipped.append((inst, _why or 'nothing could extract it'))
@@ -554,6 +769,24 @@ def main():
                     extra += copy_companions(d, out, copied)
                 if extra:
                     print('    %s: kept %d companion file(s)' % (name, extra))
+                # An MSI says where everything goes, and a plug-in looks for its
+                # data there: Frontier reads C:\ProgramData\D16 Group\Frontier\
+                # Skins, and with the skins left beside the DLL under their
+                # database keys it opened a dialog saying it had none. The
+                # plug-ins themselves are already installed above.
+                placed = 0
+                for src, rel in _msi_restored:
+                    if src in copied or is_scaffold(rel) or rel.lower().endswith(NOT_OURS) \
+                            or '.aaxplugin/' in rel.lower():
+                        continue
+                    dst = safe_member(a.prefix, rel)
+                    if dst is None:
+                        continue
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    if copy_file(src, dst):
+                        placed += 1
+                if placed:
+                    print('    %s: placed %d data file(s) under %s' % (name, placed, a.prefix))
         except OSError as e:
             # Disk full, a destination that cannot be written, an installer's
             # tree that vanished: this installer is lost, the others are not.
