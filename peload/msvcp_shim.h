@@ -2073,14 +2073,16 @@ static MS const char *mp_Future_error_map(int32_t e)
 static MS void *mp_Fiopen(const uint16_t *wname, int32_t mode, int32_t prot)
 {
     char path[1024], mstr[8];
-    size_t i = 0;
     int j = 0;
     int in = (mode & 1) != 0, out = (mode & 2) != 0;
     int app = (mode & 8) != 0, trunc = (mode & 0x10) != 0;
     (void)prot;
     if (!wname) return NULL;
-    while (wname[i] && i < sizeof path - 1) { path[i] = (char)wname[i]; i++; }
-    path[i] = 0;
+    /* The same conversion every other path entry point uses: UTF-8 rather than
+     * the low byte of each WCHAR, backslashes and drive letters undone, and
+     * case matched against the disk. An ifstream on a plug-in's own resource
+     * folder is spelled the Windows way as often as a CreateFile is. */
+    w2c_path(wname, path, sizeof path);
     if (in && out)      { mstr[j++] = trunc ? 'w' : 'r'; mstr[j++] = '+'; }
     else if (out)       { mstr[j++] = app ? 'a' : 'w'; }
     else                { mstr[j++] = 'r'; }

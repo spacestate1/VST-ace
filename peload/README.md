@@ -1542,6 +1542,54 @@ default it looks like. The MSVC CRT probes for optional APIs with
 per-DLL handles plus a `GetProcAddress` that answers from the stub table turn
 those probes into hits.
 
+## OpenGL editors
+
+Helm's editor is JUCE's `OpenGLContext` and nothing else: no GDI path to fall
+back to. With `opengl32` answering from generic stubs it got a context handle
+that was nothing, drew into it, and showed a black window.
+
+`gl_shim.h` is a real `opengl32`. Each window a plug-in renders to gets an
+off-screen EGL pbuffer of the window's size, so the plug-in's framebuffer 0 is
+a real one and nothing it draws needs translating. `SwapBuffers` reads the
+frame back; the next `w32_pump`, on the UI thread, copies it into the window's
+surface, where it is composited like any GDI paint. The display is Mesa's
+surfaceless platform where there is one — no X server or compositor needed,
+so the bridge helper and a headless run behave the same — then an EGL device,
+then the default display. `libEGL.so.1` is opened at run time; without it, or
+without a display that will make a context, `wglCreateContext` fails as it
+does on a machine with no GL driver, and `LoadLibrary("opengl32")` keeps
+answering absent.
+
+Every GL call crosses the calling-convention boundary, and where an argument
+travels depends on every argument before it, so each entry point needs its own
+wrapper. `tools/gen_gl_thunks.py` writes all 2974 of them into `gl_thunks.h`
+from the Khronos headers — the 336 that `opengl32.dll` exports are registered
+by name, the rest are reached through `wglGetProcAddress` — and the output is
+checked in, so building needs no GL headers. A function that takes a callback
+(`glDebugMessageCallback`) accepts it and does not pass it on: the host's GL
+would call a Windows-convention function with System V registers.
+
+Getting Helm to draw every time took three fixes elsewhere, all general:
+
+- **The posted-message queue dropped a message, and the render thread waited
+  for it for ever.** JUCE's render thread takes the message-thread lock before
+  each frame by posting a message and waiting for it to be handled. Helm posts
+  some 650 of JUCE's own while its editor opens, before anything drains them,
+  and the queue held 512 — the render thread's was the one dropped, one run in
+  three. Windows allows ten thousand per thread; so does this now. The queue
+  also gained a lock: any thread may post, and two at once overwrote each
+  other's slot.
+- **32-bit threads had no implicit TLS.** The 64-bit `teb_install` gives each
+  new thread its own copy of the DLL's TLS block; the i386 one only gave it to
+  the loading thread. The first plug-in thread to touch a `thread_local`, or an
+  MSVC function-local static whose guard lives there, read slot 0 of an empty
+  array.
+- **`IDWriteFontFace::GetGlyphRunOutline` was a placeholder.** JUCE builds every
+  glyph from it, and on i386 a placeholder cannot know how many bytes of
+  stdcall arguments to pop: the caller came back with its registers wrong and
+  faulted. It now walks FreeType's outline into the `ID2D1SimplifiedGeometrySink`
+  it is handed — which is also why Helm's keyboard has its octave labels.
+
 ## Building
 
 ```sh
@@ -1988,6 +2036,11 @@ the realistic case:
   A 64-bit plugin still runs in-process, so `TAL-U-No-62` still takes the host
   down. Routing those through the same helper would fix it, and the protocol
   already fits — it just needs a 64-bit build of the server side.
+- **BC Free Amp's editor.** It reads its whole skin, decodes its images and
+  makes its fonts, then registers no window class and creates no window, so
+  there is nothing to show. The one generic stub it reaches on the way is
+  `VCRUNTIME140!__intrinsic_setjmp`, which libpng's error handling sits on;
+  a real `setjmp`/`longjmp` in the MSVC layout is the first thing to try.
 - **CLAP (5 present) and LV2 (43 present) are not implemented.** CLAP is a clean
   C ABI and would be a small host; LV2 needs Turtle parsing, so it wants lilv.
 - **SEH.** `__try` regions work only insofar as nothing throws; real unwinding

@@ -43,6 +43,7 @@ typedef struct {
     int         editor_open;
     double      last_publish;      /* ms, CLOCK_MONOTONIC */
     double      last_idle;
+    double      spin_since;     /* first pump call since the main loop last ran */
 } server;
 
 static void audio_rt_priority(void)
@@ -289,13 +290,20 @@ static void on_pump_input(void *ud)
     /* Idle it too, rate-limited. A plugin spinning in its own loop still expects
      * the host's idle to come round -- that is where it repaints -- and without
      * it a drag arrives as one jump when the loop finally exits. Re-entrant into
-     * the plugin by construction, which is why `inside` guards it. */
+     * the plugin by construction, which is why `inside` guards it.
+     *
+     * But only once it is spinning: inside one call for 50 ms. Every plug-in
+     * asks for the cursor or the key state on its way through an ordinary
+     * handler, and idling it there ran its timers and its own posted messages
+     * in the middle of that handler -- JUCE's async callbacks inside its
+     * mouseDown, which ended the knob's gesture before the first move. */
     if (g_server->editor_open) {
         struct timespec now;
         double t;
         clock_gettime(CLOCK_MONOTONIC, &now);
         t = (double)now.tv_sec * 1e3 + (double)now.tv_nsec / 1e6;
-        if (t - g_server->last_idle > 12.0) {
+        if (g_server->spin_since <= 0.0) g_server->spin_since = t;
+        if (t - g_server->spin_since > 50.0 && t - g_server->last_idle > 12.0) {
             g_server->last_idle = t;
             pehost_editor_pump(g_server->h);
         }
@@ -520,6 +528,7 @@ int main(int argc, char **argv)
 
         pfd.fd = sock; pfd.events = POLLIN; pfd.revents = 0;
         if (poll(&pfd, 1, S.editor_open ? 4 : 500) < 0 && errno != EINTR) break;
+        S.spin_since = 0.0;                     /* back out here: nothing is spinning */
         drain_input(&S);
         if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR))) { publish_editor(&S); continue; }
         if (recv(sock, &q, sizeof q, MSG_WAITALL) != (ssize_t)sizeof q) break;

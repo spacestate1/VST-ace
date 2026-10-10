@@ -1267,6 +1267,12 @@ static MS int32_t st_GetVersionExW(void *p)
     }
     return 1;
 }
+/* ntdll's own spelling of the same question, and the one JUCE asks: without it
+ * SystemStats::getOperatingSystemType() answers "Unknown OS". RTL_OSVERSIONINFOW
+ * and its EX form are laid out exactly as OSVERSIONINFOW, so the answer is
+ * GetVersionExW's, as an NTSTATUS. */
+static MS int32_t st_RtlGetVersion(void *p)
+{ return st_GetVersionExW(p) ? 0 : (int32_t)0xC000000Du; /* STATUS_INVALID_PARAMETER */ }
 static MS void st_Sleep(uint32_t ms)
 { struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000L }; nanosleep(&t, NULL); }
 static MS int32_t st_SwitchToThread(void) { sched_yield(); return 1; }
@@ -1541,6 +1547,11 @@ static const char *const g_sysdlls[] = {
     /* Winsock's older name. Nothing is registered under it; the name search
      * that follows a miss finds ws2_32's, which is what it is a subset of. */
     "wsock32.dll",
+    /* Real when the host's GL is: gl_shim.h. Where there is none it answers
+     * absent instead -- see w32_lib_absent -- because a plug-in that finds
+     * OpenGL switches to it, and with nothing behind it that is a blank
+     * editor where the GDI fallback would have drawn. */
+    "opengl32.dll",
 };
 #define NSYSDLL   ((int)(sizeof g_sysdlls / sizeof *g_sysdlls))
 #define H_DLL(i)  ((void *)(uintptr_t)(0x5044u << 16 | (unsigned)(i)))   /* 'PD' */
@@ -1622,8 +1633,11 @@ static const char *const g_stockdlls[] = {
  * unknown DLL does. This is only about LoadLibrary. */
 static const char *const g_absentdlls[] = {
     "d2d1", "d3d9", "d3d10", "d3d11", "d3d12", "dxgi", "dcomp", "dxva2",
-    "opengl32", "glu32", "windowscodecs",
+    "glu32", "windowscodecs",
 };
+#ifndef PELOAD_NO_GUI_LAYER
+static int wgl_available(void);            /* gl_shim.h: is there a real GL? */
+#endif
 #define NABSENTDLL ((int)(sizeof g_absentdlls / sizeof *g_absentdlls))
 
 /* Is this one of them? Takes a name in any of the shapes LoadLibrary is given:
@@ -1643,6 +1657,16 @@ static int w32_lib_absent(const char *name)
     if (i > 4 && !strcmp(b + i - 4, ".dll")) b[i - 4] = 0;
     for (d = 0; d < NABSENTDLL; d++)
         if (!strcmp(b, g_absentdlls[d])) return 1;
+    /* OpenGL is here when the host's GL is: gl_shim.h draws it. It is absent
+     * on a machine with no EGL, where it would be the blank editor the list
+     * above exists to prevent. */
+    if (!strcmp(b, "opengl32")) {
+#ifndef PELOAD_NO_GUI_LAYER
+        return !wgl_available();
+#else
+        return 1;
+#endif
+    }
     return 0;
 }
 #define NSTOCKDLL  ((int)(sizeof g_stockdlls / sizeof *g_stockdlls))
@@ -1688,6 +1712,7 @@ static void *w32_lib_handle(const char *name)
 
     for (d = 0; d < NABSENTDLL; d++)
         if (!strcmp(b, g_absentdlls[d])) return NULL;
+    if (w32_lib_absent(b)) return NULL;          /* opengl32 with no GL behind it */
 
     for (d = 0; d < NSYSDLL; d++) {
         char cur[32];
@@ -2405,6 +2430,48 @@ static const char *peload_data_root(void);
  * points that take a path would not.
  *
  * Backslashes are converted first, so everything below sees one separator. */
+
+/* Windows paths ignore case and these do not. Spacer installs GUI/Primary/ and
+ * asks for GUI/primary/x1/bg.png -- all 404 of its images missed, and the
+ * editor opened black. So a path that does not exist as spelled has each
+ * component looked up case-insensitively, and the directory's own spelling
+ * written back. An ASCII case match is the same length, so this is in place.
+ * A component with no match ends the walk: the rest is a file being created,
+ * and it still gets its parents' real spelling. */
+static void path_fold_case(char *p)
+{
+    struct stat st;
+    char *s, *e;
+
+    if (!p || p[0] != '/' || !lstat(p, &st)) return;
+    for (s = p + 1; *s; s = e + 1) {
+        DIR *d;
+        struct dirent *de;
+        char save;
+        int found = 0;
+
+        e = strchr(s, '/');
+        if (!e) e = s + strlen(s);
+        if (e == s) { if (!*e) break; continue; }      /* "//" */
+        save = *e; *e = 0;
+        if (lstat(p, &st)) {
+            s[-1] = 0;                                  /* p is now the parent */
+            if ((d = opendir(p[0] ? p : "/"))) {
+                while ((de = readdir(d)))
+                    if (!strcasecmp(de->d_name, s) && strlen(de->d_name) == strlen(s)) {
+                        memcpy(s, de->d_name, strlen(s));
+                        found = 1;
+                        break;
+                    }
+                closedir(d);
+            }
+            s[-1] = '/';
+        } else found = 1;
+        *e = save;
+        if (!found || !save) break;
+    }
+}
+
 static char *path_norm_n(char *p, size_t n)
 {
     char *q;
@@ -2444,6 +2511,7 @@ static char *path_norm_n(char *p, size_t n)
             }
         }
     }
+    path_fold_case(p);
     return p;
 }
 static char *w2c_path(const uint16_t *w, char *out, size_t n)
@@ -3130,6 +3198,50 @@ static MS int32_t st_CopyFileW(const uint16_t *from, const uint16_t *to, int32_t
     w2c(to, b, sizeof b);
     return st_CopyFileA(a, b, fx);
 }
+/* Rename. JUCE saves every settings file as "write a temp file, then move it
+ * over the real one", so with this left to the generic stub Spacer's settings
+ * were written and never landed -- each run began from defaults and left a
+ * Spacer_temp*.settings behind.
+ *
+ * MOVEFILE_REPLACE_EXISTING (1) is the difference between MoveFile and a plain
+ * rename(): without it an existing target is an error, not a replacement.
+ * MOVEFILE_COPY_ALLOWED (2) lets it cross filesystems by copying. Delay until
+ * reboot (4) has no reboot to wait for; write-through (8) is what rename gives. */
+static MS int32_t st_MoveFileExA(const char *from, const char *to, uint32_t flags)
+{
+    char pf[1024], pt[1024];
+    if (!from) { g_last_error = 87; return 0; }
+    path_fix(from, pf, sizeof pf);
+    if (!to) {                                  /* delete-on-reboot spelling */
+        if (unlink(pf) == 0) return 1;
+        g_last_error = errno == ENOENT ? 2 : 5;
+        return 0;
+    }
+    path_fix(to, pt, sizeof pt);
+    if (access(pf, F_OK)) { g_last_error = 2; return 0; }   /* FILE_NOT_FOUND */
+    if (!(flags & 1) && access(pt, F_OK) == 0) { g_last_error = 183; return 0; }
+    if (rename(pf, pt) == 0) return 1;
+    if (errno == EXDEV && (flags & 2)) {
+        if (!st_CopyFileA(pf, pt, !(flags & 1))) return 0;
+        if (unlink(pf)) { g_last_error = 5; return 0; }
+        return 1;
+    }
+    g_last_error = errno == EXDEV ? 17 /* NOT_SAME_DEVICE */
+                 : errno == ENOENT ? 3 /* PATH_NOT_FOUND */ : 5;
+    return 0;
+}
+static MS int32_t st_MoveFileExW(const uint16_t *from, const uint16_t *to, uint32_t flags)
+{
+    char a[1024], b[1024];
+    if (!from) { g_last_error = 87; return 0; }
+    w2c(from, a, sizeof a);
+    if (to) w2c(to, b, sizeof b);
+    return st_MoveFileExA(a, to ? b : NULL, flags);
+}
+static MS int32_t st_MoveFileA(const char *from, const char *to)
+{ return st_MoveFileExA(from, to, 2); }            /* MoveFile may cross volumes */
+static MS int32_t st_MoveFileW(const uint16_t *from, const uint16_t *to)
+{ return st_MoveFileExW(from, to, 2); }
 static void w32_ft_from_time(time_t t, uint64_t *ft)
 { if (ft) *ft = (uint64_t)t * 10000000ULL + 116444736000000000ULL; }
 static MS int32_t st_GetFileTime(void *h, uint64_t *create, uint64_t *access_, uint64_t *write)
@@ -3153,8 +3265,9 @@ static MS uint32_t st_GetTempFileNameA(const char *dir, const char *prefix,
 {
     static uint32_t seq;
     uint32_t n = unique ? unique : (++seq | 0x1000);
+    char d[1024];
     if (!out) { g_last_error = 87; return 0; }
-    snprintf(out, 260, "%s/%.3s%04x.tmp", dir ? dir : "/tmp",
+    snprintf(out, 260, "%s/%.3s%04x.tmp", dir ? path_fix(dir, d, sizeof d) : "/tmp",
              prefix ? prefix : "tmp", n & 0xffff);
     if (!unique) { int fd = open(out, O_CREAT | O_EXCL | O_WRONLY, 0644);
                    if (fd >= 0) close(fd); }
@@ -4717,6 +4830,7 @@ static MS void st_CoUninitialize(void) { }
 #include "dwrite_shim.h"
 #include "gdiplus_shim.h"
 #include "d3d_shim.h"
+#include "gl_shim.h"
 #include "msvcp_shim.h"
 
 /* The last few stubs this corpus actually reaches.
@@ -8182,9 +8296,11 @@ static MS uint32_t st_GetGlyphIndicesA(void *hdc, const char *str, int32_t n,
  * actually asks for: the metrics of a glyph, and its coverage as an 8-bit
  * bitmap. FreeType has the face open and answers both exactly.
  *
- * GGO_NATIVE and GGO_BEZIER -- the outline itself, as TTPOLYGON structures --
- * are refused with GDI_ERROR, which is a documented answer a caller has a path
- * for. A half-built outline would not be.
+ * And the outline itself, GGO_NATIVE and GGO_BEZIER, as TTPOLYGONHEADER and
+ * TTPOLYCURVE records -- see w32_glyph_outline below. JUCE's WindowsTypeface
+ * builds every glyph of a font it loaded from memory out of GGO_NATIVE, so with
+ * these refused every live label, value and preset name in a JUCE 7 editor
+ * (Spacer's, for one) came out blank while the images around them drew.
  *
  * The units are Windows': bitmap rows padded to four bytes, and grey coverage
  * running 0 to 64 rather than 0 to 255. */
@@ -8196,26 +8312,207 @@ typedef struct {
     int16_t  cellIncX, cellIncY;
 } W32GLYPHMETRICS;
 
+/* Outline records, built as FreeType walks the glyph.
+ *
+ * TTPOLYGONHEADER is { DWORD cb; DWORD dwType = TT_POLYGON_TYPE; POINTFX start }
+ * and each TTPOLYCURVE after it is { WORD wType; WORD cpfx; POINTFX apfx[cpfx] },
+ * with POINTFX two 16.16 FIXEDs. One header per contour; cb covers the header
+ * and its curves. Consecutive lines share a record, as GDI's do. Coordinates are
+ * pixels at the selected size, y up from the baseline -- FreeType's 26.6, which
+ * is GDI's 16.16 shifted by ten.
+ *
+ * GGO_NATIVE is TrueType's own form, lines and quadratic splines; a cubic (a CFF
+ * font) is split into four quadratics. GGO_BEZIER is lines and cubics, so there
+ * a quadratic is raised to the cubic that draws the same curve. */
+enum { W32_TT_PRIM_LINE = 1, W32_TT_PRIM_QSPLINE = 2, W32_TT_PRIM_CSPLINE = 3,
+       W32_TT_POLYGON_TYPE = 24 };
+
+typedef struct {
+    uint8_t  *buf;          /* NULL while only measuring */
+    uint32_t  cap, len;
+    int       bezier;
+    uint32_t  poly;         /* offset of the open contour's header */
+    uint32_t  curve;        /* offset of the open curve record, or ~0 */
+    int       curve_type;
+    FT_Vector last;
+} w32_ggo;
+
+static void ggo_put32(w32_ggo *g, uint32_t at, int32_t v)
+{ if (g->buf && at + 4 <= g->cap) memcpy(g->buf + at, &v, 4); }
+static void ggo_put16(w32_ggo *g, uint32_t at, uint16_t v)
+{ if (g->buf && at + 2 <= g->cap) memcpy(g->buf + at, &v, 2); }
+static int32_t ggo_fx(FT_Pos v) { return (int32_t)(v * 1024); }   /* 26.6 -> 16.16 */
+
+static void ggo_close(w32_ggo *g)
+{
+    if (g->poly != ~0u) ggo_put32(g, g->poly, (int32_t)(g->len - g->poly));
+    g->poly = ~0u;
+    g->curve = ~0u;
+}
+static void ggo_point(w32_ggo *g, const FT_Vector *p)
+{
+    ggo_put32(g, g->len, ggo_fx(p->x));
+    ggo_put32(g, g->len + 4, ggo_fx(p->y));
+    g->len += 8;
+    if (g->curve != ~0u) {
+        uint16_t n = 0;
+        if (g->buf && g->curve + 4 <= g->cap) memcpy(&n, g->buf + g->curve + 2, 2);
+        ggo_put16(g, g->curve + 2, (uint16_t)(n + 1));
+    }
+}
+/* A new curve record; lines append to an open line record instead. */
+static void ggo_curve(w32_ggo *g, int type)
+{
+    if (type == W32_TT_PRIM_LINE && g->curve != ~0u &&
+        g->curve_type == W32_TT_PRIM_LINE) return;
+    g->curve = g->len;
+    g->curve_type = type;
+    ggo_put16(g, g->len, (uint16_t)type);
+    ggo_put16(g, g->len + 2, 0);
+    g->len += 4;
+}
+static int ggo_move(const FT_Vector *to, void *u)
+{
+    w32_ggo *g = u;
+    ggo_close(g);
+    g->poly = g->len;
+    ggo_put32(g, g->len, 0);                         /* cb, filled on close */
+    ggo_put32(g, g->len + 4, W32_TT_POLYGON_TYPE);
+    ggo_put32(g, g->len + 8, ggo_fx(to->x));
+    ggo_put32(g, g->len + 12, ggo_fx(to->y));
+    g->len += 16;
+    g->last = *to;
+    return 0;
+}
+static int ggo_line(const FT_Vector *to, void *u)
+{
+    w32_ggo *g = u;
+    ggo_curve(g, W32_TT_PRIM_LINE);
+    ggo_point(g, to);
+    g->last = *to;
+    return 0;
+}
+static int ggo_conic(const FT_Vector *c, const FT_Vector *to, void *u)
+{
+    w32_ggo *g = u;
+    if (g->bezier) {                    /* the cubic through the same curve */
+        FT_Vector c1 = { g->last.x + 2 * (c->x - g->last.x) / 3,
+                         g->last.y + 2 * (c->y - g->last.y) / 3 };
+        FT_Vector c2 = { to->x + 2 * (c->x - to->x) / 3,
+                         to->y + 2 * (c->y - to->y) / 3 };
+        ggo_curve(g, W32_TT_PRIM_CSPLINE);
+        ggo_point(g, &c1); ggo_point(g, &c2); ggo_point(g, to);
+    } else {
+        ggo_curve(g, W32_TT_PRIM_QSPLINE);
+        ggo_point(g, c); ggo_point(g, to);
+    }
+    g->last = *to;
+    return 0;
+}
+static int ggo_cubic(const FT_Vector *c1, const FT_Vector *c2,
+                     const FT_Vector *to, void *u)
+{
+    w32_ggo *g = u;
+    int k;
+    if (g->bezier) {
+        ggo_curve(g, W32_TT_PRIM_CSPLINE);
+        ggo_point(g, c1); ggo_point(g, c2); ggo_point(g, to);
+        g->last = *to;
+        return 0;
+    }
+    /* Four pieces, each the quadratic whose control point is the midpoint
+     * estimate (3(q1 + q2) - q0 - q3) / 4 of that piece's cubic. */
+    for (k = 1; k <= 4; k++) {
+        double t0 = (k - 1) / 4.0, t1 = k / 4.0, tm = (t0 + t1) / 2;
+        FT_Vector q, e;
+        double p0x = g->last.x, p0y = g->last.y;
+        #define CB(t, a, b, c, d) ((1-(t))*(1-(t))*(1-(t))*(a) + 3*(1-(t))*(1-(t))*(t)*(b) \
+                                   + 3*(1-(t))*(t)*(t)*(c) + (t)*(t)*(t)*(d))
+        double sx = CB(t0, p0x, c1->x, c2->x, to->x), sy = CB(t0, p0y, c1->y, c2->y, to->y);
+        double ex = CB(t1, p0x, c1->x, c2->x, to->x), ey = CB(t1, p0y, c1->y, c2->y, to->y);
+        double mx = CB(tm, p0x, c1->x, c2->x, to->x), my = CB(tm, p0y, c1->y, c2->y, to->y);
+        #undef CB
+        /* The quadratic through start, end and the cubic's midpoint. */
+        q.x = (FT_Pos)(2 * mx - (sx + ex) / 2);
+        q.y = (FT_Pos)(2 * my - (sy + ey) / 2);
+        e.x = (FT_Pos)ex; e.y = (FT_Pos)ey;
+        if (k == 4) e = *to;
+        ggo_curve(g, W32_TT_PRIM_QSPLINE);
+        ggo_point(g, &q); ggo_point(g, &e);
+    }
+    g->last = *to;
+    return 0;
+}
+
+/* Walk the glyph in the slot into `out` (or only measure it when out is NULL).
+ * Returns the bytes the records take. */
+static uint32_t w32_glyph_outline(FT_Outline *ol, int bezier, uint8_t *out, uint32_t cap)
+{
+    static const FT_Outline_Funcs fn = {
+        ggo_move, ggo_line, ggo_conic, ggo_cubic, 0, 0
+    };
+    w32_ggo g;
+    memset(&g, 0, sizeof g);
+    g.buf = out; g.cap = out ? cap : 0; g.bezier = bezier;
+    g.poly = g.curve = ~0u;
+    if (FT_Outline_Decompose(ol, &fn, &g)) return 0;
+    ggo_close(&g);
+    return g.len;
+}
+
 static MS uint32_t st_GetGlyphOutlineW(void *hdc, uint32_t ch, uint32_t format,
                                        W32GLYPHMETRICS *gm, uint32_t bufsize,
                                        void *buf, const void *mat2)
 {
-    enum { GGO_METRICS = 0, GGO_BITMAP = 1, GGO_GRAY8_BITMAP = 6,
-           GGO_GLYPH_INDEX = 0x80 };
+    enum { GGO_METRICS = 0, GGO_BITMAP = 1, GGO_NATIVE = 2, GGO_BEZIER = 3,
+           GGO_GRAY8_BITMAP = 6, GGO_GLYPH_INDEX = 0x80 };
     FT_Face face = dw_ftface();
     uint32_t fmt = format & ~(uint32_t)(GGO_GLYPH_INDEX | 0x100 /* UNHINTED */);
+    int outline = fmt == GGO_NATIVE || fmt == GGO_BEZIER;
+    FT_Int32 load = outline ? (FT_LOAD_NO_BITMAP | FT_LOAD_NO_HINTING) : FT_LOAD_RENDER;
     FT_GlyphSlot sl;
     uint32_t pitch, need, row, col;
-    (void)mat2;
 
     if (!face) return W32_GDI_ERROR;
     FT_Set_Pixel_Sizes(face, 0, (FT_UInt)w32_font_px(w32_dcget(hdc)));
     if (format & GGO_GLYPH_INDEX) {
-        if (FT_Load_Glyph(face, (FT_UInt)ch, FT_LOAD_RENDER)) return W32_GDI_ERROR;
+        if (FT_Load_Glyph(face, (FT_UInt)ch, load)) return W32_GDI_ERROR;
     } else {
-        if (FT_Load_Char(face, (FT_ULong)ch, FT_LOAD_RENDER)) return W32_GDI_ERROR;
+        if (FT_Load_Char(face, (FT_ULong)ch, load)) return W32_GDI_ERROR;
     }
     sl = face->glyph;
+
+    if (outline) {
+        FT_BBox bb;
+        if (sl->format != FT_GLYPH_FORMAT_OUTLINE) return W32_GDI_ERROR;
+        /* MAT2 is four 16.16 FIXEDs, eM11 eM12 eM21 eM22, with x' = eM11 x +
+         * eM21 y and y' = eM12 x + eM22 y. Callers pass the identity; anything
+         * else is applied rather than ignored. */
+        if (mat2) {
+            int32_t m[4];
+            memcpy(m, mat2, sizeof m);
+            if (m[0] != 0x10000 || m[1] || m[2] || m[3] != 0x10000) {
+                FT_Matrix fm = { m[0], m[2], m[1], m[3] };
+                FT_Outline_Transform(&sl->outline, &fm);
+            }
+        }
+        FT_Outline_Get_CBox(&sl->outline, &bb);
+        if (gm) {
+            gm->blackBoxX = (uint32_t)((bb.xMax - bb.xMin + 63) >> 6);
+            gm->blackBoxY = (uint32_t)((bb.yMax - bb.yMin + 63) >> 6);
+            gm->originX = (int32_t)(bb.xMin >> 6);
+            gm->originY = (int32_t)((bb.yMax + 63) >> 6);
+            gm->cellIncX = (int16_t)((sl->advance.x + 32) >> 6);
+            gm->cellIncY = (int16_t)((sl->advance.y + 32) >> 6);
+        }
+        need = w32_glyph_outline(&sl->outline, fmt == GGO_BEZIER, NULL, 0);
+        PLOG("  [font] GetGlyphOutline(%#x, %s) -> %u bytes, advance %d\n", ch,
+             fmt == GGO_BEZIER ? "bezier" : "native", need, (int)(sl->advance.x >> 6));
+        if (!need) return 0;                 /* a space has no outline */
+        if (!buf || !bufsize) return need;
+        if (bufsize < need) { g_last_error = 122; return W32_GDI_ERROR; }
+        return w32_glyph_outline(&sl->outline, fmt == GGO_BEZIER, buf, bufsize);
+    }
 
     if (gm) {
         gm->blackBoxX = sl->bitmap.width;
@@ -8227,7 +8524,7 @@ static MS uint32_t st_GetGlyphOutlineW(void *hdc, uint32_t ch, uint32_t format,
     }
     if (fmt == GGO_METRICS) return 0;
     if (fmt != GGO_BITMAP && fmt != GGO_GRAY8_BITMAP) {
-        W32_APPROX();                        /* the outline formats: not served */
+        W32_APPROX();                        /* GGO_GRAY2/4: not served */
         return W32_GDI_ERROR;
     }
 
@@ -8938,10 +9235,16 @@ static const char *shell_folder(int32_t csidl)
     case 0x05: leaf = "Documents";        break;   /* CSIDL_PERSONAL */
     case 0x0D: leaf = "Music";            break;   /* CSIDL_MYMUSIC */
     case 0x26: case 0x2A: leaf = "Program Files"; break;
+    case 0x2B: leaf = "Program Files/Common Files"; break;  /* CSIDL_PROGRAM_FILES_COMMON */
+    /* CSIDL_COMMON_DOCUMENTS, where WiX installers put shared patch banks
+     * (Helm's are in Public\Documents\Helm); it fell to the default and the
+     * plug-in looked for them in AppData. */
+    case 0x2E: leaf = "Public/Documents"; break;
+    case 0x28: leaf = "";               break;   /* CSIDL_PROFILE */
     case 0x00: case 0x10: leaf = "Desktop"; break;
     default:   leaf = "AppData/Roaming";  break;
     }
-    snprintf(buf, sizeof buf, "%s/.peload/%s", home, leaf);
+    snprintf(buf, sizeof buf, "%s/.peload%s%s", home, *leaf ? "/" : "", leaf);
     {   /* mkdir -p, component by component */
         char t[512]; size_t i;
         snprintf(t, sizeof t, "%s", buf);
@@ -12255,6 +12558,20 @@ static const winstub g_stubs[] = {
      * plug-in imports it -- there is no name in the import table to match. */
     { "d2d1.dll", "ordinal#1", (void *)st_D2D1CreateFactory },
     { "d2d1.dll", "D2D1CreateFactory", (void *)st_D2D1CreateFactory },
+    /* OpenGL: gl_shim.h's WGL and pixel formats, then gl_thunks.h's 336
+     * OpenGL 1.1 exports. */
+    S("opengl32.dll", wglCreateContext), S("opengl32.dll", wglCreateLayerContext),
+    S("opengl32.dll", wglDeleteContext), S("opengl32.dll", wglShareLists),
+    S("opengl32.dll", wglCopyContext), S("opengl32.dll", wglMakeCurrent),
+    S("opengl32.dll", wglGetCurrentContext), S("opengl32.dll", wglGetCurrentDC),
+    S("opengl32.dll", wglGetProcAddress), S("opengl32.dll", wglSwapBuffers),
+    S("opengl32.dll", wglSwapLayerBuffers), S("opengl32.dll", wglChoosePixelFormat),
+    S("opengl32.dll", wglDescribePixelFormat), S("opengl32.dll", wglSetPixelFormat),
+    S("opengl32.dll", wglGetPixelFormat), S("opengl32.dll", wglUseFontBitmapsA),
+    S("opengl32.dll", wglUseFontBitmapsW), S("gdi32.dll", SwapBuffers),
+    S("gdi32.dll", ChoosePixelFormat), S("gdi32.dll", DescribePixelFormat),
+    S("gdi32.dll", SetPixelFormat), S("gdi32.dll", GetPixelFormat),
+    GLT_STUB_ENTRIES
 #endif
     S("gdi32.dll", GetDeviceCaps),
     S("gdi32.dll", SetDIBitsToDevice), S("gdi32.dll", GetClipBox),
@@ -12414,6 +12731,8 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", MulDiv), S("kernel32.dll", lstrlenW), S("kernel32.dll", lstrcmpW),
     S("kernel32.dll", lstrcmpiW), S("kernel32.dll", ConvertDefaultLocale),
     S("kernel32.dll", CopyFileA), S("kernel32.dll", CopyFileW),
+    S("kernel32.dll", MoveFileA), S("kernel32.dll", MoveFileW),
+    S("kernel32.dll", MoveFileExA), S("kernel32.dll", MoveFileExW),
     S("kernel32.dll", GetFileTime), S("kernel32.dll", SetFileTime),
     S("kernel32.dll", GetTempFileNameA), S("kernel32.dll", SearchPathA),
     S("kernel32.dll", GetDiskFreeSpaceExA), S("kernel32.dll", CreatePipe),
@@ -12770,6 +13089,7 @@ static const winstub g_stubs[] = {
 #if defined(__i386__)
     S("kernel32.dll", RtlUnwind), S("ntdll.dll", RtlUnwind),
 #endif
+    S("ntdll.dll", RtlGetVersion),
     /* files */
     S("kernel32.dll", CreateFileA), S("kernel32.dll", ReadFile),
     S("kernel32.dll", WriteFile), S("kernel32.dll", CloseHandle),
@@ -12837,6 +13157,7 @@ static const winstub g_stubs[] = {
     S("user32.dll", CallWindowProcA), S("user32.dll", CallWindowProcW),
     S("user32.dll", RegisterWindowMessageA), S("user32.dll", RegisterWindowMessageW),
     S("user32.dll", GetMessageExtraInfo),
+    S("user32.dll", GetMessageTime), S("user32.dll", GetMessagePos),
     /* user32: painting */
     S("user32.dll", BeginPaint), S("user32.dll", EndPaint),
     S("user32.dll", GetDC), S("user32.dll", GetWindowDC), S("user32.dll", ReleaseDC),

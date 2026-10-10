@@ -122,7 +122,48 @@ static int pe_verbose(void)
 #define TEB_STACK_LIMIT_32 0x08 /* NtTib.StackLimit         */
 #define TEB_SELF_32     0x18    /* NtTib.Self               */
 #define TEB_TLS_PTR_32  0x2C    /* ThreadLocalStoragePointer */
+#define TEB_PEB_32      0x30    /* ProcessEnvironmentBlock  */
 #define TLS_SLOTS 128
+
+/* One PEB for the process, as the 64-bit host has (pehost.c says why: the CRT
+ * reads it straight off the TEB, and a NULL there is a fault at 0x10 on the
+ * first thread that asks). The i386 offsets, filled to agree with
+ * GetVersionEx and GetSystemInfo. */
+#define PEB32_SIZE               0x1000
+#define PEB32_PROCESS_PARAMETERS 0x10
+#define PEB32_PROCESS_HEAP       0x18
+#define PEB32_NUM_PROCESSORS     0x64
+#define PEB32_OS_MAJOR           0xA4
+#define PEB32_OS_MINOR           0xA8
+#define PEB32_OS_BUILD           0xAC   /* WORD */
+#define PEB32_OS_PLATFORM        0xB0
+#define PARAMS32_SIZE            0x300  /* RTL_USER_PROCESS_PARAMETERS, all empty */
+
+static uint8_t *g_peb32;
+
+static void peb32_init(void)
+{
+    uint8_t *p = calloc(1, PEB32_SIZE), *pp = calloc(1, PARAMS32_SIZE);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (!p || !pp) { free(p); free(pp); return; }
+    *(uint32_t *)(pp + 0) = PARAMS32_SIZE;                 /* MaximumLength */
+    *(uint32_t *)(pp + 4) = PARAMS32_SIZE;                 /* Length */
+    *(uint32_t *)(p + PEB32_PROCESS_PARAMETERS) = (uint32_t)(uintptr_t)pp;
+    *(uint32_t *)(p + PEB32_PROCESS_HEAP) = 0x48454150u;   /* = GetProcessHeap */
+    *(uint32_t *)(p + PEB32_NUM_PROCESSORS) = (uint32_t)(n > 0 ? n : 1);
+    *(uint32_t *)(p + PEB32_OS_MAJOR) = 10;
+    *(uint32_t *)(p + PEB32_OS_MINOR) = 0;
+    *(uint16_t *)(p + PEB32_OS_BUILD) = 19045;
+    *(uint32_t *)(p + PEB32_OS_PLATFORM) = 2;              /* VER_PLATFORM_WIN32_NT */
+    g_peb32 = p;
+}
+
+static uint8_t *peb32_get(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, peb32_init);
+    return g_peb32;
+}
 
 typedef struct {
     uint8_t *raw;
@@ -137,6 +178,8 @@ static __thread teb32 *g_teb;
  * handed out twice and there is nothing to clear. */
 static void teb_clear_slot(uint32_t i) { (void)i; }
 static void teb_clear_all_slots(void) { }
+
+static void tls_bind_current_thread(void);          /* below, with the image */
 
 static int teb_install(void)
 {
@@ -153,6 +196,7 @@ static int teb_install(void)
     memset(t->raw, 0, TEB_SIZE);
     *(uint32_t *)(t->raw + TEB_SELF_32)    = (uint32_t)(uintptr_t)t->raw;
     *(uint32_t *)(t->raw + TEB_TLS_PTR_32) = (uint32_t)(uintptr_t)t->slots;
+    *(uint32_t *)(t->raw + TEB_PEB_32)     = (uint32_t)(uintptr_t)peb32_get();
     /* An empty SEH chain is terminated by -1, not 0: an MSVC __try prologue
      * pushes the old fs:[0] and a 0 there reads as a valid record at address 0.
      * StackBase/StackLimit matter too -- __chkstk walks toward the limit when a
@@ -212,6 +256,12 @@ static int teb_install(void)
     g_teb = t;
     PLOG("teb: fs base %p via set_thread_area entry %d\n",
          (void *)t->raw, d.entry_number);
+    /* The DLL's implicit TLS block, a copy per thread, as the 64-bit loader
+     * does. Only the loading thread used to get one, so the first thread a
+     * plug-in started that touched a thread_local -- or an MSVC function-local
+     * static, whose guard lives there -- read slot 0 of an empty array:
+     * Helm's OpenGL thread, at its first frame. */
+    tls_bind_current_thread();
     return 0;
 }
 

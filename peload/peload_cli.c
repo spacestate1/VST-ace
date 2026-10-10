@@ -93,6 +93,9 @@ static struct {
     pehost *h;
     int     x0, y0, x1, y1;
     int     step, steps, released;
+    int     pressed;          /* the sweep only moves while the button is down */
+    int     in_press;         /* inside the WM_LBUTTONDOWN dispatch itself */
+    int     press_polls;      /* pump calls made from inside it */
     float   seen[512];        /* the value at each step, to prove it tracked */
     int     nseen, watch, nparam;
     float   base[MAX_WATCH_PARAMS];   /* values before the press, to spot the one moving */
@@ -103,7 +106,21 @@ static void drag_pump(void *ud)
     int x, y;
 
     (void)ud;
-    if (!g_drag.h) return;
+    /* Not before the press. The pump runs whenever the plug-in asks where the
+     * pointer is, and a JUCE editor asks on the hover move that precedes the
+     * press -- the whole sweep and the release played out there, the press
+     * arrived after it all, and a working knob was reported as "nothing
+     * moved". A hand does not sweep before it has pressed. */
+    if (!g_drag.h || !g_drag.pressed) return;
+    /* Inside the press itself, only once the plug-in is plainly polling. A
+     * tracking loop asks where the pointer is over and over; a JUCE mouseDown
+     * asks once or twice on its way through, and answering that with the whole
+     * sweep delivered 60 nested moves before mouseDown had set up the drag --
+     * the knob then settled back where the press had put it. JUCE alone asks
+     * four times (its realtime modifiers read GetAsyncKeyState per button), so
+     * the line is well above that and far below the hundreds a loop makes.
+     * Below it the press returns, and the sweep is delivered as messages. */
+    if (g_drag.in_press && ++g_drag.press_polls < 32) return;
     if (g_drag.step >= g_drag.steps) {
         /* The gesture ends here, inside the plug-in's own loop, because that is
          * the only place it can: the loop spins until the button comes up, so a
@@ -802,6 +819,21 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
             pehost_editor_pump(h);
             usleep(16000);
         }
+        /* And longer while there is still nothing to see. An OpenGL editor
+         * draws from a render thread of its own, which can take most of a
+         * second to start; photographing the black window before its first
+         * frame read as an editor that does not draw. Three seconds more at
+         * most, and only while the window is one flat colour. */
+        for (frame = 0; frame < 190; frame++) {
+            const unsigned int *fp = NULL;
+            int fw = 0, fh = 0, k, flat = 1;
+            if (pehost_editor_pixels(h, &fp, &fw, &fh) && fp && fw > 0 && fh > 0)
+                for (k = 1; k < fw * fh; k++)
+                    if ((fp[k] ^ fp[0]) & 0x00FFFFFFu) { flat = 0; break; }
+            if (!flat) break;
+            pehost_editor_pump(h);
+            usleep(16000);
+        }
         /* Then any clicks asked for. An editor whose controls only appear once
          * a tab is selected, or a page turned, cannot be photographed without
          * being touched first -- and doing it here means the picture can be
@@ -878,6 +910,7 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
             g_drag.x1 = o->drag[2]; g_drag.y1 = o->drag[3];
             g_drag.step = 0; g_drag.steps = 60; g_drag.nseen = 0; g_drag.watch = -1;
             g_drag.released = 0;
+            g_drag.pressed = 0;
             g_drag.nparam = np < MAX_WATCH_PARAMS ? np : MAX_WATCH_PARAMS;
             for (pi = 0; pi < g_drag.nparam; pi++) g_drag.base[pi] = before[pi];
 
@@ -888,7 +921,17 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
              * be known before the press -- and the press does not return until
              * the plug-in's loop has run the whole gesture. */
             g_drag.watch = -1;
+            g_drag.pressed = 1;
+            g_drag.in_press = 1;
+            g_drag.press_polls = 0;
             pehost_editor_mouse(h, o->drag[0], o->drag[1], WM_LBUTTONDOWN, 1, 0);
+            g_drag.in_press = 0;
+            /* A press that came back without polling belongs to an editor that
+             * is driven by messages. From here the sweep is delivered as move
+             * messages below, and the pump stays out of it: answering the
+             * GetCursorPos a JUCE editor makes on each move with a step of the
+             * pump's own sweep interleaved two sweeps, one going backwards. */
+            if (g_drag.press_polls < 32 && g_drag.step == 0) g_drag.pressed = 0;
             for (pi = 0; pi < np && pi < MAX_WATCH_PARAMS; pi++)
                 if (fabs(pehost_get_param(h, pi) - before[pi]) > 1e-6) {
                     g_drag.watch = pi; break;
@@ -913,7 +956,10 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
                     pehost_editor_mouse(h, mx, my, WM_MOUSEMOVE, 1, 0);
                     if (g_drag.watch >= 0)
                         g_drag.seen[swept - 1] = pehost_get_param(h, g_drag.watch);
-                    usleep(4000);
+                    /* A window system runs the application between pointer
+                     * events -- its timers, its posted messages, its paints. */
+                    pehost_editor_pump(h);
+                    usleep(16000);
                 }
                 swept = SWEEP_STEPS;
             }

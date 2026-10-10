@@ -24,10 +24,13 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_OUTLINE_H
+#include FT_TRUETYPE_TABLES_H
 
 #define DW_E_NOTIMPL   ((int32_t)0x80004001)
 #define DW_E_NOINTERFACE ((int32_t)0x80004002)
 #define DW_S_OK        ((int32_t)0)
+#define DW_E_INVALIDARG ((int32_t)0x80070057)
 
 /* Slot counts including the three IUnknown entries. Over-allocating is safe --
  * an unused slot is simply never called -- and under-allocating would let a
@@ -1173,6 +1176,33 @@ static MS void dwfa_GetMetrics(void *self, void *out)
      * plugin then killed itself with __fastfail on the way out of the function
      * that asked for the metrics. */
     memset(m, 0, DWRITE_FONT_METRICS_SIZE);
+    /* From the face the glyphs are drawn with, when there is one. Without a
+     * font of the plug-in's own, the tables above are not there and every
+     * field fell back to a nominal 1000-unit em -- while the glyph metrics
+     * and outlines came from the real face, DejaVu at 2048. Text laid out
+     * from the two together came out at double letter spacing. */
+    {
+        FT_Face f = dw_ftface();
+        if (f && f->units_per_EM) {
+            TT_OS2 *os2 = (TT_OS2 *)FT_Get_Sfnt_Table(f, FT_SFNT_OS2);
+            int asc = f->ascender, desc = -f->descender;
+            int gap = f->height - asc - desc;
+            int em = f->units_per_EM;
+            *(uint16_t *)(m + 0)  = (uint16_t)em;
+            *(uint16_t *)(m + 2)  = (uint16_t)asc;
+            *(uint16_t *)(m + 4)  = (uint16_t)desc;
+            *(int16_t *)(m + 6)   = (int16_t)(gap > 0 ? gap : 0);
+            *(uint16_t *)(m + 8)  = (uint16_t)(os2 && os2->version >= 2 && os2->sCapHeight
+                                               ? os2->sCapHeight : em * 7 / 10);
+            *(uint16_t *)(m + 10) = (uint16_t)(os2 && os2->version >= 2 && os2->sxHeight
+                                               ? os2->sxHeight : em / 2);
+            *(int16_t *)(m + 12)  = (int16_t)(f->underline_position ? f->underline_position : -em / 10);
+            *(int16_t *)(m + 14)  = (int16_t)(f->underline_thickness ? f->underline_thickness : em / 20);
+            *(int16_t *)(m + 16)  = (int16_t)(os2 && os2->yStrikeoutPosition ? os2->yStrikeoutPosition : em / 3);
+            *(int16_t *)(m + 18)  = (int16_t)(os2 && os2->yStrikeoutSize ? os2->yStrikeoutSize : em / 20);
+            return;
+        }
+    }
     *(uint16_t *)(m + 0) = upem;                                   /* designUnitsPerEm */
     *(uint16_t *)(m + 2) = (hhea && sz >= 10) ? (uint16_t)be16(hhea + 4) : (uint16_t)(upem * 8 / 10);
     *(uint16_t *)(m + 4) = (hhea && sz >= 10) ? (uint16_t)(-(int16_t)be16(hhea + 6)) : (uint16_t)(upem / 5);
@@ -1338,6 +1368,156 @@ static MS int32_t dwfa_GetFiles(void *self, uint32_t *count, void **files)
     return DW_S_OK;
 }
 
+/* IDWriteFontFace::GetGlyphRunOutline: the glyphs of a run as paths, handed to
+ * an IDWriteGeometrySink -- which is ID2D1SimplifiedGeometrySink. JUCE's
+ * DirectWrite typeface builds every glyph it draws from this, and the OpenGL
+ * renderer draws nothing but those paths.
+ *
+ * Unimplemented it was worse than missing text on i386: a placeholder slot
+ * cannot know how many bytes of arguments to pop under stdcall, so the call
+ * returned with the stack and the caller's registers wrong, and Helm's 32-bit
+ * editor faulted in the code after it.
+ *
+ * DirectWrite's outline has y pointing down with the baseline at 0, in DIPs at
+ * emSize; FreeType's is y up in font units. Quadratic segments become cubic
+ * ones, the only curve the sink takes. */
+typedef struct { float x, y; } dw_pt2f;
+typedef struct { dw_pt2f a, b, c; } dw_bez;
+typedef MS void (*dw_sink_fill_fn)(void *, int32_t);
+typedef MS void (*dw_sink_begin_fn)(void *, dw_pt2f, int32_t);
+typedef MS void (*dw_sink_lines_fn)(void *, const dw_pt2f *, uint32_t);
+typedef MS void (*dw_sink_bez_fn)(void *, const dw_bez *, uint32_t);
+typedef MS void (*dw_sink_end_fn)(void *, int32_t);
+
+typedef struct {
+    void *sink;
+    void **vt;
+    double ox, oy, sc;
+    dw_pt2f cur;
+    int open;
+} dw_outline_ctx;
+
+static dw_pt2f dw_ol_pt(dw_outline_ctx *c, const FT_Vector *v)
+{
+    dw_pt2f p;
+    p.x = (float)(c->ox + (double)v->x * c->sc);
+    p.y = (float)(c->oy - (double)v->y * c->sc);
+    return p;
+}
+static int dw_ol_move(const FT_Vector *to, void *u)
+{
+    dw_outline_ctx *c = u;
+    if (c->open) ((dw_sink_end_fn)c->vt[8])(c->sink, 1);          /* D2D1_FIGURE_END_CLOSED */
+    c->cur = dw_ol_pt(c, to);
+    ((dw_sink_begin_fn)c->vt[5])(c->sink, c->cur, 0);             /* D2D1_FIGURE_BEGIN_FILLED */
+    c->open = 1;
+    return 0;
+}
+static int dw_ol_line(const FT_Vector *to, void *u)
+{
+    dw_outline_ctx *c = u;
+    c->cur = dw_ol_pt(c, to);
+    ((dw_sink_lines_fn)c->vt[6])(c->sink, &c->cur, 1);
+    return 0;
+}
+static int dw_ol_cubic(const FT_Vector *c1, const FT_Vector *c2, const FT_Vector *to, void *u)
+{
+    dw_outline_ctx *c = u;
+    dw_bez b;
+    b.a = dw_ol_pt(c, c1);
+    b.b = dw_ol_pt(c, c2);
+    b.c = dw_ol_pt(c, to);
+    ((dw_sink_bez_fn)c->vt[7])(c->sink, &b, 1);
+    c->cur = b.c;
+    return 0;
+}
+static int dw_ol_conic(const FT_Vector *ctl, const FT_Vector *to, void *u)
+{
+    dw_outline_ctx *c = u;
+    dw_pt2f q = dw_ol_pt(c, ctl), e = dw_ol_pt(c, to);
+    dw_bez b;
+    b.a.x = c->cur.x + 2.0f / 3.0f * (q.x - c->cur.x);
+    b.a.y = c->cur.y + 2.0f / 3.0f * (q.y - c->cur.y);
+    b.b.x = e.x + 2.0f / 3.0f * (q.x - e.x);
+    b.b.y = e.y + 2.0f / 3.0f * (q.y - e.y);
+    b.c = e;
+    ((dw_sink_bez_fn)c->vt[7])(c->sink, &b, 1);
+    c->cur = e;
+    return 0;
+}
+
+static MS int32_t dwfa_GetGlyphRunOutline(void *self, float em, const uint16_t *glyphs,
+                                          const float *advances, const float *offsets,
+                                          uint32_t count, int32_t sideways, int32_t rtl,
+                                          void *sink)
+{
+    static const FT_Outline_Funcs fn = {
+        dw_ol_move, dw_ol_line, dw_ol_conic, dw_ol_cubic, 0, 0
+    };
+    FT_Face f = dw_ftface();
+    dw_outline_ctx c;
+    double pen = 0.0;
+    uint32_t i;
+
+    (void)self; (void)sideways;
+    if (!sink || !*(void ***)sink) return DW_E_INVALIDARG;
+    if (!glyphs && count) return DW_E_INVALIDARG;
+    memset(&c, 0, sizeof c);
+    c.sink = sink;
+    c.vt = *(void ***)sink;
+    ((dw_sink_fill_fn)c.vt[3])(sink, 1);                            /* D2D1_FILL_MODE_WINDING */
+    if (!f || !f->units_per_EM) return DW_S_OK;
+    c.sc = (double)em / f->units_per_EM;
+    for (i = 0; i < count; i++) {
+        double adv;
+        if (FT_Load_Glyph(f, glyphs[i], FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP))
+            continue;
+        adv = advances ? (double)advances[i] : (double)f->glyph->metrics.horiAdvance * c.sc;
+        if (rtl) pen -= adv;
+        c.ox = pen + (offsets ? (double)offsets[2 * i] * (rtl ? -1.0 : 1.0) : 0.0);
+        c.oy = offsets ? -(double)offsets[2 * i + 1] : 0.0;
+        if (f->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+            c.open = 0;
+            FT_Outline_Decompose(&f->glyph->outline, &fn, &c);
+            if (c.open) ((dw_sink_end_fn)c.vt[8])(sink, 1);
+        }
+        if (!rtl) pen += adv;
+    }
+    return DW_S_OK;
+}
+
+/* IDWriteFontFace::GetRecommendedRenderingMode(emSize, pixelsPerDip,
+ * measuringMode, renderingParams, DWRITE_RENDERING_MODE*). Symmetric
+ * anti-aliasing, which is what DirectWrite picks for text at editor sizes. */
+static MS int32_t dwfa_GetRecommendedRenderingMode(void *self, float em, float ppd,
+                                                   uint32_t mm, void *params, uint32_t *mode)
+{
+    (void)self; (void)em; (void)ppd; (void)mm; (void)params;
+    if (!mode) return DW_E_INVALIDARG;
+    *mode = 5;                                    /* DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC */
+    return DW_S_OK;
+}
+/* GetGdiCompatibleMetrics(emSize, pixelsPerDip, transform, DWRITE_FONT_METRICS*):
+ * the design metrics; nothing here hints. */
+static MS int32_t dwfa_GetGdiCompatibleMetrics(void *self, float em, float ppd,
+                                               const void *xf, void *out)
+{
+    (void)em; (void)ppd; (void)xf;
+    if (!out) return DW_E_INVALIDARG;
+    dwfa_GetMetrics(self, out);
+    return DW_S_OK;
+}
+/* GetGdiCompatibleGlyphMetrics(emSize, pixelsPerDip, transform, useGdiNatural,
+ * glyphs, count, DWRITE_GLYPH_METRICS*, sideways): the design metrics again. */
+static MS int32_t dwfa_GetGdiCompatibleGlyphMetrics(void *self, float em, float ppd,
+                                                    const void *xf, int32_t natural,
+                                                    const uint16_t *glyphs, uint32_t count,
+                                                    void *metrics, int32_t sideways)
+{
+    (void)em; (void)ppd; (void)xf; (void)natural;
+    return dwfa_GetDesignGlyphMetrics(self, glyphs, count, metrics, sideways);
+}
+
 static dwprobe *dw_make_fontface(dw_collection *c)
 {
     dwprobe *f = dwp_new("IDWriteFontFace");
@@ -1354,6 +1534,10 @@ static dwprobe *dw_make_fontface(dw_collection *c)
     dwp_set(f, 11, (void *)dwfa_GetGlyphIndices);
     dwp_set(f, 12, (void *)dwfa_TryGetFontTable);
     dwp_set(f, 13, (void *)dwfa_ReleaseFontTable);
+    dwp_set(f, 14, (void *)dwfa_GetGlyphRunOutline);
+    dwp_set(f, 15, (void *)dwfa_GetRecommendedRenderingMode);
+    dwp_set(f, 16, (void *)dwfa_GetGdiCompatibleMetrics);
+    dwp_set(f, 17, (void *)dwfa_GetGdiCompatibleGlyphMetrics);
     return f;
 }
 
@@ -1575,6 +1759,37 @@ static int dw_text_measure(const char *s, int n, int em_px,
     if (w) *w = adv;
     if (h) *h = (int)((f->size->metrics.ascender - f->size->metrics.descender) >> 6);
     if (ascent) *ascent = (int)(f->size->metrics.ascender >> 6);
+    return 1;
+}
+
+static int dw_face_metrics(int em_px, dw_face_info *fi)
+{
+    FT_Face f = dw_ftface();
+    const FT_Size_Metrics *m;
+    FT_UInt gi;
+
+    memset(fi, 0, sizeof *fi);
+    if (!f || em_px <= 0) return 0;
+    FT_Set_Pixel_Sizes(f, 0, (FT_UInt)em_px);
+    m = &f->size->metrics;
+    fi->ascent  = (int)((m->ascender + 63) >> 6);
+    fi->descent = (int)((-m->descender + 63) >> 6);
+    fi->height  = fi->ascent + fi->descent;
+    fi->line_gap = (int)((m->height >> 6) - fi->height);
+    if (fi->line_gap < 0) fi->line_gap = 0;
+    fi->max_w = (int)((m->max_advance + 63) >> 6);
+    gi = FT_Get_Char_Index(f, 'x');
+    fi->ave_w = gi && !FT_Load_Glyph(f, gi, FT_LOAD_DEFAULT)
+                  ? (int)(f->glyph->advance.x >> 6) : em_px / 2;
+    fi->em_units = f->units_per_EM;
+    fi->box[0] = (int)f->bbox.xMin; fi->box[1] = (int)f->bbox.yMin;
+    fi->box[2] = (int)f->bbox.xMax; fi->box[3] = (int)f->bbox.yMax;
+    if (f->units_per_EM) {
+        fi->ul_pos  = (int)((long)f->underline_position * em_px / f->units_per_EM);
+        fi->ul_size = (int)((long)f->underline_thickness * em_px / f->units_per_EM);
+    }
+    fi->weight = (f->style_flags & FT_STYLE_FLAG_BOLD) ? 700 : 400;
+    fi->italic = (f->style_flags & FT_STYLE_FLAG_ITALIC) != 0;
     return 1;
 }
 
@@ -1812,7 +2027,7 @@ static dwprobe *g_dwrite_factory;
  * registered a font but never asked for a factory is exactly that state, and it
  * is worth detecting so the editor can be refused instead of crashing. */
 static int dw_font_pipeline_ok(void)
-{ return !g_font_bytes || g_dwrite_factory != NULL; }
+{ return !g_font_bytes || g_dwrite_factory != NULL || g_font_gdi; }
 
 /* The font buffer is about to be replaced or freed. */
 static void dw_font_bytes_changing(void)
@@ -1825,6 +2040,7 @@ static void dw_reset(void)
     g_font_bytes = NULL;
     g_font_size = 0;
     g_font_family[0] = 0;
+    g_font_gdi = 0;
     /* The cached factory and collection belong to the plugin going away; the
      * next one builds its own through DWriteCreateFactory. */
     g_dwrite_factory = NULL;

@@ -29,7 +29,12 @@
 #define W32_MAX_DC  1024
 #define W32_MAX_OBJ  8192
 #define W32_MAX_CLS   64
-#define W32_MSGQ     512
+/* Posted messages waiting. Windows allows ten thousand per thread before a
+ * PostMessage fails, and a plug-in can lean on that: Helm posts some 650 of
+ * JUCE's own while its editor opens, before anything drains them, and at 512
+ * the next post -- its OpenGL thread asking for the message lock -- was the
+ * one dropped, and that thread waited for it for ever. */
+#define W32_MSGQ   10000
 #define W32_MAX_TIMER 32
 
 /* What a bitmap may be. One side is bounded only against arithmetic that
@@ -690,6 +695,15 @@ typedef MS W_LRESULT (*w32_wndproc)(void *, uint32_t, W_WPARAM, W_LPARAM);
 static int w32_msgtrace(void)
 { static int v = -1; if (v < 0) { const char *e = getenv("PELOAD_MSGTRACE"); v = e && *e != '0'; } return v; }
 
+/* Window procedures running on this thread, nested. Per thread: a plug-in's
+ * worker sending a message must not make the input thread think it is inside
+ * a handler. */
+static __thread int g_in_wndproc;
+/* The time and pointer position of the message being handled: see
+ * st_GetMessageTime. */
+static __thread uint32_t g_msg_time;
+static __thread uint32_t g_msg_pos;
+
 static W_LRESULT w32_call(w32_wnd *w, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
 {
     w32_wndproc p;
@@ -700,7 +714,13 @@ static W_LRESULT w32_call(w32_wnd *w, uint32_t msg, W_WPARAM wp, W_LPARAM lp)
     if (w32_msgtrace())
         fprintf(stderr, "[msg] wnd#%d '%s' msg=0x%04x wp=%#lx lp=%#lx\n",
                 idx, w->cls, msg, (unsigned long)wp, (unsigned long)lp);
-    return p(w32_h(W32_HWND_BASE, idx), msg, wp, lp);
+    {
+        W_LRESULT r;
+        g_in_wndproc++;
+        r = p(w32_h(W32_HWND_BASE, idx), msg, wp, lp);
+        g_in_wndproc--;
+        return r;
+    }
 }
 
 /* ---- rectangles ---------------------------------------------------------- */
@@ -1705,6 +1725,10 @@ static void *w32_create_id(const char *cls, const char *name, int x, int y, int 
                              (!strcasecmp(cls, "COMBOBOX") ||
                               !strcasecmp(cls, "LISTBOX")) ? -1 : 0;
         if (name) snprintf(W.wnd[i].text, sizeof W.wnd[i].text, "%s", name);
+        /* CW_USEDEFAULT (0x80000000) in x leaves the position to the system,
+         * and y is then ignored; taken literally it is two billion pixels off
+         * screen, and every coordinate summed through it with it. */
+        if (x == (int32_t)0x80000000) x = y = 0;
         W.wnd[i].x = x; W.wnd[i].y = y;
         W.wnd[i].w = w > 0 ? w : 1;
         W.wnd[i].h = h > 0 ? h : 1;
@@ -1893,6 +1917,29 @@ static void w32_screen_rect(W32RECT *r)
     r->right = 1920;
     r->bottom = 1080;
 }
+/* Where a window's client area sits on the screen.
+ *
+ * The screen here is the root window's client area: the host's container, or
+ * the plug-in's own window when there is no container. A child's x and y are
+ * relative to its parent, so the screen position is the sum up the chain --
+ * every level of it. ClientToScreen and GetWindowRect used to add only the
+ * window's own offset, which is right for a child of the root and wrong for
+ * anything deeper: a control two levels down mapped a click to the wrong place,
+ * and a plug-in that positioned a child from GetWindowRect put it beside where
+ * it meant to. A top-level window the plug-in made itself (a tooltip, a popup)
+ * has screen coordinates already, and the walk stops at it. */
+static int w32_root_idx(void);
+static void w32_screen_origin(int i, int32_t *ox, int32_t *oy)
+{
+    int root = w32_root_idx(), x = 0, y = 0;
+    while (i > 0 && i < W32_MAX_WND && i != root && W.wnd[i].used) {
+        x += W.wnd[i].x;
+        y += W.wnd[i].y;
+        i = W.wnd[i].parent;
+    }
+    *ox = x;
+    *oy = y;
+}
 static MS int32_t st_GetWindowRect(void *hwnd, W32RECT *r)
 {
     w32_wnd *w = w32_wget(hwnd);
@@ -1902,8 +1949,8 @@ static MS int32_t st_GetWindowRect(void *hwnd, W32RECT *r)
      * know -- GetDesktopWindow's, say -- does get the screen. */
     if (!hwnd) { r->left = r->top = r->right = r->bottom = 0; return 0; }
     if (!w) { w32_screen_rect(r); return 1; }
-    r->left = w->x; r->top = w->y;
-    r->right = w->x + w->w; r->bottom = w->y + w->h;
+    w32_screen_origin((int)(w - W.wnd), &r->left, &r->top);
+    r->right = r->left + w->w; r->bottom = r->top + w->h;
     return 1;
 }
 static MS int32_t st_GetClientRect(void *hwnd, W32RECT *r)
@@ -1934,6 +1981,15 @@ static MS int32_t st_GetWindowPlacement(void *hwnd, W32WINDOWPLACEMENT *p)
     p->ptMinPosition.x = p->ptMinPosition.y = -1;
     p->ptMaxPosition.x = p->ptMaxPosition.y = -1;
     st_GetWindowRect(hwnd, &p->rcNormalPosition);
+    {   /* a child's placement is in its parent's client coordinates */
+        w32_wnd *w = w32_wget(hwnd);
+        if (w && w->parent) {
+            int32_t px, py;
+            w32_screen_origin(w->parent, &px, &py);
+            p->rcNormalPosition.left -= px; p->rcNormalPosition.right  -= px;
+            p->rcNormalPosition.top  -= py; p->rcNormalPosition.bottom -= py;
+        }
+    }
     p->length = (uint32_t)sizeof *p;
     return 1;
 }
@@ -2288,15 +2344,58 @@ static MS int32_t st_GetWindowTextW(void *hwnd, uint16_t *out, int32_t n)
 static MS int32_t st_GetWindowTextLengthW(void *hwnd)
 { return st_GetWindowTextLengthA(hwnd); }
 
+/* The posted-message queue is written from any thread: PostMessage is how a
+ * plug-in's worker hands something to its UI. JUCE's render thread does
+ * exactly that to take the message-thread lock before every OpenGL frame, and
+ * with two threads posting at once into an unlocked ring one message
+ * overwrote the other -- the render thread then waited for an answer to a
+ * message that no longer existed, and Helm's editor stayed black one run in
+ * three. Held only while the ring is touched, never across a dispatch. */
+static pthread_mutex_t g_w32_qlock = PTHREAD_MUTEX_INITIALIZER;
+
+static void w32_post_locked(void *hwnd, uint32_t msg, uintptr_t wp, intptr_t lp);
 static void w32_post(void *hwnd, uint32_t msg, uintptr_t wp, intptr_t lp)
 {
+    pthread_mutex_lock(&g_w32_qlock);
+    w32_post_locked(hwnd, msg, wp, lp);
+    pthread_mutex_unlock(&g_w32_qlock);
+}
+/* Take the oldest posted message, or return 0. */
+static int w32_unqueue(W32MSG *m, int remove)
+{
+    int got = 0;
+    pthread_mutex_lock(&g_w32_qlock);
+    if (W.qtail != W.qhead) {
+        *m = W.q[W.qtail];
+        if (remove) W.qtail = (W.qtail + 1) % W32_MSGQ;
+        got = 1;
+    }
+    pthread_mutex_unlock(&g_w32_qlock);
+    return got;
+}
+static void w32_post_locked(void *hwnd, uint32_t msg, uintptr_t wp, intptr_t lp)
+{
     int next = (W.qhead + 1) % W32_MSGQ;
+    /* Pointer moves coalesce, as Windows' do: a move waiting behind another
+     * for the same window replaces it. A long drag cannot then fill the queue
+     * and push out the button-up that ends it. */
+    if (msg == 0x0200 && W.qhead != W.qtail) {
+        int last = (W.qhead + W32_MSGQ - 1) % W32_MSGQ;
+        if (W.q[last].message == 0x0200 && W.q[last].hwnd == hwnd) {
+            W.q[last].wParam = wp;
+            W.q[last].lParam = lp;
+            return;
+        }
+    }
     if (next == W.qtail) return;                  /* full: drop, like Windows */
     memset(&W.q[W.qhead], 0, sizeof W.q[0]);
     W.q[W.qhead].hwnd = hwnd;
     W.q[W.qhead].message = msg;
     W.q[W.qhead].wParam = wp;
     W.q[W.qhead].lParam = lp;
+    W.q[W.qhead].time = (uint32_t)w32_now_ms();
+    W.q[W.qhead].pt.x = W.mouse_x;
+    W.q[W.qhead].pt.y = W.mouse_y;
     W.qhead = next;
 }
 static MS int32_t st_PostMessageA(void *hwnd, uint32_t msg, uintptr_t wp, intptr_t lp)
@@ -2308,10 +2407,8 @@ static MS int32_t st_PeekMessageA(W32MSG *m, void *hwnd, uint32_t f1, uint32_t f
 {
     (void)hwnd; (void)f1; (void)f2;
     w32_pump_input();                 /* a spinning plugin gets fresh input here */
-    if (W.qtail == W.qhead || !m) return 0;
-    *m = W.q[W.qtail];
-    if (rm & 1) W.qtail = (W.qtail + 1) % W32_MSGQ;   /* PM_REMOVE */
-    return 1;
+    if (!m) return 0;
+    return w32_unqueue(m, rm & 1);                     /* PM_REMOVE */
 }
 /* Nothing in the queue is text, so the W form is the A form. */
 static MS int32_t st_PeekMessageW(W32MSG *m, void *hwnd, uint32_t f1, uint32_t f2, uint32_t rm)
@@ -2321,6 +2418,10 @@ static MS W_LRESULT st_DispatchMessageA(const W32MSG *m)
 {
     w32_wnd *w;
     if (!m) return 0;
+    if (m->time) {
+        g_msg_time = m->time;
+        g_msg_pos = ((uint32_t)(uint16_t)m->pt.y << 16) | (uint16_t)m->pt.x;
+    }
     w = w32_wget(m->hwnd);
     return w ? w32_call(w, m->message, m->wParam, m->lParam) : 0;
 }
@@ -2344,6 +2445,17 @@ static MS uint32_t st_RegisterWindowMessageA(const char *s)
 static MS uint32_t st_RegisterWindowMessageW(const uint16_t *s)
 { char b[128]; w2c(s, b, sizeof b); return st_RegisterWindowMessageA(b); }
 static MS W_LPARAM st_GetMessageExtraInfo(void) { return 0; }
+/* When, and where the pointer was, as of the message being handled. JUCE
+ * timestamps every mouse event with GetMessageTime and places the pointer with
+ * GetMessagePos when capture is lost or the pointer leaves; both were the
+ * generic stub's zero, so every event happened at the same instant at 0,0. */
+static void w32_msg_stamp_now(void)
+{
+    g_msg_time = (uint32_t)w32_now_ms();
+    g_msg_pos = ((uint32_t)(uint16_t)W.mouse_y << 16) | (uint16_t)W.mouse_x;
+}
+static MS int32_t st_GetMessageTime(void) { return (int32_t)g_msg_time; }
+static MS uint32_t st_GetMessagePos(void) { return g_msg_pos; }
 
 /* ---- device contexts ---------------------------------------------------- */
 
@@ -3682,6 +3794,7 @@ static MS void *st_CreatePen(int32_t style, int32_t width, uint32_t c)
  *
  * LOGFONTA is 28 numeric bytes then char lfFaceName[32]; LOGFONTW is the same
  * 28 then WCHAR[32]. Only the name differs. */
+static void w32_font_note_gdi_use(const void *lf, int wide);
 static void *w32_font_from_logfont(const void *lf, int wide)
 {
     int idx = w32_obj_new(OBJ_FONT, 0, 0, 0);
@@ -3709,6 +3822,7 @@ static MS void *st_CreateFontIndirectA(const void *lf)
     int32_t h = 0;
     if (lf) memcpy(&h, lf, 4);
     PLOG("  [font] CreateFontIndirectA height=%d\n", (int)h);
+    w32_font_note_gdi_use(lf, 0);
     return w32_font_from_logfont(lf, 0);
 }
 static MS void *st_CreateFontIndirectW(const void *lf);
@@ -3721,6 +3835,7 @@ static MS void *st_CreateFontIndirectW(const void *lf)
     int32_t h = 0;
     if (lf) memcpy(&h, lf, 4);
     PLOG("  [font] CreateFontIndirectW height=%d\n", (int)h);
+    w32_font_note_gdi_use(lf, 1);
     return w32_font_from_logfont(lf, 1);
 }
 /* CreateFont's fourteen arguments are a LOGFONT spelled out, so it becomes one. */
@@ -4651,6 +4766,19 @@ static MS int32_t st_FillRect(void *hdc, const W32RECT *r, void *brush)
  * cell height, negative when the caller means the character height itself --
  * the sign is a unit, not a direction, and a plug-in that asks for -11 wants
  * eleven pixels rather than a font measured upside down. */
+/* The face's metrics at a pixel size, from FreeType (the DirectWrite shim owns
+ * the face). Everything in pixels except the *_units fields, which are font
+ * design units. Returns 0 when no face is loaded. */
+typedef struct {
+    int ascent, descent, height, line_gap, ave_w, max_w;
+    int em_units, box[4];                    /* xMin yMin xMax yMax, units */
+    int ul_pos, ul_size, weight, italic;
+} dw_face_info;
+static int dw_face_metrics(int em_px, dw_face_info *fi);
+
+/* Up to 16384: a font made at -otmEMSquare is how JUCE reads outlines in design
+ * units. EM squares of 1000 and 2048 are the common ones and 16384 is the
+ * format's limit; the old cap of 400 turned all of them into 12-pixel fonts. */
 static int w32_font_px(const w32_dc *d)
 {
     int32_t h = 0;
@@ -4658,7 +4786,7 @@ static int w32_font_px(const w32_dc *d)
         memcpy(&h, W.obj[d->font].logfont, 4);
     if (h < 0) h = -h;
     if (h == 0 && g_ctl_em) return g_ctl_em;
-    if (h < 4 || h > 400) h = 12;       /* the system font, near enough */
+    if (h < 4 || h > 16384) h = 12;     /* the system font, near enough */
     return (int)h;
 }
 
@@ -4839,33 +4967,59 @@ static MS int32_t st_DrawTextW(void *hdc, const uint16_t *ws, int32_t n,
 }
 
 /* TEXTMETRIC, which layout code divides by. tmHeight and tmAveCharWidth are the
- * two fields anything here reads; a zeroed structure is a divide by zero. */
+ * two fields most callers read, and a zeroed structure is a divide by zero.
+ *
+ * The A and W forms differ after the eleven LONGs: four chars or four WCHARs,
+ * then five BYTEs. Answering the W call with the A layout put a nonsense
+ * tmDefaultChar where JUCE looks for its fallback glyph. */
+static void w32_textmetric(w32_dc *d, void *out, int wide)
+{
+    int32_t l[11];
+    uint8_t *o = out;
+    dw_face_info fi;
+    int em = w32_font_px(d), k;
+
+    memset(l, 0, sizeof l);
+    if (dw_face_metrics(em, &fi)) {
+        l[0] = fi.height; l[1] = fi.ascent; l[2] = fi.descent;
+        l[3] = fi.height - em > 0 ? fi.height - em : 0;          /* internal leading */
+        l[4] = fi.line_gap;
+        l[5] = fi.ave_w; l[6] = fi.max_w; l[7] = fi.weight;
+    } else {
+        int w = 0, h = 0, asc = 0;
+        dw_text_measure("nnnnnnnnnn", 10, em, &w, &h, &asc);
+        l[0] = h ? h : em; l[1] = asc ? asc : em; l[2] = l[0] - l[1];
+        l[5] = w ? w / 10 : em / 2; l[6] = l[5] * 2; l[7] = 400;
+    }
+    l[9] = l[10] = 96;                                           /* digitized aspect */
+    memcpy(o, l, sizeof l);
+    k = sizeof l;
+    if (wide) {
+        uint16_t c[4] = { 32, 0xFFFD, 32, 32 };  /* first, last, default, break */
+        memcpy(o + k, c, sizeof c); k += sizeof c;
+    } else {
+        o[k++] = 32; o[k++] = 255; o[k++] = '?'; o[k++] = ' ';
+    }
+    o[k++] = 0;                                  /* italic */
+    o[k++] = 0;                                  /* underlined */
+    o[k++] = 0;                                  /* struck out */
+    o[k++] = 0x06;                               /* TMPF_VECTOR | TMPF_TRUETYPE */
+    o[k++] = 1;                                  /* DEFAULT_CHARSET */
+}
 static MS int32_t st_GetTextMetricsA(void *hdc, void *out)
 {
-    w32_dc *d = w32_dcget(hdc);
-    struct { int32_t height, ascent, descent, intleading, extleading,
-                     aveCharWidth, maxCharWidth, weight, overhang,
-                     digitizedAspectX, digitizedAspectY;
-             uint8_t first, last, def, brk, italic, underlined, struckOut,
-                     pitchAndFamily, charSet; } tm;
-    int w = 0, h = 0, asc = 0, em;
-
     if (!out) return 0;
-    em = w32_font_px(d);
-    dw_text_measure("nnnnnnnnnn", 10, em, &w, &h, &asc);
-    memset(&tm, 0, sizeof tm);
-    tm.height = h ? h : em;
-    tm.ascent = asc ? asc : em;
-    tm.descent = tm.height - tm.ascent;
-    tm.aveCharWidth = w ? w / 10 : em / 2;
-    tm.maxCharWidth = tm.aveCharWidth * 2;
-    tm.weight = 400;
-    tm.first = 32; tm.last = 255; tm.def = '?'; tm.brk = ' ';
-    memcpy(out, &tm, sizeof tm);
+    memset(out, 0, 56);                          /* sizeof(TEXTMETRICA), padded */
+    w32_textmetric(w32_dcget(hdc), out, 0);
     return 1;
 }
 static MS int32_t st_GetTextMetricsW(void *hdc, void *out)
-{ return st_GetTextMetricsA(hdc, out); }
+{
+    if (!out) return 0;
+    memset(out, 0, 60);                          /* sizeof(TEXTMETRICW), padded */
+    w32_textmetric(w32_dcget(hdc), out, 1);
+    return 1;
+}
 
 /* The plugin registers its embedded TTF here. Keeping the bytes lets GetFontData
  * serve them, and parsing the family name out of the font lets
@@ -4877,6 +5031,25 @@ static MS int32_t st_GetTextMetricsW(void *hdc, void *out)
 static uint8_t *g_font_bytes;
 static uint32_t g_font_size;
 static char     g_font_family[64];
+/* The plug-in made a GDI font of the family it registered -- JUCE 7 draws its
+ * embedded fonts this way (GetGlyphOutline), never touching DirectWrite. A font
+ * that reached GDI has reached a text backend, so the editor is safe to open. */
+static int      g_font_gdi;
+
+static void w32_font_note_gdi_use(const void *lf, int wide)
+{
+    char nm[33];
+    int i;
+    if (!lf || !g_font_bytes || !g_font_family[0]) return;
+    for (i = 0; i < 32; i++) {
+        unsigned c = wide ? ((const uint16_t *)((const uint8_t *)lf + 28))[i]
+                          : ((const uint8_t *)lf)[28 + i];
+        if (!c) break;
+        nm[i] = c < 0x80 ? (char)c : '?';
+    }
+    nm[i] = 0;
+    if (!strcasecmp(nm, g_font_family)) g_font_gdi = 1;
+}
 
 /* Defined with the DirectWrite shim, which owns the FreeType face. */
 static void dw_font_bytes_changing(void);
@@ -5130,12 +5303,54 @@ static MS uint32_t st_GetKerningPairsW(void *hdc, uint32_t n, void *pairs)
 { (void)hdc; (void)n; (void)pairs; return 0; }
 static MS uint32_t st_GetKerningPairsA(void *hdc, uint32_t n, void *pairs)
 { return st_GetKerningPairsW(hdc, n, pairs); }
-/* OUTLINETEXTMETRIC is the extended metrics of a TrueType face, and zero is
- * what Windows answers for a font that is not one. Every caller falls back to
- * GetTextMetrics, which this layer does fill in properly -- which makes a
- * refusal better here than a half-filled structure. */
+/* OUTLINETEXTMETRIC: the extended metrics of a TrueType face.
+ *
+ * Refusing this was not the safe answer it looked like. JUCE takes otmEMSquare
+ * as its font's design size and divides by it: with zero here every JUCE font
+ * on Windows had a heightToPointsFactor of 0, and a font sized in points came
+ * out with no height -- Spacer's labels, values and preset names all vanished.
+ *
+ * Layout (x86-64; the four name pointers are 4 bytes on i386): otmSize, a
+ * TEXTMETRICW at 4, filler and PANOSE to 76, then UINT/int fields from
+ * otmfsSelection at 76 to otmsUnderscorePosition at 196, and the four name
+ * offsets. The names are not appended -- callers pass sizeof the struct and
+ * read none of them -- so the offsets are zero. */
 static MS uint32_t st_GetOutlineTextMetricsW(void *hdc, uint32_t n, void *otm)
-{ (void)hdc; (void)n; (void)otm; return 0; }
+{
+    const uint32_t size = 200 + 4 * (uint32_t)sizeof(void *);
+    w32_dc *d = w32_dcget(hdc);
+    dw_face_info fi;
+    uint8_t b[232];
+    int32_t *v;
+    int em = w32_font_px(d);
+    double sc;
+
+    if (!dw_face_metrics(em, &fi) || fi.em_units <= 0) return 0;
+    if (!otm) return size;
+    if (n < 4) return 0;
+    memset(b, 0, sizeof b);
+    memcpy(b, &size, 4);
+    w32_textmetric(d, b + 4, 1);
+    sc = (double)em / fi.em_units;              /* design units -> pixels */
+    v = (int32_t *)(b + 76);
+    v[0]  = fi.italic ? 1 : 0x40;               /* otmfsSelection: italic / regular */
+    v[1]  = 0;                                  /* otmfsType: installable embedding */
+    v[2]  = 1; v[3] = 0;                        /* caret slope: upright */
+    v[4]  = 0;                                  /* italic angle */
+    v[5]  = fi.em_units;                        /* otmEMSquare, in design units */
+    v[6]  = fi.ascent; v[7] = -fi.descent; v[8] = fi.line_gap;
+    v[9]  = fi.ascent; v[10] = em / 2;          /* cap height, x height: estimates */
+    v[11] = (int32_t)(fi.box[0] * sc); v[12] = (int32_t)(fi.box[3] * sc);
+    v[13] = (int32_t)(fi.box[2] * sc); v[14] = (int32_t)(fi.box[1] * sc);
+    v[15] = fi.ascent; v[16] = -fi.descent; v[17] = fi.line_gap;
+    v[18] = 9;                                  /* smallest readable ppem */
+    v[19] = em / 2; v[20] = em / 2; v[21] = 0; v[22] = em / 5;     /* subscript */
+    v[23] = em / 2; v[24] = em / 2; v[25] = 0; v[26] = em / 3;     /* superscript */
+    v[27] = fi.ul_size > 0 ? fi.ul_size : 1; v[28] = em / 4;       /* strikeout */
+    v[29] = fi.ul_size > 0 ? fi.ul_size : 1; v[30] = fi.ul_pos;    /* underscore */
+    memcpy(otm, b, n < size ? n : size);
+    return size;
+}
 static MS uint32_t st_GetOutlineTextMetricsA(void *hdc, uint32_t n, void *otm)
 { return st_GetOutlineTextMetricsW(hdc, n, otm); }
 /* The font mapper's flags: none to change, and the return is what was set
@@ -5194,11 +5409,24 @@ static MS int32_t st_GetTextFaceW(void *dc, int32_t n, uint16_t *buf)
 
 /* ---- input, cursors, metrics -------------------------------------------- */
 
+/* WM_CAPTURECHANGED goes to the window losing capture, with the new holder in
+ * lParam, whenever capture moves -- including on ReleaseCapture. JUCE ends a
+ * drag on it; a control that never hears it keeps believing it is tracking. */
+#define WM_CAPTURECHANGED 0x0215
+#define WM_NCHITTEST      0x0084
+static void w32_capture_to(int idx)
+{
+    int prev = W.capture;
+    W.capture = idx;
+    if (prev && prev != idx && prev < W32_MAX_WND && W.wnd[prev].used)
+        w32_call(&W.wnd[prev], WM_CAPTURECHANGED, 0,
+                 idx ? (W_LPARAM)(intptr_t)w32_h(W32_HWND_BASE, idx) : 0);
+}
 static MS void *st_SetCapture(void *hwnd)
 {
     w32_wnd *w = w32_wget(hwnd);
     void *prev = W.capture ? w32_h(W32_HWND_BASE, W.capture) : NULL;
-    W.capture = w ? (int)(w - W.wnd) : 0;
+    w32_capture_to(w ? (int)(w - W.wnd) : 0);
     return prev;
 }
 static int w32_child_at(int wnd, int *x, int *y);          /* below */
@@ -5248,7 +5476,7 @@ static MS uint32_t st_SetClassLongW(void *hwnd, int32_t index, uint32_t v)
 static MS uint32_t st_SetClassLongA(void *hwnd, int32_t index, uint32_t v)
 { return st_SetClassLongW(hwnd, index, v); }
 
-static MS int32_t st_ReleaseCapture(void) { W.capture = 0; return 1; }
+static MS int32_t st_ReleaseCapture(void) { w32_capture_to(0); return 1; }
 static MS void *st_GetCapture(void)
 { return W.capture ? w32_h(W32_HWND_BASE, W.capture) : NULL; }
 /* Windows sends nothing when the window already has the focus: SetFocus
@@ -5482,28 +5710,43 @@ static MS int32_t st_TrackMouseEvent(void *e)
     return 1;
 }
 static MS uint32_t st_GetDoubleClickTime(void) { return 400; }
-static MS int32_t st_ClientToScreen(void *hwnd, W32POINT *p)
+/* Client and screen coordinates, through w32_screen_origin: the whole chain of
+ * parents, not just the window's own offset. A handle that is no window of ours
+ * -- NULL, or GetDesktopWindow's -- is the desktop, whose client coordinates
+ * are the screen's. */
+static void w32_offset_of(void *hwnd, int32_t *ox, int32_t *oy)
 {
     w32_wnd *w = w32_wget(hwnd);
-    if (w && p) { p->x += w->x; p->y += w->y; }
+    *ox = *oy = 0;
+    if (w) w32_screen_origin((int)(w - W.wnd), ox, oy);
+}
+static MS int32_t st_ClientToScreen(void *hwnd, W32POINT *p)
+{
+    int32_t ox, oy;
+    if (!p) return 0;
+    w32_offset_of(hwnd, &ox, &oy);
+    p->x += ox; p->y += oy;
     return 1;
 }
 static MS int32_t st_ScreenToClient(void *hwnd, W32POINT *p)
 {
-    w32_wnd *w = w32_wget(hwnd);
-    if (w && p) { p->x -= w->x; p->y -= w->y; }
+    int32_t ox, oy;
+    if (!p) return 0;
+    w32_offset_of(hwnd, &ox, &oy);
+    p->x -= ox; p->y -= oy;
     return 1;
 }
+/* The return value is the offset applied, x in the low word and y in the high,
+ * which some callers use instead of the points. */
 static MS int32_t st_MapWindowPoints(void *from, void *to, W32POINT *p, uint32_t n)
 {
-    w32_wnd *f = w32_wget(from), *t = w32_wget(to);
+    int32_t fx, fy, tx, ty, dx, dy;
     uint32_t i;
-    if (!p) return 0;
-    for (i = 0; i < n; i++) {
-        if (f) { p[i].x += f->x; p[i].y += f->y; }
-        if (t) { p[i].x -= t->x; p[i].y -= t->y; }
-    }
-    return 1;
+    w32_offset_of(from, &fx, &fy);
+    w32_offset_of(to, &tx, &ty);
+    dx = fx - tx; dy = fy - ty;
+    if (p) for (i = 0; i < n; i++) { p[i].x += dx; p[i].y += dy; }
+    return (int32_t)(((uint32_t)(uint16_t)dy << 16) | (uint16_t)dx);
 }
 /* The system colours, as COLORREF -- 0x00BBGGRR, so the bytes read backwards
  * from an HTML colour.
@@ -5749,6 +5992,12 @@ void *w32_create_host_window(int w, int h)
     return hwnd;
 }
 
+static int w32_root_idx(void)
+{
+    return (W.host && W.wnd[W.host].used) ? W.host
+         : (W.display && W.wnd[W.display].used) ? W.display : 0;
+}
+
 void *w32_root_window(void)
 {
     int i = W.display ? W.display : W.host;
@@ -5909,18 +6158,24 @@ int w32_editor_pixels(const unsigned int **px, int *w, int *h)
 
 /* Drain queued messages, fire due timers, and repaint anything invalid.
  * Called from the host's UI thread on a timer. */
+static void wgl_flush_frames(void);        /* gl_shim.h */
+
 void w32_pump(void)
 {
     double now = w32_now();
     int i, guard = 0;
 
-    while (W.qtail != W.qhead && guard++ < W32_MSGQ) {
-        W32MSG m = W.q[W.qtail];
-        W.qtail = (W.qtail + 1) % W32_MSGQ;
+    wgl_flush_frames();                    /* frames OpenGL finished since the last pump */
+
+    while (guard++ < W32_MSGQ) {
+        W32MSG m;
+        if (!w32_unqueue(&m, 1)) break;
         {
             w32_wnd *w = w32_wget(m.hwnd);
-            if (w) w32_call(w, m.message, m.wParam, m.lParam);
-        }
+            g_msg_time = m.time;
+            g_msg_pos = ((uint32_t)(uint16_t)m.pt.y << 16) | (uint16_t)m.pt.x;
+                    if (w) w32_call(w, m.message, m.wParam, m.lParam);
+                }
     }
     for (i = 0; i < W32_MAX_TIMER; i++) {
         if (!W.timer[i].used || now < W.timer[i].next) continue;
@@ -5975,7 +6230,9 @@ void w32_reset(void)
     for (i = 1; i < W32_MAX_DC; i++) W.dc[i].used = 0;
     for (i = 0; i < W32_MAX_TIMER; i++) W.timer[i].used = 0;
     for (i = 1; i < W32_MAX_CLS; i++) W.cls[i].used = 0;
+    pthread_mutex_lock(&g_w32_qlock);
     W.qhead = W.qtail = 0;
+    pthread_mutex_unlock(&g_w32_qlock);
     W.host = W.display = 0;
     W.capture = W.focus = W.desktop = 0;
     dw_reset();
@@ -5995,6 +6252,7 @@ void w32_reset(void)
 static int w32_child_at(int wnd, int *x, int *y)
 {
     int best = wnd, bx = *x, by = *y, stepped = 1;
+    const int sx = *x, sy = *y;                    /* the point on the screen */
     while (stepped) {
         int i;
         stepped = 0;
@@ -6003,6 +6261,18 @@ static int w32_child_at(int wnd, int *x, int *y)
             if (!c->used || c->parent != wnd || !c->visible) continue;
             if (*x < c->x || *x >= c->x + c->w) continue;
             if (*y < c->y || *y >= c->y + c->h) continue;
+            /* A window that answers WM_NCHITTEST with HTTRANSPARENT is not
+             * there as far as the pointer is concerned, and Windows goes on
+             * to whatever is beneath it. JUCE's OpenGL context is exactly
+             * that: a child window laid over the whole editor that renders
+             * and declines every click, so the editor's own window gets
+             * them. Handing them to the GL window instead left every dial and
+             * button in Helm dead. */
+            if (c->wndproc &&
+                (int32_t)w32_call(c, WM_NCHITTEST, 0,
+                                  (W_LPARAM)(int64_t)(((uint32_t)(uint16_t)sy << 16) |
+                                                      (uint16_t)sx)) == -1)
+                continue;
             *x -= c->x;
             *y -= c->y;
             wnd = i;
@@ -6067,9 +6337,15 @@ void w32_mouse(int x, int y, int msg, int buttons, int wheel)
     PLOG("  [w32] mouse msg 0x%x at %d,%d -> wnd #%d cls='%s' local %d,%d%s\n",
          (unsigned)msg, x, y, target, w->cls, cx, cy,
          W.capture ? " (captured)" : "");
+    /* The cursor is where the pointer is on the screen -- the root's client
+     * area -- which is what GetCursorPos and a message's pt report. It used to
+     * be the target's local position, so a plug-in that did
+     * GetCursorPos + ScreenToClient, the usual pair, was off by the target's
+     * offset; anything not at 0,0 in the root saw the pointer elsewhere. */
+    W.mouse_x = x; W.mouse_y = y;
     x = cx;
     y = cy;
-    W.mouse_x = x; W.mouse_y = y;
+    w32_msg_stamp_now();
     /* Record the buttons as key state too. Not every GUI reads the mouse from
      * messages: TAL's polls GetAsyncKeyState(VK_LBUTTON) with GetCursorPos on
      * each idle, so with the button state missing its editor painted perfectly
@@ -6082,12 +6358,27 @@ void w32_mouse(int x, int y, int msg, int buttons, int wheel)
      * a modal dialog is doing what the user asked, and may be given one. */
     W.user_input++;
     if (msg != 0x0200 && msg != WM_MOUSEWHEEL) W.last_click_ms = w32_now_ms();
-    if (msg == WM_MOUSEWHEEL)
-        w32_call(w, WM_MOUSEWHEEL, ((W_WPARAM)(uint16_t)(int16_t)(wheel * 120) << 16) | (uint32_t)buttons,
-                 (int64_t)(((uint32_t)(uint16_t)y << 16) | (uint16_t)x));
-    else
-        w32_call(w, (uint32_t)msg, (uint64_t)buttons,
-                 (int64_t)(((uint32_t)(uint16_t)y << 16) | (uint16_t)x));
+    {
+        W_WPARAM wp = msg == WM_MOUSEWHEEL
+            ? ((W_WPARAM)(uint16_t)(int16_t)(wheel * 120) << 16) | (uint32_t)buttons
+            : (W_WPARAM)(uint32_t)buttons;
+        W_LPARAM lp = (int64_t)(((uint32_t)(uint16_t)y << 16) | (uint16_t)x);
+        /* Input that arrives while a window procedure is already running --
+         * the bridge's pump delivers it from inside GetAsyncKeyState,
+         * GetCursorPos and PeekMessage -- is posted, not dispatched. On Windows
+         * none of those calls runs a window procedure: the state they report is
+         * current, and the message waits in the queue for the next
+         * PeekMessage or GetMessage. Dispatching it there put the moves of a
+         * drag inside a JUCE mouseDown that had not finished, so the slider
+         * started its drag after the drag was over, and every JUCE knob in the
+         * studio ignored the mouse. The state above is already updated, which
+         * is all a plug-in spinning on GetAsyncKeyState needs; a loop that
+         * pumps messages gets them from the queue. */
+        if (g_in_wndproc > 0)
+            w32_post(w32_h(W32_HWND_BASE, target), (uint32_t)msg, wp, lp);
+        else
+            w32_call(w, (uint32_t)msg, wp, lp);
+    }
     W.user_input--;
 }
 
@@ -6101,10 +6392,16 @@ void w32_key(int vk, int down, int ch)
     if (!target || !W.wnd[target].used) return;
     w = &W.wnd[target];
     if (vk >= 0 && vk < 256) W.keys[vk] = down ? 1 : 0;
+    w32_msg_stamp_now();
     W.user_input++;
     if (down) W.last_click_ms = w32_now_ms();
-    w32_call(w, down ? WM_KEYDOWN : WM_KEYUP, (uint64_t)vk, 1);
-    if (down && ch > 0) w32_call(w, WM_CHAR, (uint64_t)ch, 1);
+    if (g_in_wndproc > 0) {                       /* posted, as w32_mouse explains */
+        w32_post(w32_h(W32_HWND_BASE, target), down ? WM_KEYDOWN : WM_KEYUP, (uint64_t)vk, 1);
+        if (down && ch > 0) w32_post(w32_h(W32_HWND_BASE, target), WM_CHAR, (uint64_t)ch, 1);
+    } else {
+        w32_call(w, down ? WM_KEYDOWN : WM_KEYUP, (uint64_t)vk, 1);
+        if (down && ch > 0) w32_call(w, WM_CHAR, (uint64_t)ch, 1);
+    }
     W.user_input--;
 }
 

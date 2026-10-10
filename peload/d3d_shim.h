@@ -165,14 +165,121 @@ static dwprobe *dxgi_device(void)
     }
     return o;
 }
+/* ---- one adapter, one output, and the vertical blank ---------------------
+ *
+ * JUCE 7.0.3 and later never invalidates a window from repaint(). It queues the
+ * rectangle, and the queue is flushed from a thread that sits in
+ * IDXGIOutput::WaitForVBlank for the monitor the window is on -- found by
+ * walking the factory's adapters, their outputs, and matching each output's
+ * DXGI_OUTPUT_DESC.Monitor against MonitorFromWindow. With no adapter there is
+ * no such thread, so a JUCE editor painted once and then never again: knobs
+ * turned, values changed, and the screen stayed on its first frame.
+ *
+ * So there is one adapter with one output, on the one monitor this host has
+ * (st_MonitorFromWindow's 'MON1'), and WaitForVBlank waits for the next tick of
+ * a 60 Hz clock. */
+#define DXGI_MONITOR ((void *)0x4D4F4E31)                /* = MonitorFromWindow */
+
+static void dxgi_wname(uint16_t *dst, size_t n, const char *src)
+{ size_t i; for (i = 0; i + 1 < n && src[i]; i++) dst[i] = (uint8_t)src[i]; dst[i] = 0; }
+
+/* DXGI_OUTPUT_DESC: WCHAR DeviceName[32], RECT DesktopCoordinates at 64,
+ * BOOL AttachedToDesktop at 80, Rotation at 84, HMONITOR at 88. */
+static MS int32_t dxgi_out_GetDesc(void *self, uint8_t *d)
+{
+    int32_t r[4] = { 0, 0, st_GetSystemMetrics(0), st_GetSystemMetrics(1) };
+    int32_t one = 1;
+    void *mon = DXGI_MONITOR;
+    (void)self;
+    if (!d) return (int32_t)0x80070057;                     /* E_INVALIDARG */
+    memset(d, 0, 64 + 16 + 8 + sizeof(void *));
+    dxgi_wname((uint16_t *)d, 32, "\\\\.\\DISPLAY1");
+    memcpy(d + 64, r, sizeof r);
+    memcpy(d + 80, &one, 4);                                /* attached */
+    memcpy(d + 84, &one, 4);                                /* DXGI_MODE_ROTATION_IDENTITY */
+    memcpy(d + 88, &mon, sizeof mon);
+    return D3D_OK;
+}
+/* GetDisplayModeList: no modes to list, which is an answer and not an error. */
+static MS int32_t dxgi_out_GetDisplayModeList(void *self, uint32_t fmt, uint32_t flags,
+                                              uint32_t *num, void *desc)
+{ (void)self; (void)fmt; (void)flags; (void)desc; if (num) *num = 0; return D3D_OK; }
+/* The next 1/60 s boundary of the monotonic clock. A caller loops on this, so
+ * it has to block -- returning at once would spin a core. */
+static MS int32_t dxgi_out_WaitForVBlank(void *self)
+{
+    const long period = 1000000000L / 60;
+    struct timespec now, t;
+    long long ns;
+    (void)self;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ns = (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
+    ns = (ns / period + 1) * period;
+    t.tv_sec = (time_t)(ns / 1000000000LL);
+    t.tv_nsec = (long)(ns % 1000000000LL);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL) == EINTR) {}
+    return D3D_OK;
+}
+static dwprobe *dxgi_output(void)
+{
+    static dwprobe *o;
+    if (!o && (o = dwp_new("IDXGIOutput")) != NULL) {
+        dwp_set(o, 0,  (void *)dxgi_qi_self);
+        dwp_set(o, 1,  (void *)d3d_addref);
+        dwp_set(o, 2,  (void *)d3d_release);
+        dwp_set(o, 6,  (void *)dxgi_GetParent);
+        dwp_set(o, 7,  (void *)dxgi_out_GetDesc);
+        dwp_set(o, 8,  (void *)dxgi_out_GetDisplayModeList);
+        dwp_set(o, 10, (void *)dxgi_out_WaitForVBlank);
+    }
+    return o;
+}
+
+#define DXGI_ERROR_NOT_FOUND 0x887A0002u
+static MS int32_t dxgi_ad_EnumOutputs(void *self, uint32_t idx, void **out)
+{
+    (void)self;
+    if (!out) return (int32_t)0x80070057;
+    *out = idx == 0 ? dxgi_output() : NULL;
+    return *out ? D3D_OK : (int32_t)DXGI_ERROR_NOT_FOUND;
+}
+/* DXGI_ADAPTER_DESC: WCHAR Description[128], four UINT ids at 256, three
+ * SIZE_T memory sizes at 272, LUID at 296; DESC1 adds UINT Flags at 304.
+ * Microsoft's own software adapter ids (WARP: 0x1414, 0x8C) and its flag. */
+static MS int32_t dxgi_ad_GetDesc1(void *self, uint8_t *d)
+{
+    uint32_t ids[4] = { 0x1414, 0x8C, 0, 0 }, luid[2] = { 0x5045, 0 }, flags = 2;
+    (void)self;
+    if (!d) return (int32_t)0x80070057;
+    memset(d, 0, 312);
+    dxgi_wname((uint16_t *)d, 128, "peload software adapter");
+    memcpy(d + 256, ids, sizeof ids);
+    memcpy(d + 296, luid, sizeof luid);
+    memcpy(d + 304, &flags, 4);                             /* DXGI_ADAPTER_FLAG_SOFTWARE */
+    return D3D_OK;
+}
+static MS int32_t dxgi_ad_GetDesc(void *self, uint8_t *d)
+{
+    uint8_t full[312];
+    int32_t r = dxgi_ad_GetDesc1(self, full);
+    if (d && r == D3D_OK) memcpy(d, full, 304);
+    return d ? r : (int32_t)0x80070057;
+}
+static MS int32_t dxgi_ad_CheckInterfaceSupport(void *self, const uint8_t *iid, void *ver)
+{ (void)self; (void)iid; (void)ver; return (int32_t)0x887A0004u; /* UNSUPPORTED */ }
+
 static dwprobe *dxgi_adapter(void)
 {
     static dwprobe *o;
-    if (!o && (o = dwp_new("IDXGIAdapter")) != NULL) {
-        dwp_set(o, 0, (void *)dxgi_qi_self);
-        dwp_set(o, 1, (void *)d3d_addref);
-        dwp_set(o, 2, (void *)d3d_release);
-        dwp_set(o, 6, (void *)dxgi_GetParent);
+    if (!o && (o = dwp_new("IDXGIAdapter1")) != NULL) {
+        dwp_set(o, 0,  (void *)dxgi_qi_self);
+        dwp_set(o, 1,  (void *)d3d_addref);
+        dwp_set(o, 2,  (void *)d3d_release);
+        dwp_set(o, 6,  (void *)dxgi_GetParent);
+        dwp_set(o, 7,  (void *)dxgi_ad_EnumOutputs);
+        dwp_set(o, 8,  (void *)dxgi_ad_GetDesc);
+        dwp_set(o, 9,  (void *)dxgi_ad_CheckInterfaceSupport);
+        dwp_set(o, 10, (void *)dxgi_ad_GetDesc1);
     }
     return o;
 }
@@ -186,14 +293,14 @@ static dwprobe *dxgi_adapter(void)
  * plug-in's own editor construction, which looks like a plug-in that is taking
  * a long time to open.
  *
- * There is no adapter here, so the true count is zero and the first call is
- * already past the end. */
-#define DXGI_ERROR_NOT_FOUND 0x887A0002u
+ * There is one adapter (above, for the vertical blank), so index 0 answers and
+ * index 1 is already past the end. */
 static MS int32_t dxgi_EnumAdapters(void *self, uint32_t idx, void **out)
 {
-    (void)self; (void)idx;
-    if (out) *out = NULL;
-    return (int32_t)DXGI_ERROR_NOT_FOUND;
+    (void)self;
+    if (!out) return (int32_t)0x80070057;
+    *out = idx == 0 ? dxgi_adapter() : NULL;
+    return *out ? D3D_OK : (int32_t)DXGI_ERROR_NOT_FOUND;
 }
 /* IsCurrent: whether the adapter list has changed since the factory was made.
  * It has not, and it never will. */

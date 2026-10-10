@@ -122,7 +122,49 @@ typedef struct {
 #define TEB_STACK_LIMIT  0x10
 #define TEB_SELF         0x30
 #define TEB_TLS_PTR      0x58   /* ThreadLocalStoragePointer: a POINTER to slots */
+#define TEB_PEB          0x60   /* ProcessEnvironmentBlock */
 #define TEB_LAST_ERROR   0x68
+
+/* One PEB for the process, pointed at by every TEB. The static UCRT reads it
+ * straight off %gs -- ProcessParameters->Flags, NtGlobalFlag, the OS version --
+ * with no call to stub, so a NULL here is a fault at 0x20 on whichever thread
+ * asks first (Spacer's JUCE threads do, during load). Only the fields such code
+ * reads are filled; they agree with st_GetVersionExW and st_GetSystemInfo. */
+#define PEB_SIZE               0x1000
+#define PEB_PROCESS_PARAMETERS 0x20
+#define PEB_PROCESS_HEAP       0x30
+#define PEB_NUM_PROCESSORS     0xB8
+#define PEB_OS_MAJOR           0x118
+#define PEB_OS_MINOR           0x11C
+#define PEB_OS_BUILD           0x120   /* WORD */
+#define PEB_OS_PLATFORM        0x124
+#define PARAMS_SIZE            0x400   /* RTL_USER_PROCESS_PARAMETERS, all empty */
+
+static uint8_t *g_peb;
+
+static void peb_init(void)
+{
+    uint8_t *p = calloc(1, PEB_SIZE), *pp = calloc(1, PARAMS_SIZE);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (!p || !pp) { free(p); free(pp); return; }
+    *(uint32_t *)(pp + 0) = PARAMS_SIZE;                   /* MaximumLength */
+    *(uint32_t *)(pp + 4) = PARAMS_SIZE;                   /* Length */
+    *(void **)(p + PEB_PROCESS_PARAMETERS) = pp;
+    *(void **)(p + PEB_PROCESS_HEAP) = (void *)0x48454150;  /* = GetProcessHeap */
+    *(uint32_t *)(p + PEB_NUM_PROCESSORS) = (uint32_t)(n > 0 ? n : 1);
+    *(uint32_t *)(p + PEB_OS_MAJOR) = 10;
+    *(uint32_t *)(p + PEB_OS_MINOR) = 0;
+    *(uint16_t *)(p + PEB_OS_BUILD) = 19045;
+    *(uint32_t *)(p + PEB_OS_PLATFORM) = 2;                /* VER_PLATFORM_WIN32_NT */
+    g_peb = p;
+}
+
+static uint8_t *peb_get(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, peb_init);
+    return g_peb;
+}
 
 typedef struct {
     uint8_t *raw;                 /* TEB_SIZE bytes, installed on %gs */
@@ -195,6 +237,7 @@ static int teb_install(void)
 
     *(void **)(t->raw + TEB_SELF)    = t->raw;
     *(void **)(t->raw + TEB_TLS_PTR) = t->slots;
+    *(void **)(t->raw + TEB_PEB)     = peb_get();
     /* Rough stack bounds; some CRT paths sanity-check against these. */
     {
         pthread_attr_t at; void *sp = NULL; size_t ss = 0;
