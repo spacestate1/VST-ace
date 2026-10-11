@@ -1149,6 +1149,10 @@ int bridge_editor_pixels(bridge *b, const unsigned int **px, int *w, int *h)
         size_t bytes;
 
         if (g0 & 1u) { b->ed_torn++; ed_backoff(tries); continue; }  /* mid-write */
+        /* Nothing published since the frame already held: it is still the
+         * current one, and copying it again is a megabyte or three for
+         * nothing, sixty times a second. */
+        if (b->ed_have && g0 == b->ed_seen) break;
         cw = sh->ed_w; ch = sh->ed_h;
         if (cw <= 0 || ch <= 0 || cw > BRIDGE_MAX_ED_W || ch > BRIDGE_MAX_ED_H)
             break;

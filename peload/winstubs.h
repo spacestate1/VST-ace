@@ -3242,6 +3242,54 @@ static MS int32_t st_MoveFileA(const char *from, const char *to)
 { return st_MoveFileExA(from, to, 2); }            /* MoveFile may cross volumes */
 static MS int32_t st_MoveFileW(const uint16_t *from, const uint16_t *to)
 { return st_MoveFileExW(from, to, 2); }
+/* ReplaceFile: the replacement takes the replaced file's place, the old one
+ * kept as the backup if one is named. JUCE's File::replaceFileIn -- how Helm
+ * saves its settings -- calls it, and on the generic stub the save reported
+ * failure and the settings file was never updated. Windows wants the replaced
+ * file to exist (ERROR_FILE_NOT_FOUND otherwise, which JUCE answers by moving
+ * instead). */
+static MS int32_t st_ReplaceFileA(const char *replaced, const char *replacement,
+                                  const char *backup, uint32_t flags, void *ex, void *res)
+{
+    char pd[1024], ps[1024], pb[1024];
+    (void)flags; (void)ex; (void)res;
+    if (!replaced || !replacement) { g_last_error = 87; return 0; }
+    path_fix(replaced, pd, sizeof pd);
+    path_fix(replacement, ps, sizeof ps);
+    if (access(pd, F_OK)) { g_last_error = 2; return 0; }
+    if (access(ps, F_OK)) { g_last_error = 1177; return 0; }  /* UNABLE_TO_MOVE_REPLACEMENT */
+    if (backup) {
+        path_fix(backup, pb, sizeof pb);
+        if (rename(pd, pb) != 0) { g_last_error = 1176; return 0; }  /* UNABLE_TO_REMOVE_REPLACED */
+    }
+    if (rename(ps, pd) != 0) { g_last_error = 1177; return 0; }
+    return 1;
+}
+static MS int32_t st_ReplaceFileW(const uint16_t *replaced, const uint16_t *replacement,
+                                  const uint16_t *backup, uint32_t flags, void *ex, void *res)
+{
+    char a[1024], b[1024], c[1024];
+    if (!replaced || !replacement) { g_last_error = 87; return 0; }
+    w2c(replaced, a, sizeof a);
+    w2c(replacement, b, sizeof b);
+    if (backup) w2c(backup, c, sizeof c);
+    return st_ReplaceFileA(a, b, backup ? c : NULL, flags, ex, res);
+}
+static MS int32_t st_RemoveDirectoryA(const char *p)
+{
+    char b[1024];
+    if (!p) { g_last_error = 87; return 0; }
+    if (rmdir(path_fix(p, b, sizeof b)) == 0) return 1;
+    g_last_error = errno == ENOENT ? 2 : errno == ENOTEMPTY ? 145 /* DIR_NOT_EMPTY */ : 5;
+    return 0;
+}
+static MS int32_t st_RemoveDirectoryW(const uint16_t *p)
+{
+    char b[1024];
+    if (!p) { g_last_error = 87; return 0; }
+    w2c(p, b, sizeof b);
+    return st_RemoveDirectoryA(b);
+}
 static void w32_ft_from_time(time_t t, uint64_t *ft)
 { if (ft) *ft = (uint64_t)t * 10000000ULL + 116444736000000000ULL; }
 static MS int32_t st_GetFileTime(void *h, uint64_t *create, uint64_t *access_, uint64_t *write)
@@ -12733,6 +12781,8 @@ static const winstub g_stubs[] = {
     S("kernel32.dll", CopyFileA), S("kernel32.dll", CopyFileW),
     S("kernel32.dll", MoveFileA), S("kernel32.dll", MoveFileW),
     S("kernel32.dll", MoveFileExA), S("kernel32.dll", MoveFileExW),
+    S("kernel32.dll", ReplaceFileA), S("kernel32.dll", ReplaceFileW),
+    S("kernel32.dll", RemoveDirectoryA), S("kernel32.dll", RemoveDirectoryW),
     S("kernel32.dll", GetFileTime), S("kernel32.dll", SetFileTime),
     S("kernel32.dll", GetTempFileNameA), S("kernel32.dll", SearchPathA),
     S("kernel32.dll", GetDiskFreeSpaceExA), S("kernel32.dll", CreatePipe),

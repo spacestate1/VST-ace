@@ -1014,11 +1014,13 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
             if (out) {
                 printf("  playing note %d for %ds with the editor running\n",
                        o->note, o->live);
+                double peak = 0.0;
                 pehost_note_on(h, o->note, 100);
                 while (done < total) {
-                    int n = (total - done < bs) ? total - done : bs;
+                    int n = (total - done < bs) ? total - done : bs, k;
                     if (src) fill_test_signal(src, n, done);
                     pehost_render_io(h, src, out, n);
+                    for (k = 0; k < n * 2; k++) if (fabs(out[k]) > peak) peak = fabs(out[k]);
                     done += n;
                     pehost_editor_pump(h);
                     /* Paced to the audio it just produced. An editor's lights
@@ -1027,6 +1029,7 @@ static void capture_editor(pehost *h, const char *shot, const opts *o)
                      * almost nothing to fire on. */
                     usleep((useconds_t)((double)n * 1000000.0 / RATE));
                 }
+                printf("  played, peak %.4f%s\n", peak, peak < 1e-9 ? "  !! silence" : "");
                 /* The note is deliberately left down: the photograph is meant
                  * to be of a plugin that is playing, and everything an
                  * arpeggiator lights up goes dark the moment the key is up. */

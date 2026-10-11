@@ -338,7 +338,7 @@ static void publish_pixels(server *s)
     if (w32_paint_in_progress()) return;
     clock_gettime(CLOCK_MONOTONIC, &now);
     t = (double)now.tv_sec * 1e3 + (double)now.tv_nsec / 1e6;
-    if (t - s->last_publish < 12.0) return;              /* ~80 Hz ceiling */
+    if (t - s->last_publish < 16.0) return;              /* 60 Hz: the host shows no more */
     s->last_publish = t;
 
     if (!pehost_editor_pixels(s->h, &px, &w, &h) || !px || w <= 0 || h <= 0) return;
@@ -350,6 +350,14 @@ static void publish_pixels(server *s)
      * next -- controls drawn twice at two positions, and a flicker every time a
      * partly-copied frame landed on screen. The counter existed but nothing
      * excluded a torn read. */
+    /* An unchanged frame is not published again. Most frames are unchanged
+     * -- an editor nobody is touching -- and each one cost a copy of the
+     * whole buffer here, then a copy, a compare and another copy in the
+     * host, which reads only when the generation moves. Comparing reads the
+     * two buffers and writes nothing. */
+    if (sh->ed_w == w && sh->ed_h == h && atomic_load_explicit(&sh->ed_gen, memory_order_acquire) &&
+        memcmp(bridge_pixels(sh), px, (size_t)w * h * 4) == 0)
+        return;
     atomic_fetch_add_explicit(&sh->ed_gen, 1, memory_order_release);
     sh->ed_w = w; sh->ed_h = h;
     memcpy(bridge_pixels(sh), px, (size_t)w * h * 4);

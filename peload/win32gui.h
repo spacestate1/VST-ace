@@ -6095,15 +6095,21 @@ static void w32_composite_children(int parent, w32_surf *out, int ox, int oy)
         if (!c->used || c->parent != parent || !c->visible || !c->surf.px) continue;
         if (guard++ > W32_MAX_WND) break;
         cx = ox + c->x; cy = oy + c->y;
-        for (y = 0; y < c->surf.h; y++) {
-            int ty = cy + y;
-            if (ty < 0 || ty >= out->h) continue;
-            for (x = 0; x < c->surf.w; x++) {
-                int tx = cx + x;
-                if (tx < 0 || tx >= out->w) continue;
-                out->px[(size_t)ty * out->w + tx] =
-                    c->surf.px[(size_t)y * c->surf.w + x];
-            }
+        /* Clipped once per window, then a row at a time. This was a bounds
+         * check per pixel, and with an OpenGL editor -- one child window the
+         * size of the whole editor, recomposited sixty times a second -- it
+         * was nearly half of everything the helper did. */
+        {
+            int x0 = cx < 0 ? -cx : 0, y0 = cy < 0 ? -cy : 0;
+            int x1 = c->surf.w, y1 = c->surf.h;
+            if (cx + x1 > out->w) x1 = out->w - cx;
+            if (cy + y1 > out->h) y1 = out->h - cy;
+            (void)x;
+            if (x1 > x0)
+                for (y = y0; y < y1; y++)
+                    memcpy(out->px + (size_t)(cy + y) * out->w + cx + x0,
+                           c->surf.px + (size_t)y * c->surf.w + x0,
+                           (size_t)(x1 - x0) * 4);
         }
         w32_composite_children(i, out, cx, cy);
     }
@@ -6134,8 +6140,21 @@ int w32_editor_pixels(const unsigned int **px, int *w, int *h)
     if (!g_present.px) return 0;
     if (cw != s->w || ch != s->h)
         for (y = 0; y < ch * cw; y++) g_present.px[y] = 0x00808080u;
-    for (y = 0; y < s->h; y++)
-        memcpy(g_present.px + (size_t)y * cw, s->px + (size_t)y * s->w, (size_t)s->w * 4);
+    /* The editor's own surface, unless a child covers all of it -- an OpenGL
+     * editor is exactly that, and the copy was a full frame overwritten in
+     * full by the next. */
+    {
+        int k2, covered = 0;
+        for (k2 = 1; k2 < W32_MAX_WND && !covered; k2++) {
+            w32_wnd *c = &W.wnd[k2];
+            covered = c->used && c->parent == i && c->visible && c->surf.px &&
+                      c->x <= 0 && c->y <= 0 &&
+                      c->x + c->surf.w >= s->w && c->y + c->surf.h >= s->h;
+        }
+        if (!covered)
+            for (y = 0; y < s->h; y++)
+                memcpy(g_present.px + (size_t)y * cw, s->px + (size_t)y * s->w, (size_t)s->w * 4);
+    }
     w32_composite_children(i, &g_present, 0, 0);
     for (k = 0; k < nov; k++) {
         int ox, oy, yy, xx;

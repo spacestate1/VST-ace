@@ -1762,14 +1762,47 @@ static int dw_text_measure(const char *s, int n, int em_px,
     return 1;
 }
 
+static int dw_face_metrics_uncached(FT_Face f, int em_px, dw_face_info *fi);
+/* Bumped by dw_reset: the next plug-in's face can reuse a freed one's address. */
+static unsigned g_dw_metrics_gen;
+
+/* Remembered per face and size. JUCE asks for the outline metrics every time
+ * it measures or draws a string, and each answer set the face's size and
+ * loaded a glyph -- a few percent of an animated editor's whole frame, for a
+ * value that cannot change while the face is the same. */
 static int dw_face_metrics(int em_px, dw_face_info *fi)
 {
+    enum { NCACHE = 16 };
+    static struct { FT_Face f; int em; unsigned gen; dw_face_info fi; } cache[NCACHE];
+    static int next;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     FT_Face f = dw_ftface();
-    const FT_Size_Metrics *m;
-    FT_UInt gi;
+    int k, ok;
 
     memset(fi, 0, sizeof *fi);
     if (!f || em_px <= 0) return 0;
+    pthread_mutex_lock(&lock);
+    for (k = 0; k < NCACHE; k++)
+        if (cache[k].f == f && cache[k].em == em_px && cache[k].gen == g_dw_metrics_gen) {
+            *fi = cache[k].fi;
+            pthread_mutex_unlock(&lock);
+            return 1;
+        }
+    ok = dw_face_metrics_uncached(f, em_px, fi);
+    if (ok) {
+        cache[next].f = f; cache[next].em = em_px; cache[next].fi = *fi;
+        cache[next].gen = g_dw_metrics_gen;
+        next = (next + 1) % NCACHE;
+    }
+    pthread_mutex_unlock(&lock);
+    return ok;
+}
+
+static int dw_face_metrics_uncached(FT_Face f, int em_px, dw_face_info *fi)
+{
+    const FT_Size_Metrics *m;
+    FT_UInt gi;
+
     FT_Set_Pixel_Sizes(f, 0, (FT_UInt)em_px);
     m = &f->size->metrics;
     fi->ascent  = (int)((m->ascender + 63) >> 6);
@@ -2035,6 +2068,7 @@ static void dw_font_bytes_changing(void)
 
 static void dw_reset(void)
 {
+    g_dw_metrics_gen++;
     if (g_ftface) { FT_Done_Face(g_ftface); g_ftface = NULL; }
     free(g_font_bytes);
     g_font_bytes = NULL;
