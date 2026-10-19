@@ -6,7 +6,7 @@
 # so there is no oldest-supported release to write down the way the .deb and
 # .rpm have. Run it from anywhere:
 #
-#   bash packaging/build-arch.sh 0.3.1
+#   bash packaging/build-arch.sh 0.3.2
 #
 # The .pkg.tar.zst lands in release/VERSION/. Build-dependencies:
 #

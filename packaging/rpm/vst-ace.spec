@@ -21,7 +21,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 
 Name:           vst-ace
-Version:        0.3.1
+Version:        0.3.2
 Release:        1%{?dist}
 Summary:        Run Windows, macOS and Linux audio plug-ins natively, without Wine
 
@@ -213,6 +213,13 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
 %{_mandir}/man1/studiogtk.1*
 
 %changelog
+* Sun Oct 18 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.2-1
+- pestudio Connect menu: link the synth to REAPER, or put the loaded plug-in
+  in a DAW's FX list through the VST bridge, which the package now ships.
+- Several pestudio windows can be connected to REAPER at once.
+- Show Instruments / Effects boxes sort the plug-in list.
+- Fix studiogtk being listed under %%install instead of %%files.
+
 * Thu Oct 08 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.1-1
 - Tracker and studio shells: click-free PipeWire sample output with recovery,
   per-track volume and meters, Record studio mix, Open Recent, Connect >
