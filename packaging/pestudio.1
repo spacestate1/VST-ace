@@ -16,6 +16,10 @@ Plug\-ins built for Windows, macOS and Linux all load as native code; there is
 no Wine and no emulation. They are hosted out of process by default, so one
 that faults costs a helper rather than the session.
 .PP
+The \fBShow: Instruments / Effects\fR boxes above the list narrow it to one
+kind. Each plug\-in is checked once, in the background, and the answer is kept
+in \fI~/.cache/vst\-ace/plugin\-roles\fR.
+.PP
 Given a directory it browses that; given a bank it opens the plug\-ins the bank
 names with their patches loaded. With neither, it starts on the corpus named by
 .BR VST_ROOT ,
@@ -27,6 +31,18 @@ Launching it as
 .B va pe
 sets the X11 backend first, which is what a plug\-in's own editor needs; see
 .BR va (1).
+.SH CONNECT MENU
+.TP
+.B Connect to REAPER
+Wires this synth to REAPER: its audio into the next free pair of REAPER's
+inputs, and the next free REAPER MIDI output into the synth. Several pestudio
+windows can be connected at once. Start REAPER with \fBpw\-jack reaper\fR.
+.TP
+.B Show in DAWs' FX list
+Puts the loaded plug\-in in \fI~/.vst\fR (or \fI~/.vst3\fR) so REAPER or any
+other DAW can add it to a track. Rescan plug\-ins in the DAW afterwards. Untick
+to take it out. Each start of pestudio updates these copies to the current
+build. Not available in the AppImage.
 .SH ENVIRONMENT
 .TP
 .B QT_QPA_PLATFORM

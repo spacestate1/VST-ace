@@ -71,6 +71,7 @@ override_dh_auto_build:
 	test -x $(BUILD_PELOAD)/peload
 	test -x $(BUILD_PELOAD)/peserve
 	test -x $(BUILD_PELOAD)/pestudio
+	test -f $(BUILD_PELOAD)/libvst-ace-bridge.so
 	test -x $(BUILD_PELOAD)/peload32
 	test -x $(BUILD_GUI)/dwstudio
 	test -x $(BUILD_SESSION)/studio
@@ -102,6 +103,9 @@ override_dh_auto_install:
 	install -D -m 0755 $(BUILD_PELOAD)/peload   $(DESTDIR)$(PKGLIBDIR)/peload
 	install -D -m 0755 $(BUILD_PELOAD)/peserve  $(DESTDIR)$(PKGLIBDIR)/peserve
 	install -D -m 0755 $(BUILD_PELOAD)/pestudio $(DESTDIR)$(PKGLIBDIR)/pestudio
+# The VST bridge: pestudio copies it into ~/.vst for a DAW (Connect > Show in
+# DAWs' FX list), from beside itself.
+	install -D -m 0644 $(BUILD_PELOAD)/libvst-ace-bridge.so $(DESTDIR)$(PKGLIBDIR)/libvst-ace-bridge.so
 	install -D -m 0755 $(BUILD_GUI)/dwstudio    $(DESTDIR)$(PKGLIBDIR)/dwstudio
 	install -D -m 0755 $(BUILD_SESSION)/studio  $(DESTDIR)$(PKGLIBDIR)/studio
 	install -D -m 0755 $(BUILD_SESSION)/studiogtk $(DESTDIR)$(PKGLIBDIR)/studiogtk

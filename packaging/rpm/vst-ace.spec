@@ -119,6 +119,7 @@ cmake --build obj-session --parallel --target studiogtk
 test -x obj-peload/peload
 test -x obj-peload/peserve
 test -x obj-peload/pestudio
+test -f obj-peload/libvst-ace-bridge.so
 test -x obj-gui/dwstudio
 test -x obj-session/studio
 test -x obj-session/studiogtk
@@ -130,9 +131,11 @@ test -x obj-session/studiogtk
 install -D -m 0755 obj-peload/peload   %{buildroot}%{pkglibdir}/peload
 install -D -m 0755 obj-peload/peserve  %{buildroot}%{pkglibdir}/peserve
 install -D -m 0755 obj-peload/pestudio %{buildroot}%{pkglibdir}/pestudio
+# The VST bridge: pestudio copies it into ~/.vst for a DAW (Connect > Show in
+# DAWs' FX list), from beside itself.
+install -D -m 0755 obj-peload/libvst-ace-bridge.so %{buildroot}%{pkglibdir}/libvst-ace-bridge.so
 install -D -m 0755 obj-gui/dwstudio    %{buildroot}%{pkglibdir}/dwstudio
 install -D -m 0755 obj-session/studio  %{buildroot}%{pkglibdir}/studio
-%{pkglibdir}/studiogtk
 install -D -m 0755 obj-session/studiogtk %{buildroot}%{pkglibdir}/studiogtk
 install -D -m 0755 c/build/va          %{buildroot}%{_bindir}/va
 
@@ -190,8 +193,10 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
 %{pkglibdir}/peload
 %{pkglibdir}/peserve
 %{pkglibdir}/pestudio
+%{pkglibdir}/libvst-ace-bridge.so
 %{pkglibdir}/dwstudio
 %{pkglibdir}/studio
+%{pkglibdir}/studiogtk
 %dir %{pkglibdir}/runtime
 %dir %{pkglibdir}/runtime32
 %{pkglibdir}/runtime/README

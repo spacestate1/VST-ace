@@ -31,6 +31,13 @@ VST3, native Linux VST3, and each plug\-in's own editor.
 .B gui
 The GTK4 window: instruments, patches, drums and a Juno panel.
 .TP
+.B studio
+The session window: a tab per plug\-in, each the full host, beside the
+pattern tracker's tab. Its Connect menu links the synths to REAPER.
+.TP
+.B studiogtk
+The same session window in GTK.
+.TP
 .B peload " \fIplug\-in\fR [\fIoptions\fR]"
 The same hosts from the command line.
 .B \-\-params
@@ -100,7 +107,7 @@ needs at load time.
 .TP
 .I /usr/lib/vst\-ace/
 The hosts:
-.BR peload ", " peserve ", " pestudio " and " dwstudio .
+.BR peload ", " peserve ", " pestudio ", " dwstudio ", " studio " and " studiogtk .
 .TP
 .I /usr/share/vst\-ace/patches/
 Patch banks, as JSON. Hand one to

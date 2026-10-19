@@ -111,6 +111,7 @@ build() {
     test -x obj-peload/peload
     test -x obj-peload/peserve
     test -x obj-peload/pestudio
+    test -f obj-peload/libvst-ace-bridge.so
     test -x obj-gui/dwstudio
     test -x obj-session/studio
     test -x obj-session/studiogtk
@@ -152,6 +153,9 @@ package() {
     install -Dm755 obj-peload/peload   "$pkgdir$_pkglibdir/peload"
     install -Dm755 obj-peload/peserve  "$pkgdir$_pkglibdir/peserve"
     install -Dm755 obj-peload/pestudio "$pkgdir$_pkglibdir/pestudio"
+    # The VST bridge: pestudio copies it into ~/.vst for a DAW (Connect > Show
+    # in DAWs' FX list), from beside itself.
+    install -Dm644 obj-peload/libvst-ace-bridge.so "$pkgdir$_pkglibdir/libvst-ace-bridge.so"
     install -Dm755 obj-gui/dwstudio    "$pkgdir$_pkglibdir/dwstudio"
     install -Dm755 obj-session/studio  "$pkgdir$_pkglibdir/studio"
     install -Dm755 obj-session/studiogtk "$pkgdir$_pkglibdir/studiogtk"

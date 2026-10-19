@@ -83,6 +83,10 @@ will not open, or that dies (a JACK server stopping), falls back to PipeWire.
 
 ## Running
 
+In pestudio, **Show: Instruments / Effects** above the plug-in list narrows it
+to one kind. Untick one and pestudio sorts the list in the background, opening
+each plug-in once; the answers are kept for next time.
+
     dw                       open a window — whichever matches the desktop
     va pe <dir|bank.json>    the Qt window, on a folder or a patch bank
     va peload <plug-in>      the same hosts from the command line:
@@ -106,39 +110,47 @@ take with the window and `--play` starts the song. A synth tab's own **Record**
 button still records that tab alone. Not captured: tracks routed to an outside
 ALSA program, which make their sound somewhere this program cannot hear.
 
-**Connect > REAPER** (both shells, shown while a synth is loaded): switch it on and
-the studio links each loaded synth to REAPER in the PipeWire graph, as REAPER and
-the synths appear -- synth 1's stereo output to REAPER's audio inputs 1 and 2,
-synth 2's to 3 and 4, and so on in tab order, and REAPER's first MIDI output to
-synth 1's MIDI input, the second to synth 2's. Links go when it is switched off or
-the studio closes, and the choice is kept. In the GTK shell each synth gets its own
-stream and MIDI port ("studiogtk synth 01") while this is on, so REAPER can take
-them one by one. Start REAPER through pipewire-jack (`pw-jack reaper`) so that its
-inputs are in the graph, and add input channels in REAPER's audio preferences for
-more than one synth. REAPER's MIDI outputs are linked once they appear in the graph;
-otherwise the studio's MIDI port ("pestudio in", "studiogtk synth 01") should be
-listed in REAPER's MIDI device preferences, to enable as an output (not tried with
-REAPER itself; the links above were checked against REAPER for audio only).
+## With REAPER
 
-## In a DAW
+There are two ways, both under the **Connect** menu.
 
-The hosts above are programs you run. The same loaders are also a Linux VST2
-that a DAW loads on a track, which is the only way Ardour, Reaper, Bitwig,
-Qtractor and Carla will ever open a `.dll`:
+**Show in DAWs' FX list** (pestudio, `va`) puts the loaded plug-in in REAPER's
+plug-in list, to add to a track like any other. Tick it, then in REAPER:
+Options > Preferences > Plug-ins > VST > Re-scan. Any plug-in pestudio loads
+works this way: Windows (32- and 64-bit), macOS and Linux, VST2, VST3 and AU.
+Untick to take it out.
+
+- A Linux plug-in gets a link in `~/.vst` or `~/.vst3`.
+- Anything else gets a copy of the bridge in `~/.vst`, named after the
+  plug-in, and a `.vstace` file beside it holding the plug-in's path. Inside
+  REAPER it runs in a helper process, as in pestudio, so one that crashes does
+  not take REAPER down.
+- Each time pestudio starts it updates the copies to the current build. Restart
+  REAPER to pick them up.
+- If a plug-in file moves, tick the box again.
+- Not yet: the plug-in's own window. REAPER shows its parameters as sliders.
+- Not in the AppImage. Use the .deb, .rpm or Arch package, or a built tree.
+
+**Connect to REAPER** (pestudio, and Connect > REAPER in `va studio`) keeps the
+synth in its own window and wires it to REAPER like outboard gear: its audio
+into a pair of REAPER's inputs, and a REAPER MIDI
+output into the synth. Each synth takes the next free pair and output, so
+several pestudio windows (or studio tabs) can be connected at once. Start
+REAPER with `pw-jack reaper`, give it two input channels per synth, and enable
+one MIDI output per synth in its MIDI device preferences. The choice is kept.
+
+## In other DAWs
+
+The bridge is a plain Linux VST2, so Ardour, Bitwig, Qtractor and Carla load it
+too: **Show in DAWs' FX list** puts it in `~/.vst`, which they scan. By hand:
 
     cp peload/build/libvst-ace-bridge.so  ~/.vst/FB-3300.so
-    cp /path/to/FB-3300.dll               ~/.vst/
+    echo /path/to/FB-3300.dll >           ~/.vst/FB-3300.vstace
 
-Name it after the plug-in and put the real thing beside it — the copy works
-out which plug-in it stands for from its own file name. A `.vstace` file
-holding a path does instead, for a plug-in that has to live somewhere else,
-and `VSTACE_TARGET` overrides both.
-
-Audio, MIDI with sample-accurate timing, parameters, programs, the DAW's
-tempo and transport, opaque plug-in state and the editor all go through. A
-bridged plug-in renders bit-identical audio to the same plug-in loaded
-directly. One that will not load keeps the track and passes silence, with the
-reason on stderr, rather than failing the load and losing your place.
+Use a copy, not a link. `VSTACE_TARGET=<path>` overrides the `.vstace`.
+Audio, MIDI, parameters, programs, tempo, transport and saved state go through,
+and the audio is identical to the plug-in loaded directly. A plug-in that will
+not load keeps the track and passes silence, with the reason on stderr.
 
 ## Building
 
