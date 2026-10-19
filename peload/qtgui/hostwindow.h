@@ -2666,6 +2666,94 @@ public:
  * back. */
 struct PatchRef { patch_bank *bank; int ix; };
 
+/* Instrument or effect, per plug-in file, for the browser's two check boxes.
+ *
+ * A VST2 says which it is only once it is open, so most answers come from
+ * opening it: when the user loads it, or from a background `peload --params`
+ * run on each one nobody has loaded yet. VST3 and AU bundles say it in a file
+ * beside the code, which is read instead. Answers are kept in
+ * ~/.cache/vst-ace/plugin-roles against the file's date and size, so each
+ * plug-in is opened for this at most once, and every window in the process
+ * shares them. */
+enum PluginRole { RoleUnknown = 0, RoleInstrument = 1, RoleEffect = 2, RoleFailed = -1 };
+
+struct PluginRoles {
+    QHash<QString, QPair<qint64, int>> map;      /* path -> (stamp, role) */
+    bool loaded = false;
+
+    static PluginRoles &get() { static PluginRoles r; return r; }
+    static QString file()
+    {
+        return QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation) +
+               "/vst-ace/plugin-roles";
+    }
+    static qint64 stamp(const QString &path)
+    {
+        const QFileInfo fi(path);
+        return fi.lastModified().toSecsSinceEpoch() * 1000003 + fi.size();
+    }
+    void readFile(QHash<QString, QPair<qint64, int>> &into) const
+    {
+        QFile f(file());
+        if (!f.open(QIODevice::ReadOnly)) return;
+        while (!f.atEnd()) {
+            const QList<QByteArray> c = f.readLine().trimmed().split('\t');
+            if (c.size() == 3) into.insert(QString::fromUtf8(c[2]), { c[1].toLongLong(), c[0].toInt() });
+        }
+    }
+    void load() { if (!loaded) { readFile(map); loaded = true; } }
+    /* Merged with what is on disk first: another pestudio may have added to it. */
+    void save()
+    {
+        QHash<QString, QPair<qint64, int>> disk;
+        readFile(disk);
+        for (auto it = map.constBegin(); it != map.constEnd(); ++it) disk.insert(it.key(), it.value());
+        map = disk;
+        QDir().mkpath(QFileInfo(file()).path());
+        QSaveFile f(file());
+        if (!f.open(QIODevice::WriteOnly)) return;
+        for (auto it = map.constBegin(); it != map.constEnd(); ++it)
+            f.write(QByteArray::number(it.value().second) + '\t' + QByteArray::number(it.value().first) +
+                    '\t' + it.key().toUtf8() + '\n');
+        f.commit();
+    }
+
+    /* A VST3's moduleinfo.json names its sub-categories ("Instrument|Synth",
+     * "Fx|Delay"); an AU's Info.plist its component type (aumu is an
+     * instrument, aufx/aumf/aumx effects). Neither needs the plug-in opened. */
+    static int fromBundle(const QString &path)
+    {
+        if (path.endsWith(".vst3", Qt::CaseInsensitive)) {
+            for (const char *rel : { "/Contents/Resources/moduleinfo.json", "/Contents/moduleinfo.json" }) {
+                QFile f(path + rel);
+                if (!f.open(QIODevice::ReadOnly)) continue;
+                const QByteArray t = f.readAll();
+                if (t.contains("\"Instrument")) return RoleInstrument;
+                if (t.contains("\"Fx")) return RoleEffect;
+            }
+        } else if (path.endsWith(".component", Qt::CaseInsensitive)) {
+            QFile f(path + "/Contents/Info.plist");
+            if (f.open(QIODevice::ReadOnly)) {
+                const QByteArray t = f.readAll();
+                if (t.contains(">aumu<")) return RoleInstrument;
+                if (t.contains(">aufx<") || t.contains(">aumf<") || t.contains(">aumx<")) return RoleEffect;
+            }
+        }
+        return RoleUnknown;
+    }
+
+    int role(const QString &path)
+    {
+        load();
+        auto it = map.constFind(path);
+        if (it != map.constEnd() && it->first == stamp(path)) return it->second;
+        const int r = fromBundle(path);
+        if (r != RoleUnknown) map.insert(path, { stamp(path), r });
+        return r;
+    }
+    void set(const QString &path, int r) { load(); map.insert(path, { stamp(path), r }); }
+};
+
 class HostWidget : public QWidget {
     Q_OBJECT
 public:
@@ -2686,6 +2774,15 @@ public:
      * included. */
     ~HostWidget() override
     {
+        /* A sort still running: stopped, and the answers so far kept. The flag
+         * is the process's, so another studio tab can take the sort over. */
+        if (probe_) {
+            probe_->disconnect();
+            probe_->kill();
+            probe_->waitForFinished(1000);
+            probeBusy() = false;
+            PluginRoles::get().save();
+        }
         if (midi_)        midi_->stopInput();
         if (editor_)      editor_->detach();
         if (pixelEditor_) pixelEditor_->detach();
@@ -3006,8 +3103,23 @@ public:
         dirRow->addWidget(new QLabel("Dir:"));
         dirRow->addWidget(dirEdit_);
         dirRow->addWidget(browse);
+        /* Instruments and effects: both ticked shows everything, one ticked
+         * shows only that kind. See PluginRoles for where the answers come
+         * from; one not sorted yet is shown only when both are ticked. */
+        instBox_ = new QCheckBox("Instruments");
+        fxBox_   = new QCheckBox("Effects");
+        instBox_->setChecked(true);
+        fxBox_->setChecked(true);
+        instBox_->setToolTip("Synths, drum machines, samplers -- anything that plays notes");
+        fxBox_->setToolTip("Plug-ins that process audio: delays, reverbs, vocoders, filters");
+        auto *roleRow = new QHBoxLayout;
+        roleRow->addWidget(new QLabel("Show:"));
+        roleRow->addWidget(instBox_);
+        roleRow->addWidget(fxBox_);
+        roleRow->addStretch(1);
         lv->addLayout(typeRow);
         lv->addLayout(osRow);
+        lv->addLayout(roleRow);
         lv->addLayout(dirRow);
 
         /* Opening a plug-in and adding a folder used to be a pair of buttons
@@ -3333,6 +3445,8 @@ public:
         connect(osBox_, &QComboBox::currentIndexChanged, this,
                 [this](int) { applyFilter(); });
         connect(searchEdit_, &QLineEdit::textChanged, this, [this](const QString &) { applyFilter(); });
+        connect(instBox_, &QCheckBox::toggled, this, [this](bool) { applyFilter(); startProbes(); });
+        connect(fxBox_, &QCheckBox::toggled, this, [this](bool) { applyFilter(); startProbes(); });
         connect(pluginList_, &QListWidget::currentRowChanged, this, &HostWidget::loadRow);
         connect(patchList_, &QListWidget::currentRowChanged, this, &HostWidget::applyPatchRow);
         connect(programList_, &QListWidget::currentRowChanged, this, [this](int r) {
@@ -3814,6 +3928,83 @@ private slots:
         rootCount_ = int(roots.size());
         rebuildFilters();
         applyFilter();
+        startProbes();
+    }
+
+    /* `peload` beside this program -- pestudio's place, and an installed copy's
+     * -- or, for the studio built in session/build, in peload/build. */
+    static QString peloadTool()
+    {
+        const QString d = QCoreApplication::applicationDirPath();
+        for (const QString &p : { d + "/peload", d + "/../../peload/build/peload" })
+            if (QFileInfo(p).isExecutable()) return QFileInfo(p).canonicalFilePath();
+        return QString();
+    }
+    /* One sort at a time per process: the studio's tabs share the answers. */
+    static bool &probeBusy() { static bool b = false; return b; }
+    bool sortingWanted() const { return instBox_ && fxBox_ && !(instBox_->isChecked() && fxBox_->isChecked()); }
+
+    /* The background sort, started once a Show box is unticked: each loadable
+     * plug-in of unknown kind is opened in its own `peload --params`, never in
+     * this process, so one that hangs or crashes costs only that run (killed
+     * after 20 s) and is marked so it is not tried again. */
+    void startProbes()
+    {
+        if (!sortingWanted() || probe_ || probeBusy() || peloadTool().isEmpty()) return;
+        probeQueue_.clear();
+        for (const Entry &e : all_)
+            if (e.loadable && PluginRoles::get().role(e.path) == RoleUnknown)
+                probeQueue_.append({ e.path, e.os == "linux" });
+        if (probeQueue_.isEmpty()) return;
+        probeBusy() = true;
+        probeNext();
+    }
+    void probeNext()
+    {
+        if (probeQueue_.isEmpty()) {
+            probeBusy() = false;
+            PluginRoles::get().save();
+            applyFilter();
+            return;
+        }
+        const QPair<QString, bool> next = probeQueue_.takeFirst();
+        probing_ = next.first;
+        probe_ = new QProcess(this);
+        probe_->setProcessChannelMode(QProcess::MergedChannels);
+        probe_->setStandardInputFile(QProcess::nullDevice());
+        /* No display for a Windows or Mac plug-in: one that puts up a message
+         * box while loading must not open windows on the user's desktop from a
+         * background run. A native Linux one keeps it -- a JUCE plug-in will
+         * not even load without an X server. */
+        if (!next.second) {
+            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            env.remove("DISPLAY");
+            env.remove("WAYLAND_DISPLAY");
+            probe_->setProcessEnvironment(env);
+        }
+        connect(probe_, &QProcess::finished, this, [this](int, QProcess::ExitStatus) { probeDone(); });
+        connect(probe_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+            if (e == QProcess::FailedToStart) probeDone();
+        });
+        QTimer::singleShot(20000, probe_, [p = probe_] { p->kill(); });
+        probe_->start(peloadTool(), { probing_, "--params" });
+    }
+    void probeDone()
+    {
+        if (!probe_) return;
+        const QString out = QString::fromUtf8(probe_->readAll());
+        probe_->deleteLater();
+        probe_ = nullptr;
+        static const QRegularExpression re("uniqueID 0x[0-9a-fA-F]+\\s+(synth|effect)");
+        const QRegularExpressionMatch m = re.match(out);
+        PluginRoles::get().set(probing_, !m.hasMatch() ? RoleFailed
+                                         : m.captured(1) == "synth" ? RoleInstrument : RoleEffect);
+        /* Shown as they come in, a batch at a time rather than per plug-in. */
+        if (++probed_ % 10 == 0) {
+            PluginRoles::get().save();
+            if (sortingWanted()) applyFilter();
+        }
+        probeNext();
     }
 
     /* Offer only what was actually found, once each. The selectors are built
@@ -3860,6 +4051,10 @@ private slots:
         const QString wantOs   = osBox_->currentData().toString();
         const QString needle   = searchEdit_ ? searchEdit_->text().trimmed() : QString();
 
+        const bool wantInst = !instBox_ || instBox_->isChecked();
+        const bool wantFx   = !fxBox_ || fxBox_->isChecked();
+        int unsorted = 0;
+
         pluginList_->clear();
         paths_ = QStringList();
         unloadable_.clear();
@@ -3873,9 +4068,24 @@ private slots:
             if (needle.size() == 1 ? !e.name.startsWith(needle, Qt::CaseInsensitive)
                                    : (!needle.isEmpty() && !e.label.contains(needle, Qt::CaseInsensitive) &&
                                       !e.path.contains(needle, Qt::CaseInsensitive))) continue;
+            if (!(wantInst && wantFx)) {
+                const int r = PluginRoles::get().role(e.path);
+                if (r != RoleInstrument && r != RoleEffect) { unsorted++; continue; }
+                if (r == RoleInstrument ? !wantInst : !wantFx) continue;
+            }
             paths_ << e.path;
             pluginList_->addItem(e.label);
             if (!e.loadable) unloadable_.insert(e.path);
+        }
+
+        /* The plug-in that is playing stays selected when the list is narrowed
+         * or re-sorted, rather than the first row loading over it. */
+        {
+            const int keep = loadedPath_.isEmpty() ? -1 : int(paths_.indexOf(loadedPath_));
+            if (keep >= 0) {
+                QSignalBlocker b(pluginList_);
+                pluginList_->setCurrentRow(keep);
+            }
         }
 
         const QString what =
@@ -3886,13 +4096,18 @@ private slots:
                       .arg(paths_.size()).arg(all_.size())
                       .arg(wantOs.isEmpty() ? QString("every platform") : osLabel(wantOs))
                       .arg(wantType.isEmpty() ? QString() : ", " + wantType);
-        status(needle.isEmpty() ? what
-                                : QString("%1 of %2 plugin(s) match \"%3\"")
-                                      .arg(paths_.size()).arg(all_.size()).arg(needle));
+        status((needle.isEmpty() ? what
+                                 : QString("%1 of %2 plugin(s) match \"%3\"")
+                                       .arg(paths_.size()).arg(all_.size()).arg(needle)) +
+               (unsorted ? QString(" -- %1 not sorted into instrument/effect yet%2")
+                               .arg(unsorted).arg(probeQueue_.isEmpty() && !probe_ ? QString()
+                                                                                     : QString(", sorting..."))
+                         : QString()));
 
         /* Load something straight away: an empty host makes an attached
-         * keyboard look broken when it is only unassigned. */
-        if (!paths_.isEmpty() && pluginList_->currentRow() < 0 && needle.isEmpty()) {
+         * keyboard look broken when it is only unassigned. Only an empty one:
+         * narrowing the list while a plug-in plays must not swap it out. */
+        if (!paths_.isEmpty() && pluginList_->currentRow() < 0 && needle.isEmpty() && loadedPath_.isEmpty()) {
             int want = -1;
             bool namedOnCommandLine = false;
             if (!startPlugin_.isEmpty()) {
@@ -4040,6 +4255,9 @@ private slots:
         }
         pehost *h = eng_.host();
         loadedPath_ = paths_[row];
+        /* Open now, so it can say which kind it is: kept for the Show boxes. */
+        PluginRoles::get().set(loadedPath_, pehost_is_synth(h) ? RoleInstrument : RoleEffect);
+        PluginRoles::get().save();
         /* The widget's title follows the plug-in's name. pestudio's shell sets
          * the frame's own title and never reads this; the studio window puts it
          * on the tab, through windowTitleChanged. */
@@ -6405,6 +6623,13 @@ private:
     QList<QPair<QString, QString>> userDirs_;   /* {platform, path} */
     QWidget      *keysBox_ = nullptr;     /* wheel and piano: View > On-screen keyboard */
     QLineEdit    *searchEdit_ = nullptr;   /* narrows the plug-in list by keyword */
+    QCheckBox    *instBox_ = nullptr, *fxBox_ = nullptr;   /* Show: instruments / effects */
+    /* The background sort: plug-ins nobody has loaded yet, opened one at a
+     * time with `peload --params` to learn which kind each is. */
+    QList<QPair<QString, bool>> probeQueue_;   /* {path, native Linux} */
+    QProcess     *probe_ = nullptr;
+    QString       probing_;
+    int           probed_ = 0;
     QStringList   sessionRoots_;         /* --dir or a named plug-in: this run only */
     QList<Entry>  all_;
     int           rootCount_ = 0;        /* how many folders the last scan walked */
