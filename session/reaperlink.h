@@ -7,11 +7,16 @@
  *   audio  the synth's stereo output  ->  a pair of REAPER's audio inputs
  *   MIDI   a REAPER MIDI output       ->  the synth's MIDI input
  *
- * Synth k gets REAPER's inputs 2k+1 and 2k+2 and REAPER's k-th MIDI output, so
- * the order of the synths in the studio is the order of the tracks to set up in
- * REAPER. Links are made as REAPER and the synths appear and removed when it is
- * switched off; it is the graph that does the work, so nothing here is in the
- * audio path. Only links made here are ever removed. */
+ * Synth k gets REAPER's next free input pair and next free MIDI output, in
+ * tab order, so the order of the synths in the studio is the order of the
+ * tracks to set up in REAPER -- "next free" rather than always "2k+1/2k+2" or
+ * always "k-th" because a pair or MIDI output already linked to some other
+ * studio process's synth is stepped past rather than reused, so two separate
+ * `./va` processes connecting at once land on different REAPER channels
+ * instead of fighting over the same ones. Links are made as REAPER and the
+ * synths appear and removed when it is switched off; it is the graph that
+ * does the work, so nothing here is in the audio path. Only links made here
+ * are ever removed. */
 #ifndef REAPERLINK_H
 #define REAPERLINK_H
 
