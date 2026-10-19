@@ -8,8 +8,10 @@
  * plus main(). The studio window replaces the shell and keeps the widget. */
 
 #include <QtWidgets>
+#include <cstdio>
 
 #include "hostwindow.h"
+#include "reaperlink.h"
 
 /* pestudio's shell: one HostWidget under the menu bar and the status bar the
  * widget asks its shell for. Everything per-plug-in is in the widget; this is
@@ -24,7 +26,55 @@ public:
         host_ = new HostWidget(this, dir, plugin, bankFile, bank, startPatch, this);
         setCentralWidget(host_);
         resize(1180, 760);
+
+        /* Connect > REAPER, the studio window's switch for this window's one
+         * synth -- see reaperlink.h. Several pestudios can be on at once: each
+         * takes the next REAPER input pair and MIDI output none of the others
+         * holds. The choice is the studio's too, so a new pestudio comes up
+         * connected when the last one was left connected. */
+        /* Real check boxes rather than checkable actions: many menu styles draw
+         * nothing for an unticked action, so off cannot be told from absent. */
+        QMenu *cm = menuBar()->addMenu("&Connect");
+        auto addBox = [cm](const QString &text, const QString &tip) {
+            auto *wa = new QWidgetAction(cm);
+            auto *pad = new QWidget;
+            auto *lay = new QHBoxLayout(pad);
+            lay->setContentsMargins(8, 4, 8, 4);
+            auto *box = new QCheckBox(text);
+            box->setToolTip(tip);
+            lay->addWidget(box);
+            wa->setDefaultWidget(pad);
+            cm->addAction(wa);
+            return box;
+        };
+        reaperBox_ = addBox("Connect to REAPER",
+                            "Link this synth to REAPER: its audio to the next free pair of "
+                            "REAPER's inputs, and the next free REAPER MIDI output to it");
+        connectInfo_ = cm->addAction("REAPER: off");
+        connectInfo_->setEnabled(false);
+        connect(reaperBox_, &QCheckBox::toggled, this, [this](bool on) { reaperToggled(on); });
+        cm->addSeparator();
+        bridgeBox_ = addBox("Show in DAWs' FX list",
+                            "Put this plug-in in ~/.vst as a Linux VST2, so REAPER (or any DAW) "
+                            "loads it on a track itself. Rescan plug-ins in the DAW afterwards.");
+        connect(bridgeBox_, &QCheckBox::clicked, this, [this](bool on) { bridgeToggled(on); });
+        auto *watch = new QTimer(this);
+        connect(watch, &QTimer::timeout, this, [this] { updateConnect(); updateBridge(); });
+        watch->start(1000);
+        if (loadReaperPref()) reaperBox_->setChecked(true);
+
+        /* Each start: the bridge copies already in ~/.vst brought up to this
+         * build, and the helpers' directory written down again -- so neither a
+         * rebuild nor a moved tree leaves DAWs running an old or lost bridge. */
+        if (bridgeUsable()) {
+            saveHelperDir();
+            const int n = refreshBridgeCopies();
+            if (n > 0)
+                statusBar()->showMessage(QString("updated %1 plug-in%2 in %3 to this build -- restart "
+                                                 "the DAW to use them").arg(n).arg(n == 1 ? "" : "s").arg(vstDir()), 0);
+        }
     }
+    ~StudioShell() override { rl_close(rl_); }       /* the links it made go with it */
 
     HostWidget *host() const { return host_; }
 
@@ -44,7 +94,275 @@ protected:
     }
 
 private:
+    /* The same file the studio window keeps its switch in. */
+    static QString connectPrefPath()
+    {
+        const QByteArray x = qgetenv("XDG_CONFIG_HOME");
+        const QString base = x.isEmpty() ? QDir::homePath() + "/.config" : QString::fromLocal8Bit(x);
+        return base + "/vst-ace/connect";
+    }
+    static bool loadReaperPref()
+    {
+        QFile f(connectPrefPath());
+        return f.open(QIODevice::ReadOnly) && QString::fromUtf8(f.readAll()).contains("reaper 1");
+    }
+    static void saveReaperPref(bool on)
+    {
+        QDir().mkpath(QFileInfo(connectPrefPath()).absolutePath());
+        QSaveFile f(connectPrefPath());
+        if (f.open(QIODevice::WriteOnly)) { f.write(on ? "reaper 1\n" : "reaper 0\n"); f.commit(); }
+    }
+
+    void reaperToggled(bool on)
+    {
+        if (on && !rl_ && !(rl_ = rl_open())) {
+            statusBar()->showMessage("could not connect to PipeWire -- REAPER links need it", 0);
+            QSignalBlocker b(reaperBox_);
+            reaperBox_->setChecked(false);
+            return;
+        }
+        saveReaperPref(on);
+        connectSig_.clear();
+        updateConnect();
+    }
+
+    /* Once a second and on the switch: the synth, when one is loaded, to the
+     * linker -- only when something changed -- and its status to the menu. Its
+     * MIDI client is named when the plug-in's MIDI opens, which can be after
+     * the load, so this keeps looking rather than being told once. */
+    void updateConnect()
+    {
+        if (!rl_) return;
+        const bool loaded = !host_->loadedPath().isEmpty();
+        const QByteArray node = host_->graphNodeName();
+        const QString midi = host_->midiClientName();
+        QString sig = reaperBox_->isChecked() ? "on" : "off";
+        if (loaded) sig += "|" + QString::fromUtf8(node) + "/" + midi;
+        if (sig != connectSig_) {
+            connectSig_ = sig;
+            rl_synth rs;
+            memset(&rs, 0, sizeof rs);
+            snprintf(rs.node, sizeof rs.node, "%s", node.constData());
+            snprintf(rs.alsa_client, sizeof rs.alsa_client, "%s", midi.toUtf8().constData());
+            rl_set(rl_, &rs, loaded ? 1 : 0, reaperBox_->isChecked());
+        }
+        char st[300];
+        rl_status(rl_, st, sizeof st);
+        connectInfo_->setText(QString::fromUtf8(st));
+    }
+
+    /* Connect > Show in DAWs' FX list: whatever pestudio has loaded, put where a
+     * DAW looks for plug-ins. Three routes, by what the plug-in is:
+     *
+     *   Linux VST2   a link to it in ~/.vst -- the DAW loads it itself
+     *   Linux VST3   a link to its bundle in ~/.vst3, likewise
+     *   the rest     the bridge (peload/vstbridge.c): a copy of it in ~/.vst
+     *                named after the plug-in, and a .vstace beside the copy
+     *                naming the real file; inside the DAW it loads that file
+     *                with the same loaders pestudio uses
+     *
+     * A copy of the bridge and not a link: the dynamic loader opens one file
+     * once whatever it is called, and the bridge tells which plug-in it stands
+     * for by the name it was opened under, so two links would both be the first
+     * plug-in. */
+    enum FxRoute { RouteNone, RouteLinkVst2, RouteLinkVst3, RouteBridge };
+    static QString vstDir()  { return QDir::homePath() + "/.vst"; }
+    static QString vst3Dir() { return QDir::homePath() + "/.vst3"; }
+    static QString bridgeLib() { return QCoreApplication::applicationDirPath() + "/libvst-ace-bridge.so"; }
+    /* A bridge copy, as opposed to a real Linux plug-in of the same name that
+     * must not be overwritten or removed. Asked once a second for the menu, so
+     * the answer is kept until the file changes rather than read again. */
+    static bool isBridgeCopy(const QString &so)
+    {
+        static QHash<QString, QPair<QDateTime, bool>> seen;
+        const QFileInfo fi(so);
+        if (!fi.exists()) return false;
+        auto it = seen.constFind(so);
+        if (it != seen.constEnd() && it->first == fi.lastModified()) return it->second;
+        QFile f(so);
+        const bool is = f.open(QIODevice::ReadOnly) && f.readAll().contains("VSTACE_TARGET");
+        seen.insert(so, { fi.lastModified(), is });
+        return is;
+    }
+    /* The AppImage's own directory is a mount that moves on every run and its
+     * libraries are its own, so a bridge copied out of it into ~/.vst would
+     * not load outside it. The packages and a built tree have neither problem. */
+    static bool inAppImage() { return qEnvironmentVariableIsSet("APPIMAGE"); }
+    static bool bridgeUsable() { return !inAppImage() && QFileInfo::exists(bridgeLib()); }
+    /* Put the bridge at `so` without writing into the file a running DAW may
+     * have open: a new file renamed over the old, which the DAW keeps until it
+     * restarts. */
+    static bool installBridge(const QString &so)
+    {
+        const QString tmp = so + ".new";
+        QFile::remove(tmp);
+        if (!QFile::copy(bridgeLib(), tmp)) return false;
+        if (::rename(QFile::encodeName(tmp).constData(), QFile::encodeName(so).constData()) != 0) {
+            QFile::remove(tmp);
+            return false;
+        }
+        return true;
+    }
+    static bool sameBytes(const QString &a, const QString &b)
+    {
+        QFile fa(a), fb(b);
+        return fa.size() == fb.size() && fa.open(QIODevice::ReadOnly) && fb.open(QIODevice::ReadOnly) &&
+               fa.readAll() == fb.readAll();
+    }
+    /* Every bridge copy in ~/.vst that is not this build's bridge, replaced.
+     * Returns how many were. */
+    static int refreshBridgeCopies()
+    {
+        int n = 0;
+        const QFileInfoList all = QDir(vstDir()).entryInfoList({ "*.so" }, QDir::Files);
+        for (const QFileInfo &fi : all) {
+            if (fi.isSymLink() || !isBridgeCopy(fi.filePath()) || sameBytes(fi.filePath(), bridgeLib()))
+                continue;
+            if (installBridge(fi.filePath())) n++;
+        }
+        return n;
+    }
+    /* A link we made: one that points at this plug-in, and so is ours to remove. */
+    static bool isLinkTo(const QString &link, const QString &target)
+    {
+        const QFileInfo fi(link);
+        return fi.isSymLink() &&
+               QFileInfo(fi.symLinkTarget()).canonicalFilePath() == QFileInfo(target).canonicalFilePath();
+    }
+    static bool occupied(const QString &p) { return QFileInfo::exists(p) || QFileInfo(p).isSymLink(); }
+
+    /* Classified once per plug-in rather than every tick: classifying a native
+     * .so dlopens it. */
+    FxRoute route()
+    {
+        const QString path = host_->loadedPath();
+        if (path != routePath_) {
+            routePath_ = path;
+            route_ = RouteNone;
+            if (!path.isEmpty()) {
+                pehost_info in;
+                pehost_classify(path.toLocal8Bit().constData(), &in);
+                const bool linux_ = !strcmp(in.os, "linux");
+                route_ = linux_ && !strcmp(in.format, "VST2") ? RouteLinkVst2
+                       : linux_ && !strcmp(in.format, "VST3") ? RouteLinkVst3
+                       : RouteBridge;
+            }
+        }
+        return route_;
+    }
+    /* The bundle for a VST3, which the loaded path may be inside of. */
+    QString vst3Bundle() const
+    {
+        QString p = host_->loadedPath();
+        while (!p.isEmpty() && p != "/" && !p.endsWith(".vst3", Qt::CaseInsensitive))
+            p = QFileInfo(p).path();
+        return p.endsWith(".vst3", Qt::CaseInsensitive) ? p : host_->loadedPath();
+    }
+    QString fxName() const
+    {
+        const QString p = route_ == RouteLinkVst3 ? vst3Bundle() : host_->loadedPath();
+        return QFileInfo(p).completeBaseName();
+    }
+    /* Where this plug-in's entry in the DAW's folders goes. */
+    QString fxEntry()
+    {
+        switch (route()) {
+        case RouteLinkVst3: return vst3Dir() + "/" + QFileInfo(vst3Bundle()).fileName();
+        case RouteNone:     return QString();
+        default:            return vstDir() + "/" + fxName() + ".so";
+        }
+    }
+    bool inFxList()
+    {
+        const QString e = fxEntry();
+        switch (route()) {
+        case RouteLinkVst2: return isLinkTo(e, host_->loadedPath());
+        case RouteLinkVst3: return isLinkTo(e, vst3Bundle());
+        case RouteBridge:   return isBridgeCopy(e);
+        default:            return false;
+        }
+    }
+
+    void updateBridge()
+    {
+        const bool loaded = route() != RouteNone;
+        QSignalBlocker b(bridgeBox_);
+        bridgeBox_->setEnabled(loaded);
+        bridgeBox_->setChecked(loaded && inFxList());
+        bridgeBox_->setText(loaded ? "Show " + fxName() + " in DAWs' FX list"
+                                   : "Show in DAWs' FX list (load a plug-in first)");
+    }
+
+    void bridgeToggled(bool on)
+    {
+        const FxRoute r = route();
+        const QString e = fxEntry();
+        const QString ptr = vstDir() + "/" + fxName() + ".vstace";
+        if (r == RouteNone) return;
+        if (!on) {
+            if (inFxList()) { QFile::remove(e); if (r == RouteBridge) QFile::remove(ptr); }
+            statusBar()->showMessage(fxName() + " taken out of the DAWs' list -- rescan plug-ins in the DAW", 0);
+            updateBridge();
+            return;
+        }
+        QString why;
+        if (inFxList())
+            ;                                        /* already there */
+        else if (r == RouteLinkVst2 || r == RouteLinkVst3) {
+            const QString target = r == RouteLinkVst3 ? vst3Bundle() : host_->loadedPath();
+            if (occupied(e))
+                why = e + " is another plug-in -- left alone";
+            else {
+                QDir().mkpath(QFileInfo(e).path());
+                if (!QFile::link(target, e)) why = "could not make the link " + e;
+            }
+        } else if (inAppImage())
+            why = "not in the AppImage -- install the .deb, .rpm or Arch package for this";
+        else if (!QFileInfo::exists(bridgeLib()))
+            why = "the bridge is missing: no " + bridgeLib() + " (va build makes it)";
+        else if (occupied(e) && !isBridgeCopy(e))
+            why = e + " is another plug-in, not a bridge copy -- left alone";
+        else {
+            QDir().mkpath(vstDir());
+            QSaveFile p(ptr);
+            if (!installBridge(e))
+                why = "could not copy the bridge to " + e;
+            else if (!p.open(QIODevice::WriteOnly) || p.write(host_->loadedPath().toLocal8Bit() + "\n") < 0 ||
+                     !p.commit()) {
+                QFile::remove(e);
+                why = "could not write " + ptr;
+            } else
+                saveHelperDir();
+        }
+        if (!why.isEmpty()) statusBar()->showMessage("FX list: " + why, 0);
+        else statusBar()->showMessage(fxName() + " is in " + QFileInfo(e).path() + " -- in REAPER: Options > "
+                                      "Preferences > Plug-ins > VST > Re-scan, then add it to a track", 0);
+        updateBridge();
+    }
+
+    /* Inside a DAW the bridge cannot find peload32 (32-bit plug-ins) beside
+     * the executable, which is the DAW: this is where it looks instead -- see
+     * bridge_helper_named in bridge_client.c. */
+    static void saveHelperDir()
+    {
+        const QByteArray x = qgetenv("XDG_CONFIG_HOME");
+        const QString cfg = (x.isEmpty() ? QDir::homePath() + "/.config" : QString::fromLocal8Bit(x)) +
+                            "/vst-ace/helpers";
+        QDir().mkpath(QFileInfo(cfg).path());
+        QSaveFile f(cfg);
+        if (f.open(QIODevice::WriteOnly)) {
+            f.write(QCoreApplication::applicationDirPath().toLocal8Bit() + "\n");
+            f.commit();
+        }
+    }
+
     HostWidget *host_ = nullptr;
+    rl         *rl_ = nullptr;
+    QCheckBox  *reaperBox_ = nullptr, *bridgeBox_ = nullptr;
+    QAction    *connectInfo_ = nullptr;
+    QString     connectSig_;
+    QString     routePath_;
+    FxRoute     route_ = RouteNone;
 };
 
 /* Let the window system deliver input while a plugin spins in its own drag loop.

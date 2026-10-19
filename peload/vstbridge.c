@@ -452,6 +452,15 @@ AEffect *VSTPluginMain(audioMasterCb master)
 
     snprintf(p->name, sizeof p->name, "%s", pehost_name(p->h));
     snprintf(p->vendor, sizeof p->vendor, "%s", pehost_vendor(p->h));
+    /* An Audio Unit is named "Audio Unit" by the loader, which would put every
+     * one of them in the DAW's list under the same name: the file's own name
+     * says which it is. */
+    if (!p->name[0] || !strcmp(p->name, "Audio Unit")) {
+        const char *base = strrchr(p->target, '/');
+        char *dot;
+        snprintf(p->name, sizeof p->name, "%s", base ? base + 1 : p->target);
+        if ((dot = strrchr(p->name, '.'))) *dot = 0;
+    }
     p->nin  = pehost_num_inputs(p->h);
     p->nout = pehost_num_outputs(p->h);
     if (p->nin  > MAXCH) p->nin  = MAXCH;

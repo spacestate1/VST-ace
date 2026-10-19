@@ -160,7 +160,11 @@ if(Qt6_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND)
   add_library(qthost STATIC qtgui/hostwindow.cpp qtgui/hostwindow.h qtgui/midiio.cpp)
   target_link_libraries(qthost PUBLIC pehost audioout Qt6::Widgets PkgConfig::PIPEWIRE PkgConfig::ALSA)
   target_include_directories(qthost PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-  add_executable(pestudio qtgui/main.cpp)
+  # Connect > REAPER is the studio window's linker (session/reaperlink.c),
+  # compiled in here too: each pestudio is a process of its own, so this is
+  # the way to have several synths in REAPER at once without the studio.
+  add_executable(pestudio qtgui/main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../session/reaperlink.c)
+  target_include_directories(pestudio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../session)
   target_link_libraries(pestudio PRIVATE qthost)
 else()
   message(STATUS "pestudio skipped (needs Qt6Widgets, libpipewire-0.3 and alsa)")

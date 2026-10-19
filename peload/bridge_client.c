@@ -159,6 +159,40 @@ static int bridge_helper_named(const char *helper, char *out, size_t n)
          * else can write to. */
         if (access(out, X_OK) == 0 && helper_trusted(out)) return 0;
     }
+
+    /* Then where pestudio said the helpers are. Inside a DAW -- the VST bridge
+     * on a track -- the executable is the DAW, so neither search above finds
+     * anything, and a 32-bit plug-in behind the bridge passed silence. pestudio
+     * writes its own directory to ~/.config/vst-ace/helpers each time it
+     * starts, so a tree that moved is found again after one run. */
+    {
+        const char *x = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+        char cfg[1024], dir[1024] = "";
+        FILE *f;
+        if (x && *x) snprintf(cfg, sizeof cfg, "%s/vst-ace/helpers", x);
+        else if (home && *home) snprintf(cfg, sizeof cfg, "%s/.config/vst-ace/helpers", home);
+        else cfg[0] = 0;
+        if (cfg[0] && (f = fopen(cfg, "r"))) {
+            if (!fgets(dir, sizeof dir, f)) dir[0] = 0;
+            fclose(f);
+            dir[strcspn(dir, "\r\n")] = 0;
+        }
+        if (dir[0]) {
+            snprintf(out, n, "%s/%s", dir, helper);
+            if (access(out, X_OK) == 0 && helper_trusted(out)) return 0;
+        }
+    }
+
+    /* Last, the installed packages' own places (Fedora's is lib64), for a
+     * bridge in a DAW on a machine where pestudio has not been run since. */
+    {
+        static const char *const dirs[] = { "/usr/lib/vst-ace", "/usr/lib64/vst-ace" };
+        size_t i;
+        for (i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+            snprintf(out, n, "%s/%s", dirs[i], helper);
+            if (access(out, X_OK) == 0 && helper_trusted(out)) return 0;
+        }
+    }
     return -1;
 }
 
