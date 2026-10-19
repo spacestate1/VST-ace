@@ -172,6 +172,7 @@ cmake --build obj-session --parallel --target studio studiogtk
 # The windows are skipped rather than failed when their toolkit is missing, so
 # insist here, where the missing dependency is still the obvious explanation.
 for p in peload peserve pestudio; do test -x "obj-peload/$p"; done
+test -f obj-peload/libvst-ace-bridge.so
 test -x obj-gui/dwstudio
 test -x obj-session/studio
 test -x obj-session/studiogtk
@@ -192,6 +193,10 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib/vst-ace" \
 install -m 0755 obj-peload/peload   "$APPDIR/usr/lib/vst-ace/peload"
 install -m 0755 obj-peload/peserve  "$APPDIR/usr/lib/vst-ace/peserve"
 install -m 0755 obj-peload/pestudio "$APPDIR/usr/lib/vst-ace/pestudio"
+# The VST bridge, which pestudio copies into ~/.vst for a DAW (Connect > Show
+# in DAWs' FX list). Not handed to linuxdeploy: the copy has to load outside
+# the AppImage, and it needs only libc, libm, X11 and FreeType from the host.
+install -m 0644 obj-peload/libvst-ace-bridge.so "$APPDIR/usr/lib/vst-ace/libvst-ace-bridge.so"
 install -m 0755 obj-gui/dwstudio    "$APPDIR/usr/lib/vst-ace/dwstudio"
 install -m 0755 obj-session/studio  "$APPDIR/usr/lib/vst-ace/studio"
 install -m 0755 obj-session/studiogtk "$APPDIR/usr/lib/vst-ace/studiogtk"

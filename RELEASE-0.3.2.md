@@ -19,5 +19,8 @@ Plug-ins from vst-ace in REAPER, two ways, from pestudio's new **Connect** menu.
 - 32-bit plug-ins behind the bridge played silence inside a DAW.
 - Narrowing the plug-in list no longer replaces the plug-in that is playing.
 
+The bridge ships in every package, the AppImage included (open pestudio from
+it with `./vst-ace-0.3.2-x86_64.AppImage pe`).
+
 **Not yet**: a bridged plug-in's own window inside REAPER (its parameters show
-as sliders). The FX-list option is not in the AppImage.
+as sliders).

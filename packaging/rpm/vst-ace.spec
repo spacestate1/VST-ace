@@ -166,7 +166,6 @@ install -D -m 0644 packaging/dwstudio.desktop \
     %{buildroot}%{_datadir}/applications/dwstudio.desktop
 install -D -m 0644 packaging/studio.desktop \
     %{buildroot}%{_datadir}/applications/studio.desktop
-%{_datadir}/applications/studiogtk.desktop
 install -D -m 0644 packaging/studiogtk.desktop \
     %{buildroot}%{_datadir}/applications/studiogtk.desktop
 
@@ -205,6 +204,7 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
 %{_datadir}/applications/pestudio.desktop
 %{_datadir}/applications/dwstudio.desktop
 %{_datadir}/applications/studio.desktop
+%{_datadir}/applications/studiogtk.desktop
 %{_mandir}/man1/va.1*
 %{_mandir}/man1/peload.1*
 %{_mandir}/man1/pestudio.1*
@@ -218,7 +218,8 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
   in a DAW's FX list through the VST bridge, which the package now ships.
 - Several pestudio windows can be connected to REAPER at once.
 - Show Instruments / Effects boxes sort the plug-in list.
-- Fix studiogtk being listed under %%install instead of %%files.
+- Fix studiogtk and its .desktop file being listed under %%install instead
+  of %%files.
 
 * Thu Oct 08 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.1-1
 - Tracker and studio shells: click-free PipeWire sample output with recovery,

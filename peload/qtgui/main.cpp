@@ -184,25 +184,28 @@ private:
         seen.insert(so, { fi.lastModified(), is });
         return is;
     }
-    /* The AppImage's own directory is a mount that moves on every run and its
-     * libraries are its own, so a bridge copied out of it into ~/.vst would
-     * not load outside it. The packages and a built tree have neither problem. */
+    /* The bridge and the helpers need only libc, libm, X11 and FreeType (and
+     * PipeWire and ALSA for peload32), which every desktop a DAW runs on has,
+     * so copies of them work outside the AppImage too. What does not is the
+     * AppImage's own directory: a mount that moves on every run. */
     static bool inAppImage() { return qEnvironmentVariableIsSet("APPIMAGE"); }
-    static bool bridgeUsable() { return !inAppImage() && QFileInfo::exists(bridgeLib()); }
-    /* Put the bridge at `so` without writing into the file a running DAW may
-     * have open: a new file renamed over the old, which the DAW keeps until it
+    static bool bridgeUsable() { return QFileInfo::exists(bridgeLib()); }
+    /* Copy `src` to `dst` without writing into a file a running DAW may have
+     * open: a new file renamed over the old, which the DAW keeps until it
      * restarts. */
-    static bool installBridge(const QString &so)
+    static bool replaceWith(const QString &src, const QString &dst)
     {
-        const QString tmp = so + ".new";
+        const QString tmp = dst + ".new";
         QFile::remove(tmp);
-        if (!QFile::copy(bridgeLib(), tmp)) return false;
-        if (::rename(QFile::encodeName(tmp).constData(), QFile::encodeName(so).constData()) != 0) {
+        if (!QFile::copy(src, tmp)) return false;
+        QFile::setPermissions(tmp, QFile::permissions(src));
+        if (::rename(QFile::encodeName(tmp).constData(), QFile::encodeName(dst).constData()) != 0) {
             QFile::remove(tmp);
             return false;
         }
         return true;
     }
+    static bool installBridge(const QString &so) { return replaceWith(bridgeLib(), so); }
     static bool sameBytes(const QString &a, const QString &b)
     {
         QFile fa(a), fb(b);
@@ -316,9 +319,7 @@ private:
                 QDir().mkpath(QFileInfo(e).path());
                 if (!QFile::link(target, e)) why = "could not make the link " + e;
             }
-        } else if (inAppImage())
-            why = "not in the AppImage -- install the .deb, .rpm or Arch package for this";
-        else if (!QFileInfo::exists(bridgeLib()))
+        } else if (!QFileInfo::exists(bridgeLib()))
             why = "the bridge is missing: no " + bridgeLib() + " (va build makes it)";
         else if (occupied(e) && !isBridgeCopy(e))
             why = e + " is another plug-in, not a bridge copy -- left alone";
@@ -340,9 +341,27 @@ private:
         updateBridge();
     }
 
-    /* Inside a DAW the bridge cannot find peload32 (32-bit plug-ins) beside
-     * the executable, which is the DAW: this is where it looks instead -- see
-     * bridge_helper_named in bridge_client.c. */
+    /* Where the helpers live for a DAW: beside pestudio, except in the
+     * AppImage, whose directory is gone once it exits -- there they are copied
+     * to ~/.local/share/vst-ace/helpers, and brought up to date each start. */
+    static QString helperDir()
+    {
+        const QString here = QCoreApplication::applicationDirPath();
+        if (!inAppImage()) return here;
+        const QString dir = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
+                            "/vst-ace/helpers";
+        QDir().mkpath(dir);
+        for (const char *name : { "peserve", "peload32" }) {
+            const QString src = here + "/" + name, dst = dir + "/" + name;
+            if (QFileInfo::exists(src) && !(QFileInfo::exists(dst) && sameBytes(src, dst)))
+                replaceWith(src, dst);
+        }
+        return dir;
+    }
+
+    /* Inside a DAW the bridge cannot find peserve or peload32 (32-bit
+     * plug-ins) beside the executable, which is the DAW: this is where it
+     * looks instead -- see bridge_helper_named in bridge_client.c. */
     static void saveHelperDir()
     {
         const QByteArray x = qgetenv("XDG_CONFIG_HOME");
@@ -351,7 +370,7 @@ private:
         QDir().mkpath(QFileInfo(cfg).path());
         QSaveFile f(cfg);
         if (f.open(QIODevice::WriteOnly)) {
-            f.write(QCoreApplication::applicationDirPath().toLocal8Bit() + "\n");
+            f.write(helperDir().toLocal8Bit() + "\n");
             f.commit();
         }
     }
