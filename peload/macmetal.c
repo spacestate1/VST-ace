@@ -35,6 +35,7 @@
 
 #include "macobjc.h"
 #include "macshim.h"
+#include <sys/resource.h>
 
 typedef void *id;
 typedef const char *SEL;
@@ -833,6 +834,7 @@ static void job_rows(const draw_job *j, int by0, int by1, raster_stats *rs)
 #define RASTER_MIN_ROWS   64
 #define RASTER_MIN_WORK   150000    /* pixels, summed over the call's triangles */
 #define RASTER_MAX_BANDS  12
+#define RASTER_NICE       10
 
 static int             g_nband;                  /* 0 until the pool is up */
 static pthread_t       g_rthread[RASTER_MAX_BANDS - 1];
@@ -853,6 +855,11 @@ static void band_range(int y0, int y1, int band, int *a, int *b)
 static void *raster_worker(void *arg)
 {
     int id = (int)(long)arg, seen = 0;
+    /* Below the audio thread, which may be at ordinary priority itself: drawing
+     * can always be a little late, and a block cannot. On Linux this is per
+     * thread, and it is only ever turned down, so it cannot fail in a way that
+     * matters. */
+    (void)setpriority(PRIO_PROCESS, 0, RASTER_NICE);
     for (;;) {
         int a, b;
         pthread_mutex_lock(&g_rlock);
@@ -875,7 +882,12 @@ static void raster_pool_start(void)
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     int i, n;
     if (g_nband) return;
-    n = ncpu > 1 ? (int)ncpu : 1;
+    /* Half the machine, not all of it. This runs in the process that renders the
+     * audio: one editor banding across every core kept 13 threads runnable on
+     * 12, and with two open, audio blocks ran past their period about once a
+     * second -- each one a pop. Half costs about a tenth of the drawing rate. */
+    n = ncpu > 1 ? (int)(ncpu / 2) : 1;
+    if (n < 1) n = 1;
     if (n > RASTER_MAX_BANDS) n = RASTER_MAX_BANDS;
     g_nband = n;
     for (i = 1; i < n; i++)
