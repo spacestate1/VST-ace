@@ -138,6 +138,9 @@ add_executable(peload peload_cli.c)
 target_link_libraries(peload PRIVATE pehost)
 # --play needs a sound server and a sequencer. Both optional: without them the
 # CLI still renders to a file, which is what it did before live mode existed.
+# Looked for here, ahead of the test: found any later, a first configure -- every
+# package build -- leaves live mode out and a second one puts it in.
+pkg_check_modules(PIPEWIRE IMPORTED_TARGET libpipewire-0.3)
 if(PIPEWIRE_FOUND AND ALSA_FOUND)
   target_compile_definitions(peload PRIVATE PELOAD_LIVE=1)
   target_link_libraries(peload PRIVATE PkgConfig::PIPEWIRE PkgConfig::ALSA)
@@ -147,7 +150,6 @@ endif()
 
 # Qt6 GUI: browse, load, tweak and play plugins live.
 find_package(Qt6 COMPONENTS Widgets QUIET)
-pkg_check_modules(PIPEWIRE IMPORTED_TARGET libpipewire-0.3)
 pkg_check_modules(ALSA IMPORTED_TARGET alsa)
 # FreeType backs the DirectWrite shim's glyph lookup and metrics.
 pkg_check_modules(FREETYPE REQUIRED IMPORTED_TARGET freetype2)
