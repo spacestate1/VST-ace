@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #endif
 #include "audioout.h"
+#include "rtprio.h"
 
 #include <alsa/asoundlib.h>
 #include <dlfcn.h>
@@ -50,9 +51,12 @@ struct ao {
 static void *alsa_thread(void *ud)
 {
     ao *a = ud;
-    struct sched_param sp = { .sched_priority = 60 };
-    /* Realtime if the system lets this user have it; a plain thread if not. */
-    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    char how[160];
+    /* Realtime if the system lets this user have it; a plain thread if not, and
+     * it is said, since dropouts are what comes next. Guarded: the render below
+     * can be a plug-in running in this process. */
+    if (!rtprio_request_guarded(60, how, sizeof how))
+        fprintf(stderr, "audioout: ALSA thread: %s\n", how);
     while (atomic_load_explicit(&a->running, memory_order_acquire)) {
         long n;
         int i;
@@ -75,6 +79,7 @@ static void *alsa_thread(void *ud)
             atomic_store(&a->dead, 0);
         }
     }
+    rtprio_guard_release();
     return NULL;
 }
 

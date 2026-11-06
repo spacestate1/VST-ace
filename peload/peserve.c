@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "bridge.h"
+#include "rtprio.h"
 #include "pehost.h"
 #include "hostsym.h"
 
@@ -49,11 +50,11 @@ typedef struct {
 static void audio_rt_priority(void)
 {
     /* The caller's realtime thread is blocked waiting on us, so match it. Not
-     * fatal if refused -- it only means more jitter. */
-    struct sched_param sp;
-    memset(&sp, 0, sizeof sp);
-    sp.sched_priority = 20;
-    pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+     * fatal if refused -- it only means more jitter, but it does mean that, so
+     * it is said. Guarded: this thread runs the plug-in. */
+    char how[160];
+    if (!rtprio_request_guarded(20, how, sizeof how))
+        fprintf(stderr, "peserve: audio thread: %s\n", how);
 }
 
 /* Drain the parameter and MIDI rings the host writes into. Runs on the audio
@@ -106,6 +107,7 @@ static void *audio_thread(void *ud)
         pehost_render_io(s->h, sh->in, sh->out, n);
         bridge_sem_post(&sh->done);
     }
+    rtprio_guard_release();
     return NULL;
 }
 

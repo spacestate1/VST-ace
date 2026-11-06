@@ -133,6 +133,11 @@ target_link_libraries(vstace_bridge PRIVATE pehost)
 add_executable(peserve peserve.c)
 target_link_libraries(peserve PRIVATE pehost)
 
+# Realtime behaviour that only shows at run time; see each test's own comment.
+add_executable(rtprio-test test/rtprio_test.c)
+target_include_directories(rtprio-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(rtprio-test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+
 # CLI: inspect and render a plugin to WAV.
 add_executable(peload peload_cli.c)
 target_link_libraries(peload PRIVATE pehost)
@@ -297,7 +302,7 @@ if(BUILD_PELOAD32)
   # (x86-64 needs nothing here: both ABIs already guarantee 16.)
   target_compile_options(peload32 PRIVATE -m32 -mincoming-stack-boundary=2)
   target_link_options(peload32 PRIVATE -m32)
-  target_link_libraries(peload32 PRIVATE pthread m)
+  target_link_libraries(peload32 PRIVATE pthread m ${CMAKE_DL_LIBS})
 
   # 32-bit FreeType, already resolved above -- the target only exists because
   # the query succeeded.

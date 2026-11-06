@@ -19,6 +19,7 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include "bridge.h"
+#include "rtprio.h"
 
 typedef struct {
     AEffect32  *fx;
@@ -155,12 +156,12 @@ static void *sv_audio_thread(void *ud)
 
     sv_teb_once();
     /* The host's realtime thread is blocked waiting on us, so match it. Not
-     * fatal if the policy is refused -- it just means more jitter. */
+     * fatal if refused -- it just means more jitter, but it does mean that, so
+     * it is said. Guarded: this thread runs the plug-in. */
     {
-        struct sched_param sp;
-        memset(&sp, 0, sizeof sp);
-        sp.sched_priority = 20;
-        pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
+        char how[160];
+        if (!rtprio_request_guarded(20, how, sizeof how))
+            fprintf(stderr, "peload32: audio thread: %s\n", how);
     }
 
     while (!s->stop) {
@@ -193,6 +194,7 @@ static void *sv_audio_thread(void *ud)
         }
         bridge_sem_post(&sh->done);
     }
+    rtprio_guard_release();
     return NULL;
 }
 
