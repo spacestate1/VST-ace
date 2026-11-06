@@ -137,6 +137,8 @@ target_link_libraries(peserve PRIVATE pehost)
 add_executable(rtprio-test test/rtprio_test.c)
 target_include_directories(rtprio-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rtprio-test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+add_executable(bridge-stall-test test/bridge_stall_test.c)
+target_link_libraries(bridge-stall-test PRIVATE pehost m)
 
 # CLI: inspect and render a plugin to WAV.
 add_executable(peload peload_cli.c)

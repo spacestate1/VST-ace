@@ -61,6 +61,7 @@ struct bridge {
      * before another is posted -- see bridge_render_io. */
     int         pending;
     int         behind;            /* consecutive blocks with no reply */
+    int         warm;              /* blocks delivered by this helper, up to BRIDGE_WARM_BLOCKS */
     float       last[2];           /* the last frame handed out, for fading a gap */
     int         last_valid;        /* a block went out since the last gap */
     int         regain;            /* the first block after a gap comes in over a ramp */
@@ -424,7 +425,7 @@ static void bridge_teardown(bridge *b)
     b->sh = NULL;
     if (b->shm_name[0]) shm_unlink(b->shm_name);
     b->shm_name[0] = 0;
-    b->pending = b->behind = 0;
+    b->pending = b->behind = b->warm = 0;
     b->ed_have = 0;
     b->ed_seen = 0;
 }
@@ -947,7 +948,7 @@ void bridge_import_stats(bridge *b, int *impl, int *stub, int *hit)
 
 /* Called from the host's realtime thread. Posts the request and waits, with a
  * deadline: if the helper has died or stalled we return silence rather than
- * stalling the whole graph. */
+ * stalling the whole graph. See bridge_deadline_ns for how long that is. */
 /* A block the helper did not deliver -- a missed deadline, a dead helper --
  * goes out as silence, and silence that begins on a nonzero sample is a click.
  * The first such block carries the last frame it had, faded to zero over a
@@ -989,6 +990,36 @@ static void bridge_delivered(bridge *b, float *out, int frames)
     }
 }
 
+/* How long the host's thread may wait for one block.
+ *
+ * On a realtime thread, one period. The graph is waiting on this thread, so past
+ * that the cycle is lost whatever happens next, and every other client on the
+ * graph is losing it too: the difference between giving up now and giving up
+ * later is only how many of their cycles go with it. The floor is for very short
+ * periods, where ordinary wake-up latency is a good part of the period.
+ *
+ * Not on the first blocks of a helper, which is where a plug-in does the work it
+ * put off at load: one of those being slow is expected, not a stall.
+ *
+ * And not on any other thread. An offline render comes through here as well, and
+ * is entitled to be slower than the audio it makes: nothing is waiting, and a
+ * block given up on is a hole in the file. A realtime policy is what tells the
+ * two apart, whichever of the hosts this is running under. */
+#define BRIDGE_WARM_BLOCKS 8
+
+static int bridge_on_rt_thread(void)
+{
+    const int p = sched_getscheduler(0) & ~SCHED_RESET_ON_FORK;
+    return p == SCHED_FIFO || p == SCHED_RR;
+}
+
+static long bridge_deadline_ns(const bridge *b, int frames, int rt)
+{
+    const long period = (long)(1e9 * frames / (b->sr > 0 ? b->sr : 48000.0));
+    if (!rt || b->warm < BRIDGE_WARM_BLOCKS) return 2 * period + 50000000L;
+    return period > 2000000L ? period : 2000000L;
+}
+
 static void bridge_render_inner(bridge *b, const float *in, float *out, int frames);
 
 void bridge_render_io(bridge *b, const float *in, float *out, int frames)
@@ -1025,6 +1056,7 @@ static void bridge_render_inner(bridge *b, const float *in, float *out, int fram
 {
     bridge_shm *s;
     struct timespec ts;
+    const int rt = bridge_on_rt_thread();
 
     s = b->sh;
 
@@ -1041,6 +1073,11 @@ static void bridge_render_inner(bridge *b, const float *in, float *out, int fram
         struct timespec drain;
         drain.tv_sec = 0;
         drain.tv_nsec = 2000000;                     /* 2 ms */
+        /* This block is going out either way, so it is not worth a stall. */
+        if (rt) {
+            const long quarter = bridge_deadline_ns(b, frames, 1) / 4;
+            if (quarter < drain.tv_nsec) drain.tv_nsec = quarter;
+        }
         if (bridge_sem_wait(&s->done, &drain)) break;
         b->pending--;
     }
@@ -1048,7 +1085,9 @@ static void bridge_render_inner(bridge *b, const float *in, float *out, int fram
         /* Persistently behind means it is not coming back -- most likely its audio
          * thread died, which leaves the process alive and the socket open, so
          * nothing else notices. */
-        if (++b->behind >= 200) {
+        /* A count alone is a shorter and shorter time as the period shrinks, and
+         * 200 blocks of 32 frames is a slow program change, not a wedged thread. */
+        if (++b->behind >= 200 && (double)b->behind * frames >= (b->sr > 0 ? b->sr : 48000.0)) {
             fprintf(stderr, "bridge: the helper has stopped rendering (%d blocks "
                             "with no reply) -- its audio thread is stuck; giving "
                             "up on it\n", b->behind);
@@ -1078,9 +1117,8 @@ static void bridge_render_inner(bridge *b, const float *in, float *out, int fram
 
     bridge_sem_post(&s->req);
 
-    /* Two periods plus a floor, so a slow first block does not trip it. */
     {
-        long ns = (long)(2.0 * 1e9 * frames / (b->sr > 0 ? b->sr : 48000.0)) + 50000000L;
+        const long ns = bridge_deadline_ns(b, frames, rt);
         ts.tv_sec  = ns / 1000000000L;
         ts.tv_nsec = ns % 1000000000L;
     }
@@ -1094,6 +1132,7 @@ static void bridge_render_inner(bridge *b, const float *in, float *out, int fram
         return;
     }
     memcpy(out, s->out, (size_t)frames * 2 * sizeof *out);
+    if (b->warm < BRIDGE_WARM_BLOCKS) b->warm++;
     bridge_delivered(b, out, frames);
 }
 
