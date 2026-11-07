@@ -21,7 +21,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 
 Name:           vst-ace
-Version:        0.3.3
+Version:        0.3.4
 Release:        1%{?dist}
 Summary:        Run Windows, macOS and Linux audio plug-ins natively, without Wine
 
@@ -213,6 +213,12 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
 %{_mandir}/man1/studiogtk.1*
 
 %changelog
+* Fri Nov 06 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.4-1
+- Track volume sliders are exact on sample tracks; a track sharing a synth can
+  be given its own copy of it.
+- The tracker's master volume reaches synth tabs as well as sample tracks.
+- Fix reopening a song overwriting some VST3 synths' sound with defaults.
+
 * Fri Nov 06 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.3-1
 - Realtime audio: realtime priority for helpers and ALSA output through
   RealtimeKit, stalled helpers no longer stall the audio thread, and bridged
