@@ -4481,7 +4481,9 @@ private slots:
             if (gui) editorStack_->setCurrentIndex(0);
         } else {
             pixelEditor_->dumped_ = false;
-            pixelEditor_->dumpName_ = QFileInfo(paths_[pluginList_->currentRow()]).fileName();
+            /* What is loaded, not what the list has selected: a search or the Show
+             * boxes can hide the plug-in that is playing, which leaves no row. */
+            pixelEditor_->dumpName_ = QFileInfo(loadedPath_).fileName();
             gui = pixelEditor_->attach(h);
             if (gui) editorStack_->setCurrentIndex(1);
         }
