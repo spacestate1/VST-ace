@@ -2606,6 +2606,10 @@ private:
             trk_unlock(e_);
             loading_ = false;
             view_->updateSize();
+            // The whole grid is another part now. The row updates below are only
+            // the playhead's; the rest would stay the old part's until it got
+            // there, wherever a resize or a scroll did not happen to repaint it.
+            view_->update();
         }
         if (ed_.row != r) {
             const int was = ed_.row;

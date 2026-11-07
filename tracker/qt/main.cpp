@@ -271,6 +271,52 @@ int uitest(trk_engine *e, TrackerWindow &w, const QString &outdir)
         trk_unlock(e);
         std::free(back);
     }
+    {   // Playing into the next part shows that part. In a window too short for the
+        // grid the jump back to the top scrolls, which happens to repaint it all; with
+        // room for every row nothing scrolls, and the rows the playhead had not reached
+        // stayed the old part's until it got to them.
+        struct PaintSpy : QObject {
+            QRegion seen;
+            bool eventFilter(QObject *, QEvent *ev) override
+            {
+                if (ev->type() == QEvent::Paint) seen += static_cast<QPaintEvent *>(ev)->region();
+                return false;
+            }
+        } spy;
+        const QSize was = w.size();
+        // A part of the same length: a different one resizes the view, which repaints
+        // it all, and hides this as well.
+        const int part = trk_pattern_new(e, 0);
+        trk_lock(e);
+        const int rows0 = trk_song_of(e)->pattern[0].rows;
+        trk_unlock(e);
+        w.resize(1800, rows0 * 24 + 900);
+        wait(200);
+        const int at = trk_order_insert(e, 1, part);
+        ed->follow = 1;
+        ed->pattern = 0;
+        v->updateSize();
+        v->update();
+        wait(100);
+        v->installEventFilter(&spy);
+        const int rowPx = v->height() / rows0;
+        trk_play(e, TRK_PLAY_SONG, 0, rows0 - 2);
+        QElapsedTimer t;
+        t.start();
+        // Only what is painted as the part changes: until then, keep starting over.
+        while (ed->pattern != part && t.elapsed() < 8000) { spy.seen = QRegion(); wait(5); }
+        check(ed->pattern == part, "follow goes on into the next part");
+        wait(60);                                // long enough to paint, not to reach it
+        const int row = std::min(ed->row + 8, rows0 - 1);
+        const QRect ahead(0, row * rowPx, 40, rowPx);
+        check(row > ed->row && spy.seen.contains(ahead),
+              "rows the playhead has not reached are repainted as the part changes");
+        trk_stop(e);
+        v->removeEventFilter(&spy);
+        if (at >= 0) trk_order_remove(e, at);
+        w.resize(was);
+        wait(100);
+    }
     std::printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
     return g_fail;
 }
