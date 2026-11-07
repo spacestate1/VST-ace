@@ -2357,6 +2357,15 @@ static gboolean follow_playback(gpointer u)
     ui *U = u;
     trk_poll_state ps;
     int o, p, r;
+    {   /* Notes the MIDI input played with the song stopped go in at the cursor, as
+         * typed ones do -- when a typed key would: this window active and in front. */
+        GtkRoot *root = gtk_widget_get_root(U->area);
+        const int mine = gtk_widget_get_mapped(U->area) && GTK_IS_WINDOW(root) && gtk_window_is_active(GTK_WINDOW(root));
+        int wrote = 0, note, vel;
+        while (trk_input_next_note(U->e, &note, &vel))
+            if (mine && trk_enter_note(U->e, &U->ed, note, vel)) wrote = 1;
+        if (wrote) { update_size(U); redraw(U); cursor_moved(U); }
+    }
     if (!gtk_widget_get_mapped(U->area)) { follow_rate(U, 250); return G_SOURCE_CONTINUE; }
     trk_poll(U->e, &ps);
     follow_rate(U, ps.quiet ? 100 : 33);

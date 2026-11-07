@@ -172,6 +172,11 @@ if(Qt6_FOUND AND PIPEWIRE_FOUND AND ALSA_FOUND)
   # Connect > REAPER is the studio window's linker (session/reaperlink.c),
   # compiled in here too: each pestudio is a process of its own, so this is
   # the way to have several synths in REAPER at once without the studio.
+  # The keyboard gate on the note path; talks to the real sequencer.
+  add_executable(midigate-test test/midigate_test.cpp qtgui/midiio.cpp)
+  target_include_directories(midigate-test PRIVATE qtgui)
+  target_link_libraries(midigate-test PRIVATE Qt6::Core PkgConfig::ALSA)
+
   add_executable(pestudio qtgui/main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../session/reaperlink.c)
   target_include_directories(pestudio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../session)
   target_link_libraries(pestudio PRIVATE qthost)

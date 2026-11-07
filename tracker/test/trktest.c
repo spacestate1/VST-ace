@@ -1413,6 +1413,43 @@ int main(void)
               if (n > 127 && n != TRK_NOTE_OFF && n != TRK_EMPTY) bad = 1;
           }
           check(!bad, "a MIDI note past 127 is dropped, not written into the pattern"); }
+
+        /* Stopped, a MIDI note is step entry at the window's cursor. */
+        if (sent_ok) {
+            snd_seq_event_t ev;
+            trk_editor ed;
+            int note = -1, vel = -1;
+            trk_editor_init(&ed);
+            ed.pattern = 0; ed.row = 8; ed.track = 2; ed.step = 2; ed.edit = 1; ed.field = TRK_F_VEL;
+            while (trk_input_next_note(e, &note, &vel)) {}
+            snd_seq_ev_clear(&ev); snd_seq_ev_set_source(&ev, tport); snd_seq_ev_set_subs(&ev);
+            snd_seq_ev_set_direct(&ev); snd_seq_ev_set_noteon(&ev, 0, 67, 77);
+            snd_seq_event_output_direct(tx, &ev);
+            snd_seq_ev_set_noteoff(&ev, 0, 67, 0);
+            snd_seq_event_output_direct(tx, &ev);
+            usleep(30000);
+            check(trk_input_next_note(e, &note, &vel) && note == 67 && vel == 77, "stopped, a MIDI note comes to the window");
+            check(!trk_input_next_note(e, &note, &vel), "and its release does not");
+            check(trk_enter_note(e, &ed, 67, 77) && s->pattern[0].cell[8][2].note == 67 && s->pattern[0].cell[8][2].vel == 77,
+                  "it is written at the cursor, from any field, with its velocity");
+            check(ed.row == 10 && ed.track == 2, "and the cursor steps on");
+            check(trk_undo(e) && s->pattern[0].cell[8][2].note == TRK_EMPTY, "undo takes it back");
+            ed.edit = 0;
+            check(!trk_enter_note(e, &ed, 68, 77) && s->pattern[0].cell[10][2].note == TRK_EMPTY, "edit off writes nothing");
+            trk_input_set_heard(e, 0);
+            snd_seq_ev_set_noteon(&ev, 0, 69, 77);
+            snd_seq_event_output_direct(tx, &ev);
+            usleep(30000);
+            check(!trk_input_next_note(e, &note, &vel), "nor is one kept while the keyboard plays another tab");
+            trk_input_set_heard(e, 1);
+            trk_play(e, TRK_PLAY_PATTERN, 0, 0);
+            usleep(30000);
+            snd_seq_event_output_direct(tx, &ev);
+            usleep(30000);
+            check(!trk_input_next_note(e, &note, &vel), "nor while the song plays: playing along leaves it alone");
+            trk_stop(e);
+            usleep(30000);
+        }
         got = trk_take_events(e);
         check(got >= 4, "the take kept every event as played");
         {

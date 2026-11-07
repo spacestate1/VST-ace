@@ -365,6 +365,18 @@ void trk_record_note(trk_engine *e, int track, int note, int vel, int on);
 int  trk_input_list(trk_engine *e, char names[][TRK_DEST_LEN], int max);
 int  trk_input_connect(trk_engine *e, const char *name);
 const char *trk_input_connected(trk_engine *e);
+/* The first physical keyboard on the machine, named as trk_input_connect takes
+ * it. 0, or -1 when none is plugged in. */
+int  trk_input_first_keyboard(trk_engine *e, char name[TRK_DEST_LEN]);
+/* Whether the MIDI input sounds on the cursor's track as it is played; it
+ * records regardless. A shell turns this off while the keyboard is playing
+ * something else, as a synth tab in front. A note already sounding still gets
+ * its release. Default on. */
+void trk_input_set_heard(trk_engine *e, int on);
+/* A note the MIDI input played with the song stopped, oldest first, for the
+ * window to pass to trk_enter_note. 1, or 0 when there is none. A window takes
+ * these whether it enters them or not, so none is left to land later. */
+int  trk_input_next_note(trk_engine *e, int *note, int *vel);
 
 /* The last take as it was played, before any quantizing: events with their
  * exact ticks. Written as a standard MIDI file (type 1, the song's tempo,
@@ -437,6 +449,12 @@ enum {
  * gets the same character. */
 int  trk_key(trk_engine *e, trk_editor *ed, int key);
 void trk_key_release(trk_engine *e, trk_editor *ed, int key);
+/* A note from a MIDI keyboard written at the cursor, with its velocity, and the
+ * cursor stepped on: what a typed note key does. A keyboard can only mean a note,
+ * so it goes in the note column from whichever field the cursor is in. Does
+ * nothing with edit mode off. Returns non-zero when it wrote. Sounding it is the
+ * input's own business. */
+int  trk_enter_note(trk_engine *e, trk_editor *ed, int note, int vel);
 
 /* Selecting. trk_select sets a block, corners either way round, and moves
  * the cursor to the second; trk_selection gives it top-left to bottom-right,

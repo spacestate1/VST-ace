@@ -145,6 +145,12 @@ struct trk_engine {
     pthread_t       ithread;              /* reads the MIDI input */
     int             ion, ipipe[2];
     char            in_name[TRK_DEST_LEN];
+    atomic_int      in_quiet;             /* the input records but is not heard: trk_input_set_heard */
+    int             in_sounding[128];     /* the input thread's: the track + 1 a note sounds on, 0 for none */
+    /* Notes played with the song stopped, for the window to enter at its
+     * cursor: trk_input_next_note. Under the lock. */
+    struct { uint8_t note, vel; } in_entry[32];
+    unsigned        in_entry_head, in_entry_tail;
     /* The metronome's one voice, rendered by the audio thread; under smx. */
     int             click_left, click_total;
     double          click_ph, click_freq, click_amp;
@@ -2611,10 +2617,26 @@ static void input_event(trk_engine *e, const snd_seq_event_t *ev)
     if (on) record_on(e, tick, t, note, vel);
     else if (off) record_off(e, tick, t, note);
     else if (cc) record_cc(e, tick, t, ccn, ccv);
+    /* Stopped, a note is step entry, as a typed key is. The cursor is the
+     * window's, so it is the window that writes. Not while the song plays, when
+     * only a take writes: playing along must not eat the song. Nor while the
+     * keyboard is playing something else. */
+    if (on && !e->playing && !e->recording && !atomic_load(&e->in_quiet) &&
+        e->in_entry_head - e->in_entry_tail < 32) {
+        const unsigned i = e->in_entry_head++ % 32;
+        e->in_entry[i].note = (uint8_t)note;
+        e->in_entry[i].vel = (uint8_t)vel;
+    }
     pthread_mutex_unlock(&e->lock);
-    /* Heard as it is played, on the cursor's track. */
-    if (monitor && on) trk_preview(e, t, note, vel);
-    else if (monitor && off) trk_preview_off(e, t);
+    /* Heard as it is played, on the cursor's track -- the one it started on,
+     * for the release: the cursor may have moved, or the tab changed, since. */
+    if (on && monitor && !atomic_load(&e->in_quiet)) {
+        trk_preview(e, t, note, vel);
+        e->in_sounding[note] = t + 1;
+    } else if (off && e->in_sounding[note]) {
+        trk_preview_off(e, e->in_sounding[note] - 1);
+        e->in_sounding[note] = 0;
+    }
 }
 
 static void *input_main(void *ud)
@@ -2727,6 +2749,53 @@ int trk_input_connect(trk_engine *e, const char *name)
 }
 
 const char *trk_input_connected(trk_engine *e) { return e->in_name; }
+
+void trk_input_set_heard(trk_engine *e, int on) { atomic_store(&e->in_quiet, !on); }
+
+int trk_input_next_note(trk_engine *e, int *note, int *vel)
+{
+    int got = 0;
+    pthread_mutex_lock(&e->lock);
+    if (e->in_entry_tail != e->in_entry_head) {
+        const unsigned i = e->in_entry_tail++ % 32;
+        *note = e->in_entry[i].note;
+        *vel = e->in_entry[i].vel;
+        got = 1;
+    }
+    pthread_mutex_unlock(&e->lock);
+    return got;
+}
+
+int trk_input_first_keyboard(trk_engine *e, char name[TRK_DEST_LEN])
+{
+    snd_seq_client_info_t *ci;
+    snd_seq_port_info_t *pi;
+    const unsigned need = SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ;
+
+    pthread_mutex_lock(&e->lock);
+    snd_seq_client_info_alloca(&ci);
+    snd_seq_port_info_alloca(&pi);
+    snd_seq_client_info_set_client(ci, -1);
+    while (snd_seq_query_next_client(e->seq, ci) >= 0) {
+        const int c = snd_seq_client_info_get_client(ci);
+        /* A device the kernel drives, and not its Midi Through, which is one too. */
+        if (snd_seq_client_info_get_type(ci) != SND_SEQ_KERNEL_CLIENT ||
+            c == SND_SEQ_CLIENT_SYSTEM ||
+            !strcmp(snd_seq_client_info_get_name(ci), "Midi Through")) continue;
+        snd_seq_port_info_set_client(pi, c);
+        snd_seq_port_info_set_port(pi, -1);
+        while (snd_seq_query_next_port(e->seq, pi) >= 0) {
+            if ((snd_seq_port_info_get_capability(pi) & need) != need) continue;
+            if (!(snd_seq_port_info_get_type(pi) & SND_SEQ_PORT_TYPE_MIDI_GENERIC)) continue;
+            snprintf(name, TRK_DEST_LEN, "%s: %s", snd_seq_client_info_get_name(ci),
+                     snd_seq_port_info_get_name(pi));
+            pthread_mutex_unlock(&e->lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&e->lock);
+    return -1;
+}
 
 /* ------------------------------------------------------------- the take */
 

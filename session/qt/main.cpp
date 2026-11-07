@@ -889,6 +889,7 @@ private:
          * own them -- collected under building_ and attributed after. */
         building_ = true;
         auto *h = new HostWidget(this);
+        h->setKeyboardLive(false);           /* until it is in front: routeKeyboard */
         building_ = false;
         attributeMenus(h);
         /* Whether this tab answers the computer keyboard is read at each key
@@ -1588,6 +1589,7 @@ private:
     void watchTabs()
     {
         updateConnect();
+        routeKeyboard();
         for (int i = 0; i < tabs_->count(); i++) {
             auto *h = qobject_cast<HostWidget *>(tabs_->widget(i));
             if (!h) continue;
@@ -1665,6 +1667,7 @@ private:
             trackerMixId_ = -1;
             trk_close(trkEngine_);
             trkEngine_ = nullptr;
+            keyboardConnected_ = false;      /* the next engine has its own input */
             sinks_.clear();            /* the destinations died with the engine */
             newTracker_->setEnabled(true);
         } else {
@@ -1912,7 +1915,35 @@ private:
                  * the keys then worked only while the on-screen keyboard itself
                  * had focus, and died the moment a program or patch was clicked. */
                 h->setKeysLive(tabs_->widget(i) == cur);
+        routeKeyboard();
         syncMenus();
+    }
+
+    /* A USB keyboard plays the tab in front and nothing else. Every synth tab is
+     * subscribed to it, so each is told whether it is the one. With the tracker in
+     * front it plays the cursor's track, through the tracker's MIDI input: that is
+     * what a keyboard does there, and otherwise it would go dead on that tab. The
+     * input is connected once, the first time there is a keyboard to connect,
+     * and shows in Recording options like one picked by hand; setting it to
+     * (none) there is respected for the rest of the run.
+     *
+     * The MIDI readers cannot ask the tab bar and so keep a flag, and a flag is
+     * only as good as the last time it was set. Run on every tab change, and by
+     * watchTabs each second so that no path that adds or moves a tab can leave a
+     * keyboard dead or playing the wrong synth for longer than that. */
+    void routeKeyboard()
+    {
+        QWidget *cur = tabs_->currentWidget();
+        for (int i = 0; i < tabs_->count(); i++)
+            if (auto *h = qobject_cast<HostWidget *>(tabs_->widget(i)))
+                h->setKeyboardLive(tabs_->widget(i) == cur);
+        if (!trkEngine_) return;
+        trk_input_set_heard(trkEngine_, tracker_ && cur == tracker_);
+        if (keyboardConnected_) return;
+        if (*trk_input_connected(trkEngine_)) { keyboardConnected_ = true; return; }
+        char name[TRK_DEST_LEN];
+        if (trk_input_first_keyboard(trkEngine_, name) == 0 && trk_input_connect(trkEngine_, name) == 0)
+            keyboardConnected_ = true;
     }
 
     void updateCanvas()
@@ -1971,6 +2002,7 @@ private:
     int             trackerMixId_ = -1;     /* the tracker's place on the mix bus */
     QAction        *reloadAct_ = nullptr;
     TrackerWidget  *tracker_ = nullptr;
+    bool            keyboardConnected_ = false;   /* to the tracker's MIDI input: routeKeyboard */
     QMenu          *helpMenu_ = nullptr;   /* the window's own, kept last in the bar */
     QPointer<QDialog> pluginMgr_;          /* File > Plug-ins, while it is open */
     QMenu          *fileMenu_ = nullptr;

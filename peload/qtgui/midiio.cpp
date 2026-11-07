@@ -5,6 +5,7 @@
 #include <alsa/asoundlib.h>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <poll.h>
 #include <time.h>
 
@@ -104,6 +105,9 @@ QString MidiIo::portName() const
 void MidiIo::readerLoop()
 {
     while (!stop_.load(std::memory_order_relaxed)) {
+        const bool live = keyboardLive_.load(std::memory_order_relaxed);
+        if (wasLive_ && !live) keyboardLeft();
+        wasLive_ = live;
         int n = snd_seq_poll_descriptors_count(seq_, POLLIN);
         if (n <= 0) { struct timespec t = {0, 5000000}; nanosleep(&t, nullptr); continue; }
         QVector<pollfd> pfds(n);
@@ -218,6 +222,80 @@ void MidiIo::send(int status, int d1, int d2)
     }
 }
 
+/* A keyboard is a device the kernel drives; a program's port -- the tracker's,
+ * REAPER's, a sequencer's -- belongs to a user client, and is meant for whichever
+ * synth it was connected to. PESTUDIO_TEST_KEYBOARD names a client to treat as a
+ * keyboard: a test cannot send through a real device without it sounding in every
+ * other program on the machine that listens to that device. */
+bool MidiIo::fromKeyboard(int client)
+{
+    snd_seq_client_info_t *ci;
+    snd_seq_client_info_alloca(&ci);
+    if (snd_seq_get_any_client_info(seq_, client, ci) < 0) return false;
+    if (snd_seq_client_info_get_type(ci) == SND_SEQ_KERNEL_CLIENT) return true;
+    static const QByteArray test = qgetenv("PESTUDIO_TEST_KEYBOARD");
+    return !test.isEmpty() && test == snd_seq_client_info_get_name(ci);
+}
+
+/* Whether this voice event reaches the plug-in. Releases pass whether the tab is
+ * in front or not: one for a key pressed here must arrive after a switch, or the
+ * note never stops. A live tab takes any release, which costs nothing. */
+bool MidiIo::keyboardPasses(const snd_seq_event_t *ev)
+{
+    if (!fromKeyboard(ev->source.client)) return true;
+    const bool live = channel_ >= 0 || keyboardLive_.load(std::memory_order_relaxed);
+    const int  ch   = ev->data.note.channel & 15;
+
+    switch (ev->type) {
+    case SND_SEQ_EVENT_NOTEON:
+    case SND_SEQ_EVENT_NOTEOFF: {
+        bool &held = keyHeld_[ch][ev->data.note.note & 127];
+        if (ev->type == SND_SEQ_EVENT_NOTEON && ev->data.note.velocity > 0) {
+            if (live) held = true;
+            return live;
+        }
+        const bool owed = held;
+        held = false;
+        return live || owed;
+    }
+    case SND_SEQ_EVENT_CONTROLLER:
+        if (!live) return false;
+        if (ev->data.control.param == 64) pedalDown_[ch] = ev->data.control.value >= 64;
+        if (ev->data.control.param == 1)  modUp_[ch]     = ev->data.control.value > 0;
+        return true;
+    case SND_SEQ_EVENT_PITCHBEND:
+        if (live) bent_[ch] = ev->data.control.value != 0;
+        return live;
+    default:
+        return live;
+    }
+}
+
+/* The tab has gone to the back with the keyboard's hands still on it. A key's
+ * release is on its way (keyboardPasses), but the wheel coming back to rest and
+ * the pedal coming up now go to the new tab, and this one would stay bent and
+ * sustaining under whatever the tracker plays into it. */
+void MidiIo::keyboardLeft()
+{
+    if (channel_ >= 0) return;
+    for (int ch = 0; ch < 16; ch++) {
+        if (bent_[ch])      { bent_[ch] = false;      deliver(0xE0 | ch, 0, 64); }
+        if (modUp_[ch])     { modUp_[ch] = false;     deliver(0xB0 | ch, 1, 0); }
+        if (pedalDown_[ch]) { pedalDown_[ch] = false; deliver(0xB0 | ch, 64, 0); }
+    }
+}
+
+void MidiIo::deliver(int status, int d1, int d2)
+{
+    /* Straight to the host first, before any Qt machinery. */
+    if (rtSink_) rtSink_(status, d1, d2);
+    emit midi(status, d1, d2);
+    /* Realtime is deliberately not echoed: thru exists to pass playing
+     * through to other gear, and re-emitting a clock we were given is how
+     * two devices end up driving each other. */
+    if (thru_ && status < 0xF0) send(status, d1, d2);
+}
+
 void MidiIo::drain()
 {
     if (!seq_) return;
@@ -239,6 +317,7 @@ void MidiIo::drain()
         else if (r == 0) break;
         if (r == -ENOSPC) {
             fprintf(stderr, "midi: input overran; releasing every note\n");
+            memset(keyHeld_, 0, sizeof keyHeld_);
             if (overrunSink_) overrunSink_();
             emit overrun();
             continue;
@@ -255,6 +334,7 @@ void MidiIo::drain()
                        ev->type == SND_SEQ_EVENT_CHANPRESS ||
                        ev->type == SND_SEQ_EVENT_KEYPRESS;
         if (channel_ >= 0 && isVoice && ev->data.note.channel != channel_) continue;
+        if (isVoice && !keyboardPasses(ev)) continue;
 
         int ch = isVoice ? ev->data.note.channel : 0;
         int status = -1, d1 = 0, d2 = 0;
@@ -310,14 +390,6 @@ void MidiIo::drain()
             break;
         }
 
-        if (status >= 0) {
-            /* Straight to the host first, before any Qt machinery. */
-            if (rtSink_) rtSink_(status, d1, d2);
-            emit midi(status, d1, d2);
-            /* Realtime is deliberately not echoed: thru exists to pass playing
-             * through to other gear, and re-emitting a clock we were given is how
-             * two devices end up driving each other. */
-            if (thru_ && status < 0xF0) send(status, d1, d2);
-        }
+        if (status >= 0) deliver(status, d1, d2);
     }
 }

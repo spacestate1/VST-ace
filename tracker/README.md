@@ -236,7 +236,14 @@ picture at each step.
 play into the pattern, on the cursor's track. Press it again, or Stop, to end
 the take. The notes come from the computer keyboard, or from a MIDI keyboard
 connected to the tracker's **Record In** port (pick one under **Rec…**, or
-`aconnect <keyboard> "tracker:Record In"`).
+`aconnect <keyboard> "tracker:Record In"`). In `studio` the first keyboard is
+connected for you, and a USB keyboard plays the tab in front: that tab's synth,
+or the cursor's track with the tracker in front (one note at a time per track).
+Set the input to (none) under **Rec…** to stop it on the tracker tab.
+
+With the song stopped and **edit** ticked, a MIDI keyboard also enters notes at
+the cursor and steps on, as typed note keys do, with the velocity played. While
+the song plays only a take writes, so playing along leaves the song alone.
 
 Timing is by the clock the song plays on. A MIDI event is stamped with the
 sequencer's own tick the moment it arrives, so where it lands does not depend

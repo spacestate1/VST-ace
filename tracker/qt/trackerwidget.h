@@ -2573,9 +2573,31 @@ private:
         host_->showStatus("Exported the take to " + p, 3000);
     }
 
+    // Notes the MIDI input played with the song stopped go in at the cursor, as
+    // typed ones do -- when a typed key would: this window active and in front.
+    void takeInputNotes()
+    {
+        const bool mine = view_->isVisible() && window()->isActiveWindow();
+        bool wrote = false;
+        int note, vel;
+        while (trk_input_next_note(e_, &note, &vel)) {
+            const int track = ed_.track;
+            if (mine && trk_enter_note(e_, &ed_, note, vel)) {
+                emit view_->noteTyped(track, note);
+                wrote = true;
+            }
+        }
+        if (!wrote) return;
+        view_->updateSize();
+        view_->update();
+        emit view_->cursorMoved();
+        emit view_->edited();
+    }
+
     void followPlayback()
     {
         int o, p, r;
+        takeInputNotes();
         // Thirty times a second while there is anything to follow, ten when there
         // is not, and not at all while the view is hidden: each tick is a take of
         // the engine's lock.

@@ -65,6 +65,19 @@ public:
      * default, since most users want to hear the plugin, not drive a synth. */
     void setAutoConnectOut(bool on) { autoOut_ = on; }
 
+    /* Whether a physical keyboard plays this instance. Every instance subscribes
+     * to every keyboard, so a shell with several of them -- the studio's tabs --
+     * would have one key sound them all; it marks the tab in front live and the
+     * rest not. Default true, so pestudio alone behaves as it always has.
+     *
+     * Only presses are held back. A key let go, or anything else owed to what
+     * was played here, still arrives after the tab has gone to the back -- see
+     * keyboardPasses. A program's own port (the tracker, REAPER, a sequencer
+     * connected on purpose) and the clock are not a keyboard and always arrive;
+     * and an instance on one chosen channel keeps it, for a keyboard split
+     * across synths by channel. Safe from any thread. */
+    void setKeyboardLive(bool on) { keyboardLive_.store(on, std::memory_order_relaxed); }
+
     /* Send one raw MIDI voice message out. No-op if the port is closed. */
     void send(int status, int d1, int d2);
 
@@ -108,6 +121,13 @@ private slots:
 private:
     /* Reads ALSA directly, so nothing the GUI does can delay a note. */
     void readerLoop();
+    /* To the plug-in, the widgets and thru, in that order. Reader thread. */
+    void deliver(int status, int d1, int d2);
+
+    /* The keyboard gate; all on the reader thread. See setKeyboardLive. */
+    bool fromKeyboard(int client);
+    bool keyboardPasses(const struct snd_seq_event *ev);
+    void keyboardLeft();
 
 private:
     void attachNotifiers();
@@ -117,6 +137,15 @@ private:
     std::function<void()>    overrunSink_;
     std::thread             reader_;
     std::atomic<bool>        stop_{false};
+    std::atomic<bool>        keyboardLive_{true};
+
+    /* What a keyboard left switched on here, on the reader thread only: it is
+     * owed a release after the tab goes to the back. */
+    bool                     wasLive_ = true;
+    bool                     keyHeld_[16][128] = {};
+    bool                     pedalDown_[16] = {};
+    bool                     modUp_[16] = {};
+    bool                     bent_[16] = {};
 
     /* send() runs on two threads -- the GUI's, for the on-screen piano and the
      * computer keyboard, and the reader's, for thru -- and ALSA's sequencer

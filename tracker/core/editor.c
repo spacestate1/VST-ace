@@ -831,6 +831,28 @@ int trk_key(trk_engine *e, trk_editor *ed, int key)
     return 1;
 }
 
+int trk_enter_note(trk_engine *e, trk_editor *ed, int note, int vel)
+{
+    trk_song *s = trk_song_of(e);
+    trk_cell *c;
+    int nt, rows;
+
+    if (!ed->edit || note < 0 || note > 127) return 0;
+    trk_lock(e);
+    nt = s->ntracks < 1 ? 1 : s->ntracks > TRK_TRACKS ? TRK_TRACKS : s->ntracks;
+    if (ed->track >= nt) ed->track = nt - 1;
+    rows = rows_of(e, ed);
+    if (ed->row >= rows) ed->row = rows - 1;
+    c = &s->pattern[ed->pattern].cell[ed->row][ed->track];
+    vel = vel >= 1 && vel <= 127 ? vel : TRK_EMPTY;
+    if (c->note != (uint8_t)note || c->vel != (uint8_t)vel) trk_undo_push(e);
+    c->note = (uint8_t)note;
+    c->vel = (uint8_t)vel;
+    advance(e, ed);
+    trk_unlock(e);
+    return 1;
+}
+
 void trk_key_release(trk_engine *e, trk_editor *ed, int key)
 {
     int t;

@@ -3043,6 +3043,11 @@ public:
     }
     bool keysLive() const { return keysLive_; }
 
+    /* Whether a physical MIDI keyboard plays this host: see MidiIo::setKeyboardLive.
+     * A flag, not setFrontCheck's live question, because the MIDI reader thread is
+     * the one to read it and may not touch the tab bar. */
+    void setKeyboardLive(bool on) { if (midi_) midi_->setKeyboardLive(on); }
+
     /* The shell's live answer to "is my tab the one in front?". When set, it is
      * asked at every key event instead of trusting the stored flag above: a flag
      * is only as current as the last time somebody remembered to set it, and one
