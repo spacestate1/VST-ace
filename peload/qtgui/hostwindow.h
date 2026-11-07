@@ -704,7 +704,7 @@ public:
          * silent, which is the same as no source chosen. */
         pw_init(nullptr, nullptr);
         loop_ = pw_thread_loop_new(nodeName("pestudio").constData(), nullptr);
-        if (loop_ && pw_thread_loop_start(loop_) == 0) openCapture(QString());
+        if (loop_) pw_thread_loop_start(loop_);
         return true;
     }
 
@@ -754,7 +754,6 @@ public:
         if (pw_thread_loop_start(loop_) < 0) { *err = "pw_thread_loop_start failed"; return false; }
         running_ = true;
         ring_.reset(kMaxFrames);
-        openCapture(QString());          /* the system default, until one is picked */
         return true;
     }
 
@@ -814,6 +813,18 @@ public:
         pw_thread_loop_unlock(loop_);
         captureTarget_ = target;
         return capture_ != nullptr;
+    }
+
+    /* An input stream holds a realtime thread for as long as it is open, of a
+     * small allowance per user that a few tabs use up, and whichever plug-in loads
+     * last is what goes without. So it is open only while something is listening. */
+    void closeCapture()
+    {
+        if (!loop_ || !capture_) return;
+        pw_thread_loop_lock(loop_);
+        pw_stream_destroy(capture_);
+        capture_ = nullptr;
+        pw_thread_loop_unlock(loop_);
     }
 
     QString captureTarget() const { return captureTarget_; }
@@ -4753,7 +4764,7 @@ private slots:
             if (d.node == keep) { updateAudioInState(); return; }
         /* The device that was chosen has gone. Say so rather than silently
          * listening to something else. */
-        eng_.openCapture(QString());
+        if (eng_.captureOpen()) eng_.openCapture(QString());
         status("that input device is gone -- back to the "
                                  "system default", 5000);
         updateAudioInState();
@@ -4782,6 +4793,12 @@ private slots:
     {
         const int src = srcOn_->isChecked() ? srcBox_->currentData().toInt()
                                             : int(Engine::SrcSilence);
+        if (src == int(Engine::SrcInput)) {
+            if (!eng_.captureOpen() && !eng_.openCapture(eng_.captureTarget()))
+                status("could not open the input device", 4000);
+        } else {
+            eng_.closeCapture();
+        }
         eng_.setSource(Engine::Source(src));
     }
 
@@ -4790,7 +4807,7 @@ private slots:
         const uint64_t now = eng_.captureFrames();
         const bool live = now != audioInSeen_;
         audioInSeen_ = now;
-        audioInText_ = !eng_.captureOpen() ? QString("no input stream")
+        audioInText_ = !eng_.captureOpen() ? QString("closed until input is the source")
                      : now == 0            ? QString("open, nothing received yet")
                      : live                ? QString("receiving audio")
                                            : QString("open, idle");
