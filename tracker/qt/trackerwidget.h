@@ -1326,9 +1326,9 @@ public:
     // A track's destination picked one of midiSinks -- or a window again
     // (name empty). The shell makes the routing change.
     virtual void midiSinkPicked(int track, const QString &name) { (void)track; (void)name; }
-    // A song was just loaded into the engine (openPath succeeded). A shell
-    // with synth tabs reopens the ones the song's sink lines name; the
-    // default is nothing, the standalone's whole answer.
+    // A song was just loaded into the engine (openPath succeeded), or a new one
+    // started. A shell with synth tabs reopens the ones the song's sink lines name
+    // and closes the rest; the default is nothing, the standalone's whole answer.
     virtual void songOpened() {}
     // A song was just written to `path`. A shell with synth tabs saves the
     // sounds the tracks' synths are on beside it.
@@ -1815,6 +1815,9 @@ public:
         updateTitle();
         view_->setFocus();
     }
+
+    /* File > New song, for a shell whose menu has it with this tab not in front. */
+    void startNewSong() { newSong(); }
 
     bool openPath(const QString &path)
     {
@@ -2683,6 +2686,7 @@ private:
         view_->updateSize();
         view_->update();
         updateTitle();
+        host_->songOpened();   // a shell closes the synths the last song left open
     }
 
     void openSong()

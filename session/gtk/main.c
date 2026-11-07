@@ -114,6 +114,7 @@ typedef struct {
     int           dmix;        /* its place on the studio mix bus while it has a stream */
     _Atomic int   direct;      /* the stream carries it: the shared mix leaves it out */
     float         dbuf[PERIOD_MAX * 2];
+    char         *saved_sound; /* its patch as last saved or restored, or NULL */
 } synctab;
 
 static synctab      g_tabs[MAXTABS];
@@ -1801,6 +1802,8 @@ static void close_synth_tab(synctab *tab)
     gtk_notebook_remove_page(GTK_NOTEBOOK(g_notebook),
         gtk_notebook_page_num(GTK_NOTEBOOK(g_notebook), tab->pane));
     plugview_free(tab->pv);
+    free(tab->saved_sound);
+    tab->saved_sound = NULL;
     tab->used = 0;
     engine_unpark();
     update_canvas();
@@ -1816,14 +1819,91 @@ static void remember(const char *kind, const char *path);       /* Open Recent's
 static void restore_song_sounds(const char *song);
 static void save_song_sounds(const char *song);
 
+static int confirm_sync(const char *message, const char *detail, const char *yes);
+static int g_close_unused_synths;       /* set once startup is over */
+
+/* A tab's sound as last saved or restored, to tell whether closing it loses any. */
+static void remember_sound(synctab *tab)
+{
+    free(tab->saved_sound);
+    tab->saved_sound = plugview_capture_patch(tab->pv);
+}
+
+static void remember_all_sounds(void)
+{
+    int t;
+    for (t = 0; t < MAXTABS; t++)
+        if (g_tabs[t].used && plugview_loaded_path(g_tabs[t].pv)[0]) remember_sound(&g_tabs[t]);
+}
+
+static int sink_in_song(int id)
+{
+    int t;
+    for (t = 0; t < TRK_TRACKS; t++) if (trk_sink_of(g_trk, t) == id) return 1;
+    return 0;
+}
+
+/* The tabs the song just opened came back with its saved sounds. */
+static void remember_song_sounds(void)
+{
+    int t;
+    if (!g_trk) return;
+    for (t = 0; t < MAXTABS; t++)
+        if (g_tabs[t].used && g_tabs[t].sink_id >= 0 && sink_in_song(g_tabs[t].sink_id) &&
+            plugview_loaded_path(g_tabs[t].pv)[0])
+            remember_sound(&g_tabs[t]);
+}
+
+/* A song brings its synths with it, so the last song's would otherwise pile up with
+ * each song opened, every one of them rendering and taking CPU from the song
+ * playing. Not for a session or the command line, which name their tabs on purpose.
+ *
+ * A closed tab's sound is gone, so one that differs from what was last saved -- or
+ * was never saved -- is asked about, and keeping stays the easy answer. A tab kept
+ * that way is left unremembered, and is asked about again next time. */
+static void close_synths_not_in_song(void)
+{
+    unsigned char unused[MAXTABS] = { 0 }, changed[MAXTABS] = { 0 };
+    char names[1024] = "";
+    int t, any_changed = 0, close_changed = 0;
+
+    if (!g_close_unused_synths || !g_trk) return;
+    for (t = 0; t < MAXTABS; t++) {
+        char *now;
+        if (!g_tabs[t].used || g_tabs[t].sink_id < 0 || sink_in_song(g_tabs[t].sink_id) ||
+            !plugview_loaded_path(g_tabs[t].pv)[0]) continue;
+        unused[t] = 1;
+        now = plugview_capture_patch(g_tabs[t].pv);
+        if (now && (!g_tabs[t].saved_sound || strcmp(now, g_tabs[t].saved_sound))) {
+            changed[t] = 1;
+            any_changed = 1;
+            snprintf(names + strlen(names), sizeof names - strlen(names), "%s%s",
+                     names[0] ? ", " : "", g_tabs[t].sink_name);
+        }
+        free(now);
+    }
+    if (any_changed) {
+        char detail[1200];
+        snprintf(detail, sizeof detail,
+                 "The new song doesn't use %s, and their sounds have changes that "
+                 "aren't saved.", names);
+        close_changed = confirm_sync("Close them and lose those changes?", detail, "Close");
+    }
+    for (t = 0; t < MAXTABS; t++)
+        if (unused[t] && g_tabs[t].used && (!changed[t] || close_changed))
+            close_synth_tab(&g_tabs[t]);
+}
+
 static void song_opened_cb(void *ud)
 {
     (void)ud;
     reopen_song_synths();
+    close_synths_not_in_song();
     if (g_tracker && trk_view_path(g_tracker)[0]) {
         restore_song_sounds(trk_view_path(g_tracker));
         remember("song", trk_view_path(g_tracker));      /* the tracker's own Open button too */
     }
+    remember_song_sounds();
 }
 
 static void song_saved_cb(const char *path, void *ud)
@@ -2466,6 +2546,7 @@ static int write_session(const char *path)
         status(msg);
         return 0;
     }
+    remember_all_sounds();              /* a session records every tab */
     snprintf(g_session_path, sizeof g_session_path, "%s", path);
     remember("session", path);
     snprintf(msg, sizeof msg, "session saved to %s", path);
@@ -2505,6 +2586,8 @@ static void save_song_sounds(const char *song)
             sy = &s.synths[at = s.nsynths++];
             sy->plugin = g_canonicalize_filename(plugview_loaded_path(tab->pv), NULL);
             sy->patch = plugview_capture_patch(tab->pv);
+            free(tab->saved_sound);
+            tab->saved_sound = sy->patch ? strdup(sy->patch) : NULL;
         }
         trk_sink_name(g_trk, id, nm, sizeof nm);
         if (!(r = realloc(s.routes, (size_t)(s.nroutes + 1) * sizeof *r))) break;
@@ -2779,7 +2862,20 @@ static void restore_confirmed(void *ud)
 /* Open a session: read first, so a file that will not parse costs nothing;
  * then, when the song has unsaved changes, the tracker's Save/Discard/Cancel
  * -- Cancel leaves everything as it was -- and only then the restore. */
+static int open_session_inner(const char *path);
+
 static int open_session_path(const char *path)
+{
+    const int was = g_close_unused_synths;
+    int ok;
+    g_close_unused_synths = 0;           /* it names its tabs on purpose */
+    ok = open_session_inner(path);
+    g_close_unused_synths = was;
+    remember_all_sounds();
+    return ok;
+}
+
+static int open_session_inner(const char *path)
 {
     sess_file *s;
     char err[512], msg[700];
@@ -3917,9 +4013,19 @@ static int    g_nwant_synths;
 static int    g_want_tracker;
 static char   g_want_song[4096];
 static char   g_want_record[4096];             /* --record-mix: start a take with the window */
+static int    g_then_song_ms;                  /* --then-song: a second song, as File > Open */
+static char   g_then_song[4096];
 static int    g_want_play;                     /* --play: start the song when it is open */
 static char   g_want_session[4096];
 static int    g_want_route = -1;
+
+static gboolean then_song_cb(gpointer ud)
+{
+    (void)ud;
+    if (!strcmp(g_then_song, "new") && open_tracker_tab()) trk_view_new_song(g_tracker);
+    else open_song_path(g_then_song);
+    return G_SOURCE_REMOVE;
+}
 static int    g_quit_after;
 
 static void activate(GtkApplication *app, gpointer ud)
@@ -4006,6 +4112,8 @@ static void activate(GtkApplication *app, gpointer ud)
     }
     if (g_want_tracker) open_tracker_tab();
     if (g_want_song[0]) open_song_path(g_want_song);
+    g_close_unused_synths = 1;
+    if (g_then_song_ms > 0) g_timeout_add((guint)g_then_song_ms, then_song_cb, NULL);
     if (g_want_record[0]) mix_begin(g_want_record);
     if (g_want_play && g_trk) trk_play(g_trk, TRK_PLAY_SONG, 0, 0);
     if (g_want_route > 0 && !route_track(g_want_route - 1))
@@ -4063,6 +4171,8 @@ int main(int argc, char **argv)
      *   studiogtk --route 2 --synth ... --tracker   track 2 plays the first synth tab
      *   studiogtk --smoke 15000 --synth ...   scripted exercise, then quit
      *   studiogtk --quit-after 15000 ...      just quit then
+     *   studiogtk --then-song 9000 b.trk ...  open a second song then, as File > Open does
+     *   studiogtk --then-song 9000 new ...    or a new one, as File > New song does
      */
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--synth") && i + 1 < argc) {
@@ -4084,6 +4194,9 @@ int main(int argc, char **argv)
             g_smoke_ms = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--quit-after") && i + 1 < argc) {
             g_quit_after = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--then-song") && i + 2 < argc) {
+            g_then_song_ms = atoi(argv[++i]);
+            snprintf(g_then_song, sizeof g_then_song, "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--record-mix") && i + 1 < argc) {
             snprintf(g_want_record, sizeof g_want_record, "%s", argv[++i]);
         } else if (!strcmp(argv[i], "--play")) {

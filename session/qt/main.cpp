@@ -30,6 +30,7 @@
  * play which tab -- is one JSON file (session/sessfile.h), written from
  * File > Save session and read back by File > Open session or --session. */
 
+#include <QScopedValueRollback>
 #include <QtWidgets>
 
 #include <cstring>
@@ -104,6 +105,7 @@ public:
         QMenu *file = menuBar()->addMenu("&File");
         file->addAction("New &synth...", this, &SessionShell::newSynth);
         newTracker_ = file->addAction("New &tracker", this, &SessionShell::newTracker);
+        newSongAct_ = file->addAction("New so&ng", this, &SessionShell::newSong);
         openSongAct_ = file->addAction("&Open song...", this, &SessionShell::openSong);
         /* Open Recent: songs and sessions, from the list the GTK shell keeps too.
          * Built when the menu is about to show, so it is always current. */
@@ -223,6 +225,8 @@ public:
             statusBar()->showMessage("could not load " + plugin, 0);
     }
     bool openTracker() { return addTrackerTab() != nullptr; }
+    void startupDone() { closeUnusedSynths_ = true; }
+    void startNewSong() { newSong(); }
     bool openSongPath(const QString &path)
     {
         /* openPath tells the host -- songOpened below -- so the tracker
@@ -267,6 +271,7 @@ public:
      * skipped, not fatal: half a session back is worth more than none. */
     bool openSessionPath(const QString &path)
     {
+        QScopedValueRollback<bool> keepTabs(closeUnusedSynths_, false);
         char err[512];
         sess_file *s = sess_read(path.toLocal8Bit().constData(), err, sizeof err);
         if (!s) {
@@ -366,6 +371,7 @@ public:
                                .arg(QString::fromUtf8(r.sink && *r.sink ? r.sink : "a synth"));
         }
         sessionPath_ = path;
+        rememberAllSounds();
         statusBar()->showMessage(
             trouble.isEmpty()
                 ? QString("session restored from %1").arg(path)
@@ -602,6 +608,7 @@ public:
         QWidget *cur = tabs_->currentWidget();
         /* The tracker in front has its own Open song; one is enough. */
         if (openSongAct_) openSongAct_->setVisible(!(tracker_ && cur == tracker_));
+        if (newSongAct_) newSongAct_->setVisible(!(tracker_ && cur == tracker_));
         for (auto it = actionsOf_.constBegin(); it != actionsOf_.constEnd(); ++it) {
             const bool on = it.key() == cur;
             for (const auto &p : it.value()) {
@@ -644,7 +651,9 @@ public:
     void songOpened() override
     {
         reopenSongSynths();
+        closeSynthsNotInSong();
         restoreSongSounds();
+        rememberSongSounds();
         if (tracker_ && !tracker_->songPath().isEmpty())     /* the tracker's own Open too */
             recent_add("song", QFileInfo(tracker_->songPath()).absoluteFilePath().toLocal8Bit().constData());
     }
@@ -691,6 +700,7 @@ public:
                 if (tab->engine()->host()) {
                     char perr[128];
                     sy->patch = patch_capture(tab->engine()->host(), sy->plugin, perr, sizeof perr);
+                    savedSound_.insert(tab, QByteArray(sy->patch ? sy->patch : ""));
                 }
                 recorded << tab;
                 at = s.nsynths++;
@@ -722,6 +732,82 @@ public:
     /* The other half: each synth the song's routes name gets its saved
      * patch. Matched by sink name among the tabs that exist now, which
      * reopenSongSynths has just made. */
+    /* What a tab sounds like right now, to compare with what was last saved. Empty
+     * when it cannot be asked, which is not a change. */
+    QByteArray captureSound(HostWidget *tab)
+    {
+        if (deadTabs_.contains(tab) || !tab->engine()->host()) return QByteArray();
+        const QByteArray path = QFileInfo(tab->loadedPath()).absoluteFilePath().toLocal8Bit();
+        char err[128];
+        char *p = patch_capture(tab->engine()->host(), path.constData(), err, sizeof err);
+        const QByteArray text(p ? p : "");
+        free(p);
+        return text;
+    }
+
+    /* The tabs the song just opened came back with its saved sounds. */
+    void rememberSongSounds()
+    {
+        if (!trkEngine_) return;
+        QSet<int> used;
+        for (int t = 0; t < TRK_TRACKS; t++) used.insert(trk_sink_of(trkEngine_, t));
+        for (const SinkEntry &e : sinks_)
+            if (used.contains(e.id) && !e.tab->loadedPath().isEmpty())
+                savedSound_.insert(e.tab, captureSound(e.tab));
+    }
+
+    void rememberAllSounds()
+    {
+        for (const SinkEntry &e : sinks_)
+            if (!e.tab->loadedPath().isEmpty()) savedSound_.insert(e.tab, captureSound(e.tab));
+    }
+
+    /* A song brings its synths with it, so the last song's would otherwise pile up
+     * with each song opened, every one of them rendering and taking CPU from the
+     * song playing. Not for a session or the command line, which name their tabs
+     * on purpose.
+     *
+     * A closed tab's sound is gone, so one that differs from what was last saved --
+     * or was never saved -- is asked about, and keeping stays the easy answer. A tab
+     * kept that way is left unremembered, and is asked about again next time. */
+    void closeSynthsNotInSong()
+    {
+        if (!closeUnusedSynths_ || !trkEngine_) return;
+        QSet<int> used;
+        for (int t = 0; t < TRK_TRACKS; t++) used.insert(trk_sink_of(trkEngine_, t));
+
+        QList<HostWidget *> unused, changed;
+        QStringList names;
+        for (const SinkEntry &e : sinks_) {
+            if (used.contains(e.id) || e.tab->loadedPath().isEmpty()) continue;
+            unused << e.tab;
+            const QByteArray now = captureSound(e.tab);
+            if (!now.isEmpty() && savedSound_.value(e.tab) != now) {
+                changed << e.tab;
+                names << e.name;
+            }
+        }
+        bool closeChanged = false;
+        if (!changed.isEmpty()) {
+            QMessageBox box(QMessageBox::Question, "Close synths",
+                            QString("The new song doesn't use %1, and their sounds have "
+                                    "changes that aren't saved.\n\nClose them and lose "
+                                    "those changes?").arg(names.join(", ")),
+                            QMessageBox::NoButton, this);
+            QPushButton *closeThem = box.addButton("&Close them", QMessageBox::DestructiveRole);
+            QPushButton *keepThem = box.addButton("&Keep them", QMessageBox::RejectRole);
+            box.setDefaultButton(keepThem);
+            box.setEscapeButton(keepThem);
+            box.exec();
+            closeChanged = box.clickedButton() == closeThem;
+        }
+        for (HostWidget *h : unused) {
+            if (changed.contains(h) && !closeChanged) continue;
+            const int ix = tabs_->indexOf(h);
+            if (ix >= 0) closeTabNow(ix);
+        }
+    }
+
     void restoreSongSounds()
     {
         if (!tracker_ || tracker_->songPath().isEmpty()) return;
@@ -1095,6 +1181,12 @@ private:
         if (h) h->showPluginFolders();
     }
     void newTracker() { addTrackerTab(); }
+    /* The tracker tab comes up, or to the front, and its own New runs: the question
+     * about an unsaved song included, and a blank song uses no synths. */
+    void newSong()
+    {
+        if (TrackerWidget *t = addTrackerTab()) t->startNewSong();
+    }
     void openSong()
     {
         const QString p = QFileDialog::getOpenFileName(this, "Open song", QString(),
@@ -1298,6 +1390,7 @@ private:
                                          .arg(QString::fromLocal8Bit(err)), 0);
             return false;
         }
+        rememberAllSounds();             /* a session records every tab */
         sessionPath_ = path;
         recent_add("session", QFileInfo(path).absoluteFilePath().toLocal8Bit().constData());
         statusBar()->showMessage("session saved to " + path, 5000);
@@ -1580,6 +1673,7 @@ private:
              * out -- after it returns, nothing touches the engine again, and
              * tracks routed here fall back to their ALSA windows. */
             removeSink(static_cast<HostWidget *>(w));
+            savedSound_.remove(static_cast<HostWidget *>(w));
             deadTabs_.remove(static_cast<HostWidget *>(w));
             lastCalls_.remove(static_cast<HostWidget *>(w));
             /* ~HostWidget lets go of the plug-in cleanly: the MIDI reader is
@@ -1599,6 +1693,9 @@ private:
         updateCanvas();
         arbitrateKeys();
     }
+
+    QHash<HostWidget *, QByteArray> savedSound_;   /* as last saved or restored */
+    bool closeUnusedSynths_ = false;               /* set once startup is over */
 
     /* The tracker destinations: one per synth tab, named by its plug-in. */
     struct SinkEntry { HostWidget *tab; int id; QString name; SinkCtx *ctx; };
@@ -1877,7 +1974,7 @@ private:
     QMenu          *helpMenu_ = nullptr;   /* the window's own, kept last in the bar */
     QPointer<QDialog> pluginMgr_;          /* File > Plug-ins, while it is open */
     QMenu          *fileMenu_ = nullptr;
-    QAction        *fileAnchor_ = nullptr, *helpAnchor_ = nullptr, *openSongAct_ = nullptr;
+    QAction        *fileAnchor_ = nullptr, *helpAnchor_ = nullptr, *openSongAct_ = nullptr, *newSongAct_ = nullptr;
     trk_engine     *trkEngine_ = nullptr;
     QList<SinkEntry> sinks_;             /* every synth tab the tracker can play directly */
     /* The plug-in folders as (file stem, absolute path) pairs, for
@@ -1948,13 +2045,16 @@ int main(int argc, char **argv)
      *   studio --route 2 --synth ... --tracker   track 2 plays the first synth tab
      *   studio --smoke 15000 --synth ...   scripted exercise, then quit
      *   studio --quit-after 15000 ...      just quit then
+     *   studio --then-song 9000 b.trk ...  open a second song then, as File > Open does
+     *   studio --then-song 9000 new ...    or a new one, as File > New song does
      *   studio --save-session out.vstace ...   write the session on the clean exit
      */
     QStringList synths;
     QString song, session, saveSession;
     bool wantTracker = false, wantPlay = false;
     QString recordMix;
-    int quitAfter = 0, smoke = 0, route = -1;
+    int quitAfter = 0, smoke = 0, route = -1, thenSongMs = 0;
+    QString thenSong;
     /* Read before QApplication sees argv, which it edits: Qt takes
      * -session/--session as its own X11 session-management option and removes
      * it, so --session never got here. What is not ours is passed on to Qt,
@@ -1976,6 +2076,10 @@ int main(int argc, char **argv)
             route = atoi(argv[++i]);
         else if (a == "--quit-after" && i + 1 < argc)
             quitAfter = atoi(argv[++i]);
+        else if (a == "--then-song" && i + 2 < argc) {
+            thenSongMs = atoi(argv[++i]);
+            thenSong = QString::fromLocal8Bit(argv[++i]);
+        }
         else if (a == "--smoke" && i + 1 < argc)
             smoke = atoi(argv[++i]);
         else if (a == "--record-mix" && i + 1 < argc)
@@ -2028,6 +2132,11 @@ int main(int argc, char **argv)
     for (const QString &s : synths) w.openSynth(s);
     if (wantTracker) w.openTracker();
     if (!song.isEmpty()) w.openSongPath(song);
+    w.startupDone();
+    if (thenSongMs > 0)
+        QTimer::singleShot(thenSongMs, &w, [&w, &thenSong] {
+            if (thenSong == "new") w.startNewSong(); else w.openSongPath(thenSong);
+        });
     if (!recordMix.isEmpty()) w.beginMixRecord(recordMix);
     if (wantPlay) w.playSong();
     if (!saveSession.isEmpty()) w.saveSessionOnExit(saveSession);

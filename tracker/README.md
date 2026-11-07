@@ -40,7 +40,9 @@ destination per track, as with a window: the track's window names wait in the
 song, and routing back reconnects them. The pick is saved with the song, as a
 `sink` line naming the tab, and the shells open that synth again -- at its
 default program; sounds are the session file's business -- when the song is
-opened. A routed tab closing sends the track back to its window.
+opened. Tabs the new song doesn't use are closed, as they are by File > New song, after asking if a tab's sound has
+changes that aren't saved; a session or the command line keeps the tabs it names. A
+routed tab closing sends the track back to its window.
 
 ## Samples
 

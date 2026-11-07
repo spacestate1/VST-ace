@@ -2859,6 +2859,7 @@ static void after_confirm(ui *U, after_t what)
         trk_editor_init(&U->ed);
         trk_set_bpm(U->e, 120);
         reset_view(U);
+        if (U->song_opened) U->song_opened(U->song_opened_ud);   /* the last song's synths go */
         return;
     }
     {
