@@ -3,7 +3,7 @@
 # build-appimage.sh VERSION -- build the vst-ace AppImage: one file, no install,
 # every distribution.
 #
-#   bash packaging/build-appimage.sh 0.3.4
+#   bash packaging/build-appimage.sh 0.3.5
 #
 # It lands in release/VERSION/, like the other three.
 #

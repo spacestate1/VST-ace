@@ -21,7 +21,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 
 Name:           vst-ace
-Version:        0.3.4
+Version:        0.3.5
 Release:        1%{?dist}
 Summary:        Run Windows, macOS and Linux audio plug-ins natively, without Wine
 
@@ -213,6 +213,11 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
 %{_mandir}/man1/studiogtk.1*
 
 %changelog
+* Sat Nov 07 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.5-1
+- The DAW bridge reads a relative path in a .vstace from the .vstace's own
+  folder, and says which path it tried when the file is not there.
+- Document that Ardour's Linux VST path does not include ~/.vst.
+
 * Fri Nov 06 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.4-1
 - Track volume sliders are exact on sample tracks; a track sharing a synth can
   be given its own copy of it.
