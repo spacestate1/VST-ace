@@ -1381,6 +1381,11 @@ static gboolean editor_tick(gpointer ud)
     plugview *pv = ud;
     if (pv->in_plugin) return G_SOURCE_CONTINUE;
 
+    /* A tab in back: nobody can see it, and drawing takes CPU from the audio.
+     * Told only when it changes. */
+    if (pv->host && GTK_IS_WIDGET(pv->editor))
+        pehost_editor_set_visible(pv->host, gtk_widget_get_mapped(pv->editor));
+
     /* A plug-in whose helper has died stops repainting and goes silent, and
      * both look exactly like a plug-in that is working and idle. The Qt window
      * has said so, and then restarted it, for a while; this one noticed
@@ -1922,6 +1927,8 @@ static void load(plugview *pv, const entry *e)
     if (pv->park) pv->park();
     unload_locked(pv);
     pv->host = pehost_open_as(e->path, PEHOST_KIND_AUTO, pv->rate, pv->block);
+    /* Live, always: a slow helper must not hold up the other tabs. */
+    if (pv->host) pehost_set_anticipate(pv->host, 1);
     snprintf(pv->loaded_path, sizeof pv->loaded_path, "%s", pv->host ? e->path : "");
     if (pv->host) atomic_store_explicit(&pv->live, 1, memory_order_release);
     if (pv->unpark) pv->unpark();

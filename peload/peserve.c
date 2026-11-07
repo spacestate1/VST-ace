@@ -43,6 +43,8 @@ typedef struct {
     volatile int stop;
     int         editor_open;
     double      last_publish;      /* ms, CLOCK_MONOTONIC */
+    double      last_pump;         /* ms, CLOCK_MONOTONIC */
+    int         editor_hidden;
     double      last_idle;
     double      spin_since;     /* first pump call since the main loop last ran */
 } server;
@@ -223,6 +225,7 @@ static int handle_request(server *s, const bridge_req *qp, bridge_rep *rp)
         case BR_EDITOR_CLOSE:
             if (s->editor_open) { pehost_editor_detach(s->h); s->editor_open = 0; }
             break;
+        case BR_EDITOR_VISIBLE: s->editor_hidden = !q.a; s->last_pump = 0.0; break;
         case BR_EDITOR_MOUSE:  /* legacy: the host now writes these to memory */
                                pehost_editor_mouse(s->h, q.a, q.b, q.c, q.d, q.e); break;
         case BR_EDITOR_KEY:    pehost_editor_key(s->h, q.a, q.b, q.c); break;
@@ -253,6 +256,7 @@ static int safe_while_spinning(int op)
     case BR_PARAM_NAME: case BR_PARAM_LABEL: case BR_PARAM_DISPLAY:
     case BR_PARAM_GET:  case BR_PROGRAM_NAME: case BR_GET_PROGRAM:
     case BR_EDITOR_KIND: case BR_EDITOR_SIZE: case BR_IMPORT_STATS:
+    case BR_EDITOR_VISIBLE:     /* a flag: a tab switch must not end a dialog */
         return 1;
     default:
         return 0;
@@ -366,11 +370,27 @@ static void publish_pixels(server *s)
     atomic_fetch_add_explicit(&sh->ed_gen, 1, memory_order_release);
 }
 
+/* Hidden still gets some: a plug-in's own idle work can hang off these. */
+#define EDITOR_SHOWN_MS   16.0
+#define EDITOR_HIDDEN_MS 250.0
+
 static void publish_editor(server *s)
 {
+    struct timespec now;
+    double t;
+
     if (!s->editor_open) return;
+    /* This comes round every few milliseconds and after every request, so the
+     * loop can notice input promptly. A pump is a frame of drawing -- a macOS
+     * plug-in's timers fire on it, whatever interval they asked for -- and the
+     * host shows no more than 60 a second. Unlimited it drew at 250, in the
+     * process making the audio. */
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    t = (double)now.tv_sec * 1e3 + (double)now.tv_nsec / 1e6;
+    if (t - s->last_pump < (s->editor_hidden ? EDITOR_HIDDEN_MS : EDITOR_SHOWN_MS)) return;
+    s->last_pump = t;
     pehost_editor_pump(s->h);
-    publish_pixels(s);
+    if (!s->editor_hidden) publish_pixels(s);
 }
 
 

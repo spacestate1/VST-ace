@@ -190,6 +190,7 @@ static int live_run(pehost *h, double rate, int block,
 
     memset(&st, 0, sizeof st);
     st.h = h;
+    pehost_set_anticipate(h, 1);
     st.block = block > 0 ? block : 512;
     if (!(st.buf = calloc((size_t)st.block * 2, sizeof *st.buf))) return 1;
 

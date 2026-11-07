@@ -62,6 +62,9 @@ struct bridge {
     int         pending;
     int         behind;            /* consecutive blocks with no reply */
     int         warm;              /* blocks delivered by this helper, up to BRIDGE_WARM_BLOCKS */
+    int         ahead;             /* render ahead: see bridge_set_anticipate */
+    int         inflight_frames;   /* the length of the block the helper is working on */
+    int         ed_hidden;         /* what the helper was last told */
     float       last[2];           /* the last frame handed out, for fading a gap */
     int         last_valid;        /* a block went out since the last gap */
     int         regain;            /* the first block after a gap comes in over a ramp */
@@ -425,7 +428,7 @@ static void bridge_teardown(bridge *b)
     b->sh = NULL;
     if (b->shm_name[0]) shm_unlink(b->shm_name);
     b->shm_name[0] = 0;
-    b->pending = b->behind = b->warm = 0;
+    b->pending = b->behind = b->warm = b->inflight_frames = b->ed_hidden = 0;
     b->ed_have = 0;
     b->ed_seen = 0;
 }
@@ -1021,6 +1024,7 @@ static long bridge_deadline_ns(const bridge *b, int frames, int rt)
 }
 
 static void bridge_render_inner(bridge *b, const float *in, float *out, int frames);
+static void bridge_render_ahead(bridge *b, const float *in, float *out, int frames);
 
 void bridge_render_io(bridge *b, const float *in, float *out, int frames)
 {
@@ -1048,8 +1052,97 @@ void bridge_render_io(bridge *b, const float *in, float *out, int frames)
         bridge_gap(b, out, frames);
         return;
     }
-    bridge_render_inner(b, in, out, frames);
+    if (b->ahead) bridge_render_ahead(b, in, out, frames);
+    else          bridge_render_inner(b, in, out, frames);
     bridge_leave(b);
+}
+
+/* A helper that has answered nothing for a long while, given another block with
+ * no reply.
+ *
+ * Persistently behind means it is not coming back -- most likely its audio thread
+ * died, which leaves the process alive and the socket open, so nothing else
+ * notices. A render that has produced nothing for a second is wedged inside the
+ * plug-in, not merely slow. Mark the helper dead so the host stops waiting on it
+ * and the window can say so -- pehost_alive turns false and the editor and audio
+ * are reported gone rather than silently frozen.
+ *
+ * A count alone is a shorter and shorter time as the period shrinks, and 200 blocks
+ * of 32 frames is a slow program change, not a wedged thread.
+ *
+ * Killed through the pidfd, never by pid: this thread does not reap, and the thread
+ * that does may already have, in which case a pid could belong to something else by
+ * now. The pidfd stays valid (teardown waits for this thread to leave before closing
+ * it), and the helper's process group is swept by teardown. */
+static void bridge_note_behind(bridge *b, int frames)
+{
+    if (++b->behind >= 200 && (double)b->behind * frames >= (b->sr > 0 ? b->sr : 48000.0)) {
+        fprintf(stderr, "bridge: the helper has stopped rendering (%d blocks "
+                        "with no reply) -- its audio thread is stuck; giving "
+                        "up on it\n", b->behind);
+        if (b->pidfd >= 0)
+            syscall(SYS_pidfd_send_signal, b->pidfd, SIGKILL, NULL, 0);
+        b->dead = 1;
+    }
+}
+
+/* Render ahead: hand out the block the helper finished, post the next, return.
+ *
+ * Waiting for the block just asked for gives a helper whatever is left of one
+ * period, on a thread the whole graph is waiting for: one slow plug-in and every
+ * client loses the cycle. Here the helper has the whole period to itself, at the
+ * price of that period in latency, and the wait below is short enough that the
+ * graph still finishes its cycle whatever the helper is doing. Together that is 1.5
+ * periods for a helper, and at worst one stream's gap rather than everyone's.
+ *
+ * A block that is late is not thrown away. It goes out on the next call, so the
+ * only thing lost is the moment of the gap, not a block of what the plug-in made.
+ *
+ * One block in flight at a time, so the two sides still never touch the shared
+ * buffers at once, and a helper needs to know nothing about this. */
+static void bridge_render_ahead(bridge *b, const float *in, float *out, int frames)
+{
+    bridge_shm *s = b->sh;
+
+    if (b->pending > 0) {
+        struct timespec ts;
+        long ns = (long)(0.5e9 * frames / (b->sr > 0 ? b->sr : 48000.0));
+        int n;
+        if (ns < 1000000L) ns = 1000000L;
+        ts.tv_sec = 0;
+        ts.tv_nsec = ns;
+        if (bridge_sem_wait(&s->done, &ts)) {
+            if (!s->xruns)
+                fprintf(stderr, "bridge: helper missed its deadline (%d frames); "
+                                "emitting silence\n", frames);
+            s->xruns++;
+            bridge_note_behind(b, frames);
+            bridge_gap(b, out, frames);
+            return;
+        }
+        b->pending = 0;
+        b->behind = 0;
+        /* The graph changing its block size is the only way these differ. */
+        n = b->inflight_frames < frames ? b->inflight_frames : frames;
+        memcpy(out, s->out, (size_t)n * 2 * sizeof *out);
+        if (n < frames) memset(out + (size_t)n * 2, 0, (size_t)(frames - n) * 2 * sizeof *out);
+        if (b->warm < BRIDGE_WARM_BLOCKS) b->warm++;
+        bridge_delivered(b, out, frames);
+    } else {
+        memset(out, 0, (size_t)frames * 2 * sizeof *out);    /* nothing asked for yet */
+    }
+
+    if (in) memcpy(s->in, in, (size_t)frames * 2 * sizeof *in);
+    else    memset(s->in, 0, (size_t)frames * 2 * sizeof *s->in);
+    s->frames = frames;
+    b->inflight_frames = frames;
+    b->pending = 1;
+    bridge_sem_post(&s->req);
+}
+
+void bridge_set_anticipate(bridge *b, int on)
+{
+    if (b) b->ahead = on ? 1 : 0;
 }
 
 static void bridge_render_inner(bridge *b, const float *in, float *out, int frames)
@@ -1082,30 +1175,7 @@ static void bridge_render_inner(bridge *b, const float *in, float *out, int fram
         b->pending--;
     }
     if (b->pending > 0) {                            /* still behind: skip a block */
-        /* Persistently behind means it is not coming back -- most likely its audio
-         * thread died, which leaves the process alive and the socket open, so
-         * nothing else notices. */
-        /* A count alone is a shorter and shorter time as the period shrinks, and
-         * 200 blocks of 32 frames is a slow program change, not a wedged thread. */
-        if (++b->behind >= 200 && (double)b->behind * frames >= (b->sr > 0 ? b->sr : 48000.0)) {
-            fprintf(stderr, "bridge: the helper has stopped rendering (%d blocks "
-                            "with no reply) -- its audio thread is stuck; giving "
-                            "up on it\n", b->behind);
-            /* Not coming back: a render that has produced nothing for a second
-             * is wedged inside the plug-in, not merely slow. Mark the helper
-             * dead so the host stops waiting on it and the window can say so --
-             * pehost_alive turns false and the editor and audio are reported
-             * gone rather than silently frozen.
-             *
-             * Killed through the pidfd, never by pid: this thread does not reap,
-             * and the thread that does may already have, in which case a pid
-             * could belong to something else by now. The pidfd stays valid
-             * (teardown waits for this thread to leave before closing it), and
-             * the helper's process group is swept by teardown. */
-            if (b->pidfd >= 0)
-                syscall(SYS_pidfd_send_signal, b->pidfd, SIGKILL, NULL, 0);
-            b->dead = 1;
-        }
+        bridge_note_behind(b, frames);
         bridge_gap(b, out, frames);
         return;
     }
@@ -1168,6 +1238,14 @@ int bridge_editor_open(bridge *b)
     if (!b || bridge_op(b, BR_EDITOR_OPEN, 0, 0, 0, 0, 0, &r) || !r.ok) return -1;
     b->ed_w = r.a; b->ed_h = r.b; b->ed_open = 1;
     return 0;
+}
+
+void bridge_editor_visible(bridge *b, int shown)
+{
+    bridge_rep r;
+    if (!b || b->ed_hidden == !shown) return;
+    b->ed_hidden = !shown;
+    bridge_op(b, BR_EDITOR_VISIBLE, shown ? 1 : 0, 0, 0, 0, 0, &r);
 }
 
 void bridge_editor_close(bridge *b)

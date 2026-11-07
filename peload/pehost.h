@@ -239,6 +239,9 @@ double pehost_position(const pehost *h);
  * hardware keyboard's wheels and pedals reach the plugin unchanged. Safe to
  * call from the GUI thread while the audio thread renders. */
 void  pehost_midi(pehost *h, int status, int d1, int d2);
+/* See bridge_set_anticipate. For a host playing live; no effect on a plug-in that
+ * has no helper process. */
+void  pehost_set_anticipate(pehost *h, int on);
 
 /* Whether the plug-in is still running. Only ever false for one hosted out of
  * process whose helper has died -- in process, a plug-in that faults takes this
@@ -336,6 +339,9 @@ void pehost_editor_key(pehost *h, int vk, int down, int ch);
 
 int  pehost_has_editor(pehost *h);
 void pehost_editor_size(pehost *h, int *w, int *height);
+/* Whether the editor can be seen. Drawing one nobody can see takes CPU from every
+ * plug-in's audio, so a helper slows its editor right down while it is hidden. */
+void pehost_editor_set_visible(pehost *h, int shown);
 int  pehost_editor_can_resize(pehost *h);
 int  pehost_editor_attach(pehost *h, unsigned long x11_window);
 /* Finish the embedding on the X side: tell whatever the plug-in created that

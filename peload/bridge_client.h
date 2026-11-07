@@ -86,6 +86,12 @@ int  bridge_editor_kind(bridge *b);          /* 0 none, 2 pixels */
 void bridge_editor_size(bridge *b, int *w, int *h);
 int  bridge_editor_open(bridge *b);
 void bridge_editor_close(bridge *b);
+/* A hidden editor is pumped only as often as a plug-in's idle work needs. */
+void bridge_editor_visible(bridge *b, int shown);
+/* Render ahead for a live host: one period more latency, and a slow helper can no
+ * longer hold up the audio graph. Must be off for an offline render, or for a host
+ * that was not told of the delay. Call before the first block. */
+void bridge_set_anticipate(bridge *b, int on);
 int  bridge_editor_pixels(bridge *b, const unsigned int **px, int *w, int *h);
 void bridge_editor_mouse(bridge *b, int x, int y, int msg, int buttons, int wheel);
 void bridge_editor_key(bridge *b, int vk, int down, int ch);

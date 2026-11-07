@@ -876,6 +876,10 @@ public:
             std::lock_guard<std::mutex> g(hostMx_);
             unloadLocked();
             host_ = pehost_open_as(path.toLocal8Bit().constData(), kind, kSampleRate, kQuantum);
+            /* Live, always: a slow helper must not hold up the other tabs. The
+             * block it adds also brings a synth into line with the tracker's
+             * sample tracks, which are placed two periods ahead. */
+            if (host_) pehost_set_anticipate(host_, 1);
         }
         unpark();
         if (!host_) { *err = QString::fromUtf8(pehost_last_error()); return false; }
@@ -2432,7 +2436,7 @@ public:
         }
         host_ = h;
         reported_ = false;
-        pump_->start(16);
+        applyVisible(isVisible());
         return true;
     }
     void detach()
@@ -2560,6 +2564,15 @@ private:
             return k & 0xFF;
         }
     }
+
+    void applyVisible(bool shown)
+    {
+        if (!host_) return;
+        pehost_editor_set_visible(host_, shown);
+        pump_->start(shown ? 16 : 250);
+    }
+    void showEvent(QShowEvent *e) override { QWidget::showEvent(e); applyVisible(true); }
+    void hideEvent(QHideEvent *e) override { QWidget::hideEvent(e); applyVisible(false); }
 
     void tick()
     {

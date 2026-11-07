@@ -4633,6 +4633,16 @@ int pehost_editor_attach(pehost *h, unsigned long xid)
     if (r == 0) pehost_x11_embed(xid);
     return r;
 }
+void pehost_editor_set_visible(pehost *h, int shown)
+{
+    if (h && h->br) bridge_editor_visible(h->br, shown);
+}
+
+void pehost_set_anticipate(pehost *h, int on)
+{
+    if (h && h->br) bridge_set_anticipate(h->br, on);
+}
+
 void pehost_editor_detach(pehost *h)
 {
     if (h && h->mv) { macvst_editor_close(h->mv); return; }

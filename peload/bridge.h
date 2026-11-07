@@ -235,7 +235,8 @@ enum {
     BR_IMPORT_STATS,     /*                       <- implemented,stubbed,hit */
     BR_INPUT_MASK,       /* -> mask                                          */
     BR_QUIT,
-    BR_SET_PARAM         /* -> index, f=value     (restart replay; not a ring) */
+    BR_SET_PARAM,        /* -> index, f=value     (restart replay; not a ring) */
+    BR_EDITOR_VISIBLE    /* -> 1 shown, 0 hidden: a hidden editor is pumped slowly */
 };
 
 /* One fixed-size message each way keeps framing trivial: a short read means the

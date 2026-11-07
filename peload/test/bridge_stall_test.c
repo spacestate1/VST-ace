@@ -1,6 +1,6 @@
 /* What a stalled helper costs the host's realtime thread.
  *
- *   bridge-stall-test <plug-in> [frames]
+ *   bridge-stall-test <plug-in> [frames] [ahead]
  *
  * Plays a held chord on a realtime thread, paced as a graph would, and stops the
  * helper for 200 ms part way through. The host must keep its thread moving, and
@@ -46,7 +46,7 @@ static float peak_of(const float *b, int n)
     return pk;
 }
 
-static struct { pehost *h; int frames; pid_t helper; int result; } G;
+static struct { pehost *h; int frames, ahead; pid_t helper; int result; } G;
 
 static void *audio(void *ud)
 {
@@ -86,8 +86,10 @@ static void *audio(void *ud)
     printf("longest block: before %.2f ms, during the stall %.2f ms, after %.2f ms\n",
            worst_before * 1e3, worst_stall * 1e3, worst_after * 1e3);
     printf("silent blocks: %d during the stall, %d in the last second\n", silent_during, silent_after);
-    /* The budget is a period plus the wait to collect what is still in flight. */
-    G.result = worst_stall > period + 0.003 || silent_after > 0 || worst_after > 2 * period;
+    /* The budget is a period plus the wait to collect what is still in flight;
+     * rendering ahead, half a period and the graph never waits longer. */
+    G.result = worst_stall > (G.ahead ? 0.5 * period + 0.002 : period + 0.003) ||
+               silent_after > 0 || worst_after > (G.ahead ? 0.5 * period + 0.002 : 2 * period);
     return NULL;
 }
 
@@ -96,6 +98,7 @@ int main(int argc, char **argv)
     pthread_t t;
     int notes[] = { 48, 55, 60, 64, 67, 72 }, i;
     G.frames = argc > 2 ? atoi(argv[2]) : 256;
+    G.ahead = argc > 3 && atoi(argv[3]);
     if (argc < 2 || G.frames < 16 || G.frames > MAX_FRAMES) {
         fprintf(stderr, "usage: %s <plug-in> [frames]\n", argv[0]);
         return 2;
@@ -105,6 +108,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "cannot open %s\n", argv[1]);
         return 2;
     }
+    pehost_set_anticipate(G.h, G.ahead);
     if (!(G.helper = helper_of_this_process())) {
         printf("SKIP: this plug-in has no helper process\n");
         pehost_close(G.h);

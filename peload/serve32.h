@@ -29,6 +29,8 @@ typedef struct {
     float     **ins, **outs;
     int         cap;                     /* frames the buffers are sized for */
     int         editor_open;
+    int         editor_hidden;   /* pumped slowly: see BR_EDITOR_VISIBLE */
+    double      last_hidden;     /* ms, the last pump while hidden */
     pthread_t   audio;
     volatile int stop;
     /* One VstEvents block, allocated once and reused every callback: the
@@ -253,6 +255,7 @@ static int sv_safe_while_spinning(int op)
     case BR_PARAM_NAME: case BR_PARAM_LABEL: case BR_PARAM_DISPLAY:
     case BR_PARAM_GET:  case BR_PROGRAM_NAME: case BR_GET_PROGRAM:
     case BR_EDITOR_KIND: case BR_EDITOR_SIZE: case BR_IMPORT_STATS:
+    case BR_EDITOR_VISIBLE:     /* a flag: a tab switch must not end a dialog */
         return 1;
     default:
         return 0;
@@ -282,6 +285,7 @@ static void sv_serve_pending(serve_state *s)
         memset(&r, 0, sizeof r);
         r.ok = 1;
         switch (q.op) {
+        case BR_EDITOR_VISIBLE: s->editor_hidden = !q.a; break;
         case BR_PARAM_NAME: {
             char b[64] = { 0 };
             fx->dispatcher(fx, effGetParamName, q.a, 0, b, 0.0f);
@@ -356,6 +360,18 @@ static void sv_publish_editor(serve_state *s)
     bridge_shm *sh = s->sh;
 
     if (!s->editor_open) return;
+    /* Hidden, a beat now and then for the plug-in's own idle work, and no pixels. */
+    if (s->editor_hidden) {
+        struct timespec hn;
+        double ht;
+        clock_gettime(CLOCK_MONOTONIC, &hn);
+        ht = (double)hn.tv_sec * 1e3 + (double)hn.tv_nsec / 1e6;
+        if (ht - s->last_hidden >= 250.0) {
+            s->last_hidden = ht;
+            s->fx->dispatcher(s->fx, effEditIdle, 0, 0, NULL, 0.0f);
+        }
+        return;
+    }
     /* Never mid-repaint: a frame captured between BeginPaint and EndPaint is
      * part old and part new. This runs from inside the plug-in as well as from
      * the idle poll, which is exactly when a paint is likely to be open.
@@ -540,6 +556,7 @@ static int serve_run(AEffect32 *fx, int sock, const char *shm_path)
                 S.editor_open = 0;
             }
             break;
+        case BR_EDITOR_VISIBLE: S.editor_hidden = !q.a; S.last_hidden = 0.0; break;
         case BR_EDITOR_MOUSE:
             w32_mouse(q.a, q.b, q.c, q.d, q.e);
             break;
