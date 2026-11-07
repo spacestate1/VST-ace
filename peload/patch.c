@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -776,7 +777,7 @@ const char *patch_bank_patch_name(const patch_bank *b, int i)
 
 /* ------------------------------------------------------------------- apply */
 
-static int apply_one(const patch_bank *b, int ix, pehost *h, int use_program,
+static int apply_one(const patch_bank *b, int ix, pehost *h, int use_program, int captured,
                      char *err, int errn, int *applied, int *missed)
 {
     const patch *p;
@@ -800,6 +801,7 @@ static int apply_one(const patch_bank *b, int ix, pehost *h, int use_program,
      * caller is re-asserting a patch over a program the user just chose. */
     if (use_program && p->program >= 0 && p->program < pehost_num_programs(h))
         pehost_set_program(h, p->program);
+    if (captured) pehost_flush_params(h);        /* so the reads below see the program */
 
     nparams = pehost_num_params(h);
     if (nparams > 0 && p->n > 0) {
@@ -814,8 +816,14 @@ static int apply_one(const patch_bank *b, int ix, pehost *h, int use_program,
             int px = resolve(p->v[i].key, names, nparams, used);
             if (px < 0) { nmiss++; continue; }
             used[px] = 1;
-            pehost_set_param(h, px, (float)p->v[i].val);
             nok++;
+            /* What this host read when it captured the patch, and reads the same
+             * now: nothing to change. Writing it anyway is not harmless. Some VST3
+             * controllers report defaults, not what the program they are playing
+             * holds, so the write replaces the sound with those defaults. A bank
+             * written by hand does mean every value, and is written whole. */
+            if (captured && fabsf(pehost_get_param(h, px) - (float)p->v[i].val) < 1e-5f) continue;
+            pehost_set_param(h, px, (float)p->v[i].val);
         }
         free_names(names, nparams);
         free(used);
@@ -859,13 +867,13 @@ static int apply_one(const patch_bank *b, int ix, pehost *h, int use_program,
 int patch_bank_apply(const patch_bank *b, int ix, pehost *h,
                      char *err, int errn, int *applied, int *missed)
 {
-    return apply_one(b, ix, h, 1, err, errn, applied, missed);
+    return apply_one(b, ix, h, 1, 0, err, errn, applied, missed);
 }
 
 int patch_bank_apply_params(const patch_bank *b, int ix, pehost *h,
                             char *err, int errn, int *applied, int *missed)
 {
-    return apply_one(b, ix, h, 0, err, errn, applied, missed);
+    return apply_one(b, ix, h, 0, 0, err, errn, applied, missed);
 }
 
 int patch_load(pehost *h, const char *path, char *err, int errn,
@@ -887,7 +895,7 @@ int patch_apply_text(pehost *h, const char *text, char *err, int errn,
     int         rc;
 
     if (!(b = patch_bank_read_text(text, "session", err, errn))) return -1;
-    rc = patch_bank_apply(b, 0, h, err, errn, applied, missed);
+    rc = apply_one(b, 0, h, 1, 1, err, errn, applied, missed);
     patch_bank_free(b);
     return rc;
 }
