@@ -56,7 +56,9 @@ public:
         cm->addSeparator();
         bridgeBox_ = addBox("Show in DAWs' FX list",
                             "Put this plug-in in ~/.vst as a Linux VST2, so REAPER (or any DAW) "
-                            "loads it on a track itself. Rescan plug-ins in the DAW afterwards.");
+                            "loads it on a track itself. Rescan plug-ins in the DAW afterwards.\n\n"
+                            "Ardour does not look in ~/.vst until you add it: Edit > Preferences > "
+                            "Plugins > VST > Linux VST Path.");
         connect(bridgeBox_, &QCheckBox::clicked, this, [this](bool on) { bridgeToggled(on); });
         auto *watch = new QTimer(this);
         connect(watch, &QTimer::timeout, this, [this] { updateConnect(); updateBridge(); });
@@ -336,8 +338,17 @@ private:
                 saveHelperDir();
         }
         if (!why.isEmpty()) statusBar()->showMessage("FX list: " + why, 0);
-        else statusBar()->showMessage(fxName() + " is in " + QFileInfo(e).path() + " -- in REAPER: Options > "
-                                      "Preferences > Plug-ins > VST > Re-scan, then add it to a track", 0);
+        else {
+            /* Ardour's default Linux VST path is system folders only (its VST3
+             * one does include ~/.vst3), so a copy in ~/.vst is invisible to it
+             * until the folder is added by hand -- issue #3. */
+            const QString dir = QFileInfo(e).path();
+            QString msg = fxName() + " is in " + dir + " -- rescan plug-ins in the DAW (REAPER: Options > "
+                          "Preferences > Plug-ins > VST > Re-scan";
+            if (r != RouteLinkVst3)
+                msg += "; Ardour: add " + dir + " under Preferences > Plugins > VST > Linux VST Path first";
+            statusBar()->showMessage(msg + ")", 0);
+        }
         updateBridge();
     }
 

@@ -142,12 +142,21 @@ one MIDI output per synth in its MIDI device preferences. The choice is kept.
 ## In other DAWs
 
 The bridge is a plain Linux VST2, so Ardour, Bitwig, Qtractor and Carla load it
-too: **Show in DAWs' FX list** puts it in `~/.vst`, which they scan. By hand:
+too. **Show in DAWs' FX list** puts it in `~/.vst`. By hand:
 
-    cp peload/build/libvst-ace-bridge.so  ~/.vst/FB-3300.so
-    echo /path/to/FB-3300.dll >           ~/.vst/FB-3300.vstace
+    cp /usr/lib/vst-ace/libvst-ace-bridge.so  ~/.vst/FB-3300.so
+    echo /path/to/FB-3300.dll >               ~/.vst/FB-3300.vstace
 
-Use a copy, not a link. `VSTACE_TARGET=<path>` overrides the `.vstace`.
+(`/usr/lib64/vst-ace` on Fedora, `peload/build/` in a source tree.) Use a copy,
+not a link. A relative path in the `.vstace` is taken from the `.vstace`'s own
+folder, so `echo FB-3300.dll > ~/.vst/FB-3300.vstace` means `~/.vst/FB-3300.dll`;
+`~/` works too. `VSTACE_TARGET=<path>` overrides the `.vstace`.
+
+**Ardour does not look in `~/.vst`.** Its Linux VST path is system folders only
+(`/usr/lib/lxvst`, `/usr/lib/vst` and the like). Add the folder once in
+**Edit > Preferences > Plugins > VST > Linux VST Path**, then rescan. Its VST3
+path does include `~/.vst3`, so a Linux VST3 that pestudio links there needs
+nothing.
 Audio, MIDI, parameters, programs, tempo, transport and saved state go through,
 and the audio is identical to the plug-in loaded directly. A plug-in that will
 not load keeps the track and passes silence, with the reason on stderr.

@@ -27,6 +27,7 @@
 #define VST2_SYSV              /* this side is a Linux plug-in: System V ABI */
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,23 +95,50 @@ static int readable(const char *p)
     return p && p[0] && access(p, R_OK) == 0;
 }
 
-/* Read a path out of a .vstace file: the first non-blank, non-# line. */
+/* Read a path out of a .vstace file: the first non-blank, non-# line.
+ *
+ * A relative path is relative to the .vstace file, not to the working
+ * directory: that is whatever the DAW's scanner happened to start in, so
+ * `echo FB-3300.dll > ~/.vst/FB-3300.vstace` used to point nowhere. A leading
+ * ~/ is the home directory, since a shell would not have expanded it inside
+ * the file. Surrounding blanks are dropped -- a trailing space is invisible in
+ * an editor and would otherwise make the path not exist. */
 static int read_pointer_file(const char *path, char *out, size_t n)
 {
     char line[PATH_MAX];
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     while (fgets(line, sizeof line, f)) {
-        size_t len = strlen(line);
-        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
-        if (!len || line[0] == '#') continue;
-        snprintf(out, n, "%s", line);
+        char *s = line;
+        size_t len = strlen(s);
+        while (len && (s[len - 1] == '\n' || s[len - 1] == '\r' ||
+                       s[len - 1] == ' '  || s[len - 1] == '\t')) s[--len] = 0;
+        while (*s == ' ' || *s == '\t') s++, len--;
+        if (!len || s[0] == '#') continue;
         fclose(f);
+
+        if (s[0] == '/') {
+            snprintf(out, n, "%s", s);
+        } else if (s[0] == '~' && s[1] == '/') {
+            const char *home = getenv("HOME");
+            if (!home || !*home) return 0;
+            snprintf(out, n, "%s%s", home, s + 1);
+        } else {
+            const char *slash = strrchr(path, '/');
+            if (slash)
+                snprintf(out, n, "%.*s/%s", (int)(slash - path), path, s);
+            else
+                snprintf(out, n, "%s", s);
+        }
         return 1;
     }
     fclose(f);
     return 0;
 }
+
+/* Set when a .vstace was found but its file was not: the reason has been
+ * given already, and the generic one would contradict it. */
+static int named_missing;
 
 /* The plug-in this copy fronts, by the rules in the file header. */
 static int find_target(char *out, size_t n)
@@ -122,6 +150,7 @@ static int find_target(char *out, size_t n)
     char *dot;
     int i;
 
+    named_missing = 0;
     if (readable(env)) { snprintf(out, n, "%s", env); return 1; }
 
     if (!self_path(self, sizeof self)) return 0;
@@ -129,8 +158,15 @@ static int find_target(char *out, size_t n)
     if ((dot = strrchr(stem, '.')) && !strcmp(dot, ".so")) *dot = 0;
 
     snprintf(probe, sizeof probe, "%s.vstace", stem);
-    if (readable(probe) && read_pointer_file(probe, out, n) && readable(out))
-        return 1;
+    if (readable(probe) && read_pointer_file(probe, out, n)) {
+        if (readable(out)) return 1;
+        /* Said so here, because the fallback below ends in "this copy does not
+         * say which plug-in it stands for", which is the opposite of the truth
+         * and sends whoever reads it looking in the wrong place. */
+        fprintf(stderr, "vst-ace: %s names %s, which is not there%s\n", probe, out,
+                errno == EACCES ? " (permission denied)" : "");
+        named_missing = 1;
+    }
 
     for (i = 0; ext[i]; i++) {
         snprintf(probe, sizeof probe, "%s%s", stem, ext[i]);
@@ -427,10 +463,11 @@ AEffect *VSTPluginMain(audioMasterCb master)
     p->block = block;
 
     if (!find_target(p->target, sizeof p->target)) {
-        fprintf(stderr, "vst-ace: this copy does not say which plug-in it "
-                        "stands for. Install it as <name>.so beside <name>.dll, "
-                        "or put the path in <name>.vstace, or set "
-                        "VSTACE_TARGET.\n");
+        if (!named_missing)
+            fprintf(stderr, "vst-ace: this copy does not say which plug-in it "
+                            "stands for. Install it as <name>.so beside <name>.dll, "
+                            "or put the path in <name>.vstace, or set "
+                            "VSTACE_TARGET.\n");
         p->failed = 1;
         snprintf(p->name, sizeof p->name, "vst-ace (no target)");
         snprintf(p->vendor, sizeof p->vendor, "vst-ace");
