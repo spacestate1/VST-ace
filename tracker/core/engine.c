@@ -89,7 +89,7 @@ typedef struct {
  * (a preview, a panic): start a sample on a track, fade out what one track or
  * everything is playing, or silence everything. */
 enum { SEV_PLAY, SEV_AUDITION, SEV_FADE, SEV_FADE_TRACK, SEV_SILENCE, SEV_CLICK };
-typedef struct { unsigned tick; int asap, op, kit, note, vel, track; } sample_ev;
+typedef struct { unsigned tick; int asap, op, kit, note, vel, track; double gain; } sample_ev;
 
 typedef struct { char name[TRK_PATH_LEN]; drumkit *dk; } kit_slot;
 
@@ -267,8 +267,8 @@ static int is_sampled(const trk_track *k) { return k->samples[0] != 0; }
  * for good. A control op never is -- hits stop one short of the top, and a
  * control op finding even that slot taken evicts the oldest entry: a SILENCE
  * lost to a full list would leave a panic ringing. */
-static void push_sample(trk_engine *e, unsigned tick, int asap, int op, int kit,
-                        int note, int vel, int track)
+static void push_sample_gain(trk_engine *e, unsigned tick, int asap, int op, int kit,
+                             int note, int vel, double gain, int track)
 {
     int control = op != SEV_PLAY && op != SEV_AUDITION;
     pthread_mutex_lock(&e->smx);
@@ -284,9 +284,25 @@ static void push_sample(trk_engine *e, unsigned tick, int asap, int op, int kit,
     {
         sample_ev *v = &e->sev[e->nsev++];
         v->tick = tick; v->asap = asap; v->op = op; v->kit = kit;
-        v->note = note; v->vel = vel; v->track = track;
+        v->note = note; v->vel = vel; v->track = track; v->gain = gain;
     }
     pthread_mutex_unlock(&e->smx);
+}
+
+static void push_sample(trk_engine *e, unsigned tick, int asap, int op, int kit,
+                        int note, int vel, int track)
+{
+    push_sample_gain(e, tick, asap, op, kit, note, vel, 1.0, track);
+}
+
+/* A sample track's hit: the velocity as the cell or track has it, with the fader
+ * as a gain beside it. Velocity's own curve keeps a quarter of the level at its
+ * lowest, so through velocity a fader at 10% still plays at over a third. */
+static int hit_velocity(const trk_track *k, int cell_velocity)
+{
+    trk_track open = *k;
+    open.volume = 100;
+    return trk_track_velocity(&open, cell_velocity);
 }
 
 /* Pending hits after `tick` gone -- or all of them. */
@@ -553,8 +569,8 @@ static void schedule_row(trk_engine *e)
                 continue;
             }
             if (c->note <= 127 && e->track_kit[t] >= 0 && trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel) > 0) {
-                const int vel = trk_track_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel);
-                push_sample(e, e->next_tick, 0, SEV_PLAY, e->track_kit[t], c->note, vel, t);
+                const int vel = hit_velocity(k, c->vel == TRK_EMPTY ? 0 : c->vel);
+                push_sample_gain(e, e->next_tick, 0, SEV_PLAY, e->track_kit[t], c->note, vel, k->volume / 100.0, t);
                 e->held[t] = c->note;   /* may be sounding: what a mute fades */
             }
             continue;
@@ -689,7 +705,7 @@ static void apply_due(trk_engine *e, const sample_ev *v)
              * last, and a mute can end one track's voices -- by group --
              * while the other tracks on the same set play on. */
             if (slot >= 0) {
-                drumkit_play(dk, slot, 1.0, v->vel, v->track);
+                drumkit_play_gain(dk, slot, 1.0, v->vel, v->gain, v->track);
                 e->sev_played++;
             }
         }
@@ -1661,10 +1677,11 @@ static int sink_max_volume(trk_engine *e, int s)
     return best;
 }
 
-/* Hand each sink its gain: the loudest fader among the tracks playing it. One
- * track alone is that synth's fader exactly; several share one synth output, so
- * the output follows the loudest and each track is made quieter than that by
- * velocity (see track_rel_volume). Called with the engine's lock held. */
+/* Hand each sink its gain: the loudest fader among the tracks playing it, times
+ * the master. One track alone is that synth's fader exactly; several share one
+ * synth output, so the output follows the loudest and each track is made quieter
+ * than that by velocity (see track_rel_volume). A synth no track plays is not the
+ * song's to turn down. Called with the engine's lock held. */
 static void sink_gains_locked(trk_engine *e)
 {
     int s;
@@ -1673,7 +1690,7 @@ static void sink_gains_locked(trk_engine *e)
         double g = 1.0;
         if (!e->sink[s].used || !e->sink[s].gain_cb) continue;
         m = sink_max_volume(e, s);
-        if (m >= 0) g = m / 100.0;
+        if (m >= 0) g = m / 100.0 * (e->song.volume / 100.0);
         if (g != e->sink[s].gain_sent) {
             e->sink[s].gain_sent = g;
             e->sink[s].gain_cb(e->sink[s].ud, g);
@@ -1709,6 +1726,20 @@ static int track_on_gain(trk_engine *e, int t)
 {
     const int s = e->track_sink[t];
     return s >= 0 && e->sink[s].gain_cb;
+}
+
+int trk_track_shares_synth(trk_engine *e, int t)
+{
+    int o, s, shared = 0;
+    if (!e || t < 0 || t >= TRK_TRACKS) return 0;
+    pthread_mutex_lock(&e->lock);
+    s = e->track_sink[t];
+    if (s >= 0 && !is_sampled(&e->song.track[t]))
+        for (o = 0; o < e->song.ntracks && o < TRK_TRACKS; o++)
+            if (o != t && e->track_sink[o] == s && !is_sampled(&e->song.track[o]) &&
+                e->song.track[o].volume != e->song.track[t].volume) shared = 1;
+    pthread_mutex_unlock(&e->lock);
+    return shared;
 }
 
 static int track_rel_volume(trk_engine *e, int t)
@@ -2276,6 +2307,17 @@ void trk_preview(trk_engine *e, int t, int note, int vel)
     int ch;
     if (t < 0 || t >= TRK_TRACKS || note < 0 || note > 127) return;
     pthread_mutex_lock(&e->lock);
+    if (is_sampled(&e->song.track[t])) {
+        /* Played out rather than held: a preview of a drum should be the
+         * whole hit, however quickly the key comes back up. */
+        const trk_track *k = &e->song.track[t];
+        if (k->volume > 0 && e->track_kit[t] >= 0) {
+            e->meter[t] = k->volume / 100.0f;
+            push_sample_gain(e, 0, 1, SEV_PLAY, e->track_kit[t], note, hit_velocity(k, vel), k->volume / 100.0, t);
+        }
+        pthread_mutex_unlock(&e->lock);
+        return;
+    }
     {   /* the track's fader applies to what is typed too: through the synth's gain
          * when the track is alone on it, else as velocity */
         trk_track kk = e->song.track[t];
@@ -2284,14 +2326,6 @@ void trk_preview(trk_engine *e, int t, int note, int vel)
     }
     if (vel < 1) { pthread_mutex_unlock(&e->lock); return; }
     e->meter[t] = vel / 127.0f;
-    if (is_sampled(&e->song.track[t])) {
-        /* Played out rather than held: a preview of a drum should be the
-         * whole hit, however quickly the key comes back up. */
-        if (e->track_kit[t] >= 0)
-            push_sample(e, 0, 1, SEV_PLAY, e->track_kit[t], note, vel, t);
-        pthread_mutex_unlock(&e->lock);
-        return;
-    }
     preview_off_locked(e, t);
     ch = e->song.track[t].channel & 15;
     if (!track_on_gain(e, t)) track_volume(e, t, 0, 1);
@@ -3265,6 +3299,9 @@ void trk_lock(trk_engine *e)   { pthread_mutex_lock(&e->lock); }
  * let go, and read from here, rather than read raw off the song. */
 void trk_unlock(trk_engine *e)
 {
+    /* The master moved: a slider, a song loaded, an undo. The synths follow it here
+     * so that none of those has to remember to say so. */
+    if (atomic_load_explicit(&e->vol_live, memory_order_relaxed) != e->song.volume) sink_gains_locked(e);
     atomic_store_explicit(&e->vol_live, e->song.volume, memory_order_relaxed);
     pthread_mutex_unlock(&e->lock);
 }

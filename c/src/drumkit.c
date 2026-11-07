@@ -560,6 +560,11 @@ void drumkit_note_on(drumkit *k, int note, int velocity)
 
 void drumkit_play(drumkit *k, int slot, double rate, int velocity, int group)
 {
+    drumkit_play_gain(k, slot, rate, velocity, 1.0, group);
+}
+
+void drumkit_play_gain(drumkit *k, int slot, double rate, int velocity, double gain, int group)
+{
     int i, pick = -1, choke;
     if (!k || slot < 0 || slot >= k->n || !(rate > 0.0) || !(rate <= 1e6)) return;
     if (velocity < 0) velocity = 0;
@@ -597,7 +602,7 @@ void drumkit_play(drumkit *k, int slot, double rate, int velocity, int group)
     k->voice[pick].group  = group;
     k->voice[pick].rate   = rate;
     k->voice[pick].pos    = 0.0;
-    k->voice[pick].gain   = (0.25 + 0.75 * (velocity / 127.0)) * k->sample[slot].gain;
+    k->voice[pick].gain   = (0.25 + 0.75 * (velocity / 127.0)) * k->sample[slot].gain * gain;
     k->voice[pick].fade   = 1.0;
     k->voice[pick].attack = 0.0;
     k->voice[pick].cut    = 0;

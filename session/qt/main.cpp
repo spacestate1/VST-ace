@@ -646,10 +646,69 @@ public:
         for (const SinkEntry &s : sinks_)
             if (s.name == name) { trk_route_sink(trkEngine_, track, s.id); return; }
     }
+    /* A fader on a synth shared with another track at another volume hardly does
+     * anything: there is one output between them. Offered once per track and song,
+     * and only when the fader has come to rest; a copy costs a tab and its CPU, so
+     * it is never made unasked. */
+    void trackVolumeSettled(int track) override
+    {
+        if (!trkEngine_ || splitDeclined_.contains(track) || trk_recording(trkEngine_) ||
+            !trk_track_shares_synth(trkEngine_, track)) return;
+        const SinkEntry *src = nullptr;
+        const int sink = trk_sink_of(trkEngine_, track);
+        for (const SinkEntry &e : sinks_) if (e.id == sink) src = &e;
+        if (!src || src->tab->loadedPath().isEmpty()) return;
+
+        QMessageBox box(this);
+        box.setWindowTitle("Track volume");
+        box.setText(QString("Track %1 shares %2 with another track.").arg(track + 1).arg(src->name));
+        box.setInformativeText("They have one output between them, so this slider can only lower the "
+                               "track's velocity, and many synths hardly change with velocity.\n\n"
+                               "A copy of the synth with the same sound gives the track its own level. "
+                               "It takes another tab and more CPU.");
+        QPushButton *copy = box.addButton("&Give it its own copy", QMessageBox::AcceptRole);
+        QPushButton *keep = box.addButton("&Keep sharing", QMessageBox::RejectRole);
+        box.setDefaultButton(keep);
+        box.exec();
+        if (box.clickedButton() != copy) { splitDeclined_.insert(track); return; }
+        giveTrackOwnSynth(track, src->tab);
+    }
+
+    void giveTrackOwnSynth(int track, HostWidget *from)
+    {
+        /* Taken before the load, which blocks: what the tab sounds like now. */
+        const QByteArray sound = captureSound(from);
+        const QString path = from->loadedPath();
+        QWidget *front = tabs_->currentWidget();
+        HostWidget *h = addSynthTab();
+        if (!loadBusy(h, path)) {
+            closeTabNow(tabs_->indexOf(h));
+            statusMessage("could not open a copy of " + path, 0);
+            if (front) tabs_->setCurrentWidget(front);
+            return;
+        }
+        if (!sound.isEmpty()) {
+            QString why;
+            if (!h->applyPatchText(sound.constData(), &why))
+                statusMessage("the copy did not take the sound: " + why, 0);
+        }
+        for (const SinkEntry &e : sinks_)
+            if (e.tab == h) {
+                /* The move releases what the track holds; the song keeps the new
+                 * name, which reopens the copy along with the song. */
+                trk_route_sink(trkEngine_, track, e.id);
+                statusMessage(QString("track %1 now plays %2").arg(track + 1).arg(e.name), 6000);
+                break;
+            }
+        if (tracker_) tracker_->routesChanged();
+        if (front) tabs_->setCurrentWidget(front);
+    }
+
     /* A song was loaded -- the shell's Open, the tracker tab's own, or the
      * command line -- so the synths its sink lines name come back too. */
     void songOpened() override
     {
+        splitDeclined_.clear();
         reopenSongSynths();
         closeSynthsNotInSong();
         restoreSongSounds();
@@ -1699,6 +1758,7 @@ private:
 
     QHash<HostWidget *, QByteArray> savedSound_;   /* as last saved or restored */
     bool closeUnusedSynths_ = false;               /* set once startup is over */
+    QSet<int> splitDeclined_;                      /* tracks whose faders were told no: trackVolumeSettled */
 
     /* The tracker destinations: one per synth tab, named by its plug-in. */
     struct SinkEntry { HostWidget *tab; int id; QString name; SinkCtx *ctx; };

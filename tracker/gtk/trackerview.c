@@ -2564,6 +2564,9 @@ static void on_tvol(GtkRange *r, gpointer u)
     if (lbl) gtk_label_set_text(GTK_LABEL(lbl), txt);       /* shown even while a song loads */
     if (U->loading) return;
     trk_track_set_volume(U->e, ref->n, (int)gtk_range_get_value(r));
+    if (trk_track_shares_synth(U->e, ref->n))
+        status(U, "this track shares its synth with a louder or quieter one: the fader only changes "
+                  "its velocity. Open a second tab of the synth to give it a level of its own");
 }
 
 static void on_oct(GtkDropDown *d, GParamSpec *ps, gpointer u)
@@ -3782,8 +3785,8 @@ static GtkWidget *tracker_view_new(ui *U)
     gtk_box_append(GTK_BOX(bar), labelled("step", U->step));
     gtk_box_append(GTK_BOX(bar), U->follow);
     gtk_box_append(GTK_BOX(bar), U->editbox);
-    /* Master volume: what the tracker sounds itself -- the sample tracks. The
-     * windows that play the MIDI tracks have their own. */
+    /* Master volume: the sample tracks, and through the engine the synth tabs. A
+     * MIDI window outside the studio has its own. */
     U->volume = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 150, 1);
     gtk_range_set_value(GTK_RANGE(U->volume), 100);
     gtk_scale_set_draw_value(GTK_SCALE(U->volume), TRUE);

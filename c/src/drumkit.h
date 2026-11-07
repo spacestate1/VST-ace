@@ -100,6 +100,9 @@ void drumkit_note_off(drumkit *k, int note);            /* one-shots ignore this
  * the same `group` (0 up: a track, say), and the pads in its choke group.
  * drumkit_release fades out a group: a note-off. */
 void drumkit_play(drumkit *k, int slot, double rate, int velocity, int group);
+/* The same, with a gain on top of what the velocity gives: a track's fader, which
+ * is exact where velocity's curve never goes below a quarter. */
+void drumkit_play_gain(drumkit *k, int slot, double rate, int velocity, double gain, int group);
 void drumkit_release(drumkit *k, int group);
 int  drumkit_find_sample(const drumkit *k, const char *name);   /* slot, or -1 */
 int  drumkit_slot_at(const drumkit *k, int note);                /* slot, or -1 */

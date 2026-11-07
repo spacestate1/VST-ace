@@ -127,7 +127,8 @@ marked ▶ and, with follow on, is the one shown.
 Right-click the grid for Copy, Cut, Paste, Clear and selecting a track's
 column or the whole pattern. Cut, paste and clear follow edit mode: with it
 off, nothing changes. **vol** in the toolbar is the master volume of the
-sample tracks; the windows playing MIDI tracks have their own.
+song: its sample tracks and the synth tabs its tracks play. A MIDI window outside
+the studio has its own.
 
 **Help > Cheat Sheet** (F1; in the GTK window, the Help button) lists, for
 each sample set the tracks play, every sample with its note and the key that
@@ -240,6 +241,12 @@ connected to the tracker's **Record In** port (pick one under **Rec…**, or
 connected for you, and a USB keyboard plays the tab in front: that tab's synth,
 or the cursor's track with the tracker in front (one note at a time per track).
 Set the input to (none) under **Rec…** to stop it on the tracker tab.
+
+A track's volume slider is exact on a sample set, and on a synth the track has to
+itself. Tracks sharing a synth share its one output: that follows the louder, and
+the quieter can only lower its velocity, which many synths hardly hear. `studio`
+offers such a track a copy of the synth with the same sound, for a level of its
+own; a second tab of the synth does the same by hand.
 
 With the song stopped and **edit** ticked, a MIDI keyboard also enters notes at
 the cursor and steps on, as typed note keys do, with the velocity played. While

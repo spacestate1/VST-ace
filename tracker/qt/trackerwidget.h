@@ -1326,6 +1326,9 @@ public:
     // A track's destination picked one of midiSinks -- or a window again
     // (name empty). The shell makes the routing change.
     virtual void midiSinkPicked(int track, const QString &name) { (void)track; (void)name; }
+    // A track's fader has come to rest. A shell can offer what a fader on a shared
+    // synth cannot do alone; nothing, in the standalone.
+    virtual void trackVolumeSettled(int track) { (void)track; }
     // A song was just loaded into the engine (openPath succeeded), or a new one
     // started. A shell with synth tabs reopens the ones the song's sink lines name
     // and closes the rest; the default is nothing, the standalone's whole answer.
@@ -1428,7 +1431,7 @@ public:
                                                            pattern_, step_, follow_,
                                                            edit_ })
             bar->addWidget(w);
-        // Master volume: what the tracker sounds itself -- the sample tracks.
+        // Master volume: the sample tracks, and through the engine the synth tabs.
         // The windows that play the MIDI tracks have their own.
         volLabel_ = new QLabel("vol 100%");
         volume_ = new QSlider(Qt::Horizontal);
@@ -1436,8 +1439,8 @@ public:
         volume_->setValue(100);
         volume_->setFixedWidth(120);
         volume_->setFocusPolicy(Qt::NoFocus);
-        volume_->setToolTip("Master volume of the sample tracks (the windows playing the MIDI "
-                            "tracks have their own)");
+        volume_->setToolTip("Master volume of the song: its sample tracks, and the synth tabs its "
+                            "tracks play (a MIDI window outside the studio has its own)");
         bar->addSpacing(8);
         bar->addWidget(volLabel_);
         bar->addWidget(volume_);
@@ -1713,6 +1716,8 @@ public:
                 if (loading_) return;
                 trk_track_set_volume(e_, t, v);
                 vol_[t]->setToolTip(QString("This track's volume: %1%").arg(v));
+                volSettled_->setProperty("track", t);
+                volSettled_->start();
             });
             // A track's octave, from its own box. The call locks itself and
             // moves the track's notes with the change, so the grid redraws.
@@ -1803,6 +1808,13 @@ public:
 
         // Playback position, thirty times a second; routing every two, so a
         // window opened after the song was loaded is found and connected.
+        // Not on every step of a drag: a moment after the fader stops.
+        volSettled_ = new QTimer(this);
+        volSettled_->setSingleShot(true);
+        volSettled_->setInterval(700);
+        connect(volSettled_, &QTimer::timeout, this, [this] {
+            host_->trackVolumeSettled(volSettled_->property("track").toInt());
+        });
         tick_ = new QTimer(this);
         connect(tick_, &QTimer::timeout, this, &TrackerWidget::followPlayback);
         tick_->start(33);
@@ -1818,6 +1830,9 @@ public:
 
     /* File > New song, for a shell whose menu has it with this tab not in front. */
     void startNewSong() { newSong(); }
+    /* A shell moved a track to another synth: its destination box follows now, not
+     * at the next look. Saving is asked about as for any change, as the song differs. */
+    void routesChanged() { refreshDests(true); }
 
     bool openPath(const QString &path)
     {
@@ -2803,6 +2818,7 @@ private:
     QString audioShown_;                  // the kits' output, as last reported
     QCheckBox *follow_, *edit_;
     QSlider *volume_;
+    QTimer *volSettled_ = nullptr;
     QLabel *volLabel_;
     QLineEdit *partName_ = nullptr;
     QListWidget *parts_ = nullptr;

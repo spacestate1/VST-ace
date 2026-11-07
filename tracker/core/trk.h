@@ -262,6 +262,11 @@ void trk_sink_rename(trk_engine *e, int id, const char *name);
 void trk_route_sink(trk_engine *e, int t, int id);
 /* The sink track t plays, or -1. */
 int  trk_sink_of(trk_engine *e, int t);
+/* Whether another track plays the same synth at a different volume. They share
+ * one output, which follows the louder, so the quieter only gets a lower velocity:
+ * how far that carries is up to the synth, and many hardly change. A copy of the
+ * synth for the track gives it a fader of its own. */
+int  trk_track_shares_synth(trk_engine *e, int t);
 /* Before a song replaces the one in the engine (open, new): every track routed
  * to a sink goes back to its window, so the routing and the new song's sink
  * names agree. */

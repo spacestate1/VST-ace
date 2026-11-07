@@ -1013,6 +1013,33 @@ int main(void)
         unlink(vpath);
     }
 
+    printf("a sample's fader is a gain\n");
+    {
+        char one[300];
+        drumkit *dk;
+        snprintf(one, sizeof one, "%s", kitdir);
+        dk = drumkit_load(one, 48000.0);
+        check(dk != NULL, "the test kit loads on its own");
+        if (dk) {
+            static double buf[2 * 2400];
+            double peak[3];
+            const double gains[3] = { 1.0, 0.5, 0.1 };
+            int g, i;
+            drumkit_set_raw(dk, 1);
+            for (g = 0; g < 3; g++) {
+                drumkit_all_off(dk);
+                drumkit_play_gain(dk, 0, 1.0, 100, gains[g], 0);
+                drumkit_render(dk, buf, 2400);
+                peak[g] = 0;
+                for (i = 0; i < 2 * 2400; i++) if (fabs(buf[i]) > peak[g]) peak[g] = fabs(buf[i]);
+            }
+            check(peak[0] > 0.01, "a hit sounds");
+            check(fabs(peak[1] / peak[0] - 0.5) < 0.01, "at 50% it is half as loud");
+            check(fabs(peak[2] / peak[0] - 0.1) < 0.01, "at 10% a tenth, not the third velocity would leave");
+            drumkit_free(dk);
+        }
+    }
+
     printf("track volume through a synth's gain\n");
     {
         static double got = -5;
@@ -1037,6 +1064,19 @@ int main(void)
         check(got == 1.0, "two tracks on one synth: the gain follows the louder one");
         trk_track_set_volume(e, 5, 60);
         check(got > 0.59 && got < 0.61, "and drops with it when both are down");
+        trk_lock(e);
+        { const int was = trk_song_of(e)->volume;
+          trk_song_of(e)->volume = 50;
+          trk_unlock(e);
+          check(got > 0.29 && got < 0.31, "the master turns a synth down with the song's own volume");
+          trk_lock(e);
+          trk_song_of(e)->volume = was; }
+        trk_unlock(e);
+        check(got > 0.59 && got < 0.61, "and back");
+        check(trk_track_shares_synth(e, 4) && trk_track_shares_synth(e, 5), "tracks on one synth at different volumes share it");
+        trk_track_set_volume(e, 4, 60);
+        check(!trk_track_shares_synth(e, 4), "at the same volume its gain does the whole job");
+        trk_track_set_volume(e, 4, 40);
         trk_track_set_volume(e, 5, 100);
         trk_route_sink(e, 5, -1);
         check(got > 0.39 && got < 0.41, "one left: the gain follows again");
