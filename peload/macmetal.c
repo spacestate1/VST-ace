@@ -441,8 +441,10 @@ static void sample_tex(const mtl_texture *t, const mtl_sampler *s,
     /* Clamp rather than repeat: every nanovg image paint and the font atlas are
      * addressed inside their extent, and repeating would smear edges. */
     (void)s;
-    x = (int)floorf(u * (float)t->w);
-    y = (int)floorf(v * (float)t->h);
+    /* Not floorf: on baseline x86-64 that is a library call, twice a pixel. */
+    { const float fu = u * (float)t->w, fv = v * (float)t->h;
+      x = (int)fu; if (fu < (float)x) x--;
+      y = (int)fv; if (fv < (float)y) y--; }
     if (x < 0) x = 0;
     if (x >= t->w) x = t->w - 1;
     if (y < 0) y = 0;
@@ -632,6 +634,22 @@ static void raster_tri(mtl_encoder *e, const nvg_uniforms *u,
       raster_rows(&t, y0, y1, &rs->shaded); }
 }
 
+/* Tighten [*lo, *hi] to where c + m*x >= 0 can hold, for the x of a pixel centre.
+ *
+ * Conservative: this only saves testing pixels, and the test in raster_rows still
+ * decides each one, in floats, so what is drawn does not change. The margin covers
+ * those floats disagreeing with these doubles, which matters most on an edge that
+ * is close to level across the row. */
+static void edge_span(double c, double m, double *lo, double *hi)
+{
+    double root, slack;
+    if (m == 0.0) return;
+    root = -c / m;
+    slack = 2.0 + 1e-6 * (fabs(c) / fabs(m) + fabs(root));
+    if (m > 0.0) { if (root - slack > *lo) *lo = root - slack; }
+    else         { if (root + slack < *hi) *hi = root + slack; }
+}
+
 /* The pixels of one triangle, for the rows [y0, y1). */
 static void raster_rows(const tri_ctx *t, int y0, int y1, unsigned long *shaded)
 {
@@ -643,12 +661,41 @@ static void raster_rows(const tri_ctx *t, int y0, int y1, unsigned long *shaded)
     const vtx *a = &t->a, *b = &t->b, *c = &t->c;
     const float area = t->area, sx = t->sx, sy = t->sy, ox = t->ox, oy = t->oy;
     const int x0 = t->x0, x1 = t->x1;
+    /* All of this is the same for every pixel, and was worked out for each one. */
+    const double sgn = area > 0.0f ? 1.0 : -1.0;
+    const double bax = (double)b->x - a->x, bay = (double)b->y - a->y;
+    const double cax = (double)c->x - a->x, cay = (double)c->y - a->y;
+    const int unit_x = sx == 1.0f && ox == 0.0f;
+    const int fast_blend = pipe && pipe->blend && pipe->src_rgb == BF_ONE &&
+                           pipe->dst_rgb == BF_1M_SRC_ALPHA && pipe->src_a == BF_ONE &&
+                           pipe->dst_a == BF_1M_SRC_ALPHA;
+    int ri = 0, gi = 1, bi = 2, ai = 3;
     unsigned long sh = 0;
     int x, y;
 
+    chan_order(ct->fmt, &ri, &gi, &bi, &ai);
+
     for (y = y0; y < y1; y++) {
-        for (x = x0; x < x1; x++) {
-            float pxc = (float)x + 0.5f, pyc = (float)y + 0.5f;
+        const float pyc = (float)y + 0.5f, fy = (pyc - oy) / sy;
+        int xa = x0, xb = x1;
+        /* A triangle covers about half its bounding box, and every pixel of the
+         * rest cost a full coverage test only to be thrown away. This row's
+         * three edges say where it can possibly be. */
+        {
+            const double py = (double)y + 0.5 - a->y;
+            const double c0 = sgn * (bax * py + bay * a->x), m0 = sgn * -bay;
+            const double c1 = sgn * (-cay * a->x - cax * py), m1 = sgn * cay;
+            const double c2 = sgn * (double)area - c0 - c1, m2 = -m0 - m1;
+            double lo = (double)x0, hi = (double)x1;
+            /* In terms of the pixel centre x + 0.5. */
+            edge_span(c0 + 0.5 * m0, m0, &lo, &hi);
+            edge_span(c1 + 0.5 * m1, m1, &lo, &hi);
+            edge_span(c2 + 0.5 * m2, m2, &lo, &hi);
+            if (lo > (double)xa) xa = lo >= (double)x1 ? x1 : (int)lo;
+            if (hi < (double)xb) xb = hi <= (double)x0 ? x0 : (int)hi + 1;
+        }
+        for (x = xa; x < xb; x++) {
+            float pxc = (float)x + 0.5f;
             float w0, w1, w2, tu, tv, src[4];
             size_t off;
             uint8_t *dp;
@@ -685,20 +732,23 @@ static void raster_rows(const tri_ctx *t, int y0, int y1, unsigned long *shaded)
             /* The shader sees fpos in points -- scissor and paint matrices were
              * built in that space -- so hand back the un-scaled position. */
             if (!frag_shader(u, e->ftex[0], e->fsamp,
-                             (pxc - ox) / sx, (pyc - oy) / sy, tu, tv, src))
+                             unit_x ? pxc : (pxc - ox) / sx, fy, tu, tv, src))
                 continue;
 
             off = ((size_t)y * ct->w + x) * (size_t)ct->bpp;
             dp = ct->px + off;
             sh++;
             if (ct->bpp == 4) {
-                int ri, gi, bi, ai;
                 float d[4], o[4];
                 int i;
-                chan_order(ct->fmt, &ri, &gi, &bi, &ai);
                 d[0] = dp[ri] / 255.0f; d[1] = dp[gi] / 255.0f;
                 d[2] = dp[bi] / 255.0f; d[3] = dp[ai] / 255.0f;
-                if (pipe->blend) {
+                if (fast_blend) {
+                    /* Premultiplied source-over, which is nearly every pixel: the
+                     * general case below with its eight switches worked out. */
+                    const float k = 1.0f - src[3];
+                    for (i = 0; i < 4; i++) o[i] = src[i] + d[i] * k;
+                } else if (pipe->blend) {
                     for (i = 0; i < 3; i++)
                         o[i] = src[i] * blend_factor(pipe->src_rgb, src[i], src[3], d[i], d[3])
                              + d[i]   * blend_factor(pipe->dst_rgb, src[i], src[3], d[i], d[3]);
