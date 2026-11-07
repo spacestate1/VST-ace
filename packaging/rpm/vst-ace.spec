@@ -21,7 +21,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 
 Name:           vst-ace
-Version:        0.3.2
+Version:        0.3.3
 Release:        1%{?dist}
 Summary:        Run Windows, macOS and Linux audio plug-ins natively, without Wine
 
@@ -213,6 +213,17 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/studiogtk.desktop
 %{_mandir}/man1/studiogtk.1*
 
 %changelog
+* Fri Nov 06 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.3-1
+- Realtime audio: realtime priority for helpers and ALSA output through
+  RealtimeKit, stalled helpers no longer stall the audio thread, and bridged
+  plug-ins render a block ahead on live paths.
+- Studio: far less CPU drawing macOS editors and tabs in the back; audio inputs
+  open only when chosen.
+- Studios: opening a song closes the synths it does not use; File > New song.
+- Studio: a USB keyboard plays the tab in front, and enters notes in the tracker.
+- Fix a crash opening the editor with the loaded plug-in filtered out, and the
+  tracker grid not repainting when playback moves to another part.
+
 * Sun Oct 18 2026 Connor McRann <cmcrann@protonmail.com> - 0.3.2-1
 - pestudio Connect menu: link the synth to REAPER, or put the loaded plug-in
   in a DAW's FX list through the VST bridge, which the package now ships.

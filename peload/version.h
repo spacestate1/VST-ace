@@ -15,7 +15,7 @@
 #include <stdio.h>
 
 #ifndef VSTACE_VERSION
-#define VSTACE_VERSION "0.3.2"
+#define VSTACE_VERSION "0.3.3"
 #endif
 
 #ifndef VSTACE_BUILD_DATE
