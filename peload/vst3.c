@@ -601,10 +601,24 @@ typedef struct IRunLoopVtbl {
     tresult (V3CALL *unregisterTimer)(void *, void *handler);
 } IRunLoopVtbl;
 
+/* The process-wide hooks are the fallback, for a front end with one editor
+ * (peload_cli). A front end with several sets each plug-in's own through
+ * v3_set_editor_hooks, and its registrations and resize requests then reach the
+ * window that plug-in is embedded in -- not whichever window attached last. */
 static v3_runloop_hooks g_hooks;
 
 void V3N(v3_set_runloop_hooks)(const v3_runloop_hooks *h)
 { if (h) g_hooks = *h; else memset(&g_hooks, 0, sizeof g_hooks); }
+
+/* Every IRunLoop this layer hands out carries the plug-in it belongs to. The
+ * plug-in only ever reads the vtable slot; the owner rides behind it. */
+typedef struct {
+    const struct IRunLoopVtbl *vt;
+    struct v3host             *owner;
+} RunLoopObj;
+
+static const v3_runloop_hooks *hooks_of(struct v3host *h);   /* after the struct */
+#define RL_HOOKS(s) hooks_of(((RunLoopObj *)(s))->owner)
 
 static V3CALL uint32_t rl_ref(void *s) { (void)s; return 1; }
 static V3CALL tresult rl_qi(void *s, const TUID iid, void **o)
@@ -614,24 +628,24 @@ static V3CALL tresult rl_qi(void *s, const TUID iid, void **o)
 }
 static V3CALL tresult rl_reg_fd(void *s, void *handler, int fd)
 {
-    (void)s;
+    const v3_runloop_hooks *k = RL_HOOKS(s);
     VLOG("vst3: plugin registered fd %d\n", fd);
-    if (!g_hooks.add_fd) return V3_NOTIMPL;
-    g_hooks.add_fd(g_hooks.ud, handler, fd);
+    if (!k->add_fd) return V3_NOTIMPL;
+    k->add_fd(k->ud, handler, fd);
     return V3_OK;
 }
 static V3CALL tresult rl_unreg_fd(void *s, void *handler)
-{ (void)s; if (g_hooks.del_fd) g_hooks.del_fd(g_hooks.ud, handler); return V3_OK; }
+{ const v3_runloop_hooks *k = RL_HOOKS(s); if (k->del_fd) k->del_fd(k->ud, handler); return V3_OK; }
 static V3CALL tresult rl_reg_timer(void *s, void *handler, uint64_t ms)
 {
-    (void)s;
+    const v3_runloop_hooks *k = RL_HOOKS(s);
     VLOG("vst3: plugin registered a %llu ms timer\n", (unsigned long long)ms);
-    if (!g_hooks.add_timer) return V3_NOTIMPL;
-    g_hooks.add_timer(g_hooks.ud, handler, ms ? ms : 16);
+    if (!k->add_timer) return V3_NOTIMPL;
+    k->add_timer(k->ud, handler, ms ? ms : 16);
     return V3_OK;
 }
 static V3CALL tresult rl_unreg_timer(void *s, void *handler)
-{ (void)s; if (g_hooks.del_timer) g_hooks.del_timer(g_hooks.ud, handler); return V3_OK; }
+{ const v3_runloop_hooks *k = RL_HOOKS(s); if (k->del_timer) k->del_timer(k->ud, handler); return V3_OK; }
 static const IRunLoopVtbl g_rl_vt = {
     rl_qi, rl_ref, rl_ref, rl_reg_fd, rl_unreg_fd, rl_reg_timer, rl_unreg_timer
 };
@@ -650,7 +664,7 @@ typedef struct IPlugFrameVtbl {
 
 typedef struct {
     const IPlugFrameVtbl *vt;
-    struct { const IRunLoopVtbl *vt; } runloop;
+    RunLoopObj            runloop;   /* runloop.owner is the frame's plug-in too */
 } PlugFrame;
 
 static V3CALL tresult pf_qi(void *s, const TUID iid, void **o)
@@ -661,10 +675,12 @@ static V3CALL tresult pf_qi(void *s, const TUID iid, void **o)
     if (!memcmp(iid, IID_IRunLoop, 16)) { *o = &f->runloop; return V3_OK; }
     *o = NULL; return V3_NOIFACE;
 }
+static void frame_resize(struct v3host *h, IPlugView *view, ViewRect *r);  /* below */
 static V3CALL tresult pf_resize(void *s, void *view, ViewRect *r)
 {
-    (void)s; (void)view;
-    if (r && g_hooks.resize) g_hooks.resize(g_hooks.ud, r->right - r->left, r->bottom - r->top);
+    PlugFrame *f = s;
+    if (!r || r->right - r->left <= 0 || r->bottom - r->top <= 0) return V3_FALSE;
+    frame_resize(f->runloop.owner, view, r);
     return V3_OK;
 }
 static const IPlugFrameVtbl g_pf_vt = { pf_qi, rl_ref, rl_ref, pf_resize };
@@ -679,7 +695,7 @@ typedef struct IHostApplicationVtbl {
 
 typedef struct {
     const IHostApplicationVtbl *vt;
-    struct { const IRunLoopVtbl *vt; } runloop;
+    RunLoopObj                  runloop;
 } HostApp;
 
 static V3CALL tresult ha_qi(void *s, const TUID iid, void **o)
@@ -1000,6 +1016,13 @@ struct v3host {
     IPlugView *view;
     int        view_w, view_h;
     int        view_attached;   /* removed() must be called exactly once */
+    /* The size onSize last told the view, so the same size is not sent twice
+     * when a front end's resize and the frame's own both arrive; 0 = none. */
+    int        sent_w, sent_h;
+    int        in_onsize;       /* depth: a plug-in may resizeView from onSize */
+    /* This plug-in's own editor hooks, if its front end set them. */
+    v3_runloop_hooks hooks;
+    int        has_hooks;
     unsigned char *state_buf;   /* the last v3_get_state result */
     int        resync;          /* a program changed: refresh the controller */
     volatile int blocks_since_program;
@@ -1294,8 +1317,10 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
     h->handler.ch2.vt = &g_ch2_vt;
     h->hostapp.vt = &g_ha_vt;
     h->hostapp.runloop.vt = &g_rl_vt;
+    h->hostapp.runloop.owner = h;
     h->frame.vt = &g_pf_vt;
     h->frame.runloop.vt = &g_rl_vt;
+    h->frame.runloop.owner = h;
 
 #if V3_MSABI
     /* Windows VST3: the same PE loader the VST2 path uses, then the module's
@@ -1812,6 +1837,52 @@ void V3N(v3_release_all)(v3host *h)
 
 /* ------------------------------------------------------------- editor ---- */
 
+static const v3_runloop_hooks *hooks_of(struct v3host *h)
+{ return (h && h->has_hooks) ? &h->hooks : &g_hooks; }
+
+void V3N(v3_set_editor_hooks)(v3host *h, const v3_runloop_hooks *k)
+{
+    if (!h) return;
+    if (k) { h->hooks = *k; h->has_hooks = 1; }
+    else   { memset(&h->hooks, 0, sizeof h->hooks); h->has_hooks = 0; }
+}
+
+/* Tell the view its size, once per size. Every road to onSize comes through
+ * here -- the front end resizing the window, and the frame answering the
+ * plug-in's own resizeView -- so the two cannot double up, and a plug-in that
+ * answers onSize with another resizeView cannot start a loop: the second
+ * request for the same size stops here, and a third nesting is refused. */
+static void send_onsize(v3host *h, int w, int ht)
+{
+    ViewRect r;
+    if (!h || !h->view || w <= 0 || ht <= 0) return;
+    if (w == h->sent_w && ht == h->sent_h) return;
+    if (h->in_onsize > 2) return;
+    h->sent_w = w; h->sent_h = ht;
+    r.left = 0; r.top = 0; r.right = w; r.bottom = ht;
+    h->in_onsize++;
+    h->view->vt->onSize(h->view, &r);
+    h->in_onsize--;
+}
+
+/* IPlugFrame::resizeView. The SDK's sequence is: the host resizes its window,
+ * then calls onSize with the new size, before returning. The front end does the
+ * first through its resize hook -- for the right window, because the hook is
+ * this plug-in's -- and the second is done here whatever the front end did, so
+ * a plug-in that cannot resize from the host's side still gets the onSize that
+ * completes its own request. */
+static void frame_resize(struct v3host *h, IPlugView *view, ViewRect *r)
+{
+    const v3_runloop_hooks *k = hooks_of(h);
+    const int w = r->right - r->left, ht = r->bottom - r->top;
+    (void)view;
+    if (!h) return;
+    VLOG("vst3: plug-in asked for %dx%d\n", w, ht);
+    h->view_w = w; h->view_h = ht;
+    if (k->resize) k->resize(k->ud, w, ht);
+    send_onsize(h, w, ht);
+}
+
 /* Created lazily: a plugin that is never shown should not pay for its GUI. */
 static IPlugView *view_of(v3host *h)
 {
@@ -1918,11 +1989,34 @@ void V3N(v3_ui_idle)(v3host *h)
 void V3N(v3_editor_size)(v3host *h, int *w, int *hh)
 {
     IPlugView *v = view_of(h);
+    ViewRect r = { 0, 0, 0, 0 };
     if (w) *w = 0;
     if (hh) *hh = 0;
     if (!v) return;
+    /* Asked, not remembered: a plug-in that restored a zoom or scale from its
+     * state since createView reports the size it is now. */
+    if (v->vt->getSize(v, &r) == V3_OK && r.right - r.left > 0 && r.bottom - r.top > 0) {
+        h->view_w = r.right - r.left;
+        h->view_h = r.bottom - r.top;
+    }
     if (w)  *w  = h->view_w;
     if (hh) *hh = h->view_h;
+}
+
+/* The nearest size the view will accept to the one proposed: what a host must
+ * ask before an onSize it initiates. 0 and the size adjusted if the plug-in
+ * answered; -1 and the size untouched if it cannot resize or would not say. */
+int V3N(v3_editor_check_size)(v3host *h, int *w, int *hh)
+{
+    IPlugView *v = h ? h->view : NULL;
+    ViewRect r;
+    if (!v || !w || !hh || *w <= 0 || *hh <= 0) return -1;
+    if (v->vt->canResize(v) != V3_OK) return -1;
+    r.left = 0; r.top = 0; r.right = *w; r.bottom = *hh;
+    if (v->vt->checkSizeConstraint(v, &r) != V3_OK) return -1;
+    if (r.right - r.left <= 0 || r.bottom - r.top <= 0) return -1;
+    *w = r.right - r.left; *hh = r.bottom - r.top;
+    return 0;
 }
 
 int V3N(v3_editor_can_resize)(v3host *h)
@@ -1961,7 +2055,7 @@ int V3N(v3_editor_attach_nsview)(v3host *h, void *nsview)
     if (v->vt->isPlatformTypeSupported(v, PLATFORM_NSVIEW) != V3_OK) return -1;
     r = v->vt->attached(v, nsview, PLATFORM_NSVIEW);
     VLOG("vst3: attached(NSView %p) -> %d\n", nsview, r);
-    if (r == V3_OK) h->view_attached = 1;
+    if (r == V3_OK) { h->view_attached = 1; h->sent_w = h->sent_h = 0; }
     return r == V3_OK ? 0 : -1;
 }
 
@@ -1973,7 +2067,7 @@ int V3N(v3_editor_attach_hwnd)(v3host *h, void *hwnd)
     if (v->vt->isPlatformTypeSupported(v, PLATFORM_HWND) != V3_OK) return -1;
     r = v->vt->attached(v, hwnd, PLATFORM_HWND);
     VLOG("vst3: attached(HWND %p) -> %d\n", hwnd, r);
-    if (r == V3_OK) h->view_attached = 1;
+    if (r == V3_OK) { h->view_attached = 1; h->sent_w = h->sent_h = 0; }
     return r == V3_OK ? 0 : -1;
 }
 
@@ -1993,7 +2087,7 @@ int V3N(v3_editor_attach)(v3host *h, unsigned long xid)
      * pointer to it -- a detail that silently yields a blank editor if wrong. */
     r = v->vt->attached(v, (void *)(uintptr_t)xid, PLATFORM_X11);
     VLOG("vst3: attached(0x%lx) -> %d\n", xid, r);
-    if (r == V3_OK) h->view_attached = 1;
+    if (r == V3_OK) { h->view_attached = 1; h->sent_w = h->sent_h = 0; }
     return r == V3_OK ? 0 : -1;
 }
 
@@ -2004,15 +2098,13 @@ void V3N(v3_editor_detach)(v3host *h)
     if (h && h->view && h->view_attached) {
         h->view->vt->removed(h->view);
         h->view_attached = 0;
+        h->sent_w = h->sent_h = 0;
     }
 }
 
 void V3N(v3_editor_resized)(v3host *h, int w, int hp)
 {
-    ViewRect r;
-    if (!h || !h->view) return;
-    r.left = 0; r.top = 0; r.right = w; r.bottom = hp;
-    h->view->vt->onSize(h->view, &r);
+    send_onsize(h, w, hp);
 }
 
 void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)

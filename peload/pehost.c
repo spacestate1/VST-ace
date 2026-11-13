@@ -2121,6 +2121,11 @@ struct pehost {
      * queue entry, because the queue being full is one of the reasons to raise
      * it. */
     _Atomic int release_req;
+
+    /* The front end's editor hooks for this plug-in alone; see
+     * pehost_set_editor_hooks. */
+    v3_runloop_hooks ed_hooks;
+    int              has_ed_hooks;
 };
 
 static char g_err[256];
@@ -2143,13 +2148,60 @@ static void  *g_editor_resize_ud;
 void pehost_set_editor_resize_cb(void (*fn)(void *, int, int), void *ud)
 { g_editor_resize_cb = fn; g_editor_resize_ud = ud; }
 
+/* The hosts whose front end gave them their own editor hooks, so a VST2
+ * request -- which arrives knowing only its AEffect -- can be traced back to
+ * the window that plug-in is in. A handful at most: one per open editor. */
+#define ED_REG_MAX 64
+static pehost *g_ed_reg[ED_REG_MAX];
+
+static const void *effect_of(pehost *h)
+{
+    if (!h) return NULL;
+    if (h->mv) return macvst_aeffect(h->mv);
+    return h->fx;
+}
+
+static void ed_reg_drop(pehost *h)
+{
+    int i;
+    for (i = 0; i < ED_REG_MAX; i++) if (g_ed_reg[i] == h) g_ed_reg[i] = NULL;
+}
+
+void pehost_set_editor_hooks(pehost *h, const void *hooks)
+{
+    int i;
+    if (!h) return;
+    ed_reg_drop(h);
+    if (hooks) {
+        h->ed_hooks = *(const v3_runloop_hooks *)hooks;
+        h->has_ed_hooks = 1;
+        for (i = 0; i < ED_REG_MAX; i++) if (!g_ed_reg[i]) { g_ed_reg[i] = h; break; }
+    } else {
+        memset(&h->ed_hooks, 0, sizeof h->ed_hooks);
+        h->has_ed_hooks = 0;
+    }
+    if (h->is_v3 && !h->br && h->v3)
+        v3_set_editor_hooks(h->v3, hooks ? &h->ed_hooks : NULL);
+}
+
 /* Raised by whichever driver received the plug-in's request. The Windows VST2
  * path reaches it from host_callback below; the System V one -- macOS VST2 and
  * native Linux VST2 alike -- from macvsthost.c, which has its own callback and
  * had the same opcode mislabelled in the same way. */
-int pehost_editor_resize_request(int w, int h)
+int pehost_editor_resize_request(const void *effect, int w, int h)
 {
-    if (!g_editor_resize_cb || w <= 0 || h <= 0) return 0;
+    int i;
+    if (w <= 0 || h <= 0) return 0;
+    if (effect)
+        for (i = 0; i < ED_REG_MAX; i++) {
+            pehost *p = g_ed_reg[i];
+            if (p && p->has_ed_hooks && effect_of(p) == effect) {
+                if (!p->ed_hooks.resize) return 0;
+                p->ed_hooks.resize(p->ed_hooks.ud, w, h);
+                return 1;
+            }
+        }
+    if (!g_editor_resize_cb) return 0;
     g_editor_resize_cb(g_editor_resize_ud, w, h);
     return 1;
 }
@@ -2243,7 +2295,7 @@ static MS intptr_t host_callback(AEffect *fx, int32_t op, int32_t idx,
          * outside -- a plug-in whose interface scales, or that opens at one
          * size and wants another, drawn cropped into whatever it was given and
          * no way to change it. index is the width, value the height. */
-        return pehost_editor_resize_request(idx, (int)val);
+        return pehost_editor_resize_request(fx, idx, (int)val);
     case 16: return (intptr_t)g_cb_rate;   /* audioMasterGetSampleRate */
     case 17: return g_cb_block;            /* audioMasterGetBlockSize  */
     case 23: return 1;              /* audioMasterGetCurrentProcessLevel */
@@ -3279,6 +3331,7 @@ pehost *pehost_open_as(const char *path, pehost_kind kind,
 
 void pehost_close(pehost *h)
 {
+    if (h) ed_reg_drop(h);
     /* Released up front: every backend below returns by its own path, and the
      * event block belongs to the handle rather than to any one of them. */
     if (h) { free(h->evblk); h->evblk = NULL; h->evblk_n = 0; }
@@ -4627,6 +4680,10 @@ void pehost_editor_size(pehost *h, int *w, int *height)
             if (height) *height = r->bottom - r->top;
         }
     }
+}
+int pehost_editor_check_size(pehost *h, int *w, int *height)
+{
+    return (h && !h->br && h->is_v3) ? v3_editor_check_size(h->v3, w, height) : -1;
 }
 int pehost_editor_can_resize(pehost *h)
 {

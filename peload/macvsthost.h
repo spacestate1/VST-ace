@@ -22,6 +22,8 @@ const char *macvst_name(const macvst *h);
 const char *macvst_vendor(const macvst *h);
 int macvst_num_programs(const macvst *h);
 int macvst_editor_can_resize(macvst *h);
+/* The plug-in's AEffect, which is how a request from it is traced to its host. */
+const void *macvst_aeffect(const macvst *h);
 void macvst_editor_resize(macvst *h, int w, int ht);
 int macvst_has_state(const macvst *h);
 int macvst_get_state(macvst *h, int preset, const void **data);

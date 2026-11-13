@@ -2133,8 +2133,15 @@ signals:
     /* A key X delivered to the plugin's window, snooped at the X level. Only
      * fires for a native editor, and only while one is attached. */
     void editorKey(int qtKey, bool down);
-    /* The plug-in asked for a new size and this widget took it. */
-    void editorResized(int w, int h);
+    /* The plug-in asked for a new size and this widget took it: w x h is the
+     * size it now is. `chosen` is false when the request only answered one of
+     * ours -- a plug-in adjusting a size the host proposed, or echoing it --
+     * and true when the plug-in decided on a size of its own (its scale menu,
+     * its own corner handle, a dialog that grows it). */
+    void editorResized(int w, int h, bool chosen);
+    /* Ctrl+wheel over the editor: the plug-in's window has the pointer, so
+     * the wheel is caught at the X level and offered here. +1 in, -1 out. */
+    void zoomWheel(int dir);
 
 public:
     explicit EditorHost(QWidget *p = nullptr) : QWidget(p)
@@ -2169,11 +2176,18 @@ public:
     bool attach(pehost *h)
     {
         detach();
-        /* Take the run-loop hooks back: they are process-global, and with a
-         * second HostWidget alongside they may belong to its editor. For one
-         * instance this re-installs the same hooks and changes nothing. */
+        /* The process-wide hooks are only the fallback now; what matters is
+         * that this plug-in gets hooks of its own, before its view exists --
+         * creating the view hands it the frame, and a plug-in may register
+         * descriptors and timers or ask for a size right there. With an editor
+         * per tab, a global set meant one tab's plug-in registering with, and
+         * being resized by, whichever tab attached last. */
         install();
-        if (!h || !pehost_has_editor(h)) return false;
+        if (h) { v3_runloop_hooks hk = hooks(); pehost_set_editor_hooks(h, &hk); }
+        if (!h || !pehost_has_editor(h)) {
+            if (h) { v3_runloop_hooks none{}; pehost_set_editor_hooks(h, &none); }
+            return false;
+        }
         int w = 0, ht = 0;
         pehost_editor_size(h, &w, &ht);
         zoomApplied_ = 1.0;
@@ -2201,6 +2215,7 @@ public:
         fprintf(stderr, "editor: embedded as a child of window 0x%lx (%dx%d)\n",
                 (unsigned long)winId(), w, ht);
         host_ = h;
+        grabWheel();
 #ifdef PEHOST_HAVE_X11
         /* Start snooping the plugin window's keys. The plugin's toolkit takes
          * the X input focus for its own window on click, and from then on key
@@ -2245,8 +2260,18 @@ public:
     void detach()
     {
         if (idle_) idle_->stop();
-        if (host_) { pehost_editor_detach(host_); host_ = nullptr; }
+        ungrabWheel();
+        if (host_) {
+            pehost_editor_detach(host_);
+            /* After removed(), so its unregistrations still found us; then a
+             * set that answers nothing rather than NULL, which would hand the
+             * plug-in to the process-wide hooks -- another tab's window. */
+            v3_runloop_hooks none{};
+            pehost_set_editor_hooks(host_, &none);
+            host_ = nullptr;
+        }
         natW_ = natH_ = 0;
+        hostW_ = hostH_ = 0;
 #ifdef PEHOST_HAVE_X11
         /* Before clearWatches, for the same reason: the snoop, like the hooks,
          * points back at this object. */
@@ -2276,11 +2301,36 @@ public:
     {
         if (!host_ || natW_ <= 0 || natH_ <= 0) return false;
         if (!pehost_editor_can_resize(host_)) return false;
-        const int w = int(natW_ * z + 0.5), h = int(natH_ * z + 0.5);
+        int w = int(natW_ * z + 0.5), h = int(natH_ * z + 0.5);
+        /* The nearest size the plug-in accepts, asked before it is told: a
+         * view with a minimum or a fixed aspect otherwise gets an onSize it
+         * cannot honour, clamps, and asks back for something else. */
+        pehost_editor_check_size(host_, &w, &h);
         zoomApplied_ = z;
-        setMinimumSize(1, 1);
-        resize(w, h);            /* resizeEvent tells the plug-in */
+        hostResize(w, h);
         return true;
+    }
+    /* Make the editor as large as `avail` allows, at a size the plug-in
+     * accepts. The plug-in's answer can overshoot -- an aspect-locked view
+     * widened to keep its ratio -- so the proposal is shrunk until the answer
+     * fits, and a plug-in whose minimum is larger than the room keeps its
+     * minimum (the pane scrolls). Returns the size it now is. */
+    QSize fitTo(QSize avail)
+    {
+        if (!canZoom() || avail.width() < 16 || avail.height() < 16) return QSize();
+        int pw = avail.width(), ph = avail.height(), w = pw, h = ph;
+        for (int i = 0; i < 6; i++) {
+            w = pw; h = ph;
+            if (pehost_editor_check_size(host_, &w, &h) != 0) { w = pw; h = ph; break; }
+            if (w <= avail.width() && h <= avail.height()) break;
+            const double s = qMin(double(avail.width()) / w, double(avail.height()) / h);
+            const int nw = qMax(16, int(pw * s)), nh = qMax(16, int(ph * s));
+            if (nw == pw && nh == ph) break;            /* it will not go smaller */
+            pw = nw; ph = nh;
+        }
+        zoomApplied_ = natW_ > 0 ? double(w) / natW_ : 1.0;
+        hostResize(w, h);
+        return QSize(w, h);
     }
     bool canZoom() const
     { return host_ && natW_ > 0 && pehost_editor_can_resize(host_); }
@@ -2298,15 +2348,34 @@ protected:
             pehost_editor_resized(host_, width(), height());
     }
 
+#ifdef PEHOST_HAVE_X11
+    /* Ctrl+wheel arriving through the passive grab grabWheel() set. */
+    bool nativeEvent(const QByteArray &type, void *message, qintptr *result) override
+    {
+        Q_UNUSED(result);
+        if (type == "xcb_generic_event_t" && wheelGrabbed_) {
+            auto *ev = static_cast<xcb_generic_event_t *>(message);
+            const int t = ev->response_type & ~0x80;
+            if (t == XCB_BUTTON_PRESS || t == XCB_BUTTON_RELEASE) {
+                auto *b = static_cast<xcb_button_press_event_t *>(message);
+                if (b->event == xcb_window_t(winId()) && (b->detail == 4 || b->detail == 5)) {
+                    if (t == XCB_BUTTON_PRESS) emit zoomWheel(b->detail == 4 ? +1 : -1);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+#endif
+
 private:
     /* Whoever attached most recently owns the process-global run-loop hooks;
      * attach() takes them back, the destructor gives them up only if they are
      * still ours. That is what keeps two HostWidgets' editors straight. */
     static EditorHost *self_;
 
-    void install()
+    v3_runloop_hooks hooks()
     {
-        self_ = this;
         v3_runloop_hooks hk{};
         hk.ud = this;
         hk.add_fd = [](void *ud, void *handler, int fd) {
@@ -2318,29 +2387,85 @@ private:
         hk.del_timer = [](void *ud, void *handler) {
             static_cast<EditorHost *>(ud)->delTimer(handler); };
         hk.resize = [](void *ud, int w, int h) {
-            auto *e = static_cast<EditorHost *>(ud);
-            /* The plug-in asking for a size is the plug-in's own idea of its
-             * natural one, so it replaces what attach recorded -- otherwise a
-             * later zoom would scale from a size the plug-in has moved on from.
-             * A zoomed plug-in asks in zoomed pixels, as VST3 defines it, and the
-             * natural size is what that comes to at 100%. */
-            e->natW_ = int(w / e->zoomApplied_ + 0.5);
-            e->natH_ = int(h / e->zoomApplied_ + 0.5);
-            e->setMinimumSize(1, 1);
-            e->resize(w, h);
-            emit e->editorResized(e->natW_, e->natH_);
-        };
+            static_cast<EditorHost *>(ud)->pluginResized(w, h); };
+        return hk;
+    }
+    void install()
+    {
+        self_ = this;
+        v3_runloop_hooks hk = hooks();
         v3_set_runloop_hooks(&hk);
-        /* The VST2 equivalent of hk.resize. Same destination: a plug-in that
-         * asks for a size gets it, whichever format it asked in. */
+        /* The VST2 equivalent of hk.resize, for a plug-in that asks before it
+         * has hooks of its own. */
         pehost_set_editor_resize_cb([](void *ud, int w, int h) {
-            auto *e = static_cast<EditorHost *>(ud);
-            if (w <= 0 || h <= 0) return;
-            e->natW_ = w; e->natH_ = h;
-            e->setMinimumSize(1, 1);
-            e->resize(w, h);
-            emit e->editorResized(w, h);
-        }, this);
+            static_cast<EditorHost *>(ud)->pluginResized(w, h); }, this);
+    }
+
+    /* The plug-in asked for w x h, in either format. It gets it -- the frame
+     * then sends the onSize that completes a VST3 request.
+     *
+     * Whether that is the plug-in's own decision or only its answer to ours
+     * decides what the window does next. Asked from inside one of our own
+     * resizes, or for exactly the size we last gave it, it is an answer: the
+     * size stands and nothing else changes. Anything else is the plug-in
+     * choosing a size -- and it is the new 100%, because the plug-in has laid
+     * itself out for it. */
+    void pluginResized(int w, int h)
+    {
+        if (w <= 0 || h <= 0) return;
+        const bool chosen = !hostResizing_ && !(w == hostW_ && h == hostH_);
+        if (chosen) { natW_ = w; natH_ = h; zoomApplied_ = 1.0; }
+        setMinimumSize(1, 1);
+        resize(w, h);
+        emit editorResized(w, h, chosen);
+    }
+    /* A resize this side decided on. Recorded so the plug-in's echo of it can
+     * be told from a request of its own. */
+    void hostResize(int w, int h)
+    {
+        hostW_ = w; hostH_ = h;
+        setMinimumSize(1, 1);
+        hostResizing_++;
+        resize(w, h);            /* resizeEvent tells the plug-in */
+        hostResizing_--;
+    }
+
+    /* Ctrl+wheel, taken before the plug-in sees it.
+     *
+     * Button presses can be selected by only one client per window, and the
+     * plug-in's toolkit already holds that on its own windows, so the wheel
+     * cannot be snooped the way the keys are. A passive grab on our window
+     * can: it outranks every selection beneath it, and it is narrow -- only
+     * buttons 4 and 5 with Ctrl, in each Lock/NumLock combination -- so every
+     * other wheel and click still reaches the plug-in untouched. */
+    void grabWheel()
+    {
+#ifdef PEHOST_HAVE_X11
+        auto *x = qApp->nativeInterface<QNativeInterface::QX11Application>();
+        if (!x || !x->display()) return;
+        Display *d = x->display();
+        const unsigned mods[] = { ControlMask, ControlMask | LockMask,
+                                  ControlMask | Mod2Mask, ControlMask | LockMask | Mod2Mask };
+        for (unsigned b : { 4u, 5u })
+            for (unsigned m : mods)
+                XGrabButton(d, b, m, (unsigned long)winId(), 0,
+                            ButtonPressMask | ButtonReleaseMask,
+                            GrabModeAsync, GrabModeAsync, 0UL, 0UL);
+        XFlush(d);
+        wheelGrabbed_ = true;
+#endif
+    }
+    void ungrabWheel()
+    {
+#ifdef PEHOST_HAVE_X11
+        if (!wheelGrabbed_) return;
+        wheelGrabbed_ = false;
+        auto *x = qApp->nativeInterface<QNativeInterface::QX11Application>();
+        if (!x || !x->display()) return;
+        XUngrabButton(x->display(), 4, AnyModifier, (unsigned long)winId());
+        XUngrabButton(x->display(), 5, AnyModifier, (unsigned long)winId());
+        XFlush(x->display());
+#endif
     }
 
     /* Retiring rather than deleting, because a plugin routinely unregisters
@@ -2416,6 +2541,10 @@ public:
      * of. Public because the run-loop resize hook is a plain lambda. */
     int natW_ = 0, natH_ = 0;
     double zoomApplied_ = 1.0;
+private:
+    int  hostW_ = 0, hostH_ = 0;     /* the size this side last gave it */
+    int  hostResizing_ = 0;
+    bool wheelGrabbed_ = false;
 };
 
 /* Shows a Windows plugin's editor. The plugin renders into a buffer the Win32
@@ -3514,7 +3643,8 @@ public:
         connect(zoomOut_,  &QToolButton::clicked,  this, [this] { zoomStep(-1); });
         connect(zoomIn_,   &QToolButton::clicked,  this, [this] { zoomStep(+1); });
         connect(zoomFit_,  &QPushButton::clicked,  this, [this] {
-            fitAuto_ = true; lastViewport_ = editorScroll_->viewport()->size();
+            fitAuto_ = true; fitGrow_ = true;
+            lastViewport_ = editorScroll_->viewport()->size();
             zoomFit();
         });
         connect(zoom1to1_, &QPushButton::clicked,  this, [this] { fitAuto_ = false; setZoom(1.0); });
@@ -3543,7 +3673,29 @@ public:
             QTimer::singleShot(0, vb, [vb, h, was] { vb->setValue(h > was ? vb->maximum() : 0); });
         };
         connect(pixelEditor_, &PixelEditor::editorResized, this, followEditorSize);
-        connect(editor_, &EditorHost::editorResized, this, followEditorSize);
+        /* A native editor that changed its own size. Only a size the plug-in
+         * chose moves anything here: it is the new 100%, and a choice ends the
+         * automatic fit the way touching a zoom control does -- otherwise the
+         * next poll would undo the plug-in's own scale setting. A request that
+         * merely answered one of ours (a view constraining what it was offered)
+         * leaves the fit alone; the pane just takes the size it settled on.
+         * Except while the editor is still opening: what a plug-in asks for
+         * then is its opening size, and the first fit is still to come. */
+        connect(editor_, &EditorHost::editorResized, this, [this](int w, int h, bool chosen) {
+            const int was = editorH_;
+            if (chosen) {
+                editorW_ = w; editorH_ = h; zoom_ = 1.0;
+                if (!fitPending_) fitAuto_ = false;
+            }
+            editorStack_->setMinimumSize(w, h);
+            editorStack_->resize(w, h);
+            updateZoomUi();
+            if (chosen) {
+                QScrollBar *vb = editorScroll_->verticalScrollBar();
+                QTimer::singleShot(0, vb, [vb, h, was] { vb->setValue(h > was ? vb->maximum() : 0); });
+            }
+        });
+        connect(editor_, &EditorHost::zoomWheel, this, &HostWidget::zoomStep);
         connect(recBtn_, &QPushButton::clicked, this, &HostWidget::toggleRecord);
         connect(panic, &QPushButton::clicked, this, [this] {
             if (piano_) piano_->releaseAll();
@@ -4559,8 +4711,14 @@ private slots:
              * the request alive and pollUi retries it. */
             fitPending_ = true;
             fitAuto_ = true;
+            /* A native editor that can resize fills the pane and follows the
+             * window from then on -- that is what such a view is built for, and
+             * its interface is drawn at whatever size it is given rather than
+             * stretched. Everything else is only ever shrunk to fit, never
+             * blown up. */
+            fitGrow_ = editorKind_ == PEHOST_EDITOR_X11 && editor_->canZoom();
             lastViewport_ = QSize();
-            QTimer::singleShot(0, this, [this] { zoomFit(true); });
+            QTimer::singleShot(0, this, [this] { zoomFit(!fitGrow_); });
         }
         updateZoomUi();
         if (!gui) {
@@ -4636,6 +4794,24 @@ private slots:
             fitPending_ = false;
             return;
         }
+        /* A native editor that can resize is given the room itself, not a
+         * multiple of its size: the proportions are the plug-in's to decide
+         * (checkSizeConstraint), and a free-form one fills both directions. */
+        if (editorKind_ == PEHOST_EDITOR_X11 && !onlyShrink) {
+            /* The room without scrollbars: measuring the viewport with them
+             * showing would fit to a pane the fit itself is about to widen,
+             * and the two would chase each other. */
+            const QSize room = editorScroll_->maximumViewportSize();
+            const QSize got = editor_->fitTo(room.isValid() ? room : v);
+            fitPending_ = false;
+            if (got.isValid()) {
+                zoom_ = double(got.width()) / editorW_;
+                editorStack_->setMinimumSize(got);
+                editorStack_->resize(got);
+                updateZoomUi();
+                return;
+            }
+        }
         const double z = qMin(double(v.width())  / editorW_,
                               double(v.height()) / editorH_);
         fitPending_ = false;                             /* measured something real */
@@ -4651,8 +4827,11 @@ private slots:
         else if (editorKind_ == PEHOST_EDITOR_X11) scaled = editor_->setZoom(zoom_);
         const double z = scaled ? zoom_ : 1.0;
         /* QStackedWidget sizes its pages to itself, so it has to be told how big
-         * the editor is or the page gets squeezed to nothing. */
-        const int sw = int(editorW_ * z + 0.5), sh = int(editorH_ * z + 0.5);
+         * the editor is or the page gets squeezed to nothing. A native editor is
+         * whatever size the plug-in accepted, which a constraint can have moved
+         * off the exact multiple. */
+        int sw = int(editorW_ * z + 0.5), sh = int(editorH_ * z + 0.5);
+        if (scaled && editorKind_ == PEHOST_EDITOR_X11) { sw = editor_->width(); sh = editor_->height(); }
         editorStack_->setMinimumSize(sw, sh);
         editorStack_->resize(sw, sh);
     }
@@ -4964,7 +5143,7 @@ private:
             const QSize v = editorScroll_->viewport()->size();
             if (fitPending_ || v != lastViewport_) {
                 lastViewport_ = v;
-                zoomFit(true);
+                zoomFit(!fitGrow_);
             }
         }
         /* Alongside the meter and before the g_inPlugin guard: a take running
@@ -6717,6 +6896,7 @@ private:
     int           audioInTick_ = 0;
     bool          fitPending_ = false;   /* an automatic fit still to be measured */
     bool          fitAuto_ = false;      /* keep it fitted until a zoom is chosen */
+    bool          fitGrow_ = false;      /* that fit may enlarge, not only shrink */
     QSize         lastViewport_;         /* to notice the pane changing size */
     QStackedWidget *editorStack_;
     QScrollArea  *editorScroll_;

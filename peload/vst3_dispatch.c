@@ -40,6 +40,8 @@
     int   pfx##_v3_has_editor(void *); \
     void  pfx##_v3_editor_size(void *, int *, int *); \
     int   pfx##_v3_editor_can_resize(void *); \
+    int   pfx##_v3_editor_check_size(void *, int *, int *); \
+    void  pfx##_v3_set_editor_hooks(void *, const v3_runloop_hooks *); \
     int   pfx##_v3_editor_attach(void *, unsigned long); \
     int   pfx##_v3_editor_is_hwnd(void *); \
     int   pfx##_v3_editor_attach_hwnd(void *, void *); \
@@ -232,6 +234,14 @@ void v3_editor_size(v3host *h, int *w, int *hh)
 int v3_editor_can_resize(v3host *h)
 { if (!h || !h->inner) return 0;
   return h->ms ? ms_v3_editor_can_resize(h->inner) : sv_v3_editor_can_resize(h->inner); }
+
+int v3_editor_check_size(v3host *h, int *w, int *hh)
+{ if (!h || !h->inner) return -1;
+  return h->ms ? ms_v3_editor_check_size(h->inner, w, hh) : sv_v3_editor_check_size(h->inner, w, hh); }
+
+void v3_set_editor_hooks(v3host *h, const v3_runloop_hooks *k)
+{ if (!h || !h->inner) return;
+  if (h->ms) ms_v3_set_editor_hooks(h->inner, k); else sv_v3_set_editor_hooks(h->inner, k); }
 
 int v3_editor_attach(v3host *h, unsigned long xid)
 { if (!h || !h->inner) return -1;

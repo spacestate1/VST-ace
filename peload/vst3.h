@@ -40,6 +40,11 @@ typedef struct {
 } v3_runloop_hooks;
 
 void v3_set_runloop_hooks(const v3_runloop_hooks *h);
+/* The same hooks for one plug-in only, overriding the process-wide set: a front
+ * end with an editor per plug-in gives each its own, so fd and timer
+ * registrations and resize requests reach the window the plug-in is in. NULL
+ * returns it to the process-wide set. Set before the editor is first asked for. */
+void v3_set_editor_hooks(v3host *h, const v3_runloop_hooks *hooks);
 void v3_runloop_fd(void *handler, int fd);
 void v3_runloop_timer(void *handler);
 
@@ -48,6 +53,9 @@ int  v3_has_editor(v3host *h);
 /* Natural editor size in pixels; 0 if unknown. */
 void v3_editor_size(v3host *h, int *w, int *h_out);
 int  v3_editor_can_resize(v3host *h);
+/* Ask a resizable view for the nearest size it accepts (checkSizeConstraint).
+ * 0 with *w,*h adjusted; -1 with them untouched if it cannot resize. */
+int  v3_editor_check_size(v3host *h, int *w, int *h_io);
 /* Attach to an X11 window id. Returns 0 on success. */
 int  v3_editor_attach(v3host *h, unsigned long x11_window);
 /* Windows VST3: the editor wants an HWND, which the Win32 layer supplies. */

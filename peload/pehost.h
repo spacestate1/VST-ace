@@ -358,8 +358,20 @@ void pehost_editor_resized(pehost *h, int w, int height);
  * whatever size it was first given, cropped if it wanted more, and the user
  * has no way to change it. The VST3 equivalent is v3_runloop_hooks.resize. */
 void pehost_set_editor_resize_cb(void (*fn)(void *ud, int w, int h), void *ud);
-/* Raise that request. Returns 1 if a front end took it. */
-int  pehost_editor_resize_request(int w, int h);
+/* Raise that request for the plug-in whose AEffect is `effect`. It goes to the
+ * resize hook that plug-in's front end set with pehost_set_editor_hooks, and
+ * to the process-wide callback above only if none did. Returns 1 if taken. */
+int  pehost_editor_resize_request(const void *effect, int w, int h);
+
+/* One plug-in's editor hooks, for a front end with an editor per plug-in: its
+ * run-loop registrations (native VST3) and its resize requests (VST3 and VST2)
+ * go to these and to nobody else's window. The struct is v3_runloop_hooks from
+ * vst3.h; NULL clears them. Set before the editor is first asked for, and
+ * clear before the front end's window goes away. */
+void pehost_set_editor_hooks(pehost *h, const void *v3_runloop_hooks);
+/* The size nearest to *w x *height that a resizable editor accepts: 0 with the
+ * size adjusted, -1 and untouched if it cannot be resized from the host side. */
+int  pehost_editor_check_size(pehost *h, int *w, int *height);
 
 /* Diagnostics: how many imported symbols were implemented vs stubbed, and how
  * many stubs the plugin actually reached. */

@@ -204,6 +204,15 @@ struct plugview {
     int        ed_fit_auto;
     guint      ed_fit_idle;     /* the queued zoom_fit_idle, removed on shutdown */
     int        ed_fit_vw, ed_fit_vh;   /* pane size the last fit measured */
+    int        ed_fit_grow;     /* the fit may enlarge, not only shrink */
+    /* The size this side last gave a native editor, and whether a resize of
+     * ours is under way: how a plug-in's answer to us is told from a size it
+     * chose itself. See hook_resize. */
+    int        ed_host_w, ed_host_h, ed_host_resizing;
+    int        ed_wheel_grab;   /* Ctrl+wheel is grabbed on ed_xwin */
+    gulong     ed_xevent_id;    /* the GdkX11Display "xevent" handler */
+    double     ed_mx, ed_my;    /* the pointer over a pixel editor, for the wheel */
+    double     ed_wheel_acc;    /* wheel travel not yet a whole notch */
     GtkWidget *zoom_out, *zoom_in, *zoom_fit, *zoom_one, *zoom_lbl, *zoom_note;
     int        dead_reported;   /* said once, not once per tick */
 
@@ -990,21 +999,111 @@ static gboolean zoom_fit_idle(gpointer u);
 static void     zoom_fit(plugview *pv, int only_shrink);
 static void     zoom_fit_poll(plugview *pv);
 
+static void native_editor_place(plugview *pv);
+
+/* A native editor asked for w x h (IPlugFrame::resizeView, or a VST2's
+ * audioMasterSizeWindow). It gets exactly that: the window follows, and for a
+ * VST3 the frame sends the onSize that completes the request.
+ *
+ * Not re-zoomed. The size asked for is already the size the plug-in wants to
+ * be, and multiplying it by the zoom and sending it back was a loop -- a
+ * plug-in that answers onSize with resizeView grew (or shrank) by the zoom
+ * factor every round.
+ *
+ * Asked from inside one of our own resizes, or for exactly the size we last
+ * gave it, it is only the plug-in answering us -- a view settling on the
+ * nearest size it accepts -- and the fit stays in charge. Anything else is a
+ * size the plug-in chose (its scale menu, its own corner handle), which
+ * becomes the new 100% and ends the automatic fit the way a zoom button does;
+ * otherwise the next poll would put it straight back. */
 static void hook_resize(void *ud, int w, int h)
 {
     plugview *pv = ud;
-    Display  *dpy = ed_display();
-    (void)dpy;
-    if (w > 0 && h > 0) {
-        /* The plug-in's own idea of its natural size, which replaces whatever
-         * it opened at -- otherwise a later zoom would scale from a size the
-         * plug-in has moved on from. The zoom is then re-applied on top. */
+    int chosen;
+    if (!pv || w <= 0 || h <= 0) return;
+    chosen = !pv->ed_host_resizing && !(w == pv->ed_host_w && h == pv->ed_host_h);
+    if (chosen) {
         pv->ed_base_w = w; pv->ed_base_h = h;
-        pv->ed_w = w; pv->ed_h = h;
-        pv->ed_nat_w = w; pv->ed_nat_h = h;
-        gtk_widget_set_size_request(pv->editor, w, h);   /* the pane follows */
-        zoom_apply(pv);
+        pv->ed_zoom = 1.0;
+        if (!pv->ed_fit_pending) pv->ed_fit_auto = 0;
     }
+    pv->ed_w = w; pv->ed_h = h;
+    pv->ed_nat_w = w; pv->ed_nat_h = h;
+    if (GTK_IS_WIDGET(pv->editor)) gtk_widget_set_size_request(pv->editor, w, h);
+    native_editor_place(pv);
+    zoom_update_ui(pv);
+}
+
+/* This pane's hooks for one plug-in, so its registrations and size requests
+ * reach this pane's window and no other -- with a pane per session tab, the
+ * process-wide set belonged to whichever pane was built last. */
+static plugview *g_global_hooks_pane;   /* whose hooks are the process-wide set */
+
+static void pane_hooks(plugview *pv, v3_runloop_hooks *k)
+{
+    memset(k, 0, sizeof *k);
+    k->ud = pv;
+    k->add_fd = hook_add_fd;   k->del_fd = hook_del_fd;
+    k->add_timer = hook_add_timer; k->del_timer = hook_del_timer;
+    k->resize = hook_resize;
+}
+
+/* Ctrl+wheel over a native editor zooms it, as it does a pixel editor.
+ *
+ * The pointer is over the plug-in's own X window, so GTK never sees the wheel,
+ * and it cannot be snooped: button presses can be selected by one client per
+ * window and the plug-in's toolkit already holds that. A passive grab on our
+ * window outranks every selection beneath it, and is kept narrow -- buttons 4
+ * and 5 with Ctrl, in each Lock/NumLock combination -- so every other wheel and
+ * click still reaches the plug-in. The grabbed presses come back through GDK's
+ * own connection, as raw X events on a window GDK does not know, which is what
+ * the display's "xevent" signal is for. */
+static void zoom_step(plugview *pv, int dir);
+
+static gboolean on_xevent(GdkX11Display *d, const XEvent *xe, gpointer u)
+{
+    plugview *pv = u;
+    (void)d;
+    if (!pv->ed_wheel_grab || !xe) return FALSE;
+    if ((xe->type == ButtonPress || xe->type == ButtonRelease) &&
+        xe->xbutton.window == pv->ed_xwin &&
+        (xe->xbutton.button == 4 || xe->xbutton.button == 5)) {
+        if (xe->type == ButtonPress) zoom_step(pv, xe->xbutton.button == 4 ? 1 : -1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void wheel_grab(plugview *pv)
+{
+    static const unsigned mods[] = { ControlMask, ControlMask | LockMask,
+                                     ControlMask | Mod2Mask, ControlMask | LockMask | Mod2Mask };
+    Display    *dpy = ed_display();
+    GdkDisplay *gd  = gdk_display_get_default();
+    unsigned    b, i;
+    if (!dpy || !pv->ed_xwin || pv->ed_wheel_grab) return;
+    for (b = 4; b <= 5; b++)
+        for (i = 0; i < sizeof mods / sizeof *mods; i++)
+            XGrabButton(dpy, b, mods[i], pv->ed_xwin, False,
+                        ButtonPressMask | ButtonReleaseMask,
+                        GrabModeAsync, GrabModeAsync, None, None);
+    XFlush(dpy);
+    if (!pv->ed_xevent_id && GDK_IS_X11_DISPLAY(gd))
+        pv->ed_xevent_id = g_signal_connect(gd, "xevent", G_CALLBACK(on_xevent), pv);
+    pv->ed_wheel_grab = 1;
+}
+
+static void wheel_ungrab(plugview *pv)
+{
+    Display    *dpy = ed_display();
+    GdkDisplay *gd  = gdk_display_get_default();
+    if (pv->ed_wheel_grab && dpy && pv->ed_xwin) {
+        XUngrabButton(dpy, 4, AnyModifier, pv->ed_xwin);
+        XUngrabButton(dpy, 5, AnyModifier, pv->ed_xwin);
+        XFlush(dpy);
+    }
+    pv->ed_wheel_grab = 0;
+    if (pv->ed_xevent_id && gd) { g_signal_handler_disconnect(gd, pv->ed_xevent_id); pv->ed_xevent_id = 0; }
 }
 
 static int native_editor_open(plugview *pv, pehost *h, const char *title);
@@ -1044,8 +1143,12 @@ static int editor_bounds(plugview *pv, GdkRectangle *clip, GdkRectangle *plug)
      * nothing ever needed scrolling. Taking the larger of the two makes the
      * window the plug-in gets independent of when GTK gets round to the
      * layout. */
-    if ((int)full.size.width  < pv->ed_nat_w) full.size.width  = (float)pv->ed_nat_w;
-    if ((int)full.size.height < pv->ed_nat_h) full.size.height = (float)pv->ed_nat_h;
+    /* And a ceiling. The scrolled window stretches the drawing area to the
+     * viewport whenever the editor is smaller -- zoomed out, or a small
+     * plug-in -- and a window that size is our black background everywhere the
+     * plug-in does not paint. The editor rectangle is the editor's size. */
+    if (pv->ed_nat_w > 0) full.size.width  = (float)pv->ed_nat_w;
+    if (pv->ed_nat_h > 0) full.size.height = (float)pv->ed_nat_h;
 
     x0 = (int)(full.origin.x > vis.origin.x ? full.origin.x : vis.origin.x);
     y0 = (int)(full.origin.y > vis.origin.y ? full.origin.y : vis.origin.y);
@@ -1137,9 +1240,22 @@ static void on_editor_resize(GtkDrawingArea *a, int w, int h, gpointer u)
  * juce::OpenGLContext::CachedImage::stop(), down in the NVIDIA driver, on the
  * way out. The window costs nothing to keep and the plug-in that owns it has
  * already let go by the time the next one attaches. */
+static void wheel_ungrab(plugview *pv);
+
 static void native_editor_close(plugview *pv)
 {
-    if (pv->ed_attached) { pehost_editor_detach(pv->ed_attached); pv->ed_attached = NULL; }
+    wheel_ungrab(pv);
+    if (pv->ed_attached) {
+        v3_runloop_hooks none;
+        pehost_editor_detach(pv->ed_attached);
+        /* After removed(), so its unregistrations still found this pane; then
+         * hooks that answer nothing, not NULL -- NULL would hand the plug-in to
+         * the process-wide set, which may be another pane's. */
+        memset(&none, 0, sizeof none);
+        pehost_set_editor_hooks(pv->ed_attached, &none);
+        pv->ed_attached = NULL;
+    }
+    pv->ed_host_w = pv->ed_host_h = 0;
     /* Forget the last placement with it: the next plug-in's editor is a
      * different size, and a cached rectangle that still matches would let
      * native_editor_place decide there was nothing to do. */
@@ -1278,6 +1394,7 @@ static int native_editor_open(plugview *pv, pehost *h, const char *title)
         return -1;
     }
     pv->ed_attached = h;
+    wheel_grab(pv);
     /* Zoomable from here, not from load(): until the plug-in has a window there
      * is nothing to ask to resize. Fit on the next turn of the main loop, once
      * the pane has been laid out at this editor's size. */
@@ -1421,6 +1538,14 @@ static gboolean editor_tick(gpointer ud)
      * so this is where it is noticed. */
     if (pv->ed_attached) {
         native_editor_place(pv);
+        /* And idle it. Nothing of ours is in its drawing path, but a VST2
+         * runs its event handling out of effEditIdle and a VST3 is handed the
+         * controller updates the audio side queued: without this an embedded
+         * editor appears, correctly drawn, and is inert. pestudio found it the
+         * same way. */
+        pv->in_plugin++;
+        pehost_editor_pump(pv->ed_attached);
+        pv->in_plugin--;
         zoom_fit_poll(pv);
         return G_SOURCE_CONTINUE;
     }
@@ -1521,6 +1646,8 @@ static void zoom_update_ui(plugview *pv)
                       : "");
 }
 
+static void native_set_size(plugview *pv, int sw, int sh);
+
 static void zoom_apply(plugview *pv)
 {
     int sw, sh;
@@ -1533,6 +1660,17 @@ static void zoom_apply(plugview *pv)
     }
     sw = (int)(pv->ed_base_w * pv->ed_zoom + 0.5);
     sh = (int)(pv->ed_base_h * pv->ed_zoom + 0.5);
+    /* The nearest size the view accepts, asked before it is told: one with a
+     * minimum or a fixed aspect otherwise gets an onSize it cannot honour,
+     * clamps, and asks back for something else. */
+    if (pv->ed_native) pehost_editor_check_size(pv->host, &sw, &sh);
+    native_set_size(pv, sw, sh);
+    zoom_update_ui(pv);
+}
+
+/* Give the editor w x h: the pane, the window, and the plug-in. */
+static void native_set_size(plugview *pv, int sw, int sh)
+{
     pv->ed_w = sw; pv->ed_h = sh;
     if (pv->ed_native) {
         /* The window the plug-in was given changes size, and editor_bounds
@@ -1541,14 +1679,16 @@ static void zoom_apply(plugview *pv)
         pv->ed_nat_w = sw; pv->ed_nat_h = sh;
         gtk_widget_set_size_request(pv->editor, sw, sh);
         native_editor_place(pv);
+        pv->ed_host_w = sw; pv->ed_host_h = sh;
+        pv->ed_host_resizing++;
         pv->in_plugin++;
         pehost_editor_resized(pv->host, sw, sh);
         pv->in_plugin--;
+        pv->ed_host_resizing--;
     } else {
         gtk_widget_set_size_request(pv->editor, sw, sh);
         gtk_widget_queue_draw(pv->editor);
     }
-    zoom_update_ui(pv);
 }
 
 static void zoom_set(plugview *pv, double z)
@@ -1587,6 +1727,36 @@ static void zoom_fit(plugview *pv, int only_shrink)
     vw = gtk_widget_get_width(port);
     vh = gtk_widget_get_height(port);
     if (vw < 16 || vh < 16) return;        /* not laid out yet -- try again */
+    /* A native editor that can resize is given the room itself rather than a
+     * multiple of its size: the proportions are the plug-in's to decide
+     * (checkSizeConstraint), and a free-form one fills both directions. Its
+     * answer can overshoot -- an aspect-locked view widened to keep its ratio
+     * -- so the proposal shrinks until the answer fits; one whose minimum is
+     * larger than the room keeps its minimum and the pane scrolls. */
+    if (pv->ed_native && !only_shrink) {
+        int pw = vw, ph = vh, w = vw, h = vh, i;
+        for (i = 0; i < 6; i++) {
+            w = pw; h = ph;
+            if (pehost_editor_check_size(pv->host, &w, &h) != 0) { w = pw; h = ph; break; }
+            if (w <= vw && h <= vh) break;
+            {
+                double s = (double)vw / w, sy = (double)vh / h;
+                int nw, nh;
+                if (sy < s) s = sy;
+                nw = (int)(pw * s); nh = (int)(ph * s);
+                if (nw < 16) nw = 16;
+                if (nh < 16) nh = 16;
+                if (nw == pw && nh == ph) break;
+                pw = nw; ph = nh;
+            }
+        }
+        pv->ed_zoom = (double)w / pv->ed_base_w;
+        native_set_size(pv, w, h);
+        zoom_update_ui(pv);
+        pv->ed_fit_pending = 0;
+        pv->ed_fit_vw = vw; pv->ed_fit_vh = vh;
+        return;
+    }
     z  = (double)vw / pv->ed_base_w;
     zy = (double)vh / pv->ed_base_h;
     if (zy < z) z = zy;
@@ -1607,7 +1777,7 @@ static void zoom_fit_poll(plugview *pv)
     if (!pv->ed_fit_pending &&
         gtk_widget_get_width(port)  == pv->ed_fit_vw &&
         gtk_widget_get_height(port) == pv->ed_fit_vh) return;
-    zoom_fit(pv, 1);
+    zoom_fit(pv, !pv->ed_fit_grow);
 }
 
 /* The automatic fit runs one main-loop turn after the editor opens: the pane
@@ -1624,12 +1794,15 @@ static void zoom_fit_poll(plugview *pv)
  * actually be measured. */
 static gboolean zoom_fit_idle(gpointer u)
 { plugview *pv = u; pv->ed_fit_idle = 0; pv->ed_fit_pending = 1; pv->ed_fit_auto = 1;
-  pv->ed_fit_vw = pv->ed_fit_vh = -1; zoom_fit(pv, 1); return G_SOURCE_REMOVE; }
+  /* A native editor that can resize fills the pane and follows it; anything
+   * else is only shrunk to fit, never blown up. */
+  pv->ed_fit_grow = pv->ed_native && zoom_can(pv);
+  pv->ed_fit_vw = pv->ed_fit_vh = -1; zoom_fit(pv, !pv->ed_fit_grow); return G_SOURCE_REMOVE; }
 
 static void on_zoom_out(GtkButton *b, gpointer u) { plugview *pv = u; (void)b; zoom_step(pv, -1); }
 static void on_zoom_in (GtkButton *b, gpointer u) { plugview *pv = u; (void)b; zoom_step(pv, +1); }
 static void on_zoom_fit(GtkButton *b, gpointer u)
-{ plugview *pv = u; (void)b; pv->ed_fit_auto = 1; zoom_fit(pv, 0); }
+{ plugview *pv = u; (void)b; pv->ed_fit_auto = 1; pv->ed_fit_grow = 1; zoom_fit(pv, 0); }
 static void on_zoom_one(GtkButton *b, gpointer u)
 { plugview *pv = u; (void)b; pv->ed_fit_auto = 0; zoom_set(pv, 1.0); }
 
@@ -1661,7 +1834,7 @@ static void on_ed_released(GtkGestureClick *g, int n, double x, double y, gpoint
 }
 
 static void on_ed_motion(GtkEventControllerMotion *m, double x, double y, gpointer ud)
-{ plugview *pv = ud; (void)m; ed_mouse(pv, (int)x, (int)y, WM_MOUSEMOVE, 0); }
+{ plugview *pv = ud; (void)m; pv->ed_mx = x; pv->ed_my = y; ed_mouse(pv, (int)x, (int)y, WM_MOUSEMOVE, 0); }
 
 static gboolean on_ed_scroll(GtkEventControllerScroll *s, double dx, double dy, gpointer ud)
 {
@@ -1678,8 +1851,22 @@ static gboolean on_ed_scroll(GtkEventControllerScroll *s, double dx, double dy, 
         return TRUE;
     }
     /* GTK counts notches, Windows counts 120ths of one; the plug-in expects
-     * the latter. Sign flipped: scrolling down is a negative delta there. */
-    ed_mouse(pv, 0, 0, WM_MOUSEWHEEL, (int)(-dy));
+     * the latter, which pehost makes of the notches it is handed. Sign
+     * flipped: scrolling down is a negative delta there.
+     *
+     * At the pointer, not at (0,0): the Win32 layer picks the child window the
+     * wheel goes to from the position, so the corner meant the top-left
+     * control turned whatever the pointer was over. And accumulated: a
+     * touchpad or a high-resolution wheel sends fractions of a notch, which
+     * truncated to nothing every time. */
+    pv->ed_wheel_acc += -dy;
+    {
+        int notches = (int)pv->ed_wheel_acc;
+        if (notches) {
+            pv->ed_wheel_acc -= notches;
+            ed_mouse(pv, (int)pv->ed_mx, (int)pv->ed_my, WM_MOUSEWHEEL, notches);
+        }
+    }
     return TRUE;
 }
 
@@ -1929,6 +2116,9 @@ static void load(plugview *pv, const entry *e)
     pv->host = pehost_open_as(e->path, PEHOST_KIND_AUTO, pv->rate, pv->block);
     /* Live, always: a slow helper must not hold up the other tabs. */
     if (pv->host) pehost_set_anticipate(pv->host, 1);
+    /* Before anything asks about its editor: creating the view hands the
+     * plug-in its frame, and it may register or ask for a size right then. */
+    if (pv->host) { v3_runloop_hooks k; pane_hooks(pv, &k); pehost_set_editor_hooks(pv->host, &k); }
     snprintf(pv->loaded_path, sizeof pv->loaded_path, "%s", pv->host ? e->path : "");
     if (pv->host) atomic_store_explicit(&pv->live, 1, memory_order_release);
     if (pv->unpark) pv->unpark();
@@ -3555,6 +3745,10 @@ void plugview_shutdown(plugview *pv)
     pv->zoom_one = pv->zoom_lbl = pv->zoom_note = NULL;
     unload_locked(pv);
     native_editor_destroy(pv);
+    /* The process-wide hooks point at this pane if it was the last built; a
+     * plug-in in another pane that falls back on them must not reach freed
+     * memory once plugview_free has run. */
+    if (g_global_hooks_pane == pv) { v3_set_runloop_hooks(NULL); g_global_hooks_pane = NULL; }
 }
 
 /* ------------------------------------------------------------------ the pane */
@@ -3799,10 +3993,10 @@ GtkWidget *plugview_pane(plugview *pv)
          * itself is pehost's and process-global, so with more than one pane
          * the last one built is the one editors register with -- see
          * plugview.h. */
-        v3_runloop_hooks hooks = {
-            pv, hook_add_fd, hook_del_fd, hook_add_timer, hook_del_timer, hook_resize
-        };
+        v3_runloop_hooks hooks;
+        pane_hooks(pv, &hooks);
         v3_set_runloop_hooks(&hooks);
+        g_global_hooks_pane = pv;
     }
     zoom_update_ui(pv);
     pv->tick  = g_timeout_add(30, editor_tick, pv);

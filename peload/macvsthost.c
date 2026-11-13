@@ -248,7 +248,7 @@ static intptr_t host_cb(AEffect *fx, int32_t op, int32_t idx, intptr_t val,
          * what "the editor does not fit and cannot be changed" is from the
          * outside. 15 is SizeWindow; 13 is IOChanged. index is the width,
          * value the height. */
-        return pehost_editor_resize_request(idx, (int)val);
+        return pehost_editor_resize_request(fx, idx, (int)val);
     case 33: case 34:
         if (ptr) snprintf(ptr, 64, "peload");
         return 1;
@@ -522,6 +522,8 @@ int macvst_get_program(macvst *h)
  * the front end says why the zoom is unavailable. */
 int macvst_editor_can_resize(macvst *h)
 { (void)h; return 0; }
+
+const void *macvst_aeffect(const macvst *h) { return h ? (const void *)h->fx : NULL; }
 
 void macvst_editor_resize(macvst *h, int w, int ht)
 {
