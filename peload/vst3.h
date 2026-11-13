@@ -66,6 +66,12 @@ void v3_editor_resized(v3host *h, int w, int h_px);
 /* Deliver what the processor reported back to the controller. UI thread. */
 void v3_ui_idle(v3host *h);
 
+/* The plug-in's own state: component and controller together, in one block.
+ * v3_get_state returns the length; the data stays valid until the next call. */
+int  v3_has_state(const v3host *h);
+int  v3_get_state(v3host *h, const void **data);
+int  v3_set_state(v3host *h, const void *data, int len);
+
 /* `path` may be a .vst3 bundle directory or the shared object inside it. */
 v3host *v3_open(const char *path, double samplerate, int blocksize,
                 char *err, int errlen);
@@ -89,6 +95,11 @@ float v3_get_param(v3host *h, int i);
 void  v3_set_param(v3host *h, int i, float v);      /* queued */
 
 void  v3_midi(v3host *h, int status, int d1, int d2);  /* queued */
+/* Note-offs for every note this host has started and not yet ended, at the end
+ * of the next block once the queue ahead of it has drained. VST3 has no MIDI
+ * controllers -- CC 123 reaches a plug-in only if it maps it, and few do -- so
+ * this is the only all-notes-off that a VST3 instrument reliably obeys. */
+void  v3_release_all(v3host *h);
 void  v3_set_input_mask(v3host *h, unsigned mask);
 
 /* Interleaved stereo in (may be NULL) and out. Drains the queue first. */

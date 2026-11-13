@@ -3494,6 +3494,8 @@ int pehost_get_state(pehost *h, int preset, const void **data)
     if (!h || !data) return 0;
     /* macOS VST2 and native Linux VST2 share the System V driver. */
     if (h->mv) return macvst_get_state(h->mv, preset, data);
+    if (h->br) return bridge_get_state(h->br, data);
+    if (h->is_v3) return v3_get_state(h->v3, data);
     if (!h->fx) return 0;                    /* the other backends: see below */
     if (!(h->fx->flags & effFlagsProgramChunks)) return 0;
     /* Queued parameter and program writes first, or the chunk describes the
@@ -3509,6 +3511,8 @@ int pehost_set_state(pehost *h, int preset, const void *data, int len)
 {
     if (!h || !data || len <= 0) return 0;
     if (h->mv) return macvst_set_state(h->mv, preset, data, len);
+    if (h->br) return bridge_set_state(h->br, data, len);
+    if (h->is_v3) return v3_set_state(h->v3, data, len);
     if (!h->fx) return 0;
     if (!(h->fx->flags & effFlagsProgramChunks)) return 0;
     /* effSetChunk takes the length in `value` and the bytes in `ptr`. The cast
@@ -3528,6 +3532,8 @@ int pehost_set_state(pehost *h, int preset, const void *data, int len)
 int pehost_has_state(const pehost *h)
 {
     if (h && h->mv) return macvst_has_state(h->mv);
+    if (h && h->br) return bridge_has_state(h->br);
+    if (h && h->is_v3) return v3_has_state(h->v3);
     return h && h->fx && (h->fx->flags & effFlagsProgramChunks) != 0;
 }
 
@@ -3790,6 +3796,9 @@ void pehost_note_off(pehost *h, int note)          { pehost_midi(h, 0x80, note, 
 void pehost_all_notes_off(pehost *h)
 {
     if (h && h->br) { bridge_all_notes_off(h->br); return; }
+    /* A VST3 sees a controller only if it maps it, and CC 123 has no VST3
+     * meaning: real note-offs for what is sounding are the panic it obeys. */
+    if (h && h->is_v3) v3_release_all(h->v3);
     pehost_midi(h, 0xB0, 123, 0);       /* all notes off  */
     pehost_midi(h, 0xB0, 120, 0);       /* all sound off  */
 }
@@ -3810,6 +3819,9 @@ void pehost_release_all(pehost *h)
         atomic_store_explicit(&h->release_req, 1, memory_order_release);
         return;
     }
+    /* VST3 keeps its own record of what it started; the controller pair below
+     * still goes out for a plug-in that does map CC 123 or 120. */
+    if (h->is_v3) v3_release_all(h->v3);
     /* The other hosts keep their own queues and no record of what is sounding,
      * so the most that can be done from here is the controller pair on every
      * channel. */

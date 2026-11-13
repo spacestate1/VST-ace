@@ -2133,6 +2133,8 @@ signals:
     /* A key X delivered to the plugin's window, snooped at the X level. Only
      * fires for a native editor, and only while one is attached. */
     void editorKey(int qtKey, bool down);
+    /* The plug-in asked for a new size and this widget took it. */
+    void editorResized(int w, int h);
 
 public:
     explicit EditorHost(QWidget *p = nullptr) : QWidget(p)
@@ -2174,6 +2176,7 @@ public:
         if (!h || !pehost_has_editor(h)) return false;
         int w = 0, ht = 0;
         pehost_editor_size(h, &w, &ht);
+        zoomApplied_ = 1.0;
         if (w > 0 && ht > 0) { natW_ = w; natH_ = ht; setMinimumSize(1, 1); resize(w, ht); }
         /* Realise the window before handing its id over. */
         (void)winId();
@@ -2274,6 +2277,7 @@ public:
         if (!host_ || natW_ <= 0 || natH_ <= 0) return false;
         if (!pehost_editor_can_resize(host_)) return false;
         const int w = int(natW_ * z + 0.5), h = int(natH_ * z + 0.5);
+        zoomApplied_ = z;
         setMinimumSize(1, 1);
         resize(w, h);            /* resizeEvent tells the plug-in */
         return true;
@@ -2317,10 +2321,14 @@ private:
             auto *e = static_cast<EditorHost *>(ud);
             /* The plug-in asking for a size is the plug-in's own idea of its
              * natural one, so it replaces what attach recorded -- otherwise a
-             * later zoom would scale from a size the plug-in has moved on from. */
-            e->natW_ = w; e->natH_ = h;
+             * later zoom would scale from a size the plug-in has moved on from.
+             * A zoomed plug-in asks in zoomed pixels, as VST3 defines it, and the
+             * natural size is what that comes to at 100%. */
+            e->natW_ = int(w / e->zoomApplied_ + 0.5);
+            e->natH_ = int(h / e->zoomApplied_ + 0.5);
             e->setMinimumSize(1, 1);
             e->resize(w, h);
+            emit e->editorResized(e->natW_, e->natH_);
         };
         v3_set_runloop_hooks(&hk);
         /* The VST2 equivalent of hk.resize. Same destination: a plug-in that
@@ -2331,6 +2339,7 @@ private:
             e->natW_ = w; e->natH_ = h;
             e->setMinimumSize(1, 1);
             e->resize(w, h);
+            emit e->editorResized(w, h);
         }, this);
     }
 
@@ -2406,6 +2415,7 @@ public:
     /* What the plug-in laid itself out at, which is what a zoom is a multiple
      * of. Public because the run-loop resize hook is a plain lambda. */
     int natW_ = 0, natH_ = 0;
+    double zoomApplied_ = 1.0;
 };
 
 /* Shows a Windows plugin's editor. The plugin renders into a buffer the Win32
@@ -3521,17 +3531,19 @@ public:
             connect(zo, &QShortcut::activated, this, [this] { zoomStep(-1); });
         }
         connect(pixelEditor_, &PixelEditor::zoomStep, this, &HostWidget::zoomStep);
-        connect(pixelEditor_, &PixelEditor::editorResized, this, [this](int w, int h) {
+        const auto followEditorSize = [this](int w, int h) {
             /* The stack that holds the editor was sized for the size it opened
-             * at, and would clip anything taller. Follow the plug-in, and when
-             * it grew, scroll to the new part -- that is where a dialog is. */
+             * at, and would clip anything larger. Follow the plug-in, and when
+             * it grew taller, scroll to the new part -- that is where a dialog is. */
             const int was = editorH_;
             editorW_ = w; editorH_ = h;
             applyZoom();
             if (fitAuto_) fitPending_ = true;     /* still fitted, so fit the new size too */
             QScrollBar *vb = editorScroll_->verticalScrollBar();
             QTimer::singleShot(0, vb, [vb, h, was] { vb->setValue(h > was ? vb->maximum() : 0); });
-        });
+        };
+        connect(pixelEditor_, &PixelEditor::editorResized, this, followEditorSize);
+        connect(editor_, &EditorHost::editorResized, this, followEditorSize);
         connect(recBtn_, &QPushButton::clicked, this, &HostWidget::toggleRecord);
         connect(panic, &QPushButton::clicked, this, [this] {
             if (piano_) piano_->releaseAll();

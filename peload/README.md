@@ -19,10 +19,8 @@ The i386 and x86-64 hosts now reach the same result on the same 36 plugins:
 same reasons.
 
 Known failures:
-`brokenmini` loads but registers a font that never reaches the text backend, so
-its editor is refused rather than painted (identical at both widths).
-`brokenmini` and `drumtraqs` load and run but render silence — also at both
-widths, so that is plugin behaviour, not the loader.
+`drumtraqs` only sounds on the notes its kit uses (36, 38 and 42 do), so a test
+on another note reads as silence.
 
 Six of the thirteen Linux VST3s render silence for reasons they state themselves:
 the five gearmulator plugins (`JE8086`, `Osirus`, `OsTIrus`, `Vavra`, `Xenia`)
@@ -181,8 +179,7 @@ then sleeps in tenth-millisecond steps, bounded at about five milliseconds.
 35 of the 40 32-bit plug-ins draw their editors now, where none did. Of the
 rest, four are the Native Instruments plug-ins, whose 32-bit builds fault inside
 the helper while loading -- reported, not fatal, because that is what the helper
-is for -- and `brokenmini` refuses its own editor over a font, as it does at 64
-bits too.
+is for.
 
 ## Switching plug-ins all session: what ran out
 
@@ -1802,7 +1799,7 @@ peload   patches/menu/stigma64-menu.json --pick error --render error.wav
 
 Hand-authoring thirty of these is not on, and the plugins agree on almost
 nothing — the amplifier envelope alone is `VCA EG Attack` (FB-7999), `AMPATTACK`
-(TAL-U-No-62), `AmpEnv A` (Kern, Ragnarok 2), `Loudness Attack` (brokenmini),
+(TAL-U-No-62), `AmpEnv A` (Kern, Ragnarok 2),
 `Out Attack` (ModulAir), `DEG2 Attack` (Fury800), `P1 EnvA` (Stigma) and
 `OP1: Attack` six times over (FB-02). So the generator maps *roles* onto each
 plugin's own names.
@@ -1891,11 +1888,9 @@ program and note choices the repair passes measured their way to.
 
 Result: **30 of 31 banks fully sounding and clean, none clipping, none silent.**
 The two partials are honest ones — `bucketpops` is a drum machine (1/7: only the
-note that lands on a drum sounds) and `fb0264` is FM (3/7). Nine plugins get no
+note that lands on a drum sounds) and `fb0264` is FM (3/7). Eight plugins get no
 bank: five are effects, NI Massive will not load, NI Kontakt 5 exposes only
-`#000`-style slots, drumtraqs has no envelope at all, and brokenmini renders
-silence at both widths even with Power, Fuse and Warm-Up on and a 15-second
-render — which is what this README already said about it.
+`#000`-style slots, and drumtraqs has no envelope at all.
 
 Every bank records its own `mapping` — which parameter each role bound to, and
 what was silenced — so when one sounds wrong that is the first place to look.

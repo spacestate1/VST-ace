@@ -34,6 +34,7 @@
     float pfx##_v3_get_param(void *, int); \
     void  pfx##_v3_set_param(void *, int, float); \
     void  pfx##_v3_midi(void *, int, int, int); \
+    void  pfx##_v3_release_all(void *); \
     void  pfx##_v3_set_input_mask(void *, unsigned); \
     void  pfx##_v3_render(void *, const float *, float *, int); \
     int   pfx##_v3_has_editor(void *); \
@@ -48,6 +49,9 @@
     void  pfx##_v3_editor_detach(void *); \
     void  pfx##_v3_editor_resized(void *, int, int); \
     void  pfx##_v3_ui_idle(void *); \
+    int   pfx##_v3_has_state(const void *); \
+    int   pfx##_v3_get_state(void *, const void **); \
+    int   pfx##_v3_set_state(void *, const void *, int); \
     void  pfx##_v3_set_runloop_hooks(const v3_runloop_hooks *); \
     void  pfx##_v3_runloop_fd(void *, int); \
     void  pfx##_v3_runloop_timer(void *)
@@ -199,6 +203,11 @@ void v3_param_display(v3host *h, int i, char *b, int n)
 float v3_get_param(v3host *h, int i) { FWD_RET(float, v3_get_param, 0.0f, i); }
 void v3_set_param(v3host *h, int i, float v) { FWD_VOID(v3_set_param, i, v); }
 void v3_midi(v3host *h, int st, int d1, int d2) { FWD_VOID(v3_midi, st, d1, d2); }
+void v3_release_all(v3host *h)
+{ if (!h || !h->inner) return; if (h->ms) ms_v3_release_all(h->inner); else sv_v3_release_all(h->inner); }
+int v3_has_state(const v3host *h) { FWD_RET0(int, v3_has_state, 0); }
+int v3_get_state(v3host *h, const void **data) { FWD_RET(int, v3_get_state, 0, data); }
+int v3_set_state(v3host *h, const void *data, int len) { FWD_RET(int, v3_set_state, 0, data, len); }
 void v3_set_input_mask(v3host *h, unsigned m) { FWD_VOID(v3_set_input_mask, m); }
 
 /* Run-loop plumbing is process-wide rather than per-plugin, so both builds get

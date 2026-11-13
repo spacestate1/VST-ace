@@ -74,6 +74,8 @@ struct bridge {
      * put the plug-in back the way the user had it. See bridge_recover. */
     char        path[1024];
     char        helper[32];
+    void       *state;             /* the last state block saved or restored */
+    int         state_len;
     float      *shadow;            /* the last value written to each parameter */
     int         nshadow;
     int         program;           /* the last program selected */
@@ -337,6 +339,8 @@ static int bridge_call(bridge *b, const bridge_req *q, bridge_rep *r)
     return 0;
 }
 
+static int state_send(bridge *b, const void *data, int len);
+
 static int bridge_op(bridge *b, int op, int a, int bb, int c, int d, int e, bridge_rep *r)
 {
     bridge_req q;
@@ -443,6 +447,7 @@ void bridge_close(bridge *b)
     if (b->pidfd >= 0) close(b->pidfd);
     pthread_mutex_destroy(&b->callmu);
     free(b->ed_buf);
+    free(b->state);
     free(b->shadow);
     free(b);
 }
@@ -775,6 +780,9 @@ int bridge_recover(bridge *b)
      * this starts at. */
     if (prog >= 0 && prog < b->nprograms)
         bridge_set_program(b, prog);
+    /* The opaque state first: it can move anything, so the values below win. */
+    if (b->state && b->state_len > 0 && bridge_has_state(b))
+        state_send(b, b->state, b->state_len);
     /* Replayed through the socket: the rings belong to the audio thread, which is
      * still held off, and bridge_set_param refuses while `silent`. Done after the
      * program so the user's values win over the program's. */
@@ -809,7 +817,101 @@ int bridge_num_programs(const bridge *b)   { return b ? b->nprograms : 0; }
 int bridge_num_params(const bridge *b)     { return b ? b->nparams : 0; }
 int bridge_num_inputs(const bridge *b)     { return b ? b->nin : 0; }
 int bridge_num_outputs(const bridge *b)    { return b ? b->nout : 0; }
-int bridge_is_synth(const bridge *b)       { return b ? ((b->flags & 0x100) != 0) : 0; }
+int bridge_is_synth(const bridge *b)       { return b ? ((b->flags & BRIDGE_IS_SYNTH) != 0) : 0; }
+int bridge_has_state(const bridge *b)      { return b ? ((b->flags & BRIDGE_HAS_STATE) != 0) : 0; }
+
+static int sock_read_all(bridge *b, void *buf, size_t n)
+{
+    unsigned char *p = buf;
+    while (n) {
+        ssize_t k = recv(b->sock, p, n, MSG_WAITALL);
+        if (k <= 0) { if (k < 0 && errno == EINTR) continue; return 0; }
+        p += k; n -= (size_t)k;
+    }
+    return 1;
+}
+static int sock_write_all(bridge *b, const void *buf, size_t n)
+{
+    const unsigned char *p = buf;
+    while (n) {
+        ssize_t k = send(b->sock, p, n, MSG_NOSIGNAL);
+        if (k <= 0) { if (k < 0 && errno == EINTR) continue; return 0; }
+        p += k; n -= (size_t)k;
+    }
+    return 1;
+}
+
+/* The block stays valid until the next state call or bridge_close, and is kept
+ * so a restarted helper gets the plug-in's state back as well as its values. */
+int bridge_get_state(bridge *b, const void **data)
+{
+    bridge_req q;
+    bridge_rep r;
+    void *buf;
+    if (data) *data = NULL;
+    if (!b || !data || !bridge_has_state(b)) return 0;
+    memset(&q, 0, sizeof q);
+    q.op = BR_STATE_GET;
+    pthread_mutex_lock(&b->callmu);
+    if (bridge_call(b, &q, &r) || !r.ok || r.a <= 0 || r.a > BRIDGE_MAX_STATE) {
+        pthread_mutex_unlock(&b->callmu);
+        return 0;
+    }
+    if (!(buf = malloc((size_t)r.a)) || !sock_read_all(b, buf, (size_t)r.a)) {
+        /* The payload is unread, so the socket is out of step for good. */
+        free(buf);
+        b->dead = 1;
+        pthread_mutex_unlock(&b->callmu);
+        return 0;
+    }
+    free(b->state);
+    b->state = buf; b->state_len = r.a;
+    pthread_mutex_unlock(&b->callmu);
+    *data = buf;
+    return r.a;
+}
+
+static int state_send(bridge *b, const void *data, int len)
+{
+    bridge_req q;
+    bridge_rep r;
+    memset(&q, 0, sizeof q);
+    memset(&r, 0, sizeof r);
+    q.op = BR_STATE_SET; q.a = len;
+    if (b->dead || b->sock < 0) return 0;
+    if (send(b->sock, &q, sizeof q, MSG_NOSIGNAL) != (ssize_t)sizeof q ||
+        !sock_write_all(b, data, (size_t)len) || !sock_read_all(b, &r, sizeof r)) {
+        b->dead = 1;
+        return 0;
+    }
+    return r.ok;
+}
+
+int bridge_set_state(bridge *b, const void *data, int len)
+{
+    void *copy;
+    int ok, i;
+    if (!b || !data || len <= 0 || len > BRIDGE_MAX_STATE || !bridge_has_state(b)) return 0;
+    pthread_mutex_lock(&b->callmu);
+    ok = state_send(b, data, len);
+    if (ok && (copy = malloc((size_t)len))) {
+        memcpy(copy, data, (size_t)len);
+        free(b->state);
+        b->state = copy; b->state_len = len;
+    }
+    /* A state moves every parameter; what is remembered for a restart must follow. */
+    if (ok && b->shadow)
+        for (i = 0; i < b->nshadow; i++) {
+            bridge_req q;
+            bridge_rep r;
+            memset(&q, 0, sizeof q);
+            q.op = BR_PARAM_GET; q.a = i;
+            if (bridge_call(b, &q, &r)) break;
+            b->shadow[i] = r.f;
+        }
+    pthread_mutex_unlock(&b->callmu);
+    return ok;
+}
 int bridge_unique_id(const bridge *b)      { return b ? b->uid : 0; }
 
 static void bridge_text(bridge *b, int op, int idx, char *buf, int n)

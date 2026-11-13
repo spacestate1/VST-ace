@@ -44,6 +44,7 @@ static double v3_now(void)
 
 typedef int32_t tresult;
 #define V3_OK          0
+#define V3_FALSE       1
 #define V3_NOIFACE     (-1)   /* kNoInterface */
 #define V3_NOTIMPL     (-4)   /* kNotImplemented */
 
@@ -459,7 +460,7 @@ static const IParameterChangesVtbl g_pc_vt = {
 };
 
 /* IEventList: the note events for one block. */
-#define MAX_EVENTS 64
+#define MAX_EVENTS 256
 typedef struct {
     const struct IEventListVtbl *vt;
     V3Event ev[MAX_EVENTS];
@@ -894,7 +895,89 @@ void    V3N(v3_set_param)(v3host *, int, float);
 
 #define EVQ 512
 enum { Q_MIDI = 1, Q_PARAM };
-typedef struct { unsigned char type, a, b, c; float v; } qev_t;
+/* seq is the claim-and-publish stamp: a slot is ready when seq == its position + 1. */
+typedef struct { unsigned char type, a, b, c; float v; _Atomic unsigned seq; } qev_t;
+
+/* ---- plug-in state ----
+ * VST3 keeps a component state and a controller state, each read and written
+ * through an IBStream.  The two travel together in one block:
+ *   "V3ST", u32 component length, component bytes, u32 controller length, controller bytes. */
+typedef struct IBStreamVtbl {
+    FUNKNOWN_SLOTS;
+    tresult (V3CALL *read)(void *, void *buf, int32_t n, int32_t *got);
+    tresult (V3CALL *write)(void *, void *buf, int32_t n, int32_t *put);
+    tresult (V3CALL *seek)(void *, int64_t pos, int32_t mode, int64_t *result);
+    tresult (V3CALL *tell)(void *, int64_t *pos);
+} IBStreamVtbl;
+typedef struct { const IBStreamVtbl *vt; unsigned char *d; int64_t len, cap, pos; } MemStream;
+static const TUID IID_IBStream = TU(0xC3BF6EA2,0x30994752,0x9B6BF990,0x1EE33E9B);
+static V3CALL tresult ms_qi(void *s, const TUID iid, void **o)
+{
+    if (!memcmp(iid, IID_IBStream, 16) || !memcmp(iid, IID_FUnknown, 16)) { *o = s; return V3_OK; }
+    *o = NULL; return V3_NOIFACE;
+}
+static V3CALL tresult ms_read(void *s, void *buf, int32_t n, int32_t *got)
+{
+    MemStream *m = s;
+    int64_t left = m->len - m->pos;
+    if (n < 0) n = 0;
+    if (left < 0) left = 0;
+    if (n > left) n = (int32_t)left;
+    if (n && buf) memcpy(buf, m->d + m->pos, (size_t)n);
+    m->pos += n;
+    if (got) *got = n;
+    return V3_OK;
+}
+static V3CALL tresult ms_write(void *s, void *buf, int32_t n, int32_t *put)
+{
+    MemStream *m = s;
+    if (n < 0 || !buf) return V3_FALSE;
+    if (m->pos + n > m->cap) {
+        int64_t cap = m->cap ? m->cap : 4096;
+        while (cap < m->pos + n) cap *= 2;
+        unsigned char *d = realloc(m->d, (size_t)cap);
+        if (!d) return V3_FALSE;
+        memset(d + m->cap, 0, (size_t)(cap - m->cap));
+        m->d = d; m->cap = cap;
+    }
+    memcpy(m->d + m->pos, buf, (size_t)n);
+    m->pos += n;
+    if (m->pos > m->len) m->len = m->pos;
+    if (put) *put = n;
+    return V3_OK;
+}
+static V3CALL tresult ms_seek(void *s, int64_t pos, int32_t mode, int64_t *result)
+{
+    MemStream *m = s;
+    int64_t base = mode == 1 ? m->pos : mode == 2 ? m->len : 0;
+    if (base + pos < 0) return V3_FALSE;
+    m->pos = base + pos;
+    if (result) *result = m->pos;
+    return V3_OK;
+}
+static V3CALL tresult ms_tell(void *s, int64_t *pos) { if (pos) *pos = ((MemStream *)s)->pos; return V3_OK; }
+static const IBStreamVtbl g_ms_vt = { ms_qi, rl_ref, rl_ref, ms_read, ms_write, ms_seek, ms_tell };
+
+
+typedef struct {
+    char     cid[16];
+    int32_t  cardinality;
+    char     category[32];
+    char     name[64];
+    uint32_t classFlags;
+    char     subCategories[128];
+    char     vendor[64], version[64], sdkVersion[64];
+} PClassInfo2;
+typedef struct IPluginFactory2Vtbl {
+    FUNKNOWN_SLOTS;
+    tresult (V3CALL *getFactoryInfo)(void *, void *);
+    int32_t (V3CALL *countClasses)(void *);
+    tresult (V3CALL *getClassInfo)(void *, int32_t, void *);
+    tresult (V3CALL *createInstance)(void *, const char *, const char *, void **);
+    tresult (V3CALL *getClassInfo2)(void *, int32_t, PClassInfo2 *);
+} IPluginFactory2Vtbl;
+typedef struct { const IPluginFactory2Vtbl *vt; } IPluginFactory2;
+static const TUID IID_IPluginFactory2 = TU(0x0007B650,0xF24B4C0B,0xA464EDB9,0xF00B2ABB);
 
 struct v3host {
     void            *dl;      /* ELF path */
@@ -917,6 +1000,10 @@ struct v3host {
     IPlugView *view;
     int        view_w, view_h;
     int        view_attached;   /* removed() must be called exactly once */
+    unsigned char *state_buf;   /* the last v3_get_state result */
+    int        resync;          /* a program changed: refresh the controller */
+    volatile int blocks_since_program;
+    char       subcat[128];     /* "Fx|Delay", "Instrument|Synth": the class's own category */
 
     char   name[64], vendor[64];
     int    nparams, nin, nout, synth;
@@ -953,6 +1040,12 @@ struct v3host {
     struct { uint32_t id; float v; } oq[EVQ];
     _Atomic unsigned  ohead, otail;
     _Atomic unsigned  head, tail;
+
+    /* Which notes this host has started and not ended, per channel; written only
+     * by the audio thread. v3_release_all asks for note-offs for all of them. */
+    unsigned char     sounding[16][16];
+    _Atomic int       release_req;
+    _Atomic unsigned  q_dropped;
 };
 
 static void u16_to_ascii(const int16_t *w, char *out, int n)
@@ -966,11 +1059,31 @@ static void u16_to_ascii(const int16_t *w, char *out, int n)
 static void qpush(v3host *h, unsigned char t, unsigned char a, unsigned char b,
                   unsigned char c, float v)
 {
-    unsigned hd = atomic_load_explicit(&h->head, memory_order_relaxed);
-    unsigned tl = atomic_load_explicit(&h->tail, memory_order_acquire);
-    if (((hd + 1) & (EVQ - 1)) == (tl & (EVQ - 1))) return;
-    h->q[hd & (EVQ - 1)] = (qev_t){ t, a, b, c, v };
-    atomic_store_explicit(&h->head, hd + 1, memory_order_release);
+    /* Several threads produce here -- MIDI input, the on-screen keyboard, the
+     * editor, a sequencer -- so a slot is claimed with a compare-exchange and
+     * published once filled, as pehost's own queue does. A plain load and store
+     * of head let two of them take the same slot, and the one overwritten could
+     * be a note-off. */
+    qev_t *e;
+    unsigned hd;
+    for (;;) {
+        unsigned tl = atomic_load_explicit(&h->tail, memory_order_acquire);
+        hd = atomic_load_explicit(&h->head, memory_order_relaxed);
+        if (hd - tl >= EVQ - 1) {
+            /* Full. What was lost cannot be known, so every sounding note is
+             * released once the queue drains: a cut note beats a hung one. */
+            if (t == Q_MIDI) atomic_store_explicit(&h->release_req, 1, memory_order_release);
+            if (!atomic_fetch_add_explicit(&h->q_dropped, 1, memory_order_relaxed))
+                fprintf(stderr, "vst3: the event queue overflowed -- some events were "
+                                "lost; releasing every sounding note\n");
+            return;
+        }
+        if (atomic_compare_exchange_weak_explicit(&h->head, &hd, hd + 1,
+                memory_order_relaxed, memory_order_relaxed)) break;
+    }
+    e = &h->q[hd & (EVQ - 1)];
+    e->type = t; e->a = a; e->b = b; e->c = c; e->v = v;
+    atomic_store_explicit(&e->seq, hd + 1, memory_order_release);
 }
 
 /* The editor's own edits, on their way to the processor.
@@ -1132,6 +1245,23 @@ static uint64_t arrangement_for(int ch)
     }
 }
 
+/* What the SDK's hosts do: the controller learns the processor's real state,
+ * or it reports defaults the processor is not using. */
+static void ctrl_sync(v3host *h)
+{
+    MemStream st = { &g_ms_vt, NULL, 0, 0, 0 };
+    if (!h || !h->ctrl || h->ctrl_is_comp || !h->comp) return;
+    /* Handing the component its own state back is what makes some of them tell
+     * their controller; the controller then reads the same bytes. */
+    if (h->comp->vt->getState(h->comp, &st) == V3_OK && st.len > 0) {
+        st.pos = 0;
+        h->comp->vt->setState(h->comp, &st);
+        st.pos = 0;
+        h->ctrl->vt->setComponentState(h->ctrl, &st);
+    }
+    free(st.d);
+}
+
 v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
                 char *err, int errlen)
 {
@@ -1227,6 +1357,16 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
     if (chosen < 0) FAIL("no Audio Module Class in factory");
     h->factory->vt->getClassInfo(h->factory, chosen, &ci);
     snprintf(h->name, sizeof h->name, "%s", ci.name);
+    {   /* The class's own word on what it is; "takes MIDI" does not settle it. */
+        IPluginFactory2 *f2 = NULL;
+        PClassInfo2 c2;
+        memset(&c2, 0, sizeof c2);
+        if (h->factory->vt->queryInterface(h->factory, IID_IPluginFactory2, (void **)&f2) == V3_OK && f2) {
+            if (f2->vt->getClassInfo2(f2, chosen, &c2) == V3_OK)
+                snprintf(h->subcat, sizeof h->subcat, "%.*s", (int)sizeof c2.subCategories, c2.subCategories);
+            f2->vt->release(f2);
+        }
+    }
 
     if (h->factory->vt->createInstance(h->factory, ci.cid, IID_IComponent,
                                        (void **)&h->comp) != V3_OK || !h->comp)
@@ -1321,7 +1461,9 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
                 h->outCh[b] = bi.channelCount > MAXCH ? MAXCH : bi.channelCount;
             outArr[b] = arrangement_for(h->outCh[b]);
         }
-        h->synth = nEventIn > 0;
+        if (!strncmp(h->subcat, "Fx", 2)) h->synth = 0;
+        else if (strstr(h->subcat, "Instrument")) h->synth = 1;
+        else h->synth = nEventIn > 0;
         h->nin  = h->nInBus  ? h->inCh[0]  : 0;
         h->nout = h->outCh[0];
 
@@ -1484,6 +1626,19 @@ v3host *V3N(v3_open)(const char *path, double samplerate, int blocksize,
              h->nprograms, h->plist_id, h->prog_param, h->prog_steps);
     }
 
+    /* Some controllers report generic defaults, not what the program in play
+     * holds, so anything reading parameters back would capture the wrong values.
+     * Selecting a program makes them load its real ones, and they act only on a
+     * change, so step off the program in play and straight back, before any audio. */
+    if (h->ctrl && h->prog_param >= 0 && h->prog_steps > 0) {
+        uint32_t id = h->pid[h->prog_param];
+        double cur = h->ctrl->vt->getParamNormalized(h->ctrl, id);
+        double step = 1.0 / (double)h->prog_steps;
+        h->ctrl->vt->setParamNormalized(h->ctrl, id, cur + step <= 1.0 ? cur + step : cur - step);
+        h->ctrl->vt->setParamNormalized(h->ctrl, id, cur);
+    }
+    ctrl_sync(h);
+
     return h;
 #undef FAIL
 }
@@ -1555,6 +1710,7 @@ void V3N(v3_close)(v3host *h)
     /* Still no dlclose. Measured: it reclaimed nothing (the plugins hold their
      * own references) and crashed Odin2 and CardinalSynth outright. */
 #endif
+    free(h->state_buf);
     free(h);
 }
 
@@ -1565,28 +1721,8 @@ int V3N(v3_num_inputs)(const v3host *h)  { return h ? h->nin : 0; }
 int V3N(v3_num_outputs)(const v3host *h) { return h ? h->nout : 0; }
 int V3N(v3_is_synth)(const v3host *h)    { return h ? h->synth : 0; }
 
-/* Per-plugin quirk list. FB-02's VST3 controller accepts a program-change write
- * and then its processor faults on the very next block -- verified by bisecting
- * the write. Every other plugin here needs that write for programs to work at
- * all, so the narrow fix is to opt this one out rather than give up program
- * changes everywhere. Its VST2 build handles all 336 programs correctly. */
-static int programs_unsafe(const v3host *h)
-{
-    if (!h) return 0;
-    if (!strcmp(h->name, "FB-02")) {
-        static int said = 0;
-        if (!said) {
-            said = 1;
-            fprintf(stderr, "vst3: %s -- program switching disabled (its processor "
-                            "faults after a program write); use the VST2 build\n", h->name);
-        }
-        return 1;
-    }
-    return 0;
-}
-
 int V3N(v3_num_programs)(const v3host *h)
-{ return (h && !programs_unsafe(h)) ? h->nprograms : 0; }
+{ return h ? h->nprograms : 0; }
 int V3N(v3_get_program)(const v3host *h) { return h ? h->program : 0; }
 
 void V3N(v3_program_name)(v3host *h, int i, char *b, int n)
@@ -1602,8 +1738,9 @@ void V3N(v3_program_name)(v3host *h, int i, char *b, int n)
 
 void V3N(v3_set_program)(v3host *h, int i)
 {
-    if (!h || i < 0 || i >= h->nprograms || programs_unsafe(h)) return;
+    if (!h || i < 0 || i >= h->nprograms) return;
     h->program = i;
+    h->resync = 1;
     /* VST3 has no setProgram: write the kIsProgramChange parameter instead, so
      * the change reaches both the controller and the processor. */
     if (h->prog_param >= 0) {
@@ -1637,6 +1774,8 @@ void V3N(v3_param_display)(v3host *h, int i, char *buf, int n)
 float V3N(v3_get_param)(v3host *h, int i)
 {
     if (!h || !h->ctrl || i < 0 || i >= h->nparams) return 0.0f;
+    /* A program change reaches the processor on its next block; read after that. */
+    if (h->resync && h->blocks_since_program > 0) { h->resync = 0; h->blocks_since_program = 0; ctrl_sync(h); }
     return (float)h->ctrl->vt->getParamNormalized(h->ctrl, h->pid[i]);
 }
 
@@ -1664,6 +1803,11 @@ void V3N(v3_midi)(v3host *h, int status, int d1, int d2)
 {
     if (h) qpush(h, Q_MIDI, (unsigned char)status,
                  (unsigned char)(d1 & 0x7f), (unsigned char)(d2 & 0x7f), 0.0f);
+}
+
+void V3N(v3_release_all)(v3host *h)
+{
+    if (h) atomic_store_explicit(&h->release_req, 1, memory_order_release);
 }
 
 /* ------------------------------------------------------------- editor ---- */
@@ -1703,6 +1847,60 @@ int V3N(v3_has_editor)(v3host *h)
 
 /* Called from the editor pump, which is the UI thread. Hands the controller
  * everything the processor reported since the last one. */
+/* ---- plug-in state: the block written by v3_get_state ---- */
+int V3N(v3_has_state)(const v3host *h) { return h && h->comp; }
+
+/* Returns the length; *data stays valid until the next call or close. */
+int V3N(v3_get_state)(v3host *h, const void **data)
+{
+    MemStream c = { &g_ms_vt, NULL, 0, 0, 0 }, e = { &g_ms_vt, NULL, 0, 0, 0 };
+    int64_t total;
+    unsigned char *b;
+    uint32_t n;
+
+    if (data) *data = NULL;
+    if (!h || !h->comp || !data) return 0;
+    if (h->comp->vt->getState(h->comp, &c) != V3_OK) { free(c.d); return 0; }
+    if (h->ctrl && !h->ctrl_is_comp && h->ctrl->vt->getState(h->ctrl, &e) != V3_OK) e.len = 0;
+    total = 12 + c.len + e.len;
+    if (total > 0x7fffffff || !(b = malloc((size_t)total))) { free(c.d); free(e.d); return 0; }
+    memcpy(b, "V3ST", 4);
+    n = (uint32_t)c.len; memcpy(b + 4, &n, 4);
+    if (c.len) memcpy(b + 8, c.d, (size_t)c.len);
+    n = (uint32_t)e.len; memcpy(b + 8 + c.len, &n, 4);
+    if (e.len) memcpy(b + 12 + c.len, e.d, (size_t)e.len);
+    free(c.d); free(e.d);
+    free(h->state_buf); h->state_buf = b;
+    *data = b;
+    return (int)total;
+}
+
+int V3N(v3_set_state)(v3host *h, const void *data, int len)
+{
+    const unsigned char *p = data;
+    uint32_t cn, en;
+    MemStream m = { &g_ms_vt, NULL, 0, 0, 0 };
+    tresult r;
+
+    if (!h || !h->comp || !p || len < 12 || memcmp(p, "V3ST", 4)) return 0;
+    memcpy(&cn, p + 4, 4);
+    if ((int64_t)cn + 12 > len) return 0;
+    memcpy(&en, p + 8 + cn, 4);
+    if ((int64_t)cn + 12 + en > len) return 0;
+    m.d = (unsigned char *)(uintptr_t)(p + 8); m.len = m.cap = cn;
+    r = h->comp->vt->setState(h->comp, &m);
+    if (r != V3_OK) return 0;
+    if (h->ctrl) {
+        m.pos = 0;
+        h->ctrl->vt->setComponentState(h->ctrl, &m);
+        if (en && !h->ctrl_is_comp) {
+            MemStream c = { &g_ms_vt, (unsigned char *)(uintptr_t)(p + 12 + cn), en, en, 0 };
+            h->ctrl->vt->setState(h->ctrl, &c);
+        }
+    }
+    return 1;
+}
+
 void V3N(v3_ui_idle)(v3host *h)
 {
     unsigned hd, tl;
@@ -1846,7 +2044,15 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
     hd = atomic_load_explicit(&h->head, memory_order_acquire);
     tl = atomic_load_explicit(&h->tail, memory_order_relaxed);
     for (; tl != hd; tl++) {
-        qev_t e = h->q[tl & (EVQ - 1)];
+        qev_t *slot = &h->q[tl & (EVQ - 1)];
+        qev_t e;
+        if (atomic_load_explicit(&slot->seq, memory_order_acquire) != tl + 1)
+            break;      /* claimed, not yet filled: the rest waits a block */
+        e.type = slot->type; e.a = slot->a; e.b = slot->b; e.c = slot->c; e.v = slot->v;
+        /* A full block leaves the rest queued for the next one. Consuming it
+         * and dropping it lost note-offs: release a big chord in one go and the
+         * notes past the block's limit went on sounding. */
+        if (e.type == Q_MIDI && events.n >= MAX_EVENTS) break;
         if (e.type == Q_PARAM) {
             int idx = e.a | (e.b << 8);
             if (idx >= 0 && idx < h->nparams) {
@@ -1868,6 +2074,7 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
                 ev->u.noteOn.velocity = e.c / 127.0f;
                 ev->u.noteOn.noteId   = -1;
                 events.n++;
+                h->sounding[ch][e.b >> 3] |= (unsigned char)(1u << (e.b & 7));
             } else if (cmd == 0x80 || (cmd == 0x90 && e.c == 0)) {
                 ev->type = EV_NOTE_OFF;
                 ev->u.noteOff.channel  = (int16_t)ch;
@@ -1875,6 +2082,7 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
                 ev->u.noteOff.velocity = 0.0f;
                 ev->u.noteOff.noteId   = -1;
                 events.n++;
+                h->sounding[ch][e.b >> 3] &= (unsigned char)~(1u << (e.b & 7));
             }
             /* A control change, a channel aftertouch or a pitch bend is a
              * parameter in VST3, not an event. Ask the plug-in which one and
@@ -1903,6 +2111,32 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
         }
     }
     atomic_store_explicit(&h->tail, tl, memory_order_release);
+
+    /* A release that was asked for, once the queue ahead of it has drained: a
+     * note-on still queued arrived before the request, and letting it through
+     * after the release would be the hung note this is here to prevent. The
+     * note-offs go after everything else in the block. More than a block's
+     * worth carries over -- each one clears its bit, so the next block picks up
+     * where this stopped. */
+    if (tl == atomic_load_explicit(&h->head, memory_order_acquire) &&
+        atomic_exchange_explicit(&h->release_req, 0, memory_order_acq_rel)) {
+        int ch, n, done = 1;
+        for (ch = 0; ch < 16 && done; ch++)
+            for (n = 0; n < 128; n++) {
+                V3Event *ev;
+                if (!(h->sounding[ch][n >> 3] & (1u << (n & 7)))) continue;
+                if (events.n >= MAX_EVENTS) { done = 0; break; }
+                h->sounding[ch][n >> 3] &= (unsigned char)~(1u << (n & 7));
+                ev = &events.ev[events.n++];
+                memset(ev, 0, sizeof *ev);
+                ev->sampleOffset = frames > 0 ? frames - 1 : 0;
+                ev->type = EV_NOTE_OFF;
+                ev->u.noteOff.channel = (int16_t)ch;
+                ev->u.noteOff.pitch   = (int16_t)n;
+                ev->u.noteOff.noteId  = -1;
+            }
+        if (!done) atomic_store_explicit(&h->release_req, 1, memory_order_release);
+    }
 
     {
         int b, c;
@@ -1973,6 +2207,7 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
     }
 
     {
+    if (h->resync) h->blocks_since_program++;
         tresult pr = h->proc->vt->process(h->proc, &pd);
         /* Once, and only when it is not success: a per-block message would
          * bury the log, and a plug-in that refuses to process is the one thing

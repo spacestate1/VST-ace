@@ -7,7 +7,7 @@ these plugins agree on almost nothing. The amplifier envelope alone appears as:
 
     VCA EG Attack   FB-7999          AMPATTACK       TAL-U-No-62
     VCA Attack      Tricent          AmpEnv A        kern, Ragnarok 2
-    Loudness Attack brokenmini       Env 2 A         blooo, scrooo
+    Env 2 A         blooo, scrooo
     Out Attack      ModulAir         DEG2 Attack     Fury800
     Synth: Attack   Oxid             P1 EnvA         Stigma
     Envelope: Attack Paralogy        OP1: Attack     FB-02 (six of them)
@@ -217,15 +217,8 @@ OVERRIDES = {
     },
 }
 
-# Loads and runs, renders silence whatever it is sent. Verified here at both
-# widths, with Power, Fuse, Voltage and Warm-Up all switched on and a 15-second
-# render in case the warm-up simulation needed time. It did not. This matches
-# what peload/README.md already records about the plugin, so a bank for it would
-# only be a file that never makes a sound.
-KNOWN_SILENT = {
-    "brokenmini64": "renders silence at both widths even powered on "
-                    "(see peload/README.md)",
-}
+# Plug-ins that load but never make a sound, so a bank would be a silent file.
+KNOWN_SILENT = {}
 
 # --------------------------------------------------------------------- recipe
 #

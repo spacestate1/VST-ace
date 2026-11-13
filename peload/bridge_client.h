@@ -42,6 +42,9 @@ int bridge_num_params(const bridge *b);
 int bridge_num_inputs(const bridge *b);
 int bridge_num_outputs(const bridge *b);
 int bridge_is_synth(const bridge *b);
+int bridge_has_state(const bridge *b);
+int bridge_get_state(bridge *b, const void **data);
+int bridge_set_state(bridge *b, const void *data, int len);
 /* Whether the helper is still there. A plug-in that faults takes its helper
  * with it, and everything after that quietly returns nothing -- a frozen
  * editor and silence, with no way for the window to say which. */

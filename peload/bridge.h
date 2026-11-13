@@ -43,8 +43,9 @@
  * hanging.
  * 4: the three rings carry a per-slot sequence number so any number of host
  * threads may produce into them (see bridge_ring_claim), and BR_SET_PARAM
- * exists so a restart can replay parameters without going through a ring. */
-#define BRIDGE_VERSION  4
+ * exists so a restart can replay parameters without going through a ring.
+ * 5: BR_STATE_GET/SET carry a plug-in's opaque state. */
+#define BRIDGE_VERSION  5
 
 /* Generous enough for any period a host will ask for; the helper clamps. */
 #define BRIDGE_MAX_FRAMES  8192
@@ -236,8 +237,16 @@ enum {
     BR_INPUT_MASK,       /* -> mask                                          */
     BR_QUIT,
     BR_SET_PARAM,        /* -> index, f=value     (restart replay; not a ring) */
-    BR_EDITOR_VISIBLE    /* -> 1 shown, 0 hidden: a hidden editor is pumped slowly */
+    BR_EDITOR_VISIBLE,   /* -> 1 shown, 0 hidden: a hidden editor is pumped slowly */
+    /* The only two ops with a payload, which follows the fixed message on the
+     * socket.  Sent only to a helper that set BRIDGE_HAS_STATE in BR_HELLO. */
+    BR_STATE_GET,        /*                <- a=length, then that many bytes */
+    BR_STATE_SET         /* -> a=length, then that many bytes   <- ok        */
 };
+
+#define BRIDGE_IS_SYNTH   0x100            /* flags in the BR_HELLO reply */
+#define BRIDGE_HAS_STATE  0x200
+#define BRIDGE_MAX_STATE  (256 * 1024 * 1024)
 
 /* One fixed-size message each way keeps framing trivial: a short read means the
  * peer is gone, and there is never a partial record to resynchronise from. */

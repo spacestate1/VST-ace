@@ -147,6 +147,18 @@ static void drain_input(server *s)
 }
 
 static server S;
+/* A state block can be larger than the socket buffer; send() may stop short. */
+static int send_payload(int sock, const void *data, size_t n)
+{
+    const unsigned char *p = data;
+    while (n) {
+        ssize_t k = send(sock, p, n, MSG_NOSIGNAL);
+        if (k <= 0) { if (k < 0 && errno == EINTR) continue; return 0; }
+        p += k; n -= (size_t)k;
+    }
+    return 1;
+}
+
 static server *g_server;
 static pid_t g_ppid;
 static int sock_for_watchdog;
@@ -192,7 +204,8 @@ static int handle_request(server *s, const bridge_req *qp, bridge_rep *rp)
             r.c = pehost_num_inputs(s->h);
             r.d = pehost_num_outputs(s->h);
             /* The flags field only has to carry "is a synth" across. */
-            r.e = pehost_is_synth(s->h) ? 0x100 : 0;
+            r.e = (pehost_is_synth(s->h) ? BRIDGE_IS_SYNTH : 0) |
+                  (pehost_has_state(s->h) ? BRIDGE_HAS_STATE : 0);
             r.g = pehost_unique_id(s->h);
             break;
         case BR_PARAM_NAME:    pehost_param_name(s->h, q.a, r.text, sizeof r.text); break;
@@ -565,6 +578,23 @@ int main(int argc, char **argv)
 
         memset(&r, 0, sizeof r);
         r.ok = 1;
+        if (q.op == BR_STATE_GET) {
+            const void *data = NULL;
+            int len = pehost_get_state(S.h, 0, &data);
+            if (len <= 0 || !data || len > BRIDGE_MAX_STATE) len = 0;
+            r.ok = len > 0; r.a = len;
+            if (send(sock, &r, sizeof r, MSG_NOSIGNAL) != (ssize_t)sizeof r) break;
+            if (len && !send_payload(sock, data, (size_t)len)) break;
+            continue;
+        }
+        if (q.op == BR_STATE_SET) {
+            unsigned char *buf = (q.a > 0 && q.a <= BRIDGE_MAX_STATE) ? malloc((size_t)q.a) : NULL;
+            if (!buf || recv(sock, buf, (size_t)q.a, MSG_WAITALL) != (ssize_t)q.a) { free(buf); break; }
+            r.ok = pehost_set_state(S.h, 0, buf, q.a);
+            free(buf);
+            if (send(sock, &r, sizeof r, MSG_NOSIGNAL) != (ssize_t)sizeof r) break;
+            continue;
+        }
         { int quit = handle_request(&S, &q, &r);
           if (quit) { send(sock, &r, sizeof r, MSG_NOSIGNAL); goto done; } }
         if (send(sock, &r, sizeof r, MSG_NOSIGNAL) != (ssize_t)sizeof r) break;

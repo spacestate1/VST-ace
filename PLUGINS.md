@@ -26,28 +26,26 @@ file's headers and reports the loader it needs, without loading it.
 
 | | | |
 |---|---|---|
-| `blooo64.dll` | `freqshifter64.dll` | `oxid64.dll` |
-| `brokenmini64.dll` | `fury6864.dll` | `paralogy64.dll` |
-| `bucketone64.dll` | `fury80064.dll` | `pecs64.dll` |
-| `bucketpops64.dll` | `grainstrain64.dll` | `qyooo64.dll` |
-| `deputy64.dll` | `kern64.dll` | `ragnarok264.dll` |
-| `drumtraqs64.dll` | `modulair64.dll` | `scrooo64.dll` |
-| `fb0264.dll` | `monofury64.dll` | `sequencair64.dll` |
-| `fb310064.dll` | `mps64.dll` | `sixtraq64.dll` |
-| `fb320064.dll` | `nabla64.dll` | `stigma64.dll` |
-| `fb330064.dll` | `NI Absynth 5.dll` | `TAL-U-No-62.dll` |
-| `fb799964.dll` | `NI FM8.dll` | `tricent64.dll` |
-| `fbdelay64.dll` | `NI Kontakt 5.dll` | `whispair64.dll` |
-| `fbphaser64.dll` | `NI Massive.dll` |  |
-| `fbvc64.dll` | `ny64.dll` |  |
+| `blooo64.dll` | `freqshifter64.dll` | `ny64.dll` |
+| `bucketone64.dll` | `fury6864.dll` | `oxid64.dll` |
+| `bucketpops64.dll` | `fury80064.dll` | `paralogy64.dll` |
+| `deputy64.dll` | `grainstrain64.dll` | `pecs64.dll` |
+| `drumtraqs64.dll` | `kern64.dll` | `qyooo64.dll` |
+| `fb0264.dll` | `modulair64.dll` | `ragnarok264.dll` |
+| `fb310064.dll` | `monofury64.dll` | `scrooo64.dll` |
+| `fb320064.dll` | `mps64.dll` | `sequencair64.dll` |
+| `fb330064.dll` | `nabla64.dll` | `sixtraq64.dll` |
+| `fb799964.dll` | `NI Absynth 5.dll` | `stigma64.dll` |
+| `fbdelay64.dll` | `NI FM8.dll` | `TAL-U-No-62.dll` |
+| `fbphaser64.dll` | `NI Kontakt 5.dll` | `tricent64.dll` |
+| `fbvc64.dll` | `NI Massive.dll` | `whispair64.dll` |
 
 ## Windows VST3 — 35
 `windows/VST3` — `.vst3`, same loader, VST3 plumbing on top
 
 | | | |
 |---|---|---|
-| `blooo.vst3` | `fbphaser.vst3` | `oxid.vst3` |
-| `brokenmini.vst3` | `fbvc.vst3` | `paralogy.vst3` |
+| `blooo.vst3` | `fbvc.vst3` | `paralogy.vst3` |
 | `bucketone.vst3` | `freqshifter.vst3` | `pecs.vst3` |
 | `bucketpops.vst3` | `fury68.vst3` | `qyooo.vst3` |
 | `deputy.vst3` | `fury800.vst3` | `ragnarok2.vst3` |
@@ -58,26 +56,26 @@ file's headers and reports the loader it needs, without loading it.
 | `fb3300.vst3` | `mps.vst3` | `tricent.vst3` |
 | `fb7999.vst3` | `nabla.vst3` | `whispair.vst3` |
 | `fbdelay.vst3` | `ny.vst3` |  |
+| `fbphaser.vst3` | `oxid.vst3` |  |
 
 ## Windows VST2, 32-bit — 40
 `windows/VST2-32` — `.dll`, i386 -- run directly by `peload32`, or bridged out-of-process into the 64-bit hosts
 
 | | | |
 |---|---|---|
-| `blooo.dll` | `freqshifter.dll` | `oxid.dll` |
-| `brokenmini.dll` | `fury68.dll` | `paralogy.dll` |
-| `bucketone.dll` | `fury800.dll` | `pecs.dll` |
-| `bucketpops.dll` | `grainstrain.dll` | `qyooo.dll` |
-| `deputy.dll` | `kern.dll` | `ragnarok2.dll` |
-| `drumtraqs.dll` | `modulair.dll` | `scrooo.dll` |
-| `fb02.dll` | `monofury.dll` | `sequencair.dll` |
-| `fb3100.dll` | `mps.dll` | `sixtraq.dll` |
-| `fb3200.dll` | `nabla.dll` | `stigma.dll` |
-| `fb3300.dll` | `NI Absynth 5.dll` | `TAL-U-No-62.dll` |
-| `fb7999.dll` | `NI FM8.dll` | `tricent.dll` |
-| `fbdelay.dll` | `NI Kontakt 5.dll` | `whispair.dll` |
-| `fbphaser.dll` | `NI Massive.dll` |  |
-| `fbvc.dll` | `ny.dll` |  |
+| `blooo.dll` | `freqshifter.dll` | `ny.dll` |
+| `bucketone.dll` | `fury68.dll` | `oxid.dll` |
+| `bucketpops.dll` | `fury800.dll` | `paralogy.dll` |
+| `deputy.dll` | `grainstrain.dll` | `pecs.dll` |
+| `drumtraqs.dll` | `kern.dll` | `qyooo.dll` |
+| `fb02.dll` | `modulair.dll` | `ragnarok2.dll` |
+| `fb3100.dll` | `monofury.dll` | `scrooo.dll` |
+| `fb3200.dll` | `mps.dll` | `sequencair.dll` |
+| `fb3300.dll` | `nabla.dll` | `sixtraq.dll` |
+| `fb7999.dll` | `NI Absynth 5.dll` | `stigma.dll` |
+| `fbdelay.dll` | `NI FM8.dll` | `TAL-U-No-62.dll` |
+| `fbphaser.dll` | `NI Kontakt 5.dll` | `tricent.dll` |
+| `fbvc.dll` | `NI Massive.dll` | `whispair.dll` |
 
 ## Linux native — 56
 `linux/extracted` — `.so` and `.vst3`, dlopen'd, editors embedded as X11 child windows
@@ -167,10 +165,8 @@ documented at length in `peload/README.md`:
   emulate Access Virus and Waldorf hardware and refuse to make a sound without the
   original firmware ROM, which is in no download.
 - `Cardinal.vst3` opens an empty rack by default, so it is silent until patched.
-- `brokenmini` and `drumtraqs` load and run but render silence at both widths --
-  plug-in behaviour, not the host's.
-- `brokenmini`'s editor is refused rather than painted: it registers a font that
-  never reaches the text backend.
+- `drumtraqs` and `bucketpops` only sound on the notes their kits use (36, 38 and
+  42 sound; 48 and 72 do not), so a test on an unmapped note reads as silence.
 - `NI Massive` calls `ExitProcess(1)` while loading. It is reported as a failed
   load rather than taking the window down with it, which is why plug-ins are
   hosted out of process by default.
