@@ -6368,10 +6368,19 @@ void w32_mouse(int x, int y, int msg, int buttons, int wheel)
     /* Record the buttons as key state too. Not every GUI reads the mouse from
      * messages: TAL's polls GetAsyncKeyState(VK_LBUTTON) with GetCursorPos on
      * each idle, so with the button state missing its editor painted perfectly
-     * and ignored every click. VK_LBUTTON 1, VK_RBUTTON 2, VK_MBUTTON 4. */
-    W.keys[1] = (buttons & 1) ? 1 : 0;
-    W.keys[2] = (buttons & 2) ? 1 : 0;
-    W.keys[4] = (buttons & 4) ? 1 : 0;
+     * and ignored every click. VK_LBUTTON 1, VK_RBUTTON 2, VK_MBUTTON 4.
+     *
+     * `buttons` is a wParam MK_ mask, where the middle button is MK_MBUTTON
+     * 0x10 -- 4 is MK_SHIFT. Reading 4 as the middle button meant the middle
+     * button was never seen held. The modifiers ride along in the same mask,
+     * and are recorded as key state as well: a knob's fine adjustment asks
+     * GetKeyState(VK_SHIFT) mid-drag, and the keyboard may never have reached
+     * the editor to say so. */
+    W.keys[1] = (buttons & 0x01) ? 1 : 0;
+    W.keys[2] = (buttons & 0x02) ? 1 : 0;
+    W.keys[4] = (buttons & 0x10) ? 1 : 0;
+    W.keys[0x10] = W.keys[0xA0] = (buttons & 0x04) ? 1 : 0;   /* VK_SHIFT, VK_LSHIFT */
+    W.keys[0x11] = W.keys[0xA2] = (buttons & 0x08) ? 1 : 0;   /* VK_CONTROL, VK_LCONTROL */
     W.last_input_ms = w32_now_ms();
     /* Marked as the user's own: a plug-in that answers this click by putting up
      * a modal dialog is doing what the user asked, and may be given one. */

@@ -2126,6 +2126,9 @@ struct pehost {
      * pehost_set_editor_hooks. */
     v3_runloop_hooks ed_hooks;
     int              has_ed_hooks;
+    /* An in-process Windows VST2 editor is open: effEditOpen succeeded and no
+     * effEditClose has been sent. */
+    int              ed_open;
 };
 
 static char g_err[256];
@@ -3349,7 +3352,13 @@ void pehost_close(pehost *h)
     if (h->au) { macau_close(h->au); free(h->au_ids); free(h); return; }
     /* Tear the editor down before the image goes: the Win32 layer holds the
      * plugin's WndProc, and pumping after the unmap would jump into freed
-     * memory. */
+     * memory. The plug-in is asked to close its editor first, as every VST2
+     * host does before effClose -- it was going straight to effClose with
+     * the editor still open. */
+    if (!h->is_v3 && h->fx && h->ed_open) {
+        h->fx->dispatcher(h->fx, effEditClose, 0, 0, NULL, 0.0f);
+        h->ed_open = 0;
+    }
     w32_reset();
     if (h->is_v3) {
         /* A macOS VST3 draws through the Cocoa stand-ins and the software Metal
@@ -4523,6 +4532,7 @@ int pehost_editor_open(pehost *h)
         return -1;
     }
     w32_show_editor();
+    h->ed_open = 1;
     return 0;
 }
 
@@ -4717,7 +4727,15 @@ void pehost_editor_detach(pehost *h)
     if (h && h->mv) { macvst_editor_close(h->mv); return; }
     if (h && h->au) { macau_editor_close(h->au); return; }
     if (h && h->br) { bridge_editor_close(h->br); return; }
-    if (h && h->is_v3) v3_editor_detach(h->v3);
+    if (h && h->is_v3) { v3_editor_detach(h->v3); return; }
+    /* An in-process Windows VST2. effEditClose is what tells it to take its
+     * windows down; without it the plug-in's own idea of its editor outlived
+     * the windows w32_reset then swept away under it. */
+    if (h && h->fx && h->ed_open) {
+        h->fx->dispatcher(h->fx, effEditClose, 0, 0, NULL, 0.0f);
+        h->ed_open = 0;
+        w32_reset();
+    }
 }
 void pehost_editor_resized(pehost *h, int w, int height)
 {

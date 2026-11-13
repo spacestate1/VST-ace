@@ -1389,8 +1389,10 @@ static signed char bundle_load(id self, SEL sel) { (void)self; (void)sel; return
  *  - locationInWindow is in window coordinates with y measured up from the
  *    bottom, and iPlug2 flips it against the view's height to get its own
  *    top-down y. Hand it a top-down y and every click lands mirrored.
- *  - scrollWheel deltas are in "lines", positive away from the user, whereas the
- *    host reports Windows-style wheel notches of 120.
+ *  - scrollWheel deltas are in "lines", positive away from the user. The host
+ *    hands every editor whole notches (positive away from the user); it is the
+ *    Win32 layer that turns them into WM_MOUSEWHEEL's 120ths, not the front
+ *    end -- so here a notch is a line, not 1/120 of one.
  */
 enum {
     EV_LMOUSEDOWN = 1, EV_LMOUSEUP = 2, EV_RMOUSEDOWN = 3, EV_RMOUSEUP = 4,
@@ -1522,8 +1524,10 @@ void macns_post_mouse(int x, int y, int msg, int buttons, int wheel)
                            e->button = 2;                                 break;
     case WM_MOUSEWHEEL:
         type = EV_SCROLLWHEEL; sel = "scrollWheel:";
-        /* A notch is 120 in the host's units and one line in Cocoa's. */
-        e->dy = (double)wheel / 120.0;
+        /* One notch, one line. Dividing by 120 here, as if the front end
+         * had already scaled to Windows units, made a notch 1/120 of a line
+         * and the wheel did next to nothing in every macOS editor. */
+        e->dy = (double)wheel;
         break;
     case WM_MOUSEMOVE:
     default:
@@ -1531,7 +1535,7 @@ void macns_post_mouse(int x, int y, int msg, int buttons, int wheel)
         if (buttons & 1)      { type = EV_LMOUSEDRAGGED; sel = "mouseDragged:"; }
         else if (buttons & 2) { type = EV_RMOUSEDRAGGED; sel = "rightMouseDragged:";
                                 e->button = 1; }
-        else if (buttons & 4) { type = EV_OMOUSEDRAGGED; sel = "otherMouseDragged:";
+        else if (buttons & 0x10) { type = EV_OMOUSEDRAGGED; sel = "otherMouseDragged:";   /* MK_MBUTTON */
                                 e->button = 2; }
         else                  { type = EV_MOUSEMOVED;    sel = "mouseMoved:"; }
         break;

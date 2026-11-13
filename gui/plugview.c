@@ -213,6 +213,7 @@ struct plugview {
     gulong     ed_xevent_id;    /* the GdkX11Display "xevent" handler */
     double     ed_mx, ed_my;    /* the pointer over a pixel editor, for the wheel */
     double     ed_wheel_acc;    /* wheel travel not yet a whole notch */
+    int        ed_mk;           /* MK_SHIFT / MK_CONTROL of the last pointer event */
     GtkWidget *zoom_out, *zoom_in, *zoom_fit, *zoom_one, *zoom_lbl, *zoom_note;
     int        dead_reported;   /* said once, not once per tick */
 
@@ -1587,7 +1588,7 @@ static void ed_mouse(plugview *pv, int x, int y, int msg, int wheel)
     if (!pv->host || !pv->ed_open) return;
     if (pv->ed_zoom != 1.0) { x = (int)(x / pv->ed_zoom); y = (int)(y / pv->ed_zoom); }
     pv->in_plugin++;
-    pehost_editor_mouse(pv->host, x, y, msg, pv->buttons, wheel);
+    pehost_editor_mouse(pv->host, x, y, msg, pv->buttons | pv->ed_mk, wheel);
     pv->in_plugin--;
 }
 
@@ -1806,12 +1807,21 @@ static void on_zoom_fit(GtkButton *b, gpointer u)
 static void on_zoom_one(GtkButton *b, gpointer u)
 { plugview *pv = u; (void)b; pv->ed_fit_auto = 0; zoom_set(pv, 1.0); }
 
+/* Shift and Ctrl as the wParam of a WM_ mouse message carries them: a knob's
+ * fine adjustment is Shift-drag, its reset Ctrl-click. */
+static int ed_mods(GtkEventController *c)
+{
+    GdkModifierType st = gtk_event_controller_get_current_event_state(c);
+    return ((st & GDK_SHIFT_MASK) ? 0x0004 : 0) | ((st & GDK_CONTROL_MASK) ? 0x0008 : 0);
+}
+
 static void on_ed_pressed(GtkGestureClick *g, int n, double x, double y, gpointer ud)
 {
     int button = (int)gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(g));
     plugview *pv = ud;
     int msg;
 
+    pv->ed_mk = ed_mods(GTK_EVENT_CONTROLLER(g));
     gtk_widget_grab_focus(pv->editor);
     if (button == 3)      { pv->buttons |= MK_RBUTTON; msg = WM_RBUTTONDOWN; }
     else if (button == 2) { pv->buttons |= MK_MBUTTON; msg = WM_MBUTTONDOWN; }
@@ -1827,6 +1837,7 @@ static void on_ed_released(GtkGestureClick *g, int n, double x, double y, gpoint
     int msg;
 
     (void)n;
+    pv->ed_mk = ed_mods(GTK_EVENT_CONTROLLER(g));
     if (button == 3)      { pv->buttons &= ~MK_RBUTTON; msg = WM_RBUTTONUP; }
     else if (button == 2) { pv->buttons &= ~MK_MBUTTON; msg = WM_MBUTTONUP; }
     else                  { pv->buttons &= ~MK_LBUTTON; msg = WM_LBUTTONUP; }
@@ -1834,7 +1845,8 @@ static void on_ed_released(GtkGestureClick *g, int n, double x, double y, gpoint
 }
 
 static void on_ed_motion(GtkEventControllerMotion *m, double x, double y, gpointer ud)
-{ plugview *pv = ud; (void)m; pv->ed_mx = x; pv->ed_my = y; ed_mouse(pv, (int)x, (int)y, WM_MOUSEMOVE, 0); }
+{ plugview *pv = ud; pv->ed_mk = ed_mods(GTK_EVENT_CONTROLLER(m));
+  pv->ed_mx = x; pv->ed_my = y; ed_mouse(pv, (int)x, (int)y, WM_MOUSEMOVE, 0); }
 
 static gboolean on_ed_scroll(GtkEventControllerScroll *s, double dx, double dy, gpointer ud)
 {
@@ -1877,10 +1889,27 @@ static int gdk_to_vk(guint kv)
     case GDK_KEY_BackSpace: return 0x08;
     case GDK_KEY_Tab:       return 0x09;
     case GDK_KEY_Return: case GDK_KEY_KP_Enter: return 0x0D;
+    case GDK_KEY_Shift_L: case GDK_KEY_Shift_R:     return 0x10;
+    case GDK_KEY_Control_L: case GDK_KEY_Control_R: return 0x11;
+    case GDK_KEY_Alt_L: case GDK_KEY_Alt_R:         return 0x12;
     case GDK_KEY_Escape:    return 0x1B;
     case GDK_KEY_space:     return 0x20;
+    case GDK_KEY_Page_Up:   return 0x21;
+    case GDK_KEY_Page_Down: return 0x22;
     case GDK_KEY_End:       return 0x23;
     case GDK_KEY_Home:      return 0x24;
+    case GDK_KEY_Insert:    return 0x2D;
+    case GDK_KEY_semicolon: case GDK_KEY_colon:       return 0xBA;
+    case GDK_KEY_equal:     case GDK_KEY_plus:        return 0xBB;
+    case GDK_KEY_comma:     case GDK_KEY_less:        return 0xBC;
+    case GDK_KEY_minus:     case GDK_KEY_underscore:  return 0xBD;
+    case GDK_KEY_period:    case GDK_KEY_greater:     return 0xBE;
+    case GDK_KEY_slash:     case GDK_KEY_question:    return 0xBF;
+    case GDK_KEY_grave:     case GDK_KEY_asciitilde:  return 0xC0;
+    case GDK_KEY_bracketleft:  case GDK_KEY_braceleft:  return 0xDB;
+    case GDK_KEY_backslash:    case GDK_KEY_bar:        return 0xDC;
+    case GDK_KEY_bracketright: case GDK_KEY_braceright: return 0xDD;
+    case GDK_KEY_apostrophe:   case GDK_KEY_quotedbl:   return 0xDE;
     case GDK_KEY_Left:      return 0x25;
     case GDK_KEY_Up:        return 0x26;
     case GDK_KEY_Right:     return 0x27;
@@ -1890,6 +1919,7 @@ static int gdk_to_vk(guint kv)
         if (kv >= GDK_KEY_0 && kv <= GDK_KEY_9) return (int)(kv - GDK_KEY_0) + 0x30;
         if (kv >= GDK_KEY_a && kv <= GDK_KEY_z) return (int)(kv - GDK_KEY_a) + 0x41;
         if (kv >= GDK_KEY_A && kv <= GDK_KEY_Z) return (int)(kv - GDK_KEY_A) + 0x41;
+        if (kv >= GDK_KEY_F1 && kv <= GDK_KEY_F24) return (int)(kv - GDK_KEY_F1) + 0x70;
         return 0;
     }
 }

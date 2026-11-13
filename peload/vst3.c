@@ -1024,8 +1024,11 @@ struct v3host {
     v3_runloop_hooks hooks;
     int        has_hooks;
     unsigned char *state_buf;   /* the last v3_get_state result */
-    int        resync;          /* a program changed: refresh the controller */
-    volatile int blocks_since_program;
+    /* A program changed: refresh the controller once the processor has run a
+     * block with it. Set and cleared by the UI thread, counted by the audio
+     * thread -- atomics, since volatile orders nothing between the two. */
+    _Atomic int resync;
+    _Atomic int blocks_since_program;
     char       subcat[128];     /* "Fx|Delay", "Instrument|Synth": the class's own category */
 
     char   name[64], vendor[64];
@@ -1765,7 +1768,8 @@ void V3N(v3_set_program)(v3host *h, int i)
 {
     if (!h || i < 0 || i >= h->nprograms) return;
     h->program = i;
-    h->resync = 1;
+    atomic_store_explicit(&h->blocks_since_program, 0, memory_order_relaxed);
+    atomic_store_explicit(&h->resync, 1, memory_order_release);
     /* VST3 has no setProgram: write the kIsProgramChange parameter instead, so
      * the change reaches both the controller and the processor. */
     if (h->prog_param >= 0) {
@@ -1800,7 +1804,12 @@ float V3N(v3_get_param)(v3host *h, int i)
 {
     if (!h || !h->ctrl || i < 0 || i >= h->nparams) return 0.0f;
     /* A program change reaches the processor on its next block; read after that. */
-    if (h->resync && h->blocks_since_program > 0) { h->resync = 0; h->blocks_since_program = 0; ctrl_sync(h); }
+    if (atomic_load_explicit(&h->resync, memory_order_acquire) &&
+        atomic_load_explicit(&h->blocks_since_program, memory_order_acquire) > 0) {
+        atomic_store_explicit(&h->resync, 0, memory_order_relaxed);
+        atomic_store_explicit(&h->blocks_since_program, 0, memory_order_relaxed);
+        ctrl_sync(h);
+    }
     return (float)h->ctrl->vt->getParamNormalized(h->ctrl, h->pid[i]);
 }
 
@@ -1916,8 +1925,6 @@ int V3N(v3_has_editor)(v3host *h)
     return v->vt->isPlatformTypeSupported(v, PLATFORM_X11) == V3_OK;
 }
 
-/* Called from the editor pump, which is the UI thread. Hands the controller
- * everything the processor reported since the last one. */
 /* ---- plug-in state: the block written by v3_get_state ---- */
 int V3N(v3_has_state)(const v3host *h) { return h && h->comp; }
 
@@ -1972,6 +1979,8 @@ int V3N(v3_set_state)(v3host *h, const void *data, int len)
     return 1;
 }
 
+/* Called from the editor pump, which is the UI thread. Hands the controller
+ * everything the processor reported since the last one. */
 void V3N(v3_ui_idle)(v3host *h)
 {
     unsigned hd, tl;
@@ -2299,8 +2308,12 @@ void V3N(v3_render)(v3host *h, const float *src, float *out, int frames)
     }
 
     {
-    if (h->resync) h->blocks_since_program++;
         tresult pr = h->proc->vt->process(h->proc, &pd);
+        /* Counted after the block, not before it: the controller is synced
+         * from the processor's state, which has the program only once a block
+         * carrying the change has actually run. */
+        if (atomic_load_explicit(&h->resync, memory_order_relaxed))
+            atomic_fetch_add_explicit(&h->blocks_since_program, 1, memory_order_release);
         /* Once, and only when it is not success: a per-block message would
          * bury the log, and a plug-in that refuses to process is the one thing
          * that explains silence with no other symptom. */

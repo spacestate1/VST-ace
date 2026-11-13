@@ -2630,14 +2630,21 @@ protected:
     /* WM_* mouse codes, so the plugin sees what it expects. */
     enum { WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202,
            WM_LBUTTONDBLCLK = 0x0203, WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205,
-           WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208, WM_MOUSEWHEEL = 0x020A };
+           WM_RBUTTONDBLCLK = 0x0206,
+           WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208, WM_MBUTTONDBLCLK = 0x0209,
+           WM_MOUSEWHEEL = 0x020A };
 
+    /* The wParam a WM_ mouse message carries: buttons and the two modifiers a
+     * plug-in reads from it (Shift for fine adjustment, Ctrl for reset). */
     static int mkButtons(Qt::MouseButtons b)
     {
         int m = 0;
         if (b & Qt::LeftButton)   m |= 0x0001;   /* MK_LBUTTON */
         if (b & Qt::RightButton)  m |= 0x0002;   /* MK_RBUTTON */
         if (b & Qt::MiddleButton) m |= 0x0010;   /* MK_MBUTTON */
+        const Qt::KeyboardModifiers k = QGuiApplication::queryKeyboardModifiers();
+        if (k & Qt::ShiftModifier)   m |= 0x0004; /* MK_SHIFT */
+        if (k & Qt::ControlModifier) m |= 0x0008; /* MK_CONTROL */
         return m;
     }
     /* Every mouse message goes through here, which is what makes zoom safe to
@@ -2666,8 +2673,15 @@ protected:
            : e->button() == Qt::MiddleButton ? WM_MBUTTONUP : WM_LBUTTONUP,
              e->position().toPoint(), e->buttons());
     }
+    /* The button that was double-clicked, not always the left: a right
+     * double-click sent as WM_LBUTTONDBLCLK and followed by WM_RBUTTONUP left the
+     * plug-in believing the left button was down. */
     void mouseDoubleClickEvent(QMouseEvent *e) override
-    { send(WM_LBUTTONDBLCLK, e->position().toPoint(), e->buttons()); }
+    {
+        send(e->button() == Qt::RightButton ? WM_RBUTTONDBLCLK
+           : e->button() == Qt::MiddleButton ? WM_MBUTTONDBLCLK : WM_LBUTTONDBLCLK,
+             e->position().toPoint(), e->buttons());
+    }
     void mouseMoveEvent(QMouseEvent *e) override
     { send(WM_MOUSEMOVE, e->position().toPoint(), e->buttons()); }
     void wheelEvent(QWheelEvent *e) override
@@ -2681,40 +2695,98 @@ protected:
             e->accept();
             return;
         }
-        send(WM_MOUSEWHEEL, e->position().toPoint(), e->buttons(),
-             e->angleDelta().y() / 120);
+        /* Whole notches, accumulated: a touchpad or a high-resolution wheel
+         * sends a fraction of 120 at a time, which divided to nothing. */
+        wheelAcc_ += e->angleDelta().y();
+        const int notches = wheelAcc_ / 120;
+        if (!notches) return;
+        wheelAcc_ -= notches * 120;
+        send(WM_MOUSEWHEEL, e->position().toPoint(), e->buttons(), notches);
     }
+    /* Guarded like the mouse: a key reaches the plug-in's window procedure, and
+     * a key event delivered by the input pump from inside a plug-in call would
+     * otherwise enter it a second time. Keys with no virtual-key code and no
+     * character are not sent at all -- they used to go out as their low byte,
+     * which made Home look like Shift and '.' like Delete. */
     void keyPressEvent(QKeyEvent *e) override
     {
-        if (!host_) return;
+        if (!host_ || g_inPlugin) return;
         const QString t = e->text();
-        pehost_editor_key(host_, qtToVk(e->key()), 1,
-                          t.isEmpty() ? 0 : t.at(0).unicode());
+        const int vk = qtToVk(e->key());
+        const int ch = t.isEmpty() ? 0 : t.at(0).unicode();
+        if (!vk && !ch) return;
+        PluginCall guard;
+        pehost_editor_key(host_, vk, 1, ch);
     }
     void keyReleaseEvent(QKeyEvent *e) override
-    { if (host_) pehost_editor_key(host_, qtToVk(e->key()), 0, 0); }
+    {
+        if (!host_ || g_inPlugin) return;
+        const int vk = qtToVk(e->key());
+        if (!vk) return;
+        PluginCall guard;
+        pehost_editor_key(host_, vk, 0, 0);
+    }
 
 private:
     /* Qt key codes to Windows virtual keys, for the ones an editor cares about. */
+public:
     static int qtToVk(int k)
     {
         switch (k) {
         case Qt::Key_Backspace: return 0x08;
-        case Qt::Key_Tab:       return 0x09;
+        case Qt::Key_Tab: case Qt::Key_Backtab: return 0x09;
         case Qt::Key_Return: case Qt::Key_Enter: return 0x0D;
+        case Qt::Key_Shift:     return 0x10;
+        case Qt::Key_Control:   return 0x11;
+        case Qt::Key_Alt:       return 0x12;
+        case Qt::Key_Pause:     return 0x13;
+        case Qt::Key_CapsLock:  return 0x14;
         case Qt::Key_Escape:    return 0x1B;
-        case Qt::Key_Delete:    return 0x2E;
+        case Qt::Key_Space:     return 0x20;
+        case Qt::Key_PageUp:    return 0x21;
+        case Qt::Key_PageDown:  return 0x22;
+        case Qt::Key_End:       return 0x23;
+        case Qt::Key_Home:      return 0x24;
         case Qt::Key_Left:      return 0x25;
         case Qt::Key_Up:        return 0x26;
         case Qt::Key_Right:     return 0x27;
         case Qt::Key_Down:      return 0x28;
+        case Qt::Key_Insert:    return 0x2D;
+        case Qt::Key_Delete:    return 0x2E;
+        case Qt::Key_Meta:      return 0x5B;
+        case Qt::Key_Asterisk:  return '8';
+        case Qt::Key_Plus:      return 0xBB;          /* VK_OEM_PLUS: the = + key */
+        case Qt::Key_Equal:     return 0xBB;
+        case Qt::Key_Semicolon: case Qt::Key_Colon:      return 0xBA;
+        case Qt::Key_Comma:     case Qt::Key_Less:       return 0xBC;
+        case Qt::Key_Minus:     case Qt::Key_Underscore: return 0xBD;
+        case Qt::Key_Period:    case Qt::Key_Greater:    return 0xBE;
+        case Qt::Key_Slash:     case Qt::Key_Question:   return 0xBF;
+        case Qt::Key_QuoteLeft: case Qt::Key_AsciiTilde: return 0xC0;
+        case Qt::Key_BracketLeft:  case Qt::Key_BraceLeft:  return 0xDB;
+        case Qt::Key_Backslash:    case Qt::Key_Bar:        return 0xDC;
+        case Qt::Key_BracketRight: case Qt::Key_BraceRight: return 0xDD;
+        case Qt::Key_Apostrophe:   case Qt::Key_QuoteDbl:   return 0xDE;
+        /* Shifted digits arrive as their symbols; the key is still the digit. */
+        case Qt::Key_Exclam:      return '1';
+        case Qt::Key_At:          return '2';
+        case Qt::Key_NumberSign:  return '3';
+        case Qt::Key_Dollar:      return '4';
+        case Qt::Key_Percent:     return '5';
+        case Qt::Key_AsciiCircum: return '6';
+        case Qt::Key_Ampersand:   return '7';
+        case Qt::Key_ParenLeft:   return '9';
+        case Qt::Key_ParenRight:  return '0';
         default:
             if (k >= Qt::Key_A && k <= Qt::Key_Z) return k;          /* already VK_A.. */
             if (k >= Qt::Key_0 && k <= Qt::Key_9) return k;
-            return k & 0xFF;
+            if (k >= Qt::Key_F1 && k <= Qt::Key_F24) return 0x70 + (k - Qt::Key_F1);
+            return 0;                     /* nothing a plug-in would recognise */
         }
     }
+private:
 
+    int wheelAcc_ = 0;     /* wheel travel not yet a whole notch */
     void applyVisible(bool shown)
     {
         if (!host_) return;
@@ -4373,14 +4445,14 @@ private slots:
 
         /* Marked unsupported during the scan; say so rather than crashing into
          * a failed load. */
+        /* Nothing is unloaded for it, so nothing else changes: the plug-in
+         * that is loaded stays loaded, playing, with its editor. Detaching
+         * that editor here left a plug-in sounding with no way back to its
+         * interface -- the editor was marked open and never reopened. */
         if (unloadable_.contains(paths_[row])) {
-            editor_->detach();
-            pixelEditor_->detach();
-            info_->setText("<b>" + QFileInfo(paths_[row]).fileName().toHtmlEscaped() +
-                           "</b> cannot be loaded by this host.<br>"
-                           "<span style='color:#888'>Only 64-bit x86 plugins are "
-                           "supported.</span>");
-            status("unsupported plugin", 4000);
+            status(QFileInfo(paths_[row]).fileName() +
+                   " cannot be loaded by this host (only 64-bit x86 plug-ins are "
+                   "supported) -- the loaded plug-in is unchanged", 6000);
             return;
         }
 
@@ -4582,14 +4654,25 @@ private slots:
      * reads only one of the three is common; Return follows, since a field that
      * commits on Enter commits on nothing else. The editor is pumped between
      * keys so a plug-in that repaints per keystroke gets the chance. */
-    void typeIntoEditor(const QString &text)
+    /* Returns false when there is nobody to type into: a native editor is
+     * the plug-in's own X window, and keys sent this way go to the Win32 layer
+     * -- which has no window of that plug-in's -- so they reached nothing while
+     * the status line counted them as sent. Type into a native editor directly.
+     * Guarded, like every other call into the editor. */
+    bool typeIntoEditor(const QString &text)
     {
         pehost *h = eng_.host();
-        if (!h) return;
+        if (!h || g_inPlugin) return false;
+        if (editorKind_ != PEHOST_EDITOR_PIXELS) return false;
+        PluginCall guard;
         for (const QChar qc : text) {
             const int ch = qc.unicode();
             if (ch < 32 || ch > 126) continue;
-            const int vk = (ch >= 'a' && ch <= 'z') ? ch - 'a' + 'A' : ch;
+            /* Qt's key codes for printable ASCII are the upper-case characters,
+             * so the key map serves; a character used as its own virtual key
+             * made '-' VK_INSERT and '.' VK_DELETE. */
+            int vk = PixelEditor::qtToVk(QChar(ch).toUpper().unicode());
+            if (!vk) vk = ch;
             pehost_editor_key(h, vk, 1, ch);
             pehost_editor_pump(h);
             pehost_editor_key(h, vk, 0, ch);
@@ -4599,6 +4682,7 @@ private slots:
         pehost_editor_pump(h);
         pehost_editor_key(h, 0x0D, 0, 0);
         pehost_editor_pump(h);
+        return true;
     }
 
     void enterPluginKey()
@@ -4618,7 +4702,12 @@ private slots:
         if (!ok) return;
         const QString key = text.trimmed();
         if (key.isEmpty()) return;
-        typeIntoEditor(key);
+        if (!typeIntoEditor(key)) {
+            status(editorKind_ == PEHOST_EDITOR_X11
+                ? QString("this editor is the plug-in's own window -- click its field and type there")
+                : QString("the editor is busy; try again"), 6000);
+            return;
+        }
         status(
             QString("sent %1 character(s) to the editor").arg(key.size()), 5000);
     }
