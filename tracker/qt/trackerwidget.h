@@ -177,6 +177,7 @@ signals:
     void trackAddRequested();        // Ctrl+Insert
     void trackRemoveRequested();     // Ctrl+Delete
     void clipped(int key);           // copied, cut or pasted: for the status line
+    void restored();                 // an undo or redo put the song back: the header boxes follow
 
 public:
     // View > Dark grid: the pattern columns on a dark page whatever the
@@ -353,7 +354,7 @@ protected:
                            k == TRK_K_CUT || k == TRK_K_PASTE || k == TRK_K_PASTE_MIX ||
                            (k >= TRK_K_TRANSPOSE_DOWN && k <= TRK_K_TRANSPOSE_OCT_UP)))
                 emit edited();
-            if (k == TRK_K_UNDO || k == TRK_K_REDO) emit edited();
+            if (k == TRK_K_UNDO || k == TRK_K_REDO) { emit edited(); emit restored(); }
             if (k == TRK_K_COPY || k == TRK_K_CUT || k == TRK_K_PASTE || k == TRK_K_PASTE_MIX) emit clipped(k);
             if (k == TRK_K_EDIT) emit editToggled();
             if (k == TRK_K_MUTE_TRACK || k == TRK_K_SOLO_TRACK || k == TRK_K_UNMUTE_ALL) emit mutesChanged();
@@ -513,7 +514,8 @@ protected:
 
     void key(int k)
     {
-        trk_key(e_, ed_, k);
+        const int did = trk_key(e_, ed_, k);
+        if (did && (k == TRK_K_UNDO || k == TRK_K_REDO)) { emit edited(); emit restored(); }
         if (k == TRK_K_CUT || k == TRK_K_PASTE) emit edited();
         if (k == TRK_K_COPY || k == TRK_K_CUT || k == TRK_K_PASTE) emit clipped(k);
     }
@@ -1758,6 +1760,17 @@ public:
             else
                 host_->showStatus((k == TRK_K_COPY ? "copied " : k == TRK_K_CUT ? "cut " : "pasted ")
                                          + size, 3000);
+        });
+        // An undo or redo can bring a removed track back or take an added one
+        // away -- a different set of tracks, names and windows under the
+        // headers -- so they are read from the song again, as after + Track.
+        connect(view_, &PatternView::restored, this, [this] {
+            if (ed_.track >= view_->nt()) ed_.track = view_->nt() - 1;
+            view_->updateSize();
+            syncFromSong();
+            refreshDests(true);
+            refreshSamples();
+            view_->update();
         });
         // A key muted or soloed tracks: the header boxes show the song's state.
         connect(view_, &PatternView::mutesChanged, this, [this] {

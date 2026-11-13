@@ -1355,6 +1355,192 @@ int main(void)
         free(snap);
     }
 
+    printf("a synth track given a sample set while playing\n");
+    {
+        trk_song *keep = malloc(sizeof *keep);
+        int sid, mark_s, sounding = 0, ons = 0;
+        trk_stop(e);
+        trk_undo_clear(e);
+        trk_lock(e);
+        *keep = *s;
+        memset(s->pattern[5].cell, TRK_EMPTY, sizeof s->pattern[5].cell);
+        s->pattern[5].rows = 16;
+        s->pattern[5].cell[0][0].note = 64;          /* held: nothing in the pattern ends it */
+        s->track[0].samples[0] = 0;
+        s->track[0].mute = 0;
+        s->track[0].channel = 0;
+        trk_unlock(e);
+        sid = trk_add_sink(e, "kit switch sink", sink_cb, NULL);
+        trk_route_sink(e, 0, sid);
+        pthread_mutex_lock(&g_smx); mark_s = g_snev; pthread_mutex_unlock(&g_smx);
+        trk_play(e, TRK_PLAY_PATTERN, 5, 0);
+        usleep(400000);
+        trk_lock(e);
+        snprintf(s->track[0].samples, sizeof s->track[0].samples, "testkit");
+        trk_unlock(e);
+        trk_route(e);                                /* what the sample-set box does */
+        usleep(400000);
+        pthread_mutex_lock(&g_smx);                  /* still playing: Stop would hide it */
+        for (i = mark_s; i < g_snev; i++) {
+            const sink_rec *x = &g_sev[i];
+            if (x->d1 != 64) continue;
+            if ((x->st & 0xF0) == 0x90 && x->d2 > 0) { sounding = 1; ons++; }
+            else if ((x->st & 0xF0) == 0x80 || ((x->st & 0xF0) == 0x90 && x->d2 == 0)) sounding = 0;
+        }
+        pthread_mutex_unlock(&g_smx);
+        check(ons > 0, "the synth was playing the track's note");
+        check(!sounding, "the note is released to the synth when the track takes a sample set");
+        trk_stop(e);
+        trk_route_sink(e, 0, -1);
+        trk_remove_sink(e, sid);
+        trk_lock(e);
+        *s = *keep;
+        trk_unlock(e);
+        trk_route(e);
+        free(keep);
+    }
+
+    printf("undo across tracks added and removed\n");
+    {
+        trk_song *keep = malloc(sizeof *keep);
+        trk_editor ed;
+        int sid;
+        trk_editor_init(&ed);
+        trk_stop(e);
+        trk_undo_clear(e);
+        trk_lock(e);
+        *keep = *s;
+        s->ntracks = 6;
+        for (i = 0; i < TRK_TRACKS; i++) {
+            snprintf(s->track[i].name, sizeof s->track[i].name, "T%d", i);
+            s->track[i].sink[0] = 0;
+            s->track[i].samples[0] = 0;
+        }
+        s->track[1].channel = 5;
+        s->track[1].volume = 70;
+        trk_unlock(e);
+        sid = trk_add_sink(e, "undo track sink", sink_cb, NULL);
+        trk_route_sink(e, 2, sid);
+
+        check(trk_track_insert(e, 1) == 0, "a track added at 2");
+        check(trk_sink_of(e, 3) == sid && trk_sink_of(e, 2) < 0, "the synth moved with its track");
+        trk_lock(e); s->track[2].volume = 55; trk_unlock(e);          /* a header box, after */
+        check(trk_undo(e) == 1, "the add undone");
+        check(s->ntracks == 6 && !strcmp(s->track[1].name, "T1") && !strcmp(s->track[2].name, "T2"),
+              "the tracks are back where they were");
+        check(trk_sink_of(e, 2) == sid && trk_sink_of(e, 3) < 0 && !strcmp(s->track[2].sink, "undo track sink"),
+              "the synth is on the track that plays it, not on the one now in its old place");
+        check(s->track[1].volume == 55 && s->track[1].channel == 5,
+              "a header setting made since the add survives undoing it");
+        check(trk_redo(e) == 1 && trk_sink_of(e, 3) == sid && trk_sink_of(e, 2) < 0 &&
+              s->track[2].volume == 55, "redone: the synth and the setting follow again");
+        check(trk_undo(e) == 1 && trk_sink_of(e, 2) == sid, "and undone again");
+
+        check(trk_track_remove(e, 2) == 0 && trk_sink_of(e, 2) < 0, "the synth's track removed");
+        check(trk_undo(e) == 1 && trk_sink_of(e, 2) == sid && !strcmp(s->track[2].name, "T2"),
+              "the removal undone: the track is back on its synth");
+        {
+            int k;
+            for (k = 0; k < TRK_TRACKS; k++)
+                if (k != 2 && trk_sink_of(e, k) == sid) break;
+            check(k == TRK_TRACKS, "and no other track plays it");
+        }
+
+        /* An edit, then a header box, then undo: the box stays. */
+        trk_undo_clear(e);
+        trk_key(e, &ed, 'x');                        /* D-4: edit is on in a fresh editor */
+        trk_lock(e);
+        snprintf(s->track[0].client, sizeof s->track[0].client, "trkrx B");
+        s->track[0].mute = 1;
+        s->track[0].volume = 40;
+        trk_unlock(e);
+        check(s->pattern[0].cell[0][0].note == 62 && trk_undo(e) == 1 &&
+              s->pattern[0].cell[0][0].note == keep->pattern[0].cell[0][0].note, "the note undone");
+        check(!strcmp(s->track[0].client, "trkrx B") && s->track[0].mute == 1 && s->track[0].volume == 40,
+              "the track's window, mute and volume are not");
+
+        trk_route_sink(e, 2, -1);
+        trk_remove_sink(e, sid);
+        trk_undo_clear(e);
+        trk_lock(e);
+        *s = *keep;
+        trk_unlock(e);
+        trk_route(e);
+        free(keep);
+    }
+
+    printf("rewinds on row boundaries lose no note-off\n");
+    {
+        trk_song *keep = malloc(sizeof *keep);
+        int from, ok_rows = 0, k;
+        double until;
+        trk_stop(e);
+        trk_lock(e);
+        *keep = *s;
+        memset(s->pattern[6].cell, TRK_EMPTY, sizeof s->pattern[6].cell);
+        s->pattern[6].rows = 8;
+        for (i = 0; i < 8; i += 2) {
+            s->pattern[6].cell[i][0].note = 60;
+            s->pattern[6].cell[i + 1][0].note = TRK_NOTE_OFF;
+        }
+        s->track[0].mute = 0;
+        s->track[0].samples[0] = 0;
+        s->track[0].sink[0] = 0;
+        snprintf(s->track[0].client, sizeof s->track[0].client, "trkrx A");
+        trk_unlock(e);
+        trk_route(e);
+        trk_set_bpm(e, 120);
+        pthread_mutex_lock(&g_mx); from = g_nev; pthread_mutex_unlock(&g_mx);
+        trk_play(e, TRK_PLAY_PATTERN, 6, 0);
+        /* A rewind every few hundred microseconds -- a tempo nudge is one --
+         * for three seconds: row boundaries land under some of them. */
+        until = now_s() + 3.0;
+        k = 0;
+        while (now_s() < until) {
+            trk_set_bpm(e, (k++ & 1) ? 120.0 : 120.01);
+            usleep(300);
+        }
+        trk_set_bpm(e, 120);
+        /* Into a note-off row and past its time: nothing may still sound. */
+        for (k = 0; k < 3; k++) {
+            if (!wait_row(e, 1 + 2 * k, 60)) continue;
+            pthread_mutex_lock(&g_mx);
+            if (all_released(from, g_nev)) ok_rows++;
+            pthread_mutex_unlock(&g_mx);
+        }
+        check(ok_rows == 3, "after 3 s of rewinds, every note-off row leaves nothing sounding");
+        trk_stop(e);
+        trk_lock(e);
+        *s = *keep;
+        trk_unlock(e);
+        trk_route(e);
+        free(keep);
+    }
+
+    printf("the lowest octave, and rows past a pattern's end, round-trip\n");
+    {
+        trk_song *a = malloc(sizeof *a), *b = malloc(sizeof *b);
+        char sp[] = "/tmp/trklow-XXXXXX", nm[8];
+        int fd = mkstemp(sp), allnotes = 1;
+        if (fd >= 0) close(fd);
+        trk_song_init(a);
+        for (i = 0; i < 128; i++) a->pattern[0].cell[i][0].note = (uint8_t)i;
+        a->pattern[0].rows = 200;                    /* every note visible */
+        a->pattern[1].rows = 8;
+        a->pattern[1].cell[12][3].note = 65;         /* below the end: kept, hidden */
+        check(trk_song_save(a, sp, err, sizeof err) == 0 && trk_song_load(b, sp, err, sizeof err) == 0,
+              "saved and loaded");
+        for (i = 0; i < 128; i++) if (b->pattern[0].cell[i][0].note != i) { allnotes = 0; printf("        note %d lost\n", i); }
+        check(allnotes, "every note 0..127 comes back");
+        check(!strcmp(trk_note_name(0, nm), "C--") && !strcmp(trk_note_name(11, nm), "B--") &&
+              !strcmp(trk_note_name(12, nm), "C-0"), "the octave below C-0 is shown, as C-- .. B--");
+        check(b->pattern[1].rows == 8 && b->pattern[1].cell[12][3].note == 65,
+              "a cell below a shortened pattern's end survives the file");
+        check(!memcmp(a, b, sizeof *a), "the same song after the round trip");
+        unlink(sp);
+        free(a); free(b);
+    }
+
     printf("recording\n");
     {
         trk_editor ed;

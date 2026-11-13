@@ -167,6 +167,12 @@ struct trk_engine {
     unsigned        next_tick, next_clock;
     unsigned        clock_base;           /* tick of the first clock */
     int             held[TRK_TRACKS];     /* note the schedule has sounding, or -1 */
+    /* The row a rewind scheduled again at the queue's own tick, whose
+     * note-ons a window may or may not have had already: each is sent behind
+     * a note-off for the same note, so a window that had it retriggers one
+     * voice rather than stacking a second that one note-off would not end. */
+    int             replay_on;
+    unsigned        replay_tick;
     int             held_ch[TRK_TRACKS];
     pos_mark        pos[POS_RING];
     unsigned        npos;
@@ -248,6 +254,14 @@ struct trk_engine {
     pthread_mutex_t dmx;
     trk_sink        sink[TRK_SINKS];
     int             track_sink[TRK_TRACKS]; /* the sink a track plays, or -1: its window */
+    /* Which track is in each place, as a number no other track has had:
+     * moved with the tracks when they are inserted and removed, and kept in
+     * every undo snapshot, so a restore can tell which of the tracks it puts
+     * back is which track now -- and keep that track's routing and header
+     * settings, which are not edits. Under lock. */
+    int             track_id[TRK_TRACKS];
+    int             next_track_id;
+    _Atomic int     route_after;          /* a restore moved tracks: route at the next trk_unlock */
     pthread_t       dthread;
     int             delivery_on;
     _Atomic int     dquit;
@@ -305,13 +319,15 @@ static int hit_velocity(const trk_track *k, int cell_velocity)
     return trk_track_velocity(&open, cell_velocity);
 }
 
-/* Pending hits after `tick` gone -- or all of them. */
+/* Pending hits at `tick` and after gone -- or all of them. At, too: a rewind
+ * schedules the row at the queue's own tick again (see rewind_locked), and a
+ * hit kept there as well would play twice. */
 static void drop_samples(trk_engine *e, int all, unsigned tick)
 {
     int i, j;
     pthread_mutex_lock(&e->smx);
     for (i = j = 0; i < e->nsev; i++)
-        if (!all && (e->sev[i].asap || e->sev[i].tick <= tick)) e->sev[j++] = e->sev[i];
+        if (!all && (e->sev[i].asap || e->sev[i].tick < tick)) e->sev[j++] = e->sev[i];
     e->nsev = j;
     pthread_mutex_unlock(&e->smx);
 }
@@ -355,8 +371,11 @@ static void sink_push(trk_engine *e, int s, unsigned tick, int asap, int st, int
     pthread_mutex_unlock(&e->dmx);
 }
 
-/* Pending sink events after `tick` gone -- or all of them. As drop_samples is
- * for the kits: called wherever scheduled events are taken back. */
+/* Pending sink events at `tick` and after gone -- or all of them. As
+ * drop_samples is for the kits: called wherever scheduled events are taken
+ * back. The row at `tick` is scheduled again by the rewind, so its events go
+ * here rather than arrive twice; the clock and transport are not, so those
+ * at `tick` stay. */
 static void drop_sinks(trk_engine *e, int all, unsigned tick)
 {
     int s, i, j;
@@ -364,7 +383,9 @@ static void drop_sinks(trk_engine *e, int all, unsigned tick)
     for (s = 0; s < TRK_SINKS; s++) {
         trk_sink *k = &e->sink[s];
         for (i = j = 0; i < k->nq; i++)
-            if (!all && (k->q[i].asap || k->q[i].tick <= tick)) k->q[j++] = k->q[i];
+            if (!all && (k->q[i].asap || k->q[i].tick < tick ||
+                         (k->q[i].tick == tick && k->q[i].st >= 0xF0)))
+                k->q[j++] = k->q[i];
         k->nq = j;
     }
     pthread_mutex_unlock(&e->dmx);
@@ -604,6 +625,8 @@ static void schedule_row(trk_engine *e)
             kk.volume = track_rel_volume(e, t);
             vel = trk_track_velocity(&kk, c->vel == TRK_EMPTY ? 0 : c->vel);
             if (!on_gain) track_volume(e, t, e->next_tick, 0);
+            if (e->replay_on && e->next_tick == e->replay_tick && e->track_sink[t] < 0)
+                track_ev(e, t, e->next_tick, 0, 0x80 | ch, c->note, 0);
             track_ev(e, t, e->next_tick, 0, 0x90 | ch, c->note, vel);
             e->held[t] = c->note;
             e->held_ch[t] = ch;
@@ -611,6 +634,7 @@ static void schedule_row(trk_engine *e)
         }
     }
 
+    if (e->replay_on && e->next_tick >= e->replay_tick) e->replay_on = 0;
     e->next_tick += TRK_PPQ / (trk_lpb_ok(s->lpb) ? s->lpb : 4);
     if (++e->row >= pt->rows) {
         e->row = 0;
@@ -669,13 +693,22 @@ static void rewind_locked(trk_engine *e)
     unschedule(e);
     drop_samples(e, 0, cur);
     drop_sinks(e, 0, cur);
+    /* Back to the first row at or after the queue's tick. At, not after: the
+     * queue reports a tick once it has reached it, which is before -- and the
+     * kernel may put off -- sending that tick's events, and unschedule has just
+     * removed whatever of them was still waiting. Treated as played, such a
+     * row was lost, and with it any note-off on it: a note held until Stop.
+     * Played again, it costs at most a note that was already sent being sent
+     * again -- and replay_tick below makes even that a clean retrigger. */
     n = e->npos < POS_RING ? e->npos : POS_RING;
     for (i = 1; i <= n; i++) {
-        if (e->pos[(e->npos - i) % POS_RING].tick <= cur) break;
+        if (e->pos[(e->npos - i) % POS_RING].tick < cur) break;
         back = i;
     }
+    e->replay_on = 0;
     if (back) {
         const pos_mark *m = &e->pos[(e->npos - back) % POS_RING];
+        if (m->tick == cur) { e->replay_on = 1; e->replay_tick = cur; }
         e->next_tick = m->tick;
         e->row = m->row;
         if (e->mode == TRK_PLAY_SONG) e->order = m->order;
@@ -1593,7 +1626,7 @@ static void fit_sample_octaves(trk_engine *e)
 int trk_route(trk_engine *e)
 {
     snd_seq_addr_t want[TRK_TRACKS], clk[TRK_TRACKS];
-    int ok[TRK_TRACKS], t, i, missing, nclk = 0, moved = 0;
+    int ok[TRK_TRACKS], left_sink[TRK_TRACKS], t, i, missing, nclk = 0, moved = 0;
 
     missing = load_samples(e);
     pthread_mutex_lock(&e->lock);
@@ -1606,12 +1639,21 @@ int trk_route(trk_engine *e)
                 resolve(e, k->client, k->port, &want[t]) == 0;
         if (k->client[0] && !is_sampled(k) && e->track_sink[t] < 0 && !ok[t]) missing++;
         if (e->routed[t] && (!ok[t] || !same_addr(want[t], e->dest[t]))) moved++;
+        /* A track on an in-process synth that now plays a sample set. It was
+         * never "routed" -- the synth is not a window -- so the test above
+         * does not see it leave; but the synth may be holding the last note
+         * the track gave it, and the sample branch of the schedule sends a
+         * synth nothing, a note-off least of all. Released below, to the
+         * synth, which is still the track's sink. */
+        left_sink[t] = is_sampled(k) && e->track_sink[t] >= 0 && e->chans_used[t];
+        if (left_sink[t]) moved++;
     }
     /* A track's queued notes go wherever its port is connected when their
      * time comes. Taken back first, they cannot reach the new window. */
     if (moved && e->playing) rewind_locked(e);
 
     for (t = 0; t < TRK_TRACKS; t++) {
+        if (left_sink[t]) release_track(e, t);
         if (e->routed[t] && (!ok[t] || !same_addr(want[t], e->dest[t]))) {
             /* Going somewhere else: what it left sounding there is released
              * while the connection still exists to carry the note-offs. */
@@ -3070,6 +3112,7 @@ trk_engine *trk_open(char *err, size_t errn)
     pthread_mutex_init(&e->dmx, NULL);
     for (t = 0; t < TRK_TRACKS; t++) e->track_kit[t] = -1;
     for (t = 0; t < TRK_TRACKS; t++) e->track_sink[t] = -1;
+    for (t = 0; t < TRK_TRACKS; t++) e->track_id[t] = ++e->next_track_id;
     e->bpm_now = 120.0;
     if (pthread_create(&e->thread, NULL, sched_thread, e)) {
         snprintf(err, errn, "could not start the scheduling thread");
@@ -3304,6 +3347,9 @@ void trk_unlock(trk_engine *e)
     if (atomic_load_explicit(&e->vol_live, memory_order_relaxed) != e->song.volume) sink_gains_locked(e);
     atomic_store_explicit(&e->vol_live, e->song.volume, memory_order_relaxed);
     pthread_mutex_unlock(&e->lock);
+    /* An undo or redo that put tracks back in other places: their windows
+     * and sample sets follow now, not at the shell's next route timer. */
+    if (atomic_exchange(&e->route_after, 0)) trk_route(e);
 }
 
 /* Routing is runtime state, which a snapshot does not hold: the sink names
@@ -3333,6 +3379,7 @@ static void sync_sink_names(trk_engine *e)
  * is tens of kilobytes where the whole song is over a megabyte. */
 struct snap {
     unsigned char hdr[offsetof(trk_song, pattern)];
+    int           ids[TRK_TRACKS];          /* e->track_id as it was */
     int           npat;
     struct { int idx; trk_pattern p; } pat[];
 };
@@ -3350,14 +3397,16 @@ static int pattern_blank(const trk_pattern *p)
     return memcmp(p, &blank, sizeof blank) == 0;
 }
 
-static struct snap *snap_make(const trk_song *s)
+static struct snap *snap_make(const trk_engine *e)
 {
+    const trk_song *s = &e->song;
     struct snap *k;
     int p, n = 0;
     for (p = 0; p < TRK_PATTERNS; p++) if (!pattern_blank(&s->pattern[p])) n++;
     k = malloc(sizeof *k + (size_t)n * sizeof k->pat[0]);
     if (!k) return NULL;
     memcpy(k->hdr, s, sizeof k->hdr);
+    memcpy(k->ids, e->track_id, sizeof k->ids);
     k->npat = 0;
     for (p = 0; p < TRK_PATTERNS; p++)
         if (!pattern_blank(&s->pattern[p])) {
@@ -3368,16 +3417,53 @@ static struct snap *snap_make(const trk_song *s)
     return k;
 }
 
+/* What of a track is a setting rather than an edit: where it plays, how
+ * loud, its name. trk.h says the header boxes are not edits, so an undo of a
+ * note must not also send the track back to the window it played an hour
+ * ago. The octave is not here: changing it moves the track's notes, and that
+ * is an edit with an undo step of its own. */
+static void keep_settings(trk_track *to, const trk_track *from)
+{
+    memcpy(to->name, from->name, sizeof to->name);
+    memcpy(to->client, from->client, sizeof to->client);
+    memcpy(to->port, from->port, sizeof to->port);
+    memcpy(to->sink, from->sink, sizeof to->sink);
+    memcpy(to->samples, from->samples, sizeof to->samples);
+    to->channel  = from->channel;
+    to->velocity = from->velocity;
+    to->volume   = from->volume;
+    to->mute     = from->mute;
+}
+
+static void release_moved_tracks(trk_engine *e);
+
 /* A snapshot back into the song -- except what is live rather than edited:
  * the tempo (the queue is running at it), the rows per beat and the volume.
  * An undo of a cell edit that also took the tempo back to what it was then
- * would show one tempo while the queue played another. */
+ * would show one tempo while the queue played another.
+ *
+ * And except each track's settings, which follow the track. The snapshot
+ * says which track was in each place (its ids); a track that is still in the
+ * song keeps the settings and the synth it has now, wherever the restore puts
+ * it. Only a track the snapshot brings back -- the undo of a removal -- takes
+ * its settings from the snapshot, since there is nothing newer, and goes back
+ * to its synth if that synth is still open. When the tracks are not where
+ * they were, what they were sounding is released first, as an insert or a
+ * removal releases it, and the windows are re-routed at the next unlock. */
 static void snap_restore(trk_engine *e, const struct snap *k)
 {
     trk_song *s = &e->song;
     const double bpm = s->bpm;
     const int lpb = s->lpb, volume = s->volume;
-    int p;
+    trk_track was[TRK_TRACKS];
+    int was_sink[TRK_TRACKS], was_id[TRK_TRACKS], moved, p, t, j;
+
+    memcpy(was, s->track, sizeof was);
+    memcpy(was_sink, e->track_sink, sizeof was_sink);
+    memcpy(was_id, e->track_id, sizeof was_id);
+    moved = memcmp(was_id, k->ids, sizeof was_id) != 0;
+    if (moved) release_moved_tracks(e);
+
     for (p = 0; p < TRK_PATTERNS; p++)
         if (!pattern_blank(&s->pattern[p])) {
             memset(&s->pattern[p], 0, sizeof s->pattern[p]);
@@ -3389,6 +3475,30 @@ static void snap_restore(trk_engine *e, const struct snap *k)
     s->bpm = bpm;
     s->lpb = lpb;
     s->volume = volume;
+
+    for (t = 0; t < TRK_TRACKS; t++) {
+        int from = -1;
+        for (j = 0; j < TRK_TRACKS; j++) if (was_id[j] == k->ids[t]) { from = j; break; }
+        if (from >= 0) {
+            keep_settings(&s->track[t], &was[from]);
+            e->track_sink[t] = was_sink[from];
+        } else {
+            int id, found = -1;
+            pthread_mutex_lock(&e->dmx);
+            for (id = 0; id < TRK_SINKS && s->track[t].sink[0]; id++)
+                if (e->sink[id].used && !strcmp(e->sink[id].name, s->track[t].sink)) { found = id; break; }
+            pthread_mutex_unlock(&e->dmx);
+            e->track_sink[t] = found;
+        }
+    }
+    memcpy(e->track_id, k->ids, sizeof e->track_id);
+    if (moved) {
+        memset(e->vol_sent, 0, sizeof e->vol_sent);
+        for (t = 0; t < TRK_TRACKS; t++) e->rec_note[t] = -1;
+        sink_gains_locked(e);
+        atomic_store(&e->route_after, 1);
+        if (e->playing) top_up(e);
+    }
 }
 
 static void redo_clear(trk_engine *e)
@@ -3398,7 +3508,7 @@ static void redo_clear(trk_engine *e)
 
 /* A snapshot of the song as it is onto one of the two stacks. A full stack
  * gives up its oldest. A malloc failure drops the entry, never the edit. */
-static void stack_push(struct snap **stack, int *n, const trk_song *s)
+static void stack_push(const trk_engine *e, struct snap **stack, int *n)
 {
     struct snap *k;
     if (*n == TRK_UNDO_MAX) {
@@ -3406,7 +3516,7 @@ static void stack_push(struct snap **stack, int *n, const trk_song *s)
         memmove(stack, stack + 1, sizeof stack[0] * (TRK_UNDO_MAX - 1));
         (*n)--;
     }
-    if (!(k = snap_make(s))) return;
+    if (!(k = snap_make(e))) return;
     stack[(*n)++] = k;
 }
 
@@ -3416,7 +3526,7 @@ static void stack_push(struct snap **stack, int *n, const trk_song *s)
 void trk_undo_push(trk_engine *e)
 {
     redo_clear(e);
-    stack_push(e->undo, &e->nundo, &e->song);
+    stack_push(e, e->undo, &e->nundo);
 }
 
 /* The caller holds the lock -- trk_key's undo case does already. */
@@ -3425,7 +3535,7 @@ int trk_undo_locked(trk_engine *e)
     struct snap *k;
     if (!e->nundo) return 0;
     k = e->undo[--e->nundo];
-    stack_push(e->redo, &e->nredo, &e->song);       /* the song as it is, to redo to */
+    stack_push(e, e->redo, &e->nredo);              /* the song as it is, to redo to */
     snap_restore(e, k);
     free(k);
     sync_sink_names(e);
@@ -3437,7 +3547,7 @@ int trk_redo_locked(trk_engine *e)
     struct snap *k;
     if (!e->nredo) return 0;
     k = e->redo[--e->nredo];
-    stack_push(e->undo, &e->nundo, &e->song);       /* not trk_undo_push: that would clear the redo */
+    stack_push(e, e->undo, &e->nundo);              /* not trk_undo_push: that would clear the redo */
     snap_restore(e, k);
     free(k);
     sync_sink_names(e);
@@ -3463,21 +3573,27 @@ int trk_track_used(trk_engine *e, int t)
  * move together and the routing follows. Playing goes on; what was sounding
  * is released first, so nothing is left held by a track that is no longer
  * where it was. */
-static void move_tracks_locked(trk_engine *e, int at, int dir)
+static void release_moved_tracks(trk_engine *e)
 {
-    trk_song *s = &e->song;
-    int p, r, t;
     unsigned i, n;
-    /* Playback carries on: what was scheduled ahead is taken back (it was laid
-     * down against the tracks as they were), what is sounding is let go of, and
-     * the schedule resumes from the first row not yet played. The history the
-     * schedule rewinds to names the held notes by track number -- it is
-     * cleared, since the numbers have moved. */
+    int t;
     if (e->playing) rewind_locked(e);
     for (t = 0; t < TRK_TRACKS; t++) release_track(e, t);
     n = e->npos < POS_RING ? e->npos : POS_RING;
     for (i = 0; i < n; i++)
         for (t = 0; t < TRK_TRACKS; t++) e->pos[(e->npos - 1 - i) % POS_RING].held[t] = -1;
+}
+
+static void move_tracks_locked(trk_engine *e, int at, int dir)
+{
+    trk_song *s = &e->song;
+    int p, r, t;
+    /* Playback carries on: what was scheduled ahead is taken back (it was laid
+     * down against the tracks as they were), what is sounding is let go of, and
+     * the schedule resumes from the first row not yet played. The history the
+     * schedule rewinds to names the held notes by track number -- it is
+     * cleared, since the numbers have moved. */
+    release_moved_tracks(e);
     for (p = 0; p < TRK_PATTERNS; p++)
         for (r = 0; r < TRK_ROWS_MAX; r++) {
             trk_cell *row = s->pattern[p].cell[r];
@@ -3492,6 +3608,8 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
     if (dir > 0) {
         memmove(&s->track[at + 1], &s->track[at], sizeof s->track[0] * (size_t)(TRK_TRACKS - 1 - at));
         memmove(&e->track_sink[at + 1], &e->track_sink[at], sizeof e->track_sink[0] * (size_t)(TRK_TRACKS - 1 - at));
+        memmove(&e->track_id[at + 1], &e->track_id[at], sizeof e->track_id[0] * (size_t)(TRK_TRACKS - 1 - at));
+        e->track_id[at] = ++e->next_track_id;
         memset(&s->track[at], 0, sizeof s->track[at]);
         {   /* "Track N" for the lowest N no track has -- not the position, which
              * would name an added track after one that is already there. */
@@ -3513,6 +3631,8 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
     } else {
         memmove(&s->track[at], &s->track[at + 1], sizeof s->track[0] * (size_t)(TRK_TRACKS - 1 - at));
         memmove(&e->track_sink[at], &e->track_sink[at + 1], sizeof e->track_sink[0] * (size_t)(TRK_TRACKS - 1 - at));
+        memmove(&e->track_id[at], &e->track_id[at + 1], sizeof e->track_id[0] * (size_t)(TRK_TRACKS - 1 - at));
+        e->track_id[TRK_TRACKS - 1] = ++e->next_track_id;
         memset(&s->track[TRK_TRACKS - 1], 0, sizeof s->track[0]);
         snprintf(s->track[TRK_TRACKS - 1].name, sizeof s->track[0].name, "Track %d", TRK_TRACKS);
         s->track[TRK_TRACKS - 1].velocity = 100;
@@ -3531,6 +3651,7 @@ static void move_tracks_locked(trk_engine *e, int at, int dir)
         s->track[t].volume = 100;
         s->track[t].octave = 4;
         e->track_sink[t] = -1;
+        e->track_id[t] = ++e->next_track_id;     /* a blank place is no track any snapshot knew */
     }
     sync_sink_names(e);
     sink_gains_locked(e);

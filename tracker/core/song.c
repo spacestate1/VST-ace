@@ -46,6 +46,19 @@ int trk_lpb_ok(int lpb)
     return lpb >= 1 && lpb <= 16 && TRK_PPQ % lpb == 0;
 }
 
+/* Anything in the pattern at all, including below its length. */
+static int pattern_any(const trk_pattern *pt)
+{
+    int r, t;
+    for (r = 0; r < TRK_ROWS_MAX; r++)
+        for (t = 0; t < TRK_TRACKS; t++) {
+            const trk_cell *c = &pt->cell[r][t];
+            if (c->note != TRK_EMPTY || c->vel != TRK_EMPTY ||
+                c->cc != TRK_EMPTY || c->val != TRK_EMPTY) return 1;
+        }
+    return 0;
+}
+
 int trk_pattern_used(const trk_song *s, int p)
 {
     int r, t;
@@ -59,8 +72,11 @@ int trk_pattern_used(const trk_song *s, int p)
     return 0;
 }
 
-/* Middle C, MIDI 60, is C-4. Notes below C-0 (MIDI 12) cannot be written
- * with one octave digit and are not entered; a file naming one is refused. */
+/* Middle C, MIDI 60, is C-4. The octave below C-0 -- MIDI 0..11, which a
+ * MIDI keyboard or a recorded take can reach -- has no single digit, so its
+ * octave is written '-': "C--", "C#-", ... "B--". Three characters, as every
+ * note is, so the grid and the file keep their shape; an older build reads
+ * one as a malformed cell rather than silently as nothing. */
 const char *trk_part_label(const trk_song *s, int p, char *buf)
 {
     if (p >= 0 && p < TRK_PATTERNS && s->pattern[p].name[0])
@@ -73,7 +89,8 @@ const char *trk_part_label(const trk_song *s, int p, char *buf)
 const char *trk_note_name(int note, char *buf)
 {
     if (note == TRK_NOTE_OFF)          { strcpy(buf, "==="); return buf; }
-    if (note < 12 || note > 127)       { strcpy(buf, "..."); return buf; }
+    if (note < 0 || note > 127)        { strcpy(buf, "..."); return buf; }
+    if (note < 12)                     { snprintf(buf, 4, "%s-", k_names[note]); return buf; }
     snprintf(buf, 4, "%s%d", k_names[note % 12], note / 12 - 1);
     return buf;
 }
@@ -83,7 +100,12 @@ static int parse_note(const char *s)
     int i;
     if (!strcmp(s, "===")) return TRK_NOTE_OFF;
     if (!strcmp(s, "...")) return TRK_EMPTY;
-    if (strlen(s) != 3 || !isdigit((unsigned char)s[2])) return -1;
+    if (strlen(s) != 3) return -1;
+    if (s[2] == '-') {                       /* the octave below C-0 */
+        for (i = 0; i < 12; i++) if (!strncasecmp(s, k_names[i], 2)) return i;
+        return -1;
+    }
+    if (!isdigit((unsigned char)s[2])) return -1;
     for (i = 0; i < 12; i++)
         if (!strncasecmp(s, k_names[i], 2)) {
             int n = (s[2] - '0' + 1) * 12 + i;
@@ -220,10 +242,16 @@ int trk_song_save(const trk_song *s, const char *path, char *err, size_t errn)
          * blank one at the default length says nothing worth keeping. */
         int listed = 0;
         for (i = 0; i < s->norder; i++) if (s->order[i] == p) listed = 1;
-        if (!listed && !trk_pattern_used(s, p) && pt->rows == 64 && !pt->name[0]) continue;
+        if (!listed && !pattern_any(pt) && pt->rows == 64 && !pt->name[0]) continue;
         fprintf(f, "pattern %d rows %d\n", p, pt->rows);
         if (pt->name[0]) fprintf(f, "pattern %d name %s\n", p, one_line(pt->name, ln, sizeof ln));
-        for (r = 0; r < pt->rows; r++)
+        /* Every row the pattern can hold, not only the ones it plays: a
+         * pattern shortened keeps what was below its new end -- lengthened
+         * again, it is all still there -- and a song saved and opened again is
+         * the song that was saved, hidden rows and all. Every build reads a
+         * cell past a pattern's length; the loader has always taken any row
+         * the pattern has room for. */
+        for (r = 0; r < TRK_ROWS_MAX; r++)
             for (t = 0; t < TRK_TRACKS; t++) {
                 const trk_cell *c = &pt->cell[r][t];
                 char n[4], v[3] = "..", cc[3] = "..", val[3] = "..";

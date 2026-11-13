@@ -430,6 +430,7 @@ static void sync_mutes(ui *U);
 static void on_track_add(GtkButton *b, gpointer u);
 static void on_track_remove(GtkButton *b, gpointer u);
 static void schedule_refit(ui *U);   /* defined beside refit_columns, below */
+static void after_restore(ui *U);       /* beside tracks_changed, below */
 
 /* Help > Cheat Sheet: for each track playing a sample set, every sample
  * with its note and the key that types it at the octave set now; then the
@@ -2062,6 +2063,7 @@ static gboolean on_key(GtkEventControllerKey *k, guint kv, guint code,
         else if (r == 0) { snprintf(msg, sizeof msg, "no sample on %s: %s", nn, what); status(U, msg); }
     }
     if (trk_key(U->e, &U->ed, key)) {
+        if (key == TRK_K_UNDO || key == TRK_K_REDO) after_restore(U);
         update_size(U);
         redraw(U);
         cursor_moved(U);
@@ -2241,9 +2243,10 @@ static void clip_status(ui *U, int key)
     status(U, msg);
 }
 
+
 static void grid_key(ui *U, int key)
 {
-    trk_key(U->e, &U->ed, key);
+    if (trk_key(U->e, &U->ed, key) && (key == TRK_K_UNDO || key == TRK_K_REDO)) after_restore(U);
     if (key == TRK_K_COPY || key == TRK_K_CUT || key == TRK_K_PASTE) clip_status(U, key);
     redraw(U);
     cursor_moved(U);
@@ -2951,6 +2954,19 @@ static void show_keys(ui *U)    { show_text(U, "tracker keys", k_keys_help); }
 /* ---- adding and removing tracks ---- */
 
 /* Everything that shows a track, again, after the tracks have moved. */
+/* An undo or redo can bring a removed track back or take an added one away
+ * -- a different set of tracks, names and windows under the headers -- so they
+ * are read from the song again, as after + Track. */
+static void after_restore(ui *U)
+{
+    if (U->ed.track >= ntr(U)) U->ed.track = ntr(U) - 1;
+    sync_from_song(U);
+    refresh_dests(U, 1);
+    refresh_samples(U);
+    update_size(U);
+    schedule_refit(U);
+}
+
 static void tracks_changed(ui *U, const char *msg)
 {
     if (U->ed.track >= ntr(U)) U->ed.track = ntr(U) - 1;
