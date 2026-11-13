@@ -2358,7 +2358,7 @@ protected:
             const int t = ev->response_type & ~0x80;
             if (t == XCB_BUTTON_PRESS || t == XCB_BUTTON_RELEASE) {
                 auto *b = static_cast<xcb_button_press_event_t *>(message);
-                if (b->event == xcb_window_t(winId()) && (b->detail == 4 || b->detail == 5)) {
+                if (wheelWin_ && b->event == xcb_window_t(wheelWin_) && (b->detail == 4 || b->detail == 5)) {
                     if (t == XCB_BUTTON_PRESS) emit zoomWheel(b->detail == 4 ? +1 : -1);
                     return true;
                 }
@@ -2446,9 +2446,11 @@ private:
         Display *d = x->display();
         const unsigned mods[] = { ControlMask, ControlMask | LockMask,
                                   ControlMask | Mod2Mask, ControlMask | LockMask | Mod2Mask };
+        /* Remembered, for ungrabWheel: see there. */
+        wheelWin_ = (unsigned long)winId();
         for (unsigned b : { 4u, 5u })
             for (unsigned m : mods)
-                XGrabButton(d, b, m, (unsigned long)winId(), 0,
+                XGrabButton(d, b, m, wheelWin_, 0,
                             ButtonPressMask | ButtonReleaseMask,
                             GrabModeAsync, GrabModeAsync, 0UL, 0UL);
         XFlush(d);
@@ -2460,10 +2462,18 @@ private:
 #ifdef PEHOST_HAVE_X11
         if (!wheelGrabbed_) return;
         wheelGrabbed_ = false;
-        auto *x = qApp->nativeInterface<QNativeInterface::QX11Application>();
-        if (!x || !x->display()) return;
-        XUngrabButton(x->display(), 4, AnyModifier, (unsigned long)winId());
-        XUngrabButton(x->display(), 5, AnyModifier, (unsigned long)winId());
+        /* The id taken at grab time, never winId() here. This runs from
+         * detach(), which the destructor calls while the widget tree above is
+         * being torn down -- and winId() on a widget in that state sets about
+         * re-creating native windows for its dying parents, recursing until
+         * the stack runs out. That was a segfault on closing a studio tab or
+         * quitting with a native editor open. */
+        const unsigned long w = wheelWin_;
+        wheelWin_ = 0;
+        auto *x = qApp ? qApp->nativeInterface<QNativeInterface::QX11Application>() : nullptr;
+        if (!w || !x || !x->display()) return;
+        XUngrabButton(x->display(), 4, AnyModifier, w);
+        XUngrabButton(x->display(), 5, AnyModifier, w);
         XFlush(x->display());
 #endif
     }
@@ -2545,6 +2555,7 @@ private:
     int  hostW_ = 0, hostH_ = 0;     /* the size this side last gave it */
     int  hostResizing_ = 0;
     bool wheelGrabbed_ = false;
+    unsigned long wheelWin_ = 0;     /* the X window the grab is on */
 };
 
 /* Shows a Windows plugin's editor. The plugin renders into a buffer the Win32
@@ -3757,12 +3768,19 @@ public:
             const int was = editorH_;
             if (chosen) {
                 editorW_ = w; editorH_ = h; zoom_ = 1.0;
-                if (!fitPending_) fitAuto_ = false;
             }
+            /* A size asked for while the editor is still opening is where it
+             * starts, and the first fit is still to come -- so it neither ends
+             * the automatic fit nor scrolls anywhere. Scrolling to the bottom of
+             * an editor about to be fitted left the studio's pane drawn at the
+             * stale offset: the plug-in's window over the header, and the tab
+             * bar under it. */
+            const bool decided = chosen && !editorOpening_ && !fitPending_;
+            if (decided) fitAuto_ = false;
             editorStack_->setMinimumSize(w, h);
             editorStack_->resize(w, h);
             updateZoomUi();
-            if (chosen) {
+            if (decided) {
                 QScrollBar *vb = editorScroll_->verticalScrollBar();
                 QTimer::singleShot(0, vb, [vb, h, was] { vb->setValue(h > was ? vb->maximum() : 0); });
             }
@@ -4735,7 +4753,13 @@ private slots:
         int w = 0, ht = 0;
         pehost_editor_size(h, &w, &ht);
         if (editorKind_ == PEHOST_EDITOR_X11) {
+            /* Whatever size the plug-in asks for from inside attach -- most
+             * ask while their view is being created -- is its opening size,
+             * not a choice made in its interface: see the editorResized
+             * handler. */
+            editorOpening_ = true;
             gui = editor_->attach(h);
+            editorOpening_ = false;
             if (gui) editorStack_->setCurrentIndex(0);
         } else {
             pixelEditor_->dumped_ = false;
@@ -4897,6 +4921,13 @@ private slots:
                 zoom_ = double(got.width()) / editorW_;
                 editorStack_->setMinimumSize(got);
                 editorStack_->resize(got);
+                /* Fitted, so there is nothing to scroll to: put the view back
+                 * at the origin rather than trusting the scroll area to notice.
+                 * A native child is not clipped by the viewport, so a stale
+                 * offset is not a cosmetic slip -- it is the plug-in's window
+                 * drawn over the rest of the pane. */
+                editorScroll_->horizontalScrollBar()->setValue(0);
+                editorScroll_->verticalScrollBar()->setValue(0);
                 updateZoomUi();
                 return;
             }
@@ -6986,6 +7017,7 @@ private:
     bool          fitPending_ = false;   /* an automatic fit still to be measured */
     bool          fitAuto_ = false;      /* keep it fitted until a zoom is chosen */
     bool          fitGrow_ = false;      /* that fit may enlarge, not only shrink */
+    bool          editorOpening_ = false; /* inside EditorHost::attach */
     QSize         lastViewport_;         /* to notice the pane changing size */
     QStackedWidget *editorStack_;
     QScrollArea  *editorScroll_;
