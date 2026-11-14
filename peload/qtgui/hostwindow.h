@@ -3489,6 +3489,25 @@ public:
         editorScroll_->setWidget(editorStack_);
         editorScroll_->setWidgetResizable(false);
         editorScroll_->setAlignment(Qt::AlignCenter);
+        /* The pane the plug-in's window lives in has to be an X window too.
+         *
+         * EditorHost is native and its ancestors are not, so on its own its
+         * X window is a direct child of the top-level: X clips it to nothing
+         * but the whole window, and Qt positions it by arithmetic through
+         * every alien widget above. A plug-in larger than the pane -- after a
+         * shrink, before a fit, in a tab resized while hidden -- then painted
+         * over the zoom bar, the piano and the tab bar, and every scroll or
+         * re-centre moved it somewhere else on the window.
+         *
+         * A native viewport is the clip: X cuts the plug-in off at the pane's
+         * edge, whatever size it is. A native stack inside it makes scrolling
+         * and centring a plain X move of one window, with the plug-in fixed
+         * at its origin. Qt makes native widgets' siblings native too, and
+         * with them their ancestors, so the window ends up native throughout
+         * -- which is what pestudio already was, and why it never showed
+         * this; the multi-tab studio was not. */
+        editorScroll_->viewport()->setAttribute(Qt::WA_NativeWindow);
+        editorStack_->setAttribute(Qt::WA_NativeWindow);
 
         /* The zoom bar.
          *
